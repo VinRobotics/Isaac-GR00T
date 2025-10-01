@@ -69,6 +69,7 @@ class Gr00tPolicy(BasePolicy):
         modality_config: Dict[str, ModalityConfig],
         modality_transform: ComposedModalityTransform,
         denoising_steps: Optional[int] = None,
+        smooth_option: Optional[str] = "",
         device: Union[int, str] = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         """
@@ -117,6 +118,19 @@ class Gr00tPolicy(BasePolicy):
             ):
                 self.model.action_head.num_inference_timesteps = denoising_steps
                 print(f"Set action denoising steps to {denoising_steps}")
+            
+        self.smooth_option = smooth_option
+        if self.smooth_option == "te":
+            self.temporal_agg = True
+            self.num_queries = 16
+            if self.temporal_agg:
+                self.k = 0.015
+                self.ensemble_weights = torch.exp(-self.k * torch.arange(self.num_queries)).cuda()
+                self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0).cuda()
+                self.reset()
+        elif self.smooth_option == "rtc":
+            self.temporal_agg = False
+            self.prev_action_chunk = None
 
     def apply_transforms(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -142,6 +156,46 @@ class Gr00tPolicy(BasePolicy):
             Dict[str, Any]: The untransformed action.
         """
         return self._modality_transform.unapply(action)
+    
+    def reset(self):
+        """Resets the online computation variables."""
+        self.ensembled_actions = None
+        self.ensembled_actions_count = None
+        self.prev_action_chunk = None
+
+    def process_output(self, actions):
+        """
+        Takes a (batch, num_queries, action_dim) sequence of actions, update the temporal ensemble for all
+        time steps, and pop/return the next batch of actions in the sequence.
+        """
+        # actions = actions * self.stats["action_std"] + self.stats["action_mean"]
+        if not self.temporal_agg:
+            return actions.squeeze()
+
+        if self.ensembled_actions is None:
+            self.ensembled_actions = actions.clone()
+            self.ensembled_actions_count = torch.ones(
+                (self.num_queries, 1), dtype=torch.long, device=self.ensembled_actions.device
+            )
+        else:
+            # self.ensembled_actions will have shape (batch_size, num_queries - 1, action_dim). Compute
+            # the online update for those entries.
+            self.ensembled_actions *= self.ensemble_weights_cumsum[self.ensembled_actions_count - 1]
+            self.ensembled_actions += actions[:, :-1] * self.ensemble_weights[self.ensembled_actions_count]
+            self.ensembled_actions /= self.ensemble_weights_cumsum[self.ensembled_actions_count]
+            self.ensembled_actions_count = torch.clamp(self.ensembled_actions_count + 1, max=self.num_queries)
+            # The last action, which has no prior online average, needs to get concatenated onto the end.
+            self.ensembled_actions = torch.cat([self.ensembled_actions, actions[:, -1:]], dim=1)
+            self.ensembled_actions_count = torch.cat(
+                [self.ensembled_actions_count, torch.ones_like(self.ensembled_actions_count[-1:])]
+            )
+        # "Consume" the first action.
+        action, self.ensembled_actions, self.ensembled_actions_count = (
+            self.ensembled_actions[:, :1, :],
+            self.ensembled_actions[:, 1:],
+            self.ensembled_actions_count[1:],
+        )
+        return action
 
     def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -168,6 +222,14 @@ class Gr00tPolicy(BasePolicy):
         # Create a copy to avoid mutating input
         obs_copy = observations.copy()
 
+        if self.smooth_option == "rtc":
+            inference_delay = obs_copy.get("inference_delay", None)
+            prefix_attention_horizon = obs_copy.get("prefix_attention_horizon", None)
+            prefix_attention_schedule = obs_copy.get("prefix_attention_schedule", None)
+            max_guidance_weight = obs_copy.get("max_guidance_weight", None)
+            execute_horizon = obs_copy.get("execute_horizon", None)
+            obs_copy = obs_copy.get("observations", None)
+
         is_batch = self._check_state_is_batched(obs_copy)
         if not is_batch:
             obs_copy = unsqueeze_dict_values(obs_copy)
@@ -178,10 +240,31 @@ class Gr00tPolicy(BasePolicy):
                 obs_copy[k] = np.array(v)
 
         normalized_input = self.apply_transforms(obs_copy)
-        normalized_action = self._get_action_from_normalized_input(normalized_input)
-        unnormalized_action = self._get_unnormalized_action(normalized_action)
+        normalized_action = self._get_action_from_normalized_input(normalized_input) if self.smooth_option != "rtc" else self._get_realtime_action_from_normalized_input(
+            normalized_input,
+            self.prev_action_chunk,
+            inference_delay,
+            prefix_attention_horizon,
+            prefix_attention_schedule,
+            max_guidance_weight
+        )
+        if self.smooth_option == "rtc":
+            normalized_action, self.prev_action_chunk = normalized_action
 
-        if not is_batch:
+            self.prev_action_chunk = torch.concat(
+                (self.prev_action_chunk[:, execute_horizon:],
+                torch.zeros(
+                    [self.prev_action_chunk.shape[0], execute_horizon, self.prev_action_chunk.shape[-1]],
+                    device=self.prev_action_chunk.device,
+                )),
+                dim=1,
+            )
+        unnormalized_action = self._get_unnormalized_action(normalized_action)        
+
+        if self.smooth_option == "te":
+            for k in unnormalized_action.keys():
+                unnormalized_action[k] = unnormalized_action[k].squeeze(1)  # remove the 1 dimension
+        elif not is_batch:
             unnormalized_action = squeeze_dict_values(unnormalized_action)
         return unnormalized_action
 
@@ -192,6 +275,25 @@ class Gr00tPolicy(BasePolicy):
 
         normalized_action = model_pred["action_pred"].float()
         return normalized_action
+    
+    def _get_realtime_action_from_normalized_input(self, normalized_input: Dict[str, Any],
+                                                   prev_action_chunk: torch.Tensor | None,
+                                                   inference_delay: int,
+                                                   prefix_attention_horizon: int,
+                                                   prefix_attention_schedule: str,
+                                                   max_guidance_weight: float) -> tuple[torch.Tensor, torch.Tensor]:
+        # Set up autocast context if needed
+        # with torch.inference_mode(False), torch.enable_grad(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+        model_pred, real_action = self.model.get_realtime_action(normalized_input,
+                                                        prev_action_chunk=prev_action_chunk,
+                                                        inference_delay=inference_delay,
+                                                        prefix_attention_horizon=prefix_attention_horizon,
+                                                        prefix_attention_schedule=prefix_attention_schedule,
+                                                        max_guidance_weight=max_guidance_weight)
+
+        normalized_action = model_pred["action_pred"].float()
+        real_action = real_action["action_pred"].float()
+        return normalized_action, real_action
 
     def _get_unnormalized_action(self, normalized_action: torch.Tensor) -> Dict[str, Any]:
         return self.unapply_transforms({"action": normalized_action.cpu()})

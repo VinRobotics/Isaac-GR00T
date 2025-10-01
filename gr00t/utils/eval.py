@@ -116,6 +116,141 @@ def calc_mse_for_single_trajectory(
     return mse
 
 
+def calc_mse_for_overlapping_trajectory(
+    policy: BasePolicy,
+    dataset: LeRobotSingleDataset,
+    traj_id: int,
+    modality_keys: list,
+    prefix_attention_schedule: str,
+    max_guidance_weight: float,
+    steps=300,
+    action_horizon=16,
+    plot=False,
+):
+    policy.reset()
+    state_joints_across_time = []
+    gt_action_across_time = []
+    pred_action_across_time = []
+    pred_action_chunk_across_time = []
+    action_chunk = None
+
+    inference_delay = 3
+    execute_horizon = 5
+    prefix_attention_horizon = action_horizon - execute_horizon
+
+
+    for step_count in range(steps):
+        data_point = dataset.get_step_data(traj_id, step_count)
+
+        # NOTE this is to get all modality keys concatenated
+        # concat_state = data_point[f"state.{modality_keys[0]}"][0]
+        # # concat_gt_action = data_point[f"action.{modality_keys[0]}"][0]
+        # concat_state = np.concatenate(
+        #     [data_point[f"state.{key}"][0] for key in modality_keys], axis=0
+        # )
+        concat_state = np.concatenate(
+            [data_point[f"state.state"][0] for key in modality_keys], axis=0
+        )
+        concat_gt_action = np.concatenate(
+            [data_point[f"action.actions"][0] for key in modality_keys], axis=0
+        )
+
+        state_joints_across_time.append(concat_state)
+        gt_action_across_time.append(concat_gt_action)
+
+        if step_count % execute_horizon == 0:
+            next_action_chunk = policy.get_action(
+                dict(
+                    observations=data_point,
+                    inference_delay=inference_delay,
+                    execute_horizon=execute_horizon,
+                    prefix_attention_horizon=prefix_attention_horizon,
+                    prefix_attention_schedule=prefix_attention_schedule,
+                    max_guidance_weight=max_guidance_weight
+                )
+            )
+
+            if action_chunk is None:
+                for j in range(execute_horizon):
+                    # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
+                    # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
+                    concat_pred_action = np.concatenate(
+                        [np.atleast_1d(next_action_chunk[f"action.{key}"][j]) for key in modality_keys],
+                        axis=0,
+                    )
+                    pred_action_across_time.append(concat_pred_action)
+            else:
+                for j in range(execute_horizon, execute_horizon + inference_delay, 1):
+                    # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
+                    # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
+                    concat_pred_action = np.concatenate(
+                        [np.atleast_1d(action_chunk[f"action.{key}"][j]) for key in modality_keys],
+                        axis=0,
+                    )
+                    pred_action_across_time.append(concat_pred_action)
+                for j in range(inference_delay, execute_horizon, 1):
+                    # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
+                    # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
+                    concat_pred_action = np.concatenate(
+                        [np.atleast_1d(next_action_chunk[f"action.{key}"][j]) for key in modality_keys],
+                        axis=0,
+                    )
+                    pred_action_across_time.append(concat_pred_action)
+
+            action_chunk = next_action_chunk
+
+    # plot the joints
+    state_joints_across_time = np.array(state_joints_across_time)
+    gt_action_across_time = np.array(gt_action_across_time)
+    pred_action_across_time = np.array(pred_action_across_time)[:steps]
+    assert gt_action_across_time.shape == pred_action_across_time.shape
+
+    # calc MSE across time
+    mse = np.mean((gt_action_across_time - pred_action_across_time) ** 2)
+    print("Unnormalized Action MSE across single traj:", mse)
+
+    print("state_joints vs time", state_joints_across_time.shape)
+    print("gt_action_joints vs time", gt_action_across_time.shape)
+    print("pred_action_joints vs time", pred_action_across_time.shape)
+
+    # num_of_joints = state_joints_across_time.shape[1]
+    action_dim = gt_action_across_time.shape[1]
+
+    if plot:
+        fig, axes = plt.subplots(nrows=action_dim, ncols=1, figsize=(8, 4 * action_dim))
+
+        # Add a global title showing the modality keys
+        fig.suptitle(
+            f"Trajectory {traj_id} - Modalities: {', '.join(modality_keys)}",
+            fontsize=16,
+            color="blue",
+        )
+
+        for i, ax in enumerate(axes):
+            # The dimensions of state_joints and action are the same only when the robot uses actions directly as joint commands.
+            # Therefore, do not plot them if this is not the case.
+            if state_joints_across_time.shape == gt_action_across_time.shape:
+                ax.plot(state_joints_across_time[:, i], label="state joints")
+            ax.plot(gt_action_across_time[:, i], label="gt action")
+            ax.plot(pred_action_across_time[:, i], label="pred action")
+
+            # put a dot every ACTION_HORIZON
+            for j in range(0, steps, execute_horizon):
+                if j == 0:
+                    ax.plot(j, gt_action_across_time[j, i], "ro", label="inference point")
+                else:
+                    ax.plot(j, gt_action_across_time[j, i], "ro")
+
+            ax.set_title(f"Action {i}")
+            ax.legend()
+
+        plt.tight_layout()
+        plt.savefig(f"overlapping_trajectory_{traj_id}_mse_plot_sigma=0.5.png")
+        # plt.show()
+
+    return mse
+
+
 def plot_trajectory(
     info,
     save_plot_path=None,
