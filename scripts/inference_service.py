@@ -83,6 +83,9 @@ class ArgsConfig:
     client: bool = False
     """Whether to run the client."""
 
+    smooth_option: Literal["te", "rtc", ""] = ""
+    """Smooth option for the action generation. Options are 'te' for temporal encoding, 'rtc' for real-time chunking, or empty string for no smoothing."""
+
     denoising_steps: int = 4
     """The number of denoising steps to use."""
 
@@ -161,6 +164,7 @@ def main(args: ArgsConfig):
             modality_transform=modality_transform,
             embodiment_tag=args.embodiment_tag,
             denoising_steps=args.denoising_steps,
+            smooth_option=args.smooth_option
         )
 
         # Start the server
@@ -194,13 +198,13 @@ def main(args: ArgsConfig):
         # - action: action.right_hand: (16, 6)
         # - action: action.waist: (16, 3)
         obs = {
-            "video.ego_view": np.random.randint(0, 256, (1, 256, 256, 3), dtype=np.uint8),
+            "video.cam_front": np.random.randint(0, 256, (1, 540, 960, 3), dtype=np.uint8),
+            "video.cam_waist": np.random.randint(0, 256, (1, 540, 960, 3), dtype=np.uint8),
             "state.left_arm": np.random.rand(1, 7),
             "state.right_arm": np.random.rand(1, 7),
             "state.left_hand": np.random.rand(1, 6),
             "state.right_hand": np.random.rand(1, 6),
-            "state.waist": np.random.rand(1, 3),
-            "annotation.human.action.task_description": ["do your thing!"],
+            "annotation.human.task_description": ["do your thing!"],
         }
 
         if args.http_server:

@@ -519,7 +519,8 @@ class FlowmatchingActionHead(nn.Module):
             pinv_correction = vjp_func((error, torch.zeros_like(x_t)))[0]
             if pinv_correction is None:
                 pinv_correction = torch.zeros_like(x_1_i_vjp)
-            inv_r2 = (sigma_d_o**2 * t_cont**2 + (1 - t_cont)**2) / (sigma_d_o**2 * (1 - t_cont)**2) # inv_r2 = (t**2 + (1 - t) ** 2) / ((1 - t) ** 2)
+            # inv_r2 = (sigma_d_o**2 * t_cont**2 + (1 - t_cont)**2) / (sigma_d_o**2 * (1 - t_cont)**2)
+            inv_r2 = (t_cont**2 + (1 - t_cont) ** 2) / ((1 - t_cont) ** 2)
             c = torch.nan_to_num(torch.tensor((1 - t_cont) / max(t_cont, 1e-12), device=self.device, dtype=self.dtype),  # Avoid division by zero
                                  nan=0.0, posinf=max_guidance_weight)
             

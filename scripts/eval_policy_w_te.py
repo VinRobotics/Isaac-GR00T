@@ -25,7 +25,7 @@ from gr00t.data.embodiment_tags import EMBODIMENT_TAG_MAPPING
 from gr00t.eval.robot import RobotInferenceClient
 from gr00t.experiment.data_config import DATA_CONFIG_MAP
 from gr00t.model.policy import BasePolicy, Gr00tPolicy
-from gr00t.utils.eval import calc_mse_for_overlapping_trajectory
+from gr00t.utils.eval import calc_mse_for_single_trajectory
 
 warnings.simplefilter("ignore", category=FutureWarning)
 
@@ -52,7 +52,7 @@ class ArgsConfig:
     plot: bool = False
     """Whether to plot the images."""
 
-    modality_keys: List[str] = field(default_factory=lambda: ["left_arm", "right_arm"])
+    modality_keys: List[str] = field(default_factory=lambda: ["left_arm", "left_hand"])
     """Modality keys to evaluate."""
 
     data_config: Literal[tuple(DATA_CONFIG_MAP.keys())] = "fourier_gr1_arms_only"
@@ -79,17 +79,15 @@ class ArgsConfig:
     model_path: str = None
     """Path to the model checkpoint."""
 
-    denoising_steps: int = 5
+    denoising_steps: int = 4
     """Number of denoising steps to use."""
 
-    prefix_attention_schedule: Literal["linear", "exp", "ones", "zeros"] = "linear"
-    """Prefix attention schedule to use."""
-
-    max_guidance_weight: float = 5.0
-    """Maximum guidance weight to use."""
+    save_plot_path: str = None
+    """Path to save the plot."""
 
 
 def main(args: ArgsConfig):
+    print(args)
     data_config = DATA_CONFIG_MAP[args.data_config]
     if args.model_path is not None:
         import torch
@@ -103,10 +101,9 @@ def main(args: ArgsConfig):
             modality_transform=modality_transform,
             embodiment_tag=args.embodiment_tag,
             denoising_steps=args.denoising_steps,
-            smooth_option="rtc",
             device="cuda" if torch.cuda.is_available() else "cpu",
+            smooth_option="te"
         )
-        policy.model.train()
     else:
         policy: BasePolicy = RobotInferenceClient(host=args.host, port=args.port)
 
@@ -146,16 +143,16 @@ def main(args: ArgsConfig):
     all_mse = []
     for traj_id in range(args.trajs):
         print("Running trajectory:", traj_id)
-        mse = calc_mse_for_overlapping_trajectory(
+        mse = calc_mse_for_single_trajectory(
             policy,
             dataset,
             traj_id,
             modality_keys=args.modality_keys,
             steps=args.steps,
-            action_horizon=args.action_horizon,
+            action_horizon=16,
             plot=args.plot,
-            prefix_attention_schedule=args.prefix_attention_schedule,
-            max_guidance_weight=args.max_guidance_weight,
+            temp_agg=True,
+            save_plot_path=args.save_plot_path,
         )
         print("MSE:", mse)
         all_mse.append(mse)
@@ -168,3 +165,4 @@ if __name__ == "__main__":
     # Parse arguments using tyro
     config = tyro.cli(ArgsConfig)
     main(config)
+

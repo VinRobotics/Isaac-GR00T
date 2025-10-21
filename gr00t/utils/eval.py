@@ -44,7 +44,10 @@ def calc_mse_for_single_trajectory(
     plot=False,
     plot_state=False,
     save_plot_path=None,
+    temp_agg=False
 ):
+    if temp_agg:
+        action_horizon = 1
     state_joints_across_time = []
     gt_action_across_time = []
     pred_action_across_time = []
@@ -149,10 +152,10 @@ def calc_mse_for_overlapping_trajectory(
         #     [data_point[f"state.{key}"][0] for key in modality_keys], axis=0
         # )
         concat_state = np.concatenate(
-            [data_point[f"state.state"][0] for key in modality_keys], axis=0
+            [data_point[f"state.{key}"][0] for key in modality_keys], axis=0
         )
         concat_gt_action = np.concatenate(
-            [data_point[f"action.actions"][0] for key in modality_keys], axis=0
+            [data_point[f"action.{key}"][0] for key in modality_keys], axis=0
         )
 
         state_joints_across_time.append(concat_state)

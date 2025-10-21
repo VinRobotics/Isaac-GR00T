@@ -124,7 +124,7 @@ class Gr00tPolicy(BasePolicy):
             self.temporal_agg = True
             self.num_queries = 16
             if self.temporal_agg:
-                self.k = 0.015
+                self.k = -0.02
                 self.ensemble_weights = torch.exp(-self.k * torch.arange(self.num_queries)).cuda()
                 self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0).cuda()
                 self.reset()
@@ -195,6 +195,7 @@ class Gr00tPolicy(BasePolicy):
             self.ensembled_actions[:, 1:],
             self.ensembled_actions_count[1:],
         )
+        print("PROCESS OUTPUT", action.shape)
         return action
 
     def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
@@ -223,10 +224,11 @@ class Gr00tPolicy(BasePolicy):
         obs_copy = observations.copy()
 
         if self.smooth_option == "rtc":
+            print(obs_copy)
             inference_delay = obs_copy.get("inference_delay", None)
             prefix_attention_horizon = obs_copy.get("prefix_attention_horizon", None)
             prefix_attention_schedule = obs_copy.get("prefix_attention_schedule", None)
-            max_guidance_weight = obs_copy.get("max_guidance_weight", None)
+            max_guidance_weight = obs_copy.get("max_guidance_weight", 5)
             execute_horizon = obs_copy.get("execute_horizon", None)
             obs_copy = obs_copy.get("observations", None)
 
@@ -274,6 +276,8 @@ class Gr00tPolicy(BasePolicy):
             model_pred = self.model.get_action(normalized_input)
 
         normalized_action = model_pred["action_pred"].float()
+        if self.smooth_option == "te":
+            normalized_action = self.process_output(normalized_action)
         return normalized_action
     
     def _get_realtime_action_from_normalized_input(self, normalized_input: Dict[str, Any],
