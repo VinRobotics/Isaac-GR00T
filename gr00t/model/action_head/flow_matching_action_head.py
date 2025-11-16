@@ -186,6 +186,18 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     num_target_vision_tokens: int = field(
         default=32, metadata={"help": "Number of target vision tokens."}
     )
+    
+    # Torque aware
+    torque_aware: bool = field(
+        default=False, metadata={"help": "Whether to use torque-aware training."}
+    )
+    effort_dim: int = field(
+        default=None, metadata={"help": "Effort dimension."}
+    )
+    
+    action_dim: int = field(
+        default=None, metadata={"help": "Action dimension."}
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -373,7 +385,18 @@ class FlowmatchingActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
-        loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+        
+        weights = torch.ones(
+            action_mask.shape,
+            device=pred_actions.device,
+            dtype=pred_actions.dtype,
+        )
+        
+        if self.config.torque_aware:
+            weights[:, : self.action_dim] = 1.0
+            weights[:, self.config.action_dim : self.config.action_dim + self.config.effort_dim] = 0.1  # downweight effort loss
+        
+        loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask * weights
         loss = loss.sum() / action_mask.sum()
         output_dict = {
             "loss": loss,

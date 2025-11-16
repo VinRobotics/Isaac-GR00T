@@ -134,6 +134,9 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+    # Torque aware
+    torque_aware: bool = False
+    """Whether to use torque-aware training."""
 
 #####################################################################################
 # main training function
@@ -212,6 +215,11 @@ def main(config: ArgsConfig):
         # Update the action head config
         new_action_head_config = model.action_head.config
         new_action_head_config.action_horizon = data_action_horizon
+        
+        if config.torque_aware:
+            new_action_head_config.action_dim = data_config_cls.action_dim
+            new_action_head_config.effort_dim = data_config_cls.effort_dim
+            new_action_head_config.torque_aware = True
 
         # Import the FlowmatchingActionHead class
         from gr00t.model.action_head.flow_matching_action_head import (
@@ -228,6 +236,7 @@ def main(config: ArgsConfig):
         model.action_head = new_action_head
 
         # Update model config AND the action_head_cfg dictionary that gets saved
+        model.config.action_head_cfg = new_action_head_config.dict()
         model.config.action_horizon = data_action_horizon
         model.action_horizon = data_action_horizon
         model.config.action_head_cfg["action_horizon"] = data_action_horizon
