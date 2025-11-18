@@ -194,10 +194,6 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     effort_dim: int = field(
         default=None, metadata={"help": "Effort dimension."}
     )
-    
-    action_dim: int = field(
-        default=None, metadata={"help": "Action dimension."}
-    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -218,7 +214,9 @@ class FlowmatchingActionHead(nn.Module):
         self.input_embedding_dim = config.input_embedding_dim
 
         self.model = DiT(**config.diffusion_model_cfg)
+        self.torque_aware = config.torque_aware
         self.action_dim = config.action_dim
+        self.effort_dim = config.effort_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
 
@@ -229,7 +227,7 @@ class FlowmatchingActionHead(nn.Module):
             output_dim=self.input_embedding_dim,
         )
         self.action_encoder = MultiEmbodimentActionEncoder(
-            action_dim=config.action_dim,
+            action_dim=config.action_dim if not self.torque_aware else self.action_dim + self.effort_dim,
             hidden_size=self.input_embedding_dim,
             num_embodiments=config.max_num_embodiments,
         )
@@ -237,7 +235,7 @@ class FlowmatchingActionHead(nn.Module):
             num_categories=config.max_num_embodiments,
             input_dim=self.hidden_size,
             hidden_dim=self.hidden_size,
-            output_dim=self.action_dim,
+            output_dim=self.action_dim if not self.torque_aware else self.action_dim + self.effort_dim,
         )
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
@@ -282,6 +280,59 @@ class FlowmatchingActionHead(nn.Module):
                     print(f"Action head trainable parameter: {name}")
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No action head trainable parameters found.")
+
+    def expand_action_weights_for_torque_aware(self, pretrained_state_dict: dict, old_action_dim: int, new_action_dim: int):
+        """
+        Expand action encoder and decoder weights to accommodate effort dimensions.
+        This preserves pretrained weights for action dimensions and randomly initializes effort dimensions.
+        
+        Args:
+            pretrained_state_dict: State dict from pretrained model
+            old_action_dim: Original action dimension (from pretrained model)
+            new_action_dim: New action dimension (action_dim + effort_dim)
+        """
+        
+        # For action_encoder.W1: shape is (num_embodiments, action_dim, hidden_size)
+        # We need to expand the action_dim dimension
+        if 'action_encoder.W1.W' in pretrained_state_dict:
+            old_W1_W = pretrained_state_dict['action_encoder.W1.W']  # (num_emb, old_action_dim, hidden_size)
+            num_emb, _, hidden_size = old_W1_W.shape
+            
+            # Create new tensor with expanded dimension
+            new_W1_W = torch.randn(num_emb, new_action_dim, hidden_size) * 0.02
+            # Copy pretrained weights for action portion
+            new_W1_W[:, :old_action_dim, :] = old_W1_W
+            
+            pretrained_state_dict['action_encoder.W1.W'] = new_W1_W
+            print(f"  Expanded action_encoder.W1.W: {old_W1_W.shape} -> {new_W1_W.shape}")
+        
+        # For action_decoder.layer2: output_dim needs to be expanded
+        # shape is (num_embodiments, hidden_size, output_dim)
+        if 'action_decoder.layer2.W' in pretrained_state_dict:
+            old_layer2_W = pretrained_state_dict['action_decoder.layer2.W']  # (num_emb, hidden_size, old_action_dim)
+            num_emb, hidden_size, _ = old_layer2_W.shape
+            
+            # Create new tensor with expanded output dimension
+            new_layer2_W = torch.randn(num_emb, hidden_size, new_action_dim) * 0.02
+            # Copy pretrained weights for action portion
+            new_layer2_W[:, :, :old_action_dim] = old_layer2_W
+            
+            pretrained_state_dict['action_decoder.layer2.W'] = new_layer2_W
+            print(f"  Expanded action_decoder.layer2.W: {old_layer2_W.shape} -> {new_layer2_W.shape}")
+        
+        if 'action_decoder.layer2.b' in pretrained_state_dict:
+            old_layer2_b = pretrained_state_dict['action_decoder.layer2.b']  # (num_emb, old_action_dim)
+            num_emb, _ = old_layer2_b.shape
+            
+            # Create new tensor with expanded dimension
+            new_layer2_b = torch.zeros(num_emb, new_action_dim)
+            # Copy pretrained biases for action portion
+            new_layer2_b[:, :old_action_dim] = old_layer2_b
+            
+            pretrained_state_dict['action_decoder.layer2.b'] = new_layer2_b
+            print(f"  Expanded action_decoder.layer2.b: {old_layer2_b.shape} -> {new_layer2_b.shape}")
+        
+        return pretrained_state_dict
 
     def set_frozen_modules_to_eval_mode(self):
         """
@@ -349,7 +400,10 @@ class FlowmatchingActionHead(nn.Module):
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
         # Embed noised action trajectory.
-        actions = action_input.action
+        if self.torque_aware:
+            actions = torch.concat([action_input.action, action_input.effort], dim=-1)
+        else:
+            actions = action_input.action
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
@@ -386,20 +440,21 @@ class FlowmatchingActionHead(nn.Module):
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
         
-        weights = torch.ones(
-            action_mask.shape,
-            device=pred_actions.device,
-            dtype=pred_actions.dtype,
-        )
+        pred_actions = pred_actions[..., :self.action_dim]
+        velocity_actions = velocity[..., :self.action_dim]
+        action_loss = F.mse_loss(pred_actions, velocity_actions, reduction="none") * action_mask
+        loss = (action_loss.sum() / action_mask.sum())
         
-        if self.config.torque_aware:
-            weights[:, : self.action_dim] = 1.0
-            weights[:, self.config.action_dim : self.config.action_dim + self.config.effort_dim] = 0.1  # downweight effort loss
+        if self.torque_aware:
+            effort_mask = action_input.effort_mask       
+            pred_efforts = pred_actions[..., self.action_dim:]
+            velocity_efforts = velocity[..., self.action_dim:]
+            effort_loss = F.mse_loss(pred_efforts, velocity_efforts, reduction="none") * effort_mask
+            loss += 0.1 * (effort_loss.sum() / effort_mask.sum())
         
-        loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask * weights
-        loss = loss.sum() / action_mask.sum()
         output_dict = {
             "loss": loss,
+            "action_loss": action_loss
         }
         return BatchFeature(data=output_dict)
 
@@ -418,8 +473,15 @@ class FlowmatchingActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
+        
+        # When torque_aware, we predict both action and effort
+        if self.torque_aware:
+            action_effort_dim = self.config.action_dim + self.config.effort_dim
+        else:
+            action_effort_dim = self.config.action_dim
+            
         actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
+            size=(batch_size, self.config.action_horizon, action_effort_dim),
             dtype=vl_embs.dtype,
             device=device,
         )
@@ -459,7 +521,14 @@ class FlowmatchingActionHead(nn.Module):
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
-        return BatchFeature(data={"action_pred": actions})
+        
+        # If torque_aware, split the output into action and effort
+        if self.torque_aware:
+            action_pred = actions[:, :, :self.config.action_dim]
+            effort_pred = actions[:, :, self.config.action_dim:]
+            return BatchFeature(data={"action_pred": action_pred, "effort_pred": effort_pred})
+        else:
+            return BatchFeature(data={"action_pred": actions})
     
     @torch.enable_grad()
     def get_realtime_action(

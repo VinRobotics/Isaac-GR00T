@@ -98,12 +98,25 @@ class LeRobotActionMetadata(LeRobotStateActionMetadata):
     )
 
 
+class LeRobotEffortMetadata(LeRobotStateActionMetadata):
+    """Metadata for a LeRobot action modality."""
+
+    original_key: Optional[str] = Field(
+        default="observation.effort",  # LeRobot convention for effort
+        description="The original key of the effort modality in the LeRobot dataset",
+    )
+
+
 class LeRobotModalityMetadata(BaseModel):
     """Metadata for a LeRobot modality."""
 
     state: dict[str, LeRobotStateMetadata] = Field(
         ...,
         description="The metadata for the state modality. The keys are the names of each split of the state vector.",
+    )
+    effort: dict[str, LeRobotEffortMetadata] = Field(
+        ...,
+        description="The metadata for the effort modality. The keys are the names of each split of the effort vector.",
     )
     action: dict[str, LeRobotActionMetadata] = Field(
         ...,
@@ -130,6 +143,7 @@ class LeRobotModalityMetadata(BaseModel):
         Example:
             lerobot_modality_meta = LeRobotModalityMetadata.model_validate(U.load_json(modality_meta_path))
             lerobot_modality_meta.get_key_meta("state.joint_shoulder_y")
+            lerobot_modality_meta.get_key_meta("effort.joint_shoulder_y")
             lerobot_modality_meta.get_key_meta("video.main_camera")
             lerobot_modality_meta.get_key_meta("annotation.human.action.task_description")
         """
@@ -142,6 +156,12 @@ class LeRobotModalityMetadata(BaseModel):
                     f"Key: {key}, state key {subkey} not found in metadata, available state keys: {self.state.keys()}"
                 )
             return self.state[subkey]
+        elif modality == "effort":
+            if subkey not in self.effort:
+                raise ValueError(
+                    f"Key: {key}, effort key {subkey} not found in metadata, available effort keys: {self.effort.keys()}"
+                )
+            return self.effort[subkey]
         elif modality == "action":
             if subkey not in self.action:
                 raise ValueError(
@@ -185,6 +205,7 @@ class DatasetStatisticalValues(BaseModel):
 
 class DatasetStatistics(BaseModel):
     state: dict[str, DatasetStatisticalValues] = Field(..., description="Statistics of the state")
+    effort: dict[str, DatasetStatisticalValues] = Field(..., description="Statistics of the effort")
     action: dict[str, DatasetStatisticalValues] = Field(..., description="Statistics of the action")
 
 
@@ -206,6 +227,7 @@ class StateActionMetadata(BaseModel):
 class DatasetModalities(BaseModel):
     video: dict[str, VideoMetadata] = Field(..., description="Metadata of the video")
     state: dict[str, StateActionMetadata] = Field(..., description="Metadata of the state")
+    effort: dict[str, StateActionMetadata] = Field(..., description="Metadata of the effort")
     action: dict[str, StateActionMetadata] = Field(..., description="Metadata of the action")
 
 

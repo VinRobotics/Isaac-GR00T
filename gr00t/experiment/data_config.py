@@ -1325,8 +1325,8 @@ class AlohaRightArmConfig(BaseDataConfig):
     video_keys = ["video.cam_high", "video.cam_wrist_right"]
     state_keys = [
         "state.right_arm",
-        "state.velocity_right_arm",
-        "state.effort_right_arm",
+        # "state.velocity_right_arm",
+        # "state.effort_right_arm",
     ]
     action_keys = [
         "action.right_arm",
@@ -1409,23 +1409,23 @@ class AlohaRightArmConfig(BaseDataConfig):
 
 ###########################################################################################
 
-class AlohaRightArmConfig(BaseDataConfig):
+class AlohaRightArmEffortConfig(BaseDataConfig):
     video_keys = ["video.cam_high", "video.cam_wrist_right"]
     state_keys = [
         "state.right_arm",
-        "state.velocity_right_arm",
+    ]
+    effort_keys = [
+        "effort.right_arm",
     ]
     action_keys = [
         "action.right_arm",
-        "action.effort_right_arm",
     ]
     language_keys = ["annotation.human.task_description"]
     observation_indices = [0]
     state_indices = [0]
     action_indices = list(range(16))
     
-    action_dim = 7
-    effort_dim = 7
+    effort_dims=7
 
     def modality_config(self):
         video_modality = ModalityConfig(
@@ -1435,6 +1435,10 @@ class AlohaRightArmConfig(BaseDataConfig):
         state_modality = ModalityConfig(
             delta_indices=self.observation_indices,
             modality_keys=self.state_keys,
+        )
+        effort_modality = ModalityConfig(
+            delta_indices=self.action_indices,  # Effort should use action_indices, not observation_indices
+            modality_keys=self.effort_keys,
         )
         action_modality = ModalityConfig(
             delta_indices=self.action_indices,
@@ -1447,6 +1451,7 @@ class AlohaRightArmConfig(BaseDataConfig):
         modality_configs = {
             "video": video_modality,
             "state": state_modality,
+            "effort": effort_modality,
             "action": action_modality,
             "language": language_modality,
         }
@@ -1482,17 +1487,25 @@ class AlohaRightArmConfig(BaseDataConfig):
                 apply_to=self.action_keys,
                 normalization_modes={key: "min_max" for key in self.action_keys},
             ),
+            StateActionToTensor(apply_to=self.effort_keys),
+            StateActionTransform(
+                apply_to=self.effort_keys,
+                normalization_modes={key: "min_max" for key in self.effort_keys},
+            ),
             # concat transforms
             ConcatTransform(
                 video_concat_order=self.video_keys,
                 state_concat_order=self.state_keys,
+                effort_concat_order=self.effort_keys,
                 action_concat_order=self.action_keys,
             ),
             GR00TTransform(
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
+                effort_horizon=len(self.action_indices),
                 max_state_dim=64,
                 max_action_dim=32,
+                max_effort_dim=7,
             ),
         ]
 
@@ -1520,5 +1533,6 @@ DATA_CONFIG_MAP = {
     "libero": LiberoConfig(),
     "vrh2_two_hand_2_cam": VRH2TwotHand2CamConfig(),
     "vrh2_two_hand_2_cam_vel_eff": VRH2TwotHand2CamVelEffConfig(),
-    "aloha_right_arm_only": AlohaRightArmConfig()
+    "aloha_right_arm_only": AlohaRightArmConfig(),
+    "aloha_right_arm_only_effort": AlohaRightArmEffortConfig()
 }

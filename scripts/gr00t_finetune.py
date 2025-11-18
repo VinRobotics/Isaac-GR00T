@@ -191,7 +191,6 @@ def main(config: ArgsConfig):
             },
         )
         print(f"Loaded {len(single_datasets)} datasets, with {config.dataset_path} ")
-
     # ------------ step 2: load model ------------
     # First, get the data config to determine action horizon
     data_action_horizon = len(data_config_cls.action_indices)
@@ -204,22 +203,35 @@ def main(config: ArgsConfig):
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
     )
-
-    # Update action_horizon to match data config
-    # Need to recreate action head with correct config since it was initialized with old config
+    # Check if we need to recreate action head (either for action_horizon or torque_aware changes)
+    need_recreate = False
+    
+    # Create a copy of the config (important: don't modify the original)
+    import copy
+    new_action_head_config = copy.deepcopy(model.action_head.config)
+    
     if data_action_horizon != model.action_head.config.action_horizon:
         print(
-            f"Recreating action head with action_horizon {data_action_horizon} (was {model.action_head.config.action_horizon})"
+            f"Action horizon mismatch: data has {data_action_horizon}, model has {model.action_head.config.action_horizon}"
         )
-
-        # Update the action head config
-        new_action_head_config = model.action_head.config
         new_action_head_config.action_horizon = data_action_horizon
+        need_recreate = True
+    
+    if config.torque_aware:
+        effort_dims = getattr(data_config_cls, 'effort_dims', None)
+        if effort_dims is None:
+            raise ValueError(f"Data config {config.data_config} does not have effort_dims defined, but torque_aware=True")
+        print(f"Enabling torque-aware training with effort_dim={effort_dims}")
+        new_action_head_config.effort_dim = effort_dims
+        new_action_head_config.torque_aware = True
+        need_recreate = True
         
-        if config.torque_aware:
-            new_action_head_config.action_dim = data_config_cls.action_dim
-            new_action_head_config.effort_dim = data_config_cls.effort_dim
-            new_action_head_config.torque_aware = True
+    # Update action_horizon to match data config
+    # Need to recreate action head with correct config since it was initialized with old config
+    if need_recreate:
+        print(
+            f"Recreating action head with action_horizon={data_action_horizon}, torque_aware={config.torque_aware}"
+        )
 
         # Import the FlowmatchingActionHead class
         from gr00t.model.action_head.flow_matching_action_head import (
@@ -229,17 +241,41 @@ def main(config: ArgsConfig):
         # Create new action head with updated config
         new_action_head = FlowmatchingActionHead(new_action_head_config)
 
-        # Copy the weights from the old action head to the new one
-        new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
+        # Copy the weights from the old action head to the new one (strict=False allows partial loading)
+        old_state_dict = model.action_head.state_dict()
+        
+        # If torque_aware is enabled, expand the action encoder/decoder weights
+        if config.torque_aware and new_action_head_config.effort_dim is not None:
+            # The old action_dim from the pretrained model's actual weights (not config)
+            old_action_dim = model.action_head.action_encoder.W1.W.shape[1]  # Get actual dimension from weight shape
+            new_action_dim = old_action_dim + new_action_head_config.effort_dim
+            
+            print(f"Expanding action weights from {old_action_dim} to {new_action_dim} (adding {new_action_head_config.effort_dim} effort dims)")
+            
+            old_state_dict = new_action_head.expand_action_weights_for_torque_aware(
+                old_state_dict, old_action_dim, new_action_dim
+            )
+        
+        missing_keys, unexpected_keys = new_action_head.load_state_dict(old_state_dict, strict=False)
+        
+        if missing_keys:
+            print(f"Missing keys when loading pretrained weights (will be randomly initialized): {missing_keys}")
+        if unexpected_keys:
+            print(f"Unexpected keys in pretrained weights (will be ignored): {unexpected_keys}")
 
         # Replace the action head
         model.action_head = new_action_head
 
         # Update model config AND the action_head_cfg dictionary that gets saved
-        model.config.action_head_cfg = new_action_head_config.dict()
+        # Use to_dict() method from PretrainedConfig
+        model.config.action_head_cfg = new_action_head_config.to_dict()
         model.config.action_horizon = data_action_horizon
         model.action_horizon = data_action_horizon
         model.config.action_head_cfg["action_horizon"] = data_action_horizon
+        if config.torque_aware:
+            effort_dims = getattr(data_config_cls, 'effort_dims', None)
+            model.config.action_head_cfg["torque_aware"] = True
+            model.config.action_head_cfg["effort_dim"] = effort_dims
 
         # Set trainable parameters for the new action head
         model.action_head.set_trainable_parameters(
