@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -142,7 +143,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=True, metadata={"help": "Whether to add positional embedding"}
     )
     model_dtype: str = field(default="float32", metadata={"help": "Model data type."})
-    diffusion_model_cfg: dict = field(
+    diffusion_model_cfg: Optional[dict] = field(
         default=None, metadata={"help": "Diffusion model configuration."}
     )
     input_embedding_dim: int = field(
@@ -154,8 +155,8 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
 
     hidden_size: int = field(default=1024, metadata={"help": "Input embedding dimension."})
     max_seq_len: int = field(default=1024, metadata={"help": "Maxium Sequence Length"})
-    action_dim: int = field(default=None, metadata={"help": "Action dimension."})
-    action_horizon: int = field(default=None, metadata={"help": "Action horizon."})
+    action_dim: Optional[int] = field(default=None, metadata={"help": "Action dimension."})
+    action_horizon: Optional[int] = field(default=None, metadata={"help": "Action horizon."})
     noise_beta_alpha: float = field(default=1.5, metadata={"help": ""})
     noise_beta_beta: float = field(default=1.0, metadata={"help": ""})
     noise_s: float = field(
@@ -164,7 +165,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     num_timestep_buckets: int = field(
         default=1000, metadata={"help": "Number of timestep discretization buckets."}
     )
-    num_inference_timesteps: int = field(
+    num_inference_timesteps: Optional[int] = field(
         default=None,
         metadata={"help": "Number of inference steps for noise diffusion."},
     )
@@ -173,16 +174,16 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     tune_diffusion_model: bool = field(
         default=True, metadata={"help": "Whether to tune the diffusion model."}
     )
-    load_pretrained_det_decode_layer_path: str = field(
+    load_pretrained_det_decode_layer_path: Optional[str] = field(
         default=None, metadata={"help": "Path to pretrained detection model."}
     )
     detection_coeff: float = field(default=1.0, metadata={"help": "Detection coefficient."})
 
     freeze_decode_layer: bool = field(default=False)
-    expand_batch: int = field(default=None)
+    expand_batch: Optional[int] = field(default=None)
     use_vlln: bool = field(default=True)
 
-    vl_self_attention_cfg: dict = field(default=None)
+    vl_self_attention_cfg: Optional[dict] = field(default=None)
     num_target_vision_tokens: int = field(
         default=32, metadata={"help": "Number of target vision tokens."}
     )
@@ -191,7 +192,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     torque_aware: bool = field(
         default=False, metadata={"help": "Whether to use torque-aware training."}
     )
-    effort_dim: int = field(
+    effort_dim: Optional[int] = field(
         default=None, metadata={"help": "Effort dimension."}
     )
 
@@ -257,6 +258,7 @@ class FlowmatchingActionHead(nn.Module):
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+        print("Using torque aware", self.action_dim if not self.torque_aware else self.action_dim + self.effort_dim)
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -435,26 +437,29 @@ class FlowmatchingActionHead(nn.Module):
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
         )
         pred = self.action_decoder(model_output, embodiment_id)
+        # Keep full prediction (including effort dims when torque_aware) and then slice the tail
         pred_actions = pred[:, -actions.shape[1] :]
 
-        # Slice out only the action portion of pred and target.
+        # Slice out only the action portion of pred and target for action loss.
         action_mask = action_input.action_mask
-        
-        pred_actions = pred_actions[..., :self.action_dim]
+
+        pred_only_actions = pred_actions[..., :self.action_dim]
         velocity_actions = velocity[..., :self.action_dim]
-        action_loss = F.mse_loss(pred_actions, velocity_actions, reduction="none") * action_mask
+        action_loss = F.mse_loss(pred_only_actions, velocity_actions, reduction="none") * action_mask
         loss = (action_loss.sum() / action_mask.sum())
-        
+
         if self.torque_aware:
-            effort_mask = action_input.effort_mask       
+            # For efforts we must slice from the full pred_actions tensor (which still contains effort dims)
+            effort_mask = action_input.effort_mask
             pred_efforts = pred_actions[..., self.action_dim:]
             velocity_efforts = velocity[..., self.action_dim:]
+            # Ensure masks and tensors broadcast correctly. effort_mask expected shape matches effort dims.
             effort_loss = F.mse_loss(pred_efforts, velocity_efforts, reduction="none") * effort_mask
-            loss += 0.1 * (effort_loss.sum() / effort_mask.sum())
+            loss += 0.15 * (effort_loss.sum() / effort_mask.sum())
         
         output_dict = {
             "loss": loss,
-            "action_loss": action_loss
+            "action_loss": action_loss,
         }
         return BatchFeature(data=output_dict)
 
@@ -604,7 +609,10 @@ class FlowmatchingActionHead(nn.Module):
                 pred_velocity = pred[:, -self.action_horizon :]
                 return x_t_ + pred_velocity * (1 - t_cont), pred_velocity
             
-            (outputs, vjp_func) = torch.func.vjp(denoiser, x_t)
+            vjp_res = torch.func.vjp(denoiser, x_t)
+            # torch.func.vjp may return a tuple of length 2 or 3 depending on PyTorch version; index safely
+            outputs = vjp_res[0]
+            vjp_func = vjp_res[1]
             (x_1_i_vjp, v_t_i_vjp) = outputs
             error = (prev_action_chunk - x_1_i_vjp) * weights[:, None]
             

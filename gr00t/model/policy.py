@@ -124,7 +124,7 @@ class Gr00tPolicy(BasePolicy):
             self.temporal_agg = True
             self.num_queries = 16
             if self.temporal_agg:
-                self.k = -0.02
+                self.k = 0.0
                 self.ensemble_weights = torch.exp(-self.k * torch.arange(self.num_queries)).cuda()
                 self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0).cuda()
                 self.reset()
@@ -250,6 +250,7 @@ class Gr00tPolicy(BasePolicy):
             prefix_attention_schedule,
             max_guidance_weight
         )
+        unnormalized_effort = None
         if self.smooth_option == "rtc":
             normalized_action, self.prev_action_chunk = normalized_action
 
@@ -261,24 +262,32 @@ class Gr00tPolicy(BasePolicy):
                 )),
                 dim=1,
             )
+        else:
+            normalized_action, normalized_effort = normalized_action
+            unnormalized_effort = self._get_unnormalized_effort(normalized_effort)   
         unnormalized_action = self._get_unnormalized_action(normalized_action)        
+        
 
         if self.smooth_option == "te":
             for k in unnormalized_action.keys():
                 unnormalized_action[k] = unnormalized_action[k].squeeze(1)  # remove the 1 dimension
         elif not is_batch:
             unnormalized_action = squeeze_dict_values(unnormalized_action)
+        if unnormalized_effort is not None:
+            unnormalized_action.update(unnormalized_effort)
+
         return unnormalized_action
 
     def _get_action_from_normalized_input(self, normalized_input: Dict[str, Any]) -> torch.Tensor:
         # Set up autocast context if needed
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
             model_pred = self.model.get_action(normalized_input)
-
         normalized_action = model_pred["action_pred"].float()
+        
+        normalized_effort = model_pred.get("effort_pred", None)
         if self.smooth_option == "te":
             normalized_action = self.process_output(normalized_action)
-        return normalized_action
+        return normalized_action, normalized_effort
     
     def _get_realtime_action_from_normalized_input(self, normalized_input: Dict[str, Any],
                                                    prev_action_chunk: torch.Tensor | None,
@@ -301,6 +310,9 @@ class Gr00tPolicy(BasePolicy):
 
     def _get_unnormalized_action(self, normalized_action: torch.Tensor) -> Dict[str, Any]:
         return self.unapply_transforms({"action": normalized_action.cpu()})
+
+    def _get_unnormalized_effort(self, normalized_effort: torch.Tensor) -> Dict[str, Any]:
+        return self.unapply_transforms({"effort": normalized_effort.cpu()})
 
     def get_modality_config(self) -> Dict[str, ModalityConfig]:
         """

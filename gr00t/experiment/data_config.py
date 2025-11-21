@@ -1326,7 +1326,7 @@ class AlohaRightArmConfig(BaseDataConfig):
     state_keys = [
         "state.right_arm",
         # "state.velocity_right_arm",
-        # "state.effort_right_arm",
+        "state.effort_right_arm",
     ]
     action_keys = [
         "action.right_arm",
@@ -1424,6 +1424,7 @@ class AlohaRightArmEffortConfig(BaseDataConfig):
     observation_indices = [0]
     state_indices = [0]
     action_indices = list(range(16))
+    effort_indices = list(range(1, 17))
     
     effort_dims=7
 
@@ -1437,7 +1438,7 @@ class AlohaRightArmEffortConfig(BaseDataConfig):
             modality_keys=self.state_keys,
         )
         effort_modality = ModalityConfig(
-            delta_indices=self.action_indices,  # Effort should use action_indices, not observation_indices
+            delta_indices=self.effort_indices,
             modality_keys=self.effort_keys,
         )
         action_modality = ModalityConfig(

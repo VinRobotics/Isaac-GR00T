@@ -193,16 +193,17 @@ class ConcatTransform(InvertibleModalityTransform):
 
     def unapply(self, data: dict) -> dict:
         start_dim = 0
-        assert "action" in data, f"{data.keys()=}"
+        # assert "action" in data, f"{data.keys()=}"
         # For those dataset without actions (LAPA), we'll never run unapply
         assert self.action_concat_order is not None, f"{self.action_concat_order=}"
-        action_tensor = data.pop("action")
-        for key in self.action_concat_order:
-            if key not in self.action_dims:
-                raise ValueError(f"Action dim {key} not found in action_dims.")
-            end_dim = start_dim + self.action_dims[key]
-            data[key] = action_tensor[..., start_dim:end_dim]
-            start_dim = end_dim
+        if "action" in data:
+            action_tensor = data.pop("action")
+            for key in self.action_concat_order:
+                if key not in self.action_dims:
+                    raise ValueError(f"Action dim {key} not found in action_dims.")
+                end_dim = start_dim + self.action_dims[key]
+                data[key] = action_tensor[..., start_dim:end_dim]
+                start_dim = end_dim
         if "state" in data:
             assert self.state_concat_order is not None, f"{self.state_concat_order=}"
             start_dim = 0

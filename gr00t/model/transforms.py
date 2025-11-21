@@ -352,10 +352,10 @@ class GR00TTransform(InvertibleModalityTransform):
             actions, actions_mask, _ = self._prepare_action(data)
             transformed_data["action"] = actions
             transformed_data["action_mask"] = actions_mask
-            if self.max_effort_dim is not None:
-                efforts, efforts_mask, _ = self._prepare_effort(data)
-                transformed_data["effort"] = efforts
-                transformed_data["effort_mask"] = efforts_mask
+        if self.max_effort_dim is not None:
+            efforts, efforts_mask, _ = self._prepare_effort(data)
+            transformed_data["effort"] = efforts
+            transformed_data["effort_mask"] = efforts_mask
 
         for k, v in vlm_outputs.items():
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."
