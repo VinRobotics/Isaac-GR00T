@@ -455,7 +455,7 @@ class FlowmatchingActionHead(nn.Module):
             velocity_efforts = velocity[..., self.action_dim:]
             # Ensure masks and tensors broadcast correctly. effort_mask expected shape matches effort dims.
             effort_loss = F.mse_loss(pred_efforts, velocity_efforts, reduction="none") * effort_mask
-            loss += 0.15 * (effort_loss.sum() / effort_mask.sum())
+            loss += 0.1 * (effort_loss.sum() / effort_mask.sum())
         
         output_dict = {
             "loss": loss,
