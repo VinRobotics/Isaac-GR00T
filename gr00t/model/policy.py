@@ -45,6 +45,10 @@ class BasePolicy(ABC):
             The action to take in the environment in dictionary format.
         """
         raise NotImplementedError
+    
+    @abstractmethod
+    def reset(self):
+        raise NotImplementedError
 
     @abstractmethod
     def get_modality_config(self) -> Dict[str, ModalityConfig]:
@@ -124,7 +128,7 @@ class Gr00tPolicy(BasePolicy):
             self.temporal_agg = True
             self.num_queries = 16
             if self.temporal_agg:
-                self.k = -0.02
+                self.k = 0.015
                 self.ensemble_weights = torch.exp(-self.k * torch.arange(self.num_queries)).cuda()
                 self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0).cuda()
                 self.reset()
