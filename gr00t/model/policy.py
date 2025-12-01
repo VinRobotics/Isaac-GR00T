@@ -45,6 +45,10 @@ class BasePolicy(ABC):
             The action to take in the environment in dictionary format.
         """
         raise NotImplementedError
+    
+    @abstractmethod
+    def reset(self):
+        raise NotImplementedError
 
     @abstractmethod
     def get_modality_config(self) -> Dict[str, ModalityConfig]:

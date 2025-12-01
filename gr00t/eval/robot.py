@@ -31,6 +31,7 @@ class RobotInferenceServer(BaseInferenceServer):
         self.register_endpoint(
             "get_modality_config", model.get_modality_config, requires_input=False
         )
+        self.register_endpoint("reset", model.reset, requires_input=False)
 
     @staticmethod
     def start_server(policy: BasePolicy, port: int, api_token: str = None):
@@ -51,3 +52,6 @@ class RobotInferenceClient(BaseInferenceClient, BasePolicy):
 
     def get_modality_config(self) -> Dict[str, ModalityConfig]:
         return self.call_endpoint("get_modality_config", requires_input=False)
+
+    def reset(self):
+        return self.call_endpoint("reset", requires_input=False)
