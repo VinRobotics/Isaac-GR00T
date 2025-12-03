@@ -228,13 +228,22 @@ class Gr00tPolicy(BasePolicy):
         obs_copy = observations.copy()
 
         if self.smooth_option == "rtc":
-            print(obs_copy)
             inference_delay = obs_copy.get("inference_delay", None)
             prefix_attention_horizon = obs_copy.get("prefix_attention_horizon", None)
             prefix_attention_schedule = obs_copy.get("prefix_attention_schedule", None)
             max_guidance_weight = obs_copy.get("max_guidance_weight", 5)
             execute_horizon = obs_copy.get("execute_horizon", None)
             obs_copy = obs_copy.get("observations", None)
+
+            if self.prev_action_chunk is not None:
+                self.prev_action_chunk = torch.concat(
+                    (self.prev_action_chunk[:, execute_horizon:],
+                    torch.zeros(
+                        [self.prev_action_chunk.shape[0], execute_horizon, self.prev_action_chunk.shape[-1]],
+                        device=self.prev_action_chunk.device,
+                    )),
+                    dim=1,
+                )
 
         is_batch = self._check_state_is_batched(obs_copy)
         if not is_batch:
@@ -257,14 +266,6 @@ class Gr00tPolicy(BasePolicy):
         if self.smooth_option == "rtc":
             normalized_action, self.prev_action_chunk = normalized_action
 
-            self.prev_action_chunk = torch.concat(
-                (self.prev_action_chunk[:, execute_horizon:],
-                torch.zeros(
-                    [self.prev_action_chunk.shape[0], execute_horizon, self.prev_action_chunk.shape[-1]],
-                    device=self.prev_action_chunk.device,
-                )),
-                dim=1,
-            )
         unnormalized_action = self._get_unnormalized_action(normalized_action)        
 
         if self.smooth_option == "te":

@@ -499,7 +499,8 @@ class FlowmatchingActionHead(nn.Module):
                 vl_embs = vl_embeds
 
                 # Join vision, language, state and action embedding along sequence dimension.
-                sa_embs = torch.cat((state_features, action_features), dim=1)
+                future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+                sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
                 # Run model forward.
                 model_output = self.model(
@@ -531,6 +532,7 @@ class FlowmatchingActionHead(nn.Module):
 
         assert x_t.shape == (batch_size, self.config.action_horizon, self.config.action_dim), x_t.shape
         x_t = x_t.clone().detach()
+        print("EACH DENOISING STEP: ", (x_t[:,:inference_delay,:] - prev_action_chunk[:,:inference_delay,:]).abs().mean())
         return BatchFeature(data={"action_pred": x_t})
 
     @property
