@@ -22,6 +22,16 @@ from torch.distributions import Beta
 from transformers import PretrainedConfig
 from transformers.feature_extraction_utils import BatchFeature
 
+from escnn import gspaces, nn as enn
+from escnn.group import CyclicGroup 
+import numpy as np
+
+from typing import Union
+import pytorch3d.transforms as pt
+import torch
+import numpy as np
+import functools
+
 from gr00t.model.action_head.action_encoder import (
     SinusoidalPositionalEncoding,
     swish,
@@ -85,7 +95,120 @@ class CategorySpecificMLP(nn.Module):
     def forward(self, x, cat_ids):
         hidden = F.relu(self.layer1(x, cat_ids))
         return self.layer2(hidden, cat_ids)
+### equi
 
+
+class RotationTransformer:
+    valid_reps = [
+        'axis_angle',
+        'euler_angles',
+        'quaternion',
+        'rotation_6d',
+        'matrix'
+    ]
+
+    def __init__(self, 
+            from_rep='axis_angle', 
+            to_rep='rotation_6d', 
+            from_convention=None,
+            to_convention=None):
+        """
+        Valid representations
+
+        Always use matrix as intermediate representation.
+        """
+        assert from_rep != to_rep
+        assert from_rep in self.valid_reps
+        assert to_rep in self.valid_reps
+        if from_rep == 'euler_angles':
+            assert from_convention is not None
+        if to_rep == 'euler_angles':
+            assert to_convention is not None
+
+        forward_funcs = list()
+        inverse_funcs = list()
+
+        if from_rep != 'matrix':
+            funcs = [
+                getattr(pt, f'{from_rep}_to_matrix'),
+                getattr(pt, f'matrix_to_{from_rep}')
+            ]
+            if from_convention is not None:
+                funcs = [functools.partial(func, convention=from_convention) 
+                    for func in funcs]
+            forward_funcs.append(funcs[0])
+            inverse_funcs.append(funcs[1])
+
+        if to_rep != 'matrix':
+            funcs = [
+                getattr(pt, f'matrix_to_{to_rep}'),
+                getattr(pt, f'{to_rep}_to_matrix')
+            ]
+            if to_convention is not None:
+                funcs = [functools.partial(func, convention=to_convention) 
+                    for func in funcs]
+            forward_funcs.append(funcs[0])
+            inverse_funcs.append(funcs[1])
+        
+        inverse_funcs = inverse_funcs[::-1]
+        
+        self.forward_funcs = forward_funcs
+        self.inverse_funcs = inverse_funcs
+
+    @staticmethod
+    def _apply_funcs(x: Union[np.ndarray, torch.Tensor], funcs: list) -> Union[np.ndarray, torch.Tensor]:
+        x_ = x
+        if isinstance(x, np.ndarray):
+            x_ = torch.from_numpy(x)
+        x_: torch.Tensor
+        for func in funcs:
+            x_ = func(x_)
+        y = x_
+        if isinstance(x, np.ndarray):
+            y = x_.numpy()
+        return y
+        
+    def forward(self, x: Union[np.ndarray, torch.Tensor]
+        ) -> Union[np.ndarray, torch.Tensor]:
+        return self._apply_funcs(x, self.forward_funcs)
+    
+    def inverse(self, x: Union[np.ndarray, torch.Tensor]
+        ) -> Union[np.ndarray, torch.Tensor]:
+        return self._apply_funcs(x, self.inverse_funcs)
+
+
+class EquiCategorySpecificMLP(nn.Module):
+    def __init__(self, num_categories, in_type, hidden_type, out_type):
+        super().__init__()
+        self.num_categories = num_categories
+        self.layer1 = EquiCategorySpecificLinear(num_categories, in_type, hidden_type)
+        self.layer2 = EquiCategorySpecificLinear(num_categories, hidden_type, out_type)
+        self.activation = enn.ReLU(hidden_type)
+
+    def forward(self, x, cat_ids):
+        hidden = self.activation(self.layer1(x, cat_ids))
+        return self.layer2(hidden, cat_ids)
+
+class EquiCategorySpecificLinear(nn.Module):
+    def __init__(self, num_categories, in_type, hidden_type):
+        super().__init__()
+        self.num_categories = num_categories
+        # For each category, we have separate weights and biases.
+        self.in_type = in_type
+        self.hidden_type = hidden_type
+        self.layers = nn.ModuleList()
+        
+        for _ in range(self.num_categories):
+            layer = enn.Linear(
+                self.in_type,
+                self.hidden_type
+            )
+            self.layers.append(
+                layer
+            )
+        
+    def forward(self, x, cat_ids):
+        return self.layers[cat_ids](x)
 
 class MultiEmbodimentActionEncoder(nn.Module):
     def __init__(self, action_dim, hidden_size, num_embodiments):
@@ -202,6 +325,8 @@ class FlowmatchingActionHead(nn.Module):
         config: FlowmatchingActionHeadConfig,
     ):
         super().__init__()
+        self.config = config
+        
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
@@ -210,12 +335,19 @@ class FlowmatchingActionHead(nn.Module):
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
 
-        self.state_encoder = CategorySpecificMLP(
+        # equi state
+        self.group = gspaces.no_base_space(CyclicGroup(8))
+        self.state_in_type = self.getJointFieldType()
+        self.state_hidden_type = enn.FieldType(self.group, int(config.hidden_size / 8) * [self.group.regular_repr])
+        self.state_out_type = enn.FieldType(self.group, int(config.input_embedding_dim / 8) * [self.group.regular_repr])
+        self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
+        self.state_encoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
-            input_dim=config.max_state_dim,
-            hidden_dim=self.hidden_size,
-            output_dim=self.input_embedding_dim,
+            in_type=self.state_in_type,
+            hidden_type=self.state_hidden_type,
+            out_type=self.state_out_type,
         )
+        
         self.action_encoder = MultiEmbodimentActionEncoder(
             action_dim=config.action_dim,
             hidden_size=self.input_embedding_dim,
@@ -245,8 +377,52 @@ class FlowmatchingActionHead(nn.Module):
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
-        self.config = config
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+    
+    def getJointFieldType(self):
+        return enn.FieldType(
+            self.group,
+            2 * 4 * [self.group.irrep(1)] # pos xy, rot 6, left and right
+            + (self.config.max_state_dim - 14 + 2) * [self.group.trivial_repr], # gripper 1, z from both ee is 2
+        )
+        
+    def getJointGeometricTensor(self, state):
+        def getJointGeometricTensorEachHand(ee_state):
+            ee_pos = ee_state[:, :, :3] # (bs, t, 3)
+            ee_quat = ee_state[:, :, :4] # (bs, t, 4)
+            print(ee_quat.shape, ee_pos.shape)
+            ee_rot = self.get6DRotation(ee_quat)
+            pos_xy = ee_pos[:, 0:2] # 2
+            pos_z = ee_pos[:, 2:3] # 1
+            joint_features = torch.cat(
+                [
+                    pos_xy,
+                    ee_rot[:, 0:1], # 1
+                    ee_rot[:, 3:4], # 1
+                    ee_rot[:, 1:2], # 1
+                    ee_rot[:, 4:5], # 1
+                    ee_rot[:, 2:3], # 1
+                    ee_rot[:, 5:6], # 1
+                ],
+                dim=1
+            )
+            return joint_features, pos_z
+        
+        l_ee_state = state[:, :, :7] # bs, t, 7 
+        r_ee_state = state[:, :, 7:14] # bs, t, 7  
+        hand_state = state[:, :, 14:]
+        
+        l_tf, l_pos_z = getJointGeometricTensorEachHand(l_ee_state)
+        r_tf, r_pos_z = getJointGeometricTensorEachHand(r_ee_state)
+
+        return enn.GeometricTensor(torch.cat([
+            l_tf, r_tf,
+            l_pos_z, r_pos_z, hand_state
+        ]), self.getJointFieldType())
+    
+    def get6DRotation(self, quat):
+        # data is in xyzw, but rotation transformer takes wxyz
+        return self.quaternion_to_sixd.forward(quat[:, [3, 0, 1, 2]]) 
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -334,8 +510,10 @@ class FlowmatchingActionHead(nn.Module):
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
-        state_features = self.state_encoder(action_input.state, embodiment_id)
-
+        state_input = self.getJointGeometricTensor(action_input.state)
+        state_features = self.state_encoder(state_input, embodiment_id)
+        state_features = state_features.tensor
+        print(state_features.shape)
         # Embed noised action trajectory.
         actions = action_input.action
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
