@@ -124,13 +124,14 @@ class DualBrainTrainer(transformers.Trainer):
 
     def save_model(self, output_dir: Optional[str], _internal_call: bool):
         ## save tuned model separately
+        self.model.eval()
         if self.is_deepspeed_enabled:
             state_dict = self.accelerator.get_state_dict(self.deepspeed)
         else:
             state_dict = self.model.state_dict()
-
+        self.model.train()
         if self.args.should_save:
-            return self.model.save_pretrained(output_dir, state_dict=state_dict)
+            return self.model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=False)
 
     def train(
         self,

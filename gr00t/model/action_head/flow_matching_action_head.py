@@ -198,8 +198,9 @@ class EquiCategorySpecificLinear(nn.Module):
         self.in_type = in_type
         self.out_type = out_type
 
+        # Use initialize=True to get proper weight initialization from ESCNN
         self.layers = nn.ModuleList([
-            enn.Linear(in_type, out_type)
+            enn.Linear(in_type, out_type, initialize=True)
             for _ in range(num_categories)
         ])
 
@@ -212,37 +213,46 @@ class EquiCategorySpecificLinear(nn.Module):
 
     def forward(self, x: enn.GeometricTensor, cat_ids):
         B = x.tensor.shape[0]
-
-        # ALWAYS FP32 to avoid ESCNN BF16 corruption
-        out = torch.zeros(x.tensor.shape, dtype=torch.float32, device=x.tensor.device)
+        
+        C_out = self.out_type.size
+        
+        # Get a sample output to determine the correct dtype
+        sample_idx = torch.where(torch.ones_like(cat_ids, dtype=torch.bool))[0][0]
+        sample_input = enn.GeometricTensor(x.tensor[sample_idx:sample_idx+1], self.in_type)
+        sample_output = self.layers[int(cat_ids[sample_idx])](sample_input)
+        output_dtype = sample_output.tensor.dtype
+        
+        out = torch.zeros((B, C_out), dtype=output_dtype, device=x.tensor.device)
 
         groups = self._group_indices(cat_ids)
 
         for cat, idx in groups.items():
             xb = x.tensor[idx]
 
-            geom_xb = enn.GeometricTensor(xb.float(), self.in_type)
+            geom_xb = enn.GeometricTensor(xb, self.in_type)
 
             layer = self.layers[cat]
             geom_out = layer(geom_xb)
 
-            out[idx] = geom_out.tensor.float()
+            out[idx] = geom_out.tensor
 
         return enn.GeometricTensor(out, self.out_type)
 
 
-
 class MultiEmbodimentActionEncoder(nn.Module):
-    def __init__(self, action_dim, hidden_size, num_embodiments):
+    def __init__(self, in_type, hidden_type, out_type, num_embodiments):
         super().__init__()
-        self.hidden_size = hidden_size
+        self.in_type = in_type
+        self.hidden_type = hidden_type
+        self.out_type = out_type
         self.num_embodiments = num_embodiments
 
+
         # W1: R^{w x d}, W2: R^{w x 2w}, W3: R^{w x w}
-        self.W1 = CategorySpecificLinear(num_embodiments, action_dim, hidden_size)  # (d -> w)
-        self.W2 = CategorySpecificLinear(num_embodiments, 2 * hidden_size, hidden_size)  # (2w -> w)
-        self.W3 = CategorySpecificLinear(num_embodiments, hidden_size, hidden_size)  # (w -> w)
-        self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
+        self.W1 = EquiCategorySpecificLinear(num_embodiments, self.in_type, self.out_type)  # (d -> w)
+        self.W2 = EquiCategorySpecificLinear(num_embodiments, self.hidden_type, self.out_type)  # (2w -> w)
+        self.W3 = EquiCategorySpecificLinear(num_embodiments, self.out_type , self.out_type)  # (w -> w)
+        self.pos_encoding = SinusoidalPositionalEncoding(self.out_type.size)
 
     def forward(self, actions, timesteps, cat_ids):
         """
@@ -251,46 +261,30 @@ class MultiEmbodimentActionEncoder(nn.Module):
         cat_ids:   shape (B,)
         returns:   shape (B, T, hidden_size)
         """
-        B, T, _ = actions.shape
+        B, _ = actions.shape
 
         # 1) Expand each batch's single scalar time 'tau' across all T steps
         #    so that shape => (B, T)
         #    e.g. if timesteps is (B,), replicate across T
-        if timesteps.dim() == 1 and timesteps.shape[0] == B:
-            # shape (B,) => (B,T)
-            timesteps = timesteps.unsqueeze(1).expand(-1, T)
-        else:
-            raise ValueError(
-                "Expected `timesteps` to have shape (B,) so we can replicate across T."
-            )
+        
+        timesteps = timesteps.repeat(B/timesteps.shape[0])
+        
 
-        # 2) Standard action MLP step for shape => (B, T, w)
+        # 2) Standard action MLP step for shape => (B * T, w)
         a_emb = self.W1(actions, cat_ids)
 
-        # 3) Get the sinusoidal encoding (B, T, w)
+        # 3) Get the sinusoidal encoding (B * T, w)
         tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.dtype)
 
-        # 4) Concat along last dim => (B, T, 2w), then W2 => (B, T, w), swish
-        x = torch.cat([a_emb, tau_emb], dim=-1)
-        x = swish(self.W2(x, cat_ids))
+        # 4) Concat along last dim => (B * T, 2w), then W2 => (B * T, w), swish
+        x = torch.cat([a_emb.tensor, tau_emb], dim=-1)
+        x = enn.GeometricTensor(x, self.hidden_type)
+        x = swish(self.W2(x, cat_ids).tensor)
 
-        # 5) Finally W3 => (B, T, w)
+        # 5) Finally W3 => (B * T, w)
+        x = enn.GeometricTensor(x, self.out_type)
         x = self.W3(x, cat_ids)
         return x
-
-class FP32Layer(nn.Module):
-    def __init__(self, module):
-        super().__init__()
-        self.module = module.float()
-
-    def forward(self, x):
-        # force stable FP32 computation
-        with torch.autocast(device_type="cuda", enabled=False):
-            out_fp32 = self.module(x.float())
-
-        # return in BF16 so the rest of the network stays BF16
-        return out_fp32.to(torch.bfloat16)
-
 
 @dataclass
 class FlowmatchingActionHeadConfig(PretrainedConfig):
@@ -371,29 +365,38 @@ class FlowmatchingActionHead(nn.Module):
         self.num_inference_timesteps = config.num_inference_timesteps
 
         # equi state
-        self.group = gspaces.no_base_space(CyclicGroup(8))
-        self.state_in_type = self.getJointFieldType()
-        self.state_hidden_type = enn.FieldType(self.group, int(config.hidden_size / 8) * [self.group.regular_repr])
-        self.state_out_type = enn.FieldType(self.group, int(config.input_embedding_dim / 8) * [self.group.regular_repr])
+        self.n_group = 8
+        self.group = gspaces.no_base_space(CyclicGroup(self.n_group))
+        self.state_in_type = self.getJointFieldType(is_action=False)
+        self.state_hidden_type = enn.FieldType(self.group, int(config.hidden_size / self.n_group) * [self.group.regular_repr])
+        self.state_out_type = enn.FieldType(self.group, int(config.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
-        self.state_encoder = FP32Layer(EquiCategorySpecificMLP(
+
+        self.state_encoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
             in_type=self.state_in_type,
             hidden_type=self.state_hidden_type,
             out_type=self.state_out_type,
-        ))
+        )
+        
+        self.action_type = self.getJointFieldType(is_action=True)
+        self.action_hidden_type = enn.FieldType(self.group, int(2 * self.input_embedding_dim / self.n_group) * [self.group.regular_repr])
+        self.action_out_type = enn.FieldType(self.group, int(self.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         
         self.action_encoder = MultiEmbodimentActionEncoder(
-            action_dim=config.action_dim,
-            hidden_size=self.input_embedding_dim,
+            in_type=self.action_type,
+            hidden_type=self.action_hidden_type,
+            out_type=self.action_out_type,
             num_embodiments=config.max_num_embodiments,
         )
-        self.action_decoder = CategorySpecificMLP(
+        
+        self.action_decoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
-            input_dim=self.hidden_size,
-            hidden_dim=self.hidden_size,
-            output_dim=self.action_dim,
+            in_type=self.action_out_type,
+            hidden_type=self.action_out_type,
+            out_type=self.action_type,
         )
+        
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
@@ -414,14 +417,15 @@ class FlowmatchingActionHead(nn.Module):
         self.num_timestep_buckets = config.num_timestep_buckets
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
     
-    def getJointFieldType(self):
+    def getJointFieldType(self, is_action):
+        max_dim = self.config.max_action_dim if is_action else self.config.max_state_dim
         return enn.FieldType(
             self.group,
             2 * 4 * [self.group.irrep(1)] # pos xy, rot 6, left and right
-            + (self.config.max_state_dim - 14 + 2) * [self.group.trivial_repr], # gripper 1, z from both ee is 2
+            + (max_dim - 14 + 2) * [self.group.trivial_repr], # gripper 1, z from both ee is 2
         )
         
-    def getJointGeometricTensor(self, state):
+    def getJointGeometricTensor(self, state, is_action):
         def getJointGeometricTensorEachHand(ee_state):
             ee_pos = ee_state[:, :, :3] # (bs, t, 3)
             ee_quat = ee_state[:, :, 3:7] # (bs, t, 4)
@@ -449,14 +453,48 @@ class FlowmatchingActionHead(nn.Module):
         l_tf, l_pos_z = getJointGeometricTensorEachHand(l_ee_state)
         r_tf, r_pos_z = getJointGeometricTensorEachHand(r_ee_state)
         
+        print(l_tf.shape, l_pos_z.shape, r_tf.shape, r_pos_z.shape, hand_state.shape)
+        
         state_features = torch.cat([l_tf, r_tf, l_pos_z, r_pos_z, hand_state], dim=-1)
+        print(state_features.shape)
         state_features = einops.rearrange(state_features, 'b t c -> (b t) c')
 
-        return enn.GeometricTensor(state_features, self.getJointFieldType())
+        return enn.GeometricTensor(state_features, self.getJointFieldType(is_action))
     
+    def getActionOutput(self, pred):
+        def getActionOutputEachHand(ee_pred):
+            ee_xy = ee_pred[:, :, 0:2] # (bs, t, 3)
+            ee_cos1 = ee_pred[:, :, 2:3]
+            ee_sin1 = ee_pred[:, :, 3:4]
+            ee_cos2 = ee_pred[:, :, 4:5]
+            ee_sin2 = ee_pred[:, :, 5:6]
+            ee_cos3 = ee_pred[:, :, 6:7]
+            ee_sin3 = ee_pred[:, :, 7:8]
+
+            rot_6d = torch.cat([ee_cos1, ee_sin1, ee_cos2, ee_sin2, ee_cos3, ee_sin3], dim=-1)
+            quat = self.getQuaternionFrom6D(rot_6d)
+            return ee_xy, quat
+
+        l_xy, l_quat = getActionOutputEachHand(pred[:, :, :8]) # bs, t, 8
+        r_xy, r_quat = getActionOutputEachHand(pred[:, :, 8:16]) # bs, t, 8
+        
+        l_z, r_z = pred[:, :, 16:17], pred[:, :, 17:18] # bs, t, 1
+        hand_state = pred[:, :, 18:] # bs, t, rest
+        
+        action_output = torch.cat(
+            [l_xy, l_z, l_quat, r_xy, r_z, r_quat, hand_state],
+            dim=-1
+        )
+        
+        return action_output
+
     def get6DRotation(self, quat):
         # data is in xyzw, but rotation transformer takes wxyz
         return self.quaternion_to_sixd.forward(quat[:, :, [3, 0, 1, 2]]) 
+    
+    def getQuaternionFrom6D(self, rot_6d):
+        quat = self.quaternion_to_sixd.inverse(rot_6d)
+        return quat[:, :, [1, 2, 3, 0]]  # xyzw
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -480,6 +518,28 @@ class FlowmatchingActionHead(nn.Module):
                     print(f"Action head trainable parameter: {name}")
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No action head trainable parameters found.")
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """
+        Custom load_state_dict that handles the transition from old state_encoder (simple linear)
+        to new state_encoder (ESCNN equivariant).
+        
+        Old checkpoint has: action_head.state_encoder.layer1.W, action_head.state_encoder.layer1.b
+        New model has: action_head.state_encoder.layer1.layers.*.* (ESCNN linear layers)
+        
+        This method filters out incompatible state_encoder keys to prevent weight mismatches.
+        """
+        # Filter out old state_encoder weights that don't match the new ESCNN architecture
+        filtered_state_dict = {}
+        for key, value in state_dict.items():
+            # Skip old-style state_encoder weights
+            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key:
+                print(f"Skipping incompatible state_encoder weight: {key}")
+                continue
+            filtered_state_dict[key] = value
+        # print(filtered_state_dict)
+        # Call parent's load_state_dict with filtered state
+        return super().load_state_dict(filtered_state_dict, strict=False, assign=assign)
 
     def set_frozen_modules_to_eval_mode(self):
         """
@@ -545,7 +605,7 @@ class FlowmatchingActionHead(nn.Module):
 
         # Embed state.
         b, t, _ = action_input.state.shape
-        state_input = self.getJointGeometricTensor(action_input.state)
+        state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
         state_features = self.state_encoder(state_input, embodiment_id)
         state_features = state_features.tensor
         state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=b, t=t)
@@ -561,7 +621,17 @@ class FlowmatchingActionHead(nn.Module):
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+        
+        print("noise", noisy_trajectory.shape)
+        noisy_trajectory = self.getJointGeometricTensor(noisy_trajectory, is_action=True)
         action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+        action_features = action_features.tensor
+        action_features = einops.rearrange(
+            action_features,
+            '(b t) c -> b t c',
+            b=action_input.batch_size,
+            t=action_input.action_horizon
+        )
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
@@ -582,7 +652,21 @@ class FlowmatchingActionHead(nn.Module):
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
         )
+        
+        model_output = einops.rearrange(
+            model_output,
+            'b t c -> (b t) c',
+        )
+        model_output = enn.GeometricTensor(model_output, self.action_out_type)
         pred = self.action_decoder(model_output, embodiment_id)
+        pred = einops.rearrange(
+            pred.tensor,
+            '(b t) c -> b t c',
+            b=action_input.batch_size,
+            t=action_input.action_horizon,
+        )
+        pred = self.getActionOutput(pred)
+        
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.

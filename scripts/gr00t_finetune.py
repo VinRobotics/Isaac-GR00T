@@ -31,7 +31,28 @@ from gr00t.experiment.runner import TrainRunner
 from gr00t.model.gr00t_n1 import GR00T_N1_5
 from gr00t.model.transforms import EMBODIMENT_TAG_MAPPING
 from gr00t.utils.peft import get_lora_model
+def print_layer_weights(layer):
+    # ESCNN Linear stores weights in: layer.weights
+    if hasattr(layer, "weights"):
+        W = layer.weights.data
+        print("Weight shape:", tuple(W.shape))
+        print("dtype:", W.dtype)
+        print("min:", W.min())
+        print("max:", W.max())
+        print("mean:", W.mean())
+        print("std:", W.std())
+        print("has_nan:", torch.isnan(W).any())
+    else:
+        print("Layer has no .weights attribute")
 
+    if hasattr(layer, "bias") and layer.bias is not None:
+        b = layer.bias.data
+        print("Bias shape:", tuple(b.shape))
+        print("Bias dtype:", b.dtype)
+        print("Bias min/max:", b.min(), b.max())
+        print("Bias has_nan:", torch.isnan(b).any())
+    else:
+        print("No bias")
 
 @dataclass
 class ArgsConfig:
@@ -204,7 +225,7 @@ def main(config: ArgsConfig):
 
     # Update action_horizon to match data config
     # Need to recreate action head with correct config since it was initialized with old config
-    if data_action_horizon != model.action_head.config.action_horizon:
+    if 1 or data_action_horizon != model.action_head.config.action_horizon:
         print(
             f"Recreating action head with action_horizon {data_action_horizon} (was {model.action_head.config.action_horizon})"
         )
@@ -249,7 +270,7 @@ def main(config: ArgsConfig):
             lora_dropout=config.lora_dropout,
             action_head_only=not config.lora_full_model,
         )
-
+    print_layer_weights(model.action_head.state_encoder.layer1.layers[31])
     # 2.1 modify training args
     training_args = TrainingArguments(
         output_dir=config.output_dir,

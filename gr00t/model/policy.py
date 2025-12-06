@@ -347,8 +347,12 @@ class Gr00tPolicy(BasePolicy):
         return True
 
     def _load_model(self, model_path):
-        model = GR00T_N1_5.from_pretrained(model_path, torch_dtype=COMPUTE_DTYPE)
+        # Load model without specifying torch_dtype to avoid dtype mismatch during ESCNN initialization
+        model = GR00T_N1_5.from_pretrained(model_path)
         model.eval()  # Set model to eval mode
+        
+        # Cast to desired dtype after initialization is complete
+        model = model.to(dtype=COMPUTE_DTYPE)
 
         # Update action_horizon to match modality config
         # Get the expected action horizon from the modality config
