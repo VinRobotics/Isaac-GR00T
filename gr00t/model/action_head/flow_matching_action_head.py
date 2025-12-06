@@ -266,15 +266,15 @@ class MultiEmbodimentActionEncoder(nn.Module):
         # 1) Expand each batch's single scalar time 'tau' across all T steps
         #    so that shape => (B, T)
         #    e.g. if timesteps is (B,), replicate across T
-        
-        timesteps = timesteps.repeat(B/timesteps.shape[0])
+        print(timesteps.shape)
+        timesteps = timesteps.repeat((B//timesteps.shape[0]))
         
 
         # 2) Standard action MLP step for shape => (B * T, w)
         a_emb = self.W1(actions, cat_ids)
 
         # 3) Get the sinusoidal encoding (B * T, w)
-        tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.dtype)
+        tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.tensor.dtype)
 
         # 4) Concat along last dim => (B * T, 2w), then W2 => (B * T, w), swish
         x = torch.cat([a_emb.tensor, tau_emb], dim=-1)
@@ -392,8 +392,8 @@ class FlowmatchingActionHead(nn.Module):
         
         self.action_decoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
-            in_type=self.action_out_type,
-            hidden_type=self.action_out_type,
+            in_type=self.state_hidden_type,
+            hidden_type=self.state_hidden_type,
             out_type=self.action_type,
         )
         
@@ -629,8 +629,8 @@ class FlowmatchingActionHead(nn.Module):
         action_features = einops.rearrange(
             action_features,
             '(b t) c -> b t c',
-            b=action_input.batch_size,
-            t=action_input.action_horizon
+            b=actions.shape[0],
+            t=actions.shape[1]
         )
 
         # Maybe add position embedding.
@@ -642,7 +642,7 @@ class FlowmatchingActionHead(nn.Module):
         # Join vision, language, state and action embedding along sequence dimension.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
-
+        print("sa_embs", sa_embs.shape)
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         model_output = self.model(
@@ -652,18 +652,19 @@ class FlowmatchingActionHead(nn.Module):
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
         )
+        print("model_output", model_output.shape)
         
         model_output = einops.rearrange(
             model_output,
             'b t c -> (b t) c',
         )
-        model_output = enn.GeometricTensor(model_output, self.action_out_type)
+        model_output = enn.GeometricTensor(model_output, self.state_hidden_type)
         pred = self.action_decoder(model_output, embodiment_id)
         pred = einops.rearrange(
             pred.tensor,
             '(b t) c -> b t c',
-            b=action_input.batch_size,
-            t=action_input.action_horizon,
+            b=actions.shape[0],
+            t=actions.shape[1]
         )
         pred = self.getActionOutput(pred)
         

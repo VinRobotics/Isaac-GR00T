@@ -36,7 +36,6 @@ class SinusoidalPositionalEncoding(nn.Module):
         # We'll compute sin/cos frequencies across dim T
         timesteps = timesteps.float()  # ensure float
 
-        B, T = timesteps.shape
         device = timesteps.device
 
         half_dim = self.embedding_dim // 2
