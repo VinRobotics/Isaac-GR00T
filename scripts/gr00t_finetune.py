@@ -271,6 +271,8 @@ def main(config: ArgsConfig):
             action_head_only=not config.lora_full_model,
         )
     print_layer_weights(model.action_head.state_encoder.layer1.layers[31])
+    print_layer_weights(model.action_head.action_encoder.W1.layers[31])
+    print_layer_weights(model.action_head.action_decoder.layer1.layers[31])
     # 2.1 modify training args
     training_args = TrainingArguments(
         output_dir=config.output_dir,

@@ -228,12 +228,12 @@ class EquiCategorySpecificLinear(nn.Module):
 
         for cat, idx in groups.items():
             xb = x.tensor[idx]
-
+            print(xb)
             geom_xb = enn.GeometricTensor(xb, self.in_type)
 
             layer = self.layers[cat]
             geom_out = layer(geom_xb)
-
+            print(geom_out)
             out[idx] = geom_out.tensor
 
         return enn.GeometricTensor(out, self.out_type)
@@ -622,7 +622,6 @@ class FlowmatchingActionHead(nn.Module):
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
         
-        print("noise", noisy_trajectory.shape)
         noisy_trajectory = self.getJointGeometricTensor(noisy_trajectory, is_action=True)
         action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
         action_features = action_features.tensor
@@ -632,6 +631,7 @@ class FlowmatchingActionHead(nn.Module):
             b=actions.shape[0],
             t=actions.shape[1]
         )
+        print("action feature", action_features)
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
@@ -642,7 +642,7 @@ class FlowmatchingActionHead(nn.Module):
         # Join vision, language, state and action embedding along sequence dimension.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
-        print("sa_embs", sa_embs.shape)
+
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         model_output = self.model(
@@ -652,27 +652,32 @@ class FlowmatchingActionHead(nn.Module):
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
         )
-        print("model_output", model_output.shape)
         
+        print("model_output", model_output)
+        
+
         model_output = einops.rearrange(
             model_output,
             'b t c -> (b t) c',
         )
         model_output = enn.GeometricTensor(model_output, self.state_hidden_type)
         pred = self.action_decoder(model_output, embodiment_id)
+        print("pred", pred)
+        
         pred = einops.rearrange(
             pred.tensor,
             '(b t) c -> b t c',
-            b=actions.shape[0],
-            t=actions.shape[1]
+            b=sa_embs.shape[0],
+            t=sa_embs.shape[1]
         )
-        pred = self.getActionOutput(pred)
-        
-        pred_actions = pred[:, -actions.shape[1] :]
 
+        pred_actions = pred[:, -actions.shape[1] :, :]
+
+        pred_actions = self.getActionOutput(pred_actions)
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
         loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+        print("loss", loss)
         loss = loss.sum() / action_mask.sum()
         output_dict = {
             "loss": loss,
