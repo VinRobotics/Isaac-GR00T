@@ -232,6 +232,7 @@ class Gr00tPolicy(BasePolicy):
             prefix_attention_horizon = obs_copy.get("prefix_attention_horizon", None)
             prefix_attention_schedule = obs_copy.get("prefix_attention_schedule", None)
             max_guidance_weight = obs_copy.get("max_guidance_weight", 5)
+            sigma_d_o = obs_copy.get("sigma_d_o", 5)
             execute_horizon = obs_copy.get("execute_horizon", None)
             obs_copy = obs_copy.get("observations", None)
 
@@ -261,7 +262,8 @@ class Gr00tPolicy(BasePolicy):
             inference_delay,
             prefix_attention_horizon,
             prefix_attention_schedule,
-            max_guidance_weight
+            max_guidance_weight,
+            sigma_d_o
         )
         if self.smooth_option == "rtc":
             normalized_action, self.prev_action_chunk = normalized_action
@@ -290,7 +292,8 @@ class Gr00tPolicy(BasePolicy):
                                                    inference_delay: int,
                                                    prefix_attention_horizon: int,
                                                    prefix_attention_schedule: str,
-                                                   max_guidance_weight: float) -> tuple[torch.Tensor, torch.Tensor]:
+                                                   max_guidance_weight: float,
+                                                   sigma_d_o: float) -> tuple[torch.Tensor, torch.Tensor]:
         # Set up autocast context if needed
         # with torch.inference_mode(False), torch.enable_grad(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
         model_pred, real_action = self.model.get_realtime_action(normalized_input,
@@ -298,7 +301,8 @@ class Gr00tPolicy(BasePolicy):
                                                         inference_delay=inference_delay,
                                                         prefix_attention_horizon=prefix_attention_horizon,
                                                         prefix_attention_schedule=prefix_attention_schedule,
-                                                        max_guidance_weight=max_guidance_weight)
+                                                        max_guidance_weight=max_guidance_weight,
+                                                        sigma_d_o=sigma_d_o)
 
         normalized_action = model_pred["action_pred"].float()
         real_action = real_action["action_pred"].float()
