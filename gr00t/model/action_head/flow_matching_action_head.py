@@ -448,28 +448,29 @@ class FlowmatchingActionHead(nn.Module):
         prefix_attention_horizon: int,
         prefix_attention_schedule: str,
         max_guidance_weight: float,
+        sigma_d_o: float
     )  -> BatchFeature:
         torch.set_grad_enabled(True)
         num_steps = self.num_inference_timesteps
-        self.sigma_d_o = 1.0
+        self.sigma_d_o = sigma_d_o
         dt = 1.0 / num_steps
         prev_action_chunk = torch.as_tensor(prev_action_chunk, device=self.device, dtype=self.dtype)
 
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
-        vl_embeds      = backbone_output.backbone_features          # [B, T_vl, D]
-        embodiment_id  = action_input.embodiment_id
+        vl_embs = backbone_output.backbone_features
+        embodiment_id = action_input.embodiment_id
 
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
         # Set initial actions as the sampled noise.
-        batch_size = vl_embeds.shape[0]
-        device = vl_embeds.device
+        batch_size = vl_embs.shape[0]
+        device = vl_embs.device
         x_t = torch.randn(
             size=(batch_size, self.config.action_horizon, self.config.action_dim),
-            dtype=vl_embeds.dtype,
+            dtype=vl_embs.dtype,
             device=device,
         )
 
@@ -496,8 +497,6 @@ class FlowmatchingActionHead(nn.Module):
                     pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                     action_features = action_features + pos_embs
 
-                vl_embs = vl_embeds
-
                 # Join vision, language, state and action embedding along sequence dimension.
                 future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
                 sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
@@ -511,7 +510,7 @@ class FlowmatchingActionHead(nn.Module):
                 pred = self.action_decoder(model_output, embodiment_id)
 
                 pred_velocity = pred[:, -self.action_horizon :]
-                return x_t_ + pred_velocity * (1 - t_cont), pred_velocity
+                return x_t_ + pred_velocity * dt, pred_velocity
             
             (outputs, vjp_func) = torch.func.vjp(denoiser, x_t)
             (x_1_i_vjp, v_t_i_vjp) = outputs
@@ -527,8 +526,7 @@ class FlowmatchingActionHead(nn.Module):
             
             guidance_weight = torch.minimum(c * inv_r2, torch.tensor(max_guidance_weight, device=device))
             v_t_corr = v_t_i_vjp + guidance_weight * pinv_correction
-
-            x_t = x_t + dt * v_t_corr
+            x_t = x_t + v_t_corr * dt
 
         assert x_t.shape == (batch_size, self.config.action_horizon, self.config.action_dim), x_t.shape
         x_t = x_t.clone().detach()
