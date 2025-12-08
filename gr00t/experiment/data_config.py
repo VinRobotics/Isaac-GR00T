@@ -1478,18 +1478,24 @@ class VRH3TwotHand1CamEquiConfig(BaseDataConfig):
             # state transforms
             StateActionToTensor(apply_to=self.ee_state_keys + self.state_keys),
             StateActionTransform(
-                apply_to=self.state_keys,
-                normalization_modes={key: "min_max" for key in self.state_keys},
-                # target_rotations={
-                #     "state.end_effector_rotation_relative": "rotation_6d",
-                #     "state.base_rotation": "rotation_6d",
-                # },
+                apply_to=self.ee_state_keys + self.state_keys,
+                normalization_modes={
+                    "state.l_ee_pos": "min_max",
+                    "state.r_ee_pos": "min_max",
+                    "state.left_hand": "min_max",
+                    "state.right_hand": "min_max",
+                },
             ),
             # action transforms
             StateActionToTensor(apply_to=self.ee_action_keys + self.action_keys),
             StateActionTransform(
-                apply_to=self.action_keys,
-                normalization_modes={key: "min_max" for key in self.action_keys},
+                apply_to=self.ee_action_keys + self.action_keys,
+                normalization_modes={
+                    "action.l_ee_pos": "min_max",
+                    "action.r_ee_pos": "min_max",
+                    "action.left_hand": "min_max",
+                    "action.right_hand": "min_max",
+                },
             ),
             # concat transforms
             ConcatTransform(
