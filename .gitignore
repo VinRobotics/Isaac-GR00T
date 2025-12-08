@@ -120,5 +120,6 @@ playground/
 
 # Data
 demo_data/gr00t-gr1-apple-to-shelf/
+demo_data/
 tmp/
 output/

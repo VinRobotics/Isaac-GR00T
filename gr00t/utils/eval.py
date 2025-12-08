@@ -126,6 +126,7 @@ def calc_mse_for_overlapping_trajectory(
     modality_keys: list,
     prefix_attention_schedule: str,
     max_guidance_weight: float,
+    sigma_d_o: float,
     steps=300,
     action_horizon=16,
     plot=False,
@@ -161,7 +162,7 @@ def calc_mse_for_overlapping_trajectory(
         state_joints_across_time.append(concat_state)
         gt_action_across_time.append(concat_gt_action)
 
-        if step_count % execute_horizon == 0:
+        if step_count % execute_horizon == 0 :
             next_action_chunk = policy.get_action(
                 dict(
                     observations=data_point,
@@ -169,7 +170,8 @@ def calc_mse_for_overlapping_trajectory(
                     execute_horizon=execute_horizon,
                     prefix_attention_horizon=prefix_attention_horizon,
                     prefix_attention_schedule=prefix_attention_schedule,
-                    max_guidance_weight=max_guidance_weight
+                    max_guidance_weight=max_guidance_weight,
+                    sigma_d_o=sigma_d_o
                 )
             )
 
@@ -248,7 +250,7 @@ def calc_mse_for_overlapping_trajectory(
             ax.legend()
 
         plt.tight_layout()
-        plt.savefig(f"overlapping_trajectory_{traj_id}_mse_plot_sigma=0.5.png")
+        plt.savefig(f"overlapping_trajectory_{traj_id}_mse_plot_sigma_{sigma_d_o}_mgw_{max_guidance_weight}.png")
         # plt.show()
 
     return mse

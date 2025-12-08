@@ -88,6 +88,9 @@ class ArgsConfig:
     max_guidance_weight: float = 5.0
     """Maximum guidance weight to use."""
 
+    sigma_d_o: float = 1.0
+    """Sigma D/O to use."""
+
 
 def main(args: ArgsConfig):
     data_config = DATA_CONFIG_MAP[args.data_config]
@@ -156,6 +159,7 @@ def main(args: ArgsConfig):
             plot=args.plot,
             prefix_attention_schedule=args.prefix_attention_schedule,
             max_guidance_weight=args.max_guidance_weight,
+            sigma_d_o=args.sigma_d_o
         )
         print("MSE:", mse)
         all_mse.append(mse)
