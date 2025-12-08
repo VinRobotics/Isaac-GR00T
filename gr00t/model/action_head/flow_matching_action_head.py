@@ -693,7 +693,11 @@ class FlowmatchingActionHead(nn.Module):
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
-        state_features = self.state_encoder(action_input.state, embodiment_id)
+        b, t, _ = action_input.state.shape
+        state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
+        state_features = self.state_encoder(state_input, embodiment_id)
+        state_features = state_features.tensor
+        state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=b, t=t)
 
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
@@ -716,7 +720,17 @@ class FlowmatchingActionHead(nn.Module):
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+            action_encoder_embodiment_id = embodiment_id.repeat((actions.shape[1]))
+            noisy_trajectory = self.getJointGeometricTensor(actions, is_action=True)
+            action_features = self.action_encoder(noisy_trajectory, timesteps_tensor, action_encoder_embodiment_id)
+            action_features = action_features.tensor
+            action_features = einops.rearrange(
+                action_features,
+                '(b t) c -> b t c',
+                b=actions.shape[0],
+                t=actions.shape[1]
+            )
+
             # Maybe add position embedding.
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
@@ -733,9 +747,26 @@ class FlowmatchingActionHead(nn.Module):
                 encoder_hidden_states=vl_embs,
                 timestep=timesteps_tensor,
             )
-            pred = self.action_decoder(model_output, embodiment_id)
+            
+            action_decoder_embodiment_id = embodiment_id.repeat((model_output.shape[1]))
+
+            model_output = einops.rearrange(
+                model_output,
+                'b t c -> (b t) c',
+            )
+            model_output = enn.GeometricTensor(model_output, self.state_hidden_type)
+            pred = self.action_decoder(model_output, action_decoder_embodiment_id)
+
+            pred = einops.rearrange(
+                pred.tensor,
+                '(b t) c -> b t c',
+                b=sa_embs.shape[0],
+                t=sa_embs.shape[1]
+            )
 
             pred_velocity = pred[:, -self.action_horizon :]
+
+            pred_velocity = self.getActionOutput(pred_velocity)
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
