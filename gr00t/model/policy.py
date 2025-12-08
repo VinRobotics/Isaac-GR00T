@@ -201,6 +201,30 @@ class Gr00tPolicy(BasePolicy):
         )
         print("PROCESS OUTPUT", action.shape)
         return action
+    
+    def drsl_get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Make a prediction with the model using DRS-L method.
+        Args:
+            obs (Dict[str, Any]): The observation to make a prediction for.
+
+        e.g. obs = {
+            "video.<>": np.ndarray,  # (T, H, W, C)
+            "state.<>": np.ndarray, # (T, D)
+            "annotation.<>": np.ndarray, # (T, )
+        }
+
+        or with batched input:
+        e.g. obs = {
+            "video.<>": np.ndarray,, # (B, T, H, W, C)
+            "state.<>": np.ndarray, # (B, T, D)
+            "annotation.<>": np.ndarray, # (B, T, )
+        }
+
+        Returns:
+            List[]: The predicted action.
+        """
+        raise NotImplementedError("DSRL method is not implemented yet.")        
 
     def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """
