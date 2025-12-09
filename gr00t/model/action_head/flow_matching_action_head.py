@@ -467,7 +467,7 @@ class FlowmatchingActionHead(nn.Module):
             ee_cos3 = ee_pred[:, :, 6:7]
             ee_sin3 = ee_pred[:, :, 7:8]
 
-            rot_6d = torch.cat([ee_cos1, ee_sin1, ee_cos2, ee_sin2, ee_cos3, ee_sin3], dim=-1)
+            rot_6d = torch.cat([ee_cos1, ee_cos2, ee_cos3, ee_sin1, ee_sin2, ee_sin3], dim=-1)
             quat = self.getQuaternionFrom6D(rot_6d)
             return ee_xy, quat
 
