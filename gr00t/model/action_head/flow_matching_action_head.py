@@ -457,6 +457,38 @@ class FlowmatchingActionHead(nn.Module):
 
         return enn.GeometricTensor(state_features, self.getJointFieldType(is_action))
     
+    def getActionGT(self, action):
+        def getActionGTEachHand(ee_state):
+            ee_pos = ee_state[:, :, :3] # (bs, t, 3)
+            ee_quat = ee_state[:, :, 3:7] # (bs, t, 4)
+            ee_rot = self.get6DRotation(ee_quat)
+            pos_xy = ee_pos[:, :, 0:2] # 2
+            pos_z = ee_pos[:, :, 2:3] # 1
+            joint_features = torch.cat(
+                [
+                    pos_xy,
+                    ee_rot[:, :, 0:1], # 1
+                    ee_rot[:, :, 3:4], # 1
+                    ee_rot[:, :, 1:2], # 1
+                    ee_rot[:, :, 4:5], # 1
+                    ee_rot[:, :, 2:3], # 1
+                    ee_rot[:, :, 5:6], # 1
+                ],
+                dim=-1
+            )
+            return joint_features, pos_z
+        
+        l_ee_state = action[:, :, :7] # bs, t, 7 
+        r_ee_state = action[:, :, 7:14] # bs, t, 7  
+        hand_state = action[:, :, 14:]
+        
+        l_tf, l_pos_z = getActionGTEachHand(l_ee_state)
+        r_tf, r_pos_z = getActionGTEachHand(r_ee_state)
+
+        state_features = torch.cat([l_tf, r_tf, l_pos_z, r_pos_z, hand_state], dim=-1)
+        return state_features
+    
+    
     def getActionOutput(self, pred):
         def getActionOutputEachHand(ee_pred):
             ee_xy = ee_pred[:, :, 0:2] # (bs, t, 3)
@@ -613,26 +645,31 @@ class FlowmatchingActionHead(nn.Module):
         
         # Embed noised action trajectory.
         actions = action_input.action
-        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
-        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+        
+        actions_gt = self.getActionGT(actions)
+        noise = torch.randn(actions_gt.shape, device=actions_gt.device, dtype=actions_gt.dtype)
+        t = self.sample_time(actions_gt.shape[0], device=actions_gt.device, dtype=actions_gt.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
 
-        noisy_trajectory = (1 - t) * noise + t * actions
-        velocity = actions - noise
+        noisy_trajectory = (1 - t) * noise + t * actions_gt
+        velocity = actions_gt - noise
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
         
-        noisy_trajectory = self.getJointGeometricTensor(noisy_trajectory, is_action=True)
+        noisy_trajectory = einops.rearrange(
+            noisy_trajectory, "b t c -> (b t) c"
+        )
+        noisy_trajectory = enn.GeometricTensor(noisy_trajectory, self.getJointFieldType(True))
 
-        action_encoder_embodiment_id = embodiment_id.repeat((actions.shape[1]))
+        action_encoder_embodiment_id = embodiment_id.repeat((actions_gt.shape[1]))
         action_features = self.action_encoder(noisy_trajectory, t_discretized, action_encoder_embodiment_id)
         action_features = action_features.tensor
         action_features = einops.rearrange(
             action_features,
             '(b t) c -> b t c',
-            b=actions.shape[0],
-            t=actions.shape[1]
+            b=actions_gt.shape[0],
+            t=actions_gt.shape[1]
         )
 
         # Maybe add position embedding.
@@ -671,11 +708,11 @@ class FlowmatchingActionHead(nn.Module):
             t=sa_embs.shape[1]
         )
 
-        pred_actions = pred[:, -actions.shape[1] :, :]
+        pred_actions = pred[:, -actions_gt.shape[1] :, :]
 
-        pred_actions = self.getActionOutput(pred_actions)
+        # pred_actions = self.getActionOutput(pred_actions)
         # Slice out only the action portion of pred and target.
-        action_mask = action_input.action_mask
+        action_mask = torch.concatenate([action_input.action_mask, torch.zeros((velocity.shape[-1] - action_input.action_mask.shape[-1]), device=velocity.device)], dim=-1)
         loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = loss.sum() / action_mask.sum()
         output_dict = {
