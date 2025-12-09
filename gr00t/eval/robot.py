@@ -28,6 +28,7 @@ class RobotInferenceServer(BaseInferenceServer):
     def __init__(self, model, host: str = "*", port: int = 5555, api_token: str = None):
         super().__init__(host, port, api_token)
         self.register_endpoint("get_action", model.get_action)
+        self.register_endpoint("get_dsrl_action", model.get_dsrl_action)
         self.register_endpoint(
             "get_modality_config", model.get_modality_config, requires_input=False
         )

@@ -202,9 +202,9 @@ class Gr00tPolicy(BasePolicy):
         print("PROCESS OUTPUT", action.shape)
         return action
     
-    def drsl_get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
+    def get_dsrl_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Make a prediction with the model using DRS-L method.
+        Make a prediction with the model.
         Args:
             obs (Dict[str, Any]): The observation to make a prediction for.
 
@@ -224,7 +224,27 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             List[]: The predicted action.
         """
-        raise NotImplementedError("DSRL method is not implemented yet.")        
+        # Create a copy to avoid mutating input
+        obs_copy = observations.copy()
+        noise_action = obs_copy.get("noise_action")
+        obs_copy = obs_copy.get("state", None)
+
+        is_batch = self._check_state_is_batched(obs_copy)
+        if not is_batch:
+            obs_copy = unsqueeze_dict_values(obs_copy)
+
+        # Convert to numpy arrays
+        for k, v in obs_copy.items():
+            if not isinstance(v, np.ndarray):
+                obs_copy[k] = np.array(v)
+
+        normalized_input = self.apply_transforms(obs_copy)
+        normalized_action = self._get_dsrl_action_from_normalized_input(normalized_input, noise_action)
+        unnormalized_action = self._get_unnormalized_action(normalized_action)
+
+        if not is_batch:
+            unnormalized_action = squeeze_dict_values(unnormalized_action)
+        return unnormalized_action
 
     def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -331,6 +351,16 @@ class Gr00tPolicy(BasePolicy):
         normalized_action = model_pred["action_pred"].float()
         real_action = real_action["action_pred"].float()
         return normalized_action, real_action
+    
+    def _get_dsrl_action_from_normalized_input(self, normalized_input: Dict[str, Any], noise_action: torch.Tensor) -> torch.Tensor:
+        # Set up autocast context if needed
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+            model_pred = self.model.get_dsrl_action(normalized_input, noise_action)
+
+        normalized_action = model_pred["action_pred"].float()
+        # if self.smooth_option == "te":
+        #     normalized_action = self.process_output(normalized_action)
+        return normalized_action
 
     def _get_unnormalized_action(self, normalized_action: torch.Tensor) -> Dict[str, Any]:
         return self.unapply_transforms({"action": normalized_action.cpu()})

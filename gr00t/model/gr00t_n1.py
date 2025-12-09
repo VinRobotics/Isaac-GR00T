@@ -212,6 +212,18 @@ class GR00T_N1_5(PreTrainedModel):
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         
         return action_head_outputs, _real_action_head_outputs
+    
+    def get_dsrl_action(
+        self,
+        inputs: dict,
+        noise_action: torch.Tensor
+    ) -> BatchFeature:
+        backbone_inputs, action_inputs = self.prepare_input(inputs)
+        # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
+        backbone_outputs = self.backbone(backbone_inputs)
+        action_head_outputs = self.action_head.get_dsrl_action(backbone_outputs, action_inputs, noise_action)
+        self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
+        return action_head_outputs
 
     def prepare_input(self, inputs) -> Tuple[BatchFeature, BatchFeature]:
         self.validate_inputs(inputs)
