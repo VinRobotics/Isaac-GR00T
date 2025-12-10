@@ -722,7 +722,6 @@ class FlowmatchingActionHead(nn.Module):
             
             # Copy original mask values
             action_mask[:, :, :original_action_dim] = action_input.action_mask
-            print(action_mask[0,0])
         loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = loss.sum() / action_mask.sum()
         output_dict = {
