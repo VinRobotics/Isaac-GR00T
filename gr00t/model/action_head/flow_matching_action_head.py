@@ -722,18 +722,7 @@ class FlowmatchingActionHead(nn.Module):
             
             # Copy original mask values
             action_mask[:, :, :original_action_dim] = action_input.action_mask
-            
-            # Calculate the added dimensions from quaternion to 6D rotation transformation
-            # Each hand: quaternion (4D) -> 6D rotation (6D), so +2D per hand
-            # Two hands: +4D total
-            num_added_rotation_dims = 2 * 2  # 2 hands × 2 extra dimensions per hand
-            added_dims_start = original_action_dim
-            added_dims_end = added_dims_start + num_added_rotation_dims
-            
-            # Set mask to 1.0 for the added rotation dimensions
-            action_mask[:, :, added_dims_start:added_dims_end] = 1.0
-
-            
+            print(action_mask[0,0])
         loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = loss.sum() / action_mask.sum()
         output_dict = {

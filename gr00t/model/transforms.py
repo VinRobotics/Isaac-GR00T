@@ -294,7 +294,8 @@ class GR00TTransform(InvertibleModalityTransform):
 
         # Create mask: [T, max_action_dim]
         actions_mask = np.zeros((n_action_tokens, self.max_action_dim), dtype=bool)
-        actions_mask[:, :n_action_dims] = True
+        #TODO: hard code for 2 end effector
+        actions_mask[:, :n_action_dims + 2 * 2] = True 
 
         return actions, actions_mask, n_action_tokens
 
