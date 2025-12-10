@@ -85,6 +85,9 @@ class ArgsConfig:
     resume: bool = False
     """Whether to resume from a checkpoint."""
 
+    use_action_conditioning: bool = False
+    """Whether to use action conditioning in the flow matching action head."""
+
     # Advanced training parameters
     learning_rate: float = 1e-4
     """Learning rate for training."""
@@ -264,6 +267,19 @@ def main(config: ArgsConfig):
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
     )
 
+    if config.use_action_conditioning:
+        # Import the FlowmatchingActionHeadActionCondition class
+        from gr00t.model.action_head.flow_matching_action_head_action_condition import (
+            FlowmatchingActionHeadActionCondition,
+        )
+        # Create new action head with updated config
+        print("Creating new action head...", config.use_action_conditioning)
+        print(f"Using FlowmatchingActionHeadActionCondition as action head (was FlowmatchingActionHead)")
+        new_action_head = FlowmatchingActionHeadActionCondition(
+            config=model.action_head.config
+        )
+        model.action_head = new_action_head    
+
     # Update action_horizon and max_action_dim to match data config
     # Need to recreate action head with correct config since it was initialized with old config
     action_horizon_mismatch = data_action_horizon != model.action_head.config.action_horizon
@@ -290,9 +306,19 @@ def main(config: ArgsConfig):
         from gr00t.model.action_head.flow_matching_action_head import (
             FlowmatchingActionHead,
         )
+        # Import the FlowmatchingActionHeadActionCondition class
+        from gr00t.model.action_head.flow_matching_action_head_action_condition import (
+            FlowmatchingActionHeadActionCondition,
+        )
 
         # Create new action head with updated config
-        new_action_head = FlowmatchingActionHead(new_action_head_config)
+        if config.use_action_conditioning:
+            print("Using FlowmatchingActionHeadActionCondition as action head (was FlowmatchingActionHead)")
+            new_action_head = FlowmatchingActionHeadActionCondition(
+                config=new_action_head_config
+            )
+        else:
+            new_action_head = FlowmatchingActionHead(new_action_head_config)
 
         # Copy the weights from the old action head to the new one
         if not action_dim_mismatch:
