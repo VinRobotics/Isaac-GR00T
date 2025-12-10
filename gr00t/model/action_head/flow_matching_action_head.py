@@ -713,14 +713,27 @@ class FlowmatchingActionHead(nn.Module):
 
         # pred_actions = self.getActionOutput(pred_actions)
         # Slice out only the action portion of pred and target.
-        B, T, _ = action_input.action_mask.shape
-        pad_size = velocity.shape[-1] - action_input.action_mask.shape[-1]
-        pad_mask = torch.zeros((B, T, pad_size), device=velocity.device)
-        true_mask = torch.ones((B, T, 2 * 2), device=velocity.device)
-        action_mask = torch.cat([action_input.action_mask, pad_mask], dim=-1)
-        
-        action_mask[:, :, action_input.action_mask.shape[-1]:action_input.action_mask.shape[-1] + true_mask.shape[-1]] = true_mask
+        with torch.no_grad():
+            B, T, original_action_dim = action_input.action_mask.shape
+            velocity_dim = velocity.shape[-1]
+            
+            # Create action mask that matches the velocity dimension
+            action_mask = torch.zeros((B, T, velocity_dim), device=velocity.device)
+            
+            # Copy original mask values
+            action_mask[:, :, :original_action_dim] = action_input.action_mask
+            
+            # Calculate the added dimensions from quaternion to 6D rotation transformation
+            # Each hand: quaternion (4D) -> 6D rotation (6D), so +2D per hand
+            # Two hands: +4D total
+            num_added_rotation_dims = 2 * 2  # 2 hands × 2 extra dimensions per hand
+            added_dims_start = original_action_dim
+            added_dims_end = added_dims_start + num_added_rotation_dims
+            
+            # Set mask to 1.0 for the added rotation dimensions
+            action_mask[:, :, added_dims_start:added_dims_end] = 1.0
 
+            
         loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = loss.sum() / action_mask.sum()
         output_dict = {
