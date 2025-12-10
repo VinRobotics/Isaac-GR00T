@@ -85,6 +85,9 @@ class ArgsConfig:
     resume: bool = False
     """Whether to resume from a checkpoint."""
 
+    use_action_conditioning: bool = False
+    """Whether to use action conditioning in the flow matching action head."""
+
     # Advanced training parameters
     learning_rate: float = 1e-4
     """Learning rate for training."""
@@ -202,7 +205,20 @@ def main(config: ArgsConfig):
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
     )
 
-    # Update action_horizon to match data config
+    if config.use_action_conditioning:
+        # Import the FlowmatchingActionHeadActionCondition class
+        from gr00t.model.action_head.flow_matching_action_head_action_condition import (
+            FlowmatchingActionHeadActionCondition,
+        )
+        # Create new action head with updated config
+        print("Creating new action head...", config.use_action_conditioning)
+        print(f"Using FlowmatchingActionHeadActionCondition as action head (was FlowmatchingActionHead)")
+        new_action_head = FlowmatchingActionHeadActionCondition(
+            config=model.action_head.config
+        )
+        model.action_head = new_action_head    
+
+    # Update action_horizon and max_action_dim to match data config
     # Need to recreate action head with correct config since it was initialized with old config
     if data_action_horizon != model.action_head.config.action_horizon:
         print(
@@ -217,9 +233,19 @@ def main(config: ArgsConfig):
         from gr00t.model.action_head.flow_matching_action_head import (
             FlowmatchingActionHead,
         )
+        # Import the FlowmatchingActionHeadActionCondition class
+        from gr00t.model.action_head.flow_matching_action_head_action_condition import (
+            FlowmatchingActionHeadActionCondition,
+        )
 
         # Create new action head with updated config
-        new_action_head = FlowmatchingActionHead(new_action_head_config)
+        if config.use_action_conditioning:
+            print("Using FlowmatchingActionHeadActionCondition as action head (was FlowmatchingActionHead)")
+            new_action_head = FlowmatchingActionHeadActionCondition(
+                config=new_action_head_config
+            )
+        else:
+            new_action_head = FlowmatchingActionHead(new_action_head_config)
 
         # Copy the weights from the old action head to the new one
         new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)

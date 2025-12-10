@@ -521,7 +521,8 @@ class FlowmatchingActionHead(nn.Module):
             c = torch.nan_to_num(torch.tensor((1 - t_cont) / max(t_cont, 1e-12), device=self.device, dtype=self.dtype),  # Avoid division by zero
                                  nan=0.0, posinf=max_guidance_weight)
             
-            guidance_weight = torch.minimum(c * inv_r2, torch.tensor(max_guidance_weight, device=device))
+            guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
+            guidance_weight = torch.minimum(guidance_weight, torch.tensor(max_guidance_weight, device=device))
             v_t_corr = v_t_i_vjp + guidance_weight * pinv_correction
             x_t = x_t + v_t_corr * dt
 
