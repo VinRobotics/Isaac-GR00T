@@ -660,6 +660,7 @@ class FlowmatchingActionHead(nn.Module):
         noisy_trajectory = einops.rearrange(
             noisy_trajectory, "b t c -> (b t) c"
         )
+        
         noisy_trajectory = enn.GeometricTensor(noisy_trajectory, self.getJointFieldType(True))
 
         action_encoder_embodiment_id = embodiment_id.repeat((actions_gt.shape[1]))
@@ -712,7 +713,14 @@ class FlowmatchingActionHead(nn.Module):
 
         # pred_actions = self.getActionOutput(pred_actions)
         # Slice out only the action portion of pred and target.
-        action_mask = torch.concatenate([action_input.action_mask, torch.zeros((velocity.shape[-1] - action_input.action_mask.shape[-1]), device=velocity.device)], dim=-1)
+        B, T, _ = action_input.action_mask.shape
+        pad_size = velocity.shape[-1] - action_input.action_mask.shape[-1]
+        pad_mask = torch.zeros((B, T, pad_size), device=velocity.device)
+        true_mask = torch.ones((B, T, 2 * 2), device=velocity.device)
+        action_mask = torch.cat([action_input.action_mask, pad_mask], dim=-1)
+        
+        action_mask[:, :, action_input.action_mask.shape[-1]:action_input.action_mask.shape[-1] + true_mask.shape[-1]] = true_mask
+
         loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = loss.sum() / action_mask.sum()
         output_dict = {
@@ -740,7 +748,7 @@ class FlowmatchingActionHead(nn.Module):
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
         actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
+            size=(batch_size, self.config.action_horizon, self.config.action_dim + 2 * 2),
             dtype=vl_embs.dtype,
             device=device,
         )
@@ -758,7 +766,10 @@ class FlowmatchingActionHead(nn.Module):
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
             action_encoder_embodiment_id = embodiment_id.repeat((actions.shape[1]))
-            noisy_trajectory = self.getJointGeometricTensor(actions, is_action=True)
+            noisy_trajectory = einops.rearrange(
+                actions, "b t c -> (b t) c"
+            )
+            noisy_trajectory = enn.GeometricTensor(noisy_trajectory, self.getJointFieldType(True))
             action_features = self.action_encoder(noisy_trajectory, timesteps_tensor, action_encoder_embodiment_id)
             action_features = action_features.tensor
             action_features = einops.rearrange(
@@ -802,11 +813,10 @@ class FlowmatchingActionHead(nn.Module):
             )
 
             pred_velocity = pred[:, -self.action_horizon :]
-
-            pred_velocity = self.getActionOutput(pred_velocity)
-
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
+            
+        actions = self.getActionOutput(actions)
         return BatchFeature(data={"action_pred": actions})
     
     @torch.enable_grad()
