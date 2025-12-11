@@ -120,9 +120,11 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
+        action_mask = action_input.action_mask
         postfix_mask = torch.logical_not(prefix_mask)[:, :, None] # compute the loss on the postfix only
-        loss = F.mse_loss(pred_actions, velocity, reduction="none")
-        loss = torch.sum(loss * postfix_mask) / (torch.sum(postfix_mask) + 1e-8)
+        total_mask = action_mask & postfix_mask
+        loss = F.mse_loss(pred_actions, velocity, reduction="none") * total_mask
+        loss = loss.sum() / (total_mask.sum() + 1e-8)
         output_dict = {
             "loss": loss,
         }
