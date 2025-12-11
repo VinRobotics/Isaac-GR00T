@@ -295,7 +295,18 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     )
     model_dtype: str = field(default="float32", metadata={"help": "Model data type."})
     diffusion_model_cfg: dict = field(
-        default=None, metadata={"help": "Diffusion model configuration."}
+        default={
+            "n_group": 8,
+            "attention_head_dim": 48,
+            "cross_attention_dim": 2048,
+            "dropout": 0.2,
+            "final_dropout": True,
+            "interleave_self_attention": True,
+            "norm_type": "ada_norm",
+            "num_attention_heads": 32,
+            "num_layers": 16,
+            "output_dim": 1024,
+        }, metadata={"help": "Diffusion model configuration."}
     )
     input_embedding_dim: int = field(
         default=1536, metadata={"help": "Input embedding channel dimension."}

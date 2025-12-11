@@ -234,8 +234,10 @@ class GR00T_N1_5(PreTrainedModel):
         tune_llm = kwargs.pop("tune_llm", False)
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
+        load_backbone_only = kwargs.pop("load_backbone_only", False)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
+        print(f"Load backbone only: {load_backbone_only}")
         print(f"Tune backbone vision tower: {tune_visual}")
         print(f"Tune backbone LLM: {tune_llm}")
         print(f"Tune action head projector: {tune_projector}")
@@ -253,9 +255,26 @@ class GR00T_N1_5(PreTrainedModel):
             )
             local_model_path = pretrained_model_name_or_path
 
-        pretrained_model = super().from_pretrained(
-            local_model_path, local_model_path=local_model_path, **kwargs
-        )
+        if load_backbone_only:
+            # Load only backbone weights during finetuning
+            config = AutoConfig.from_pretrained(local_model_path)
+            pretrained_model = cls(config, local_model_path=local_model_path)
+            
+            # Load state dict and filter for backbone weights only
+            state_dict = torch.load(f"{local_model_path}/pytorch_model.bin", map_location="cpu")
+            backbone_state_dict = {k: v for k, v in state_dict.items() if k.startswith("backbone.")}
+            
+            # Load backbone weights
+            pretrained_model.backbone.load_state_dict(
+                {k.replace("backbone.", ""): v for k, v in backbone_state_dict.items()},
+                strict=False
+            )
+            print(f"Loaded {len(backbone_state_dict)} backbone parameters")
+        else:
+            # Load all weights for inference
+            pretrained_model = super().from_pretrained(
+                local_model_path, local_model_path=local_model_path, **kwargs
+            )
 
         pretrained_model.backbone.set_trainable_parameters(
             tune_visual=tune_visual, tune_llm=tune_llm

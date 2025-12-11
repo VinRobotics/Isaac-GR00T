@@ -31,6 +31,8 @@ import torch
 import torch.nn as nn
 import einops
 import escnn.nn as enn
+from escnn.group import CyclicGroup
+import escnn
 from typing import Optional
 from .equivariant_activation import (
     GeLU,
@@ -330,21 +332,15 @@ class BasicTransformerBlock(nn.Module):
         in_type: enn.FieldType,
         cross_attention_type: enn.FieldType,
         inner_type: enn.FieldType,
-
+        
         num_attention_heads: int,
         attention_head_dim: int,
         dropout=0.0,
         activation_fn: str = "geglu",
         attention_bias: bool = False,
-
         norm_type: str = "layer_norm",  # 'layer_norm', 'ada_norm', 'ada_norm_zero', 'ada_norm_single', 'ada_norm_continuous', 'layer_norm_i2vgen'
         norm_eps: float = 1e-5,
         final_dropout: bool = False,
-        attention_type: str = "default",
-        positional_embeddings: Optional[str] = None,
-        num_positional_embeddings: Optional[int] = None,
-        ff_inner_dim: Optional[int] = None,
-        ff_bias: bool = True,
         attention_out_bias: bool = True,
         use_relative_position_bias: bool = False,
         max_relative_position: int = 32,
@@ -386,8 +382,7 @@ class BasicTransformerBlock(nn.Module):
             self.inner_type,
             dropout=dropout,
             activation_fn=activation_fn,
-            final_dropout=final_dropout,
-            bias=ff_bias,
+            final_dropout=final_dropout
         )
         if final_dropout:
             self.final_dropout = enn.PointwiseDropout(self.in_type, p=dropout)
@@ -504,8 +499,6 @@ class EDiT(ModelMixin, ConfigMixin):
         self.n_group = n_group
 
         # Setup ESCNN group space
-        from escnn.group import CyclicGroup
-        import escnn
         G = CyclicGroup(n_group)
         self.gspace = escnn.gspaces.no_base_space(G)
         
@@ -552,6 +545,7 @@ class EDiT(ModelMixin, ConfigMixin):
                     in_type=self.in_type,
                     cross_attention_type=curr_cross_type,
                     inner_type=self.ff_inner_type,
+                    
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
                     dropout=self.config.dropout,

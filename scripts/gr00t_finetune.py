@@ -221,11 +221,12 @@ def main(config: ArgsConfig):
         tune_visual=config.tune_visual,  # backbone's vision tower
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
+        load_backbone_only=True,  # load backbone only, not the action head
     )
 
     # Update action_horizon to match data config
     # Need to recreate action head with correct config since it was initialized with old config
-    if 1 or data_action_horizon != model.action_head.config.action_horizon:
+    if data_action_horizon != model.action_head.config.action_horizon:
         print(
             f"Recreating action head with action_horizon {data_action_horizon} (was {model.action_head.config.action_horizon})"
         )
