@@ -214,7 +214,6 @@ class DiT(ModelMixin, ConfigMixin):
         cross_attention_dim: Optional[int] = None,
     ):
         super().__init__()
-
         self.attention_head_dim = attention_head_dim
         self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
         self.gradient_checkpointing = False
@@ -328,7 +327,7 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
         interleave_self_attention=False,
     ):
         super().__init__()
-
+        print("888888", self.config)
         self.attention_head_dim = attention_head_dim
         self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
         self.gradient_checkpointing = False

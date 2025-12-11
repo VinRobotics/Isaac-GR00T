@@ -41,6 +41,7 @@ from gr00t.model.action_head.action_encoder import (
 )
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
+# from .equivariant_cross_attention_dit import EDiT, SelfAttentionTransformer
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -354,6 +355,7 @@ class FlowmatchingActionHead(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.n_group = 8
         
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
@@ -364,7 +366,6 @@ class FlowmatchingActionHead(nn.Module):
         self.num_inference_timesteps = config.num_inference_timesteps
 
         # equi state
-        self.n_group = 8
         self.group = gspaces.no_base_space(CyclicGroup(self.n_group))
         self.state_in_type = self.getJointFieldType(is_action=False)
         self.state_hidden_type = enn.FieldType(self.group, int(config.hidden_size / self.n_group) * [self.group.regular_repr])
