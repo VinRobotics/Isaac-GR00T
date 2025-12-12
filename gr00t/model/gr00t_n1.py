@@ -261,7 +261,36 @@ class GR00T_N1_5(PreTrainedModel):
             pretrained_model = cls(config, local_model_path=local_model_path)
             
             # Load state dict and filter for backbone weights only
-            state_dict = torch.load(f"{local_model_path}/pytorch_model.bin", map_location="cpu")
+            # Try safetensors first, fall back to pytorch_model.bin
+            import os
+            from safetensors.torch import load_file as load_safetensors
+            
+            safetensors_path = os.path.join(local_model_path, "model.safetensors")
+            safetensors_index_path = os.path.join(local_model_path, "model.safetensors.index.json")
+            pytorch_bin_path = os.path.join(local_model_path, "pytorch_model.bin")
+            
+            if os.path.exists(safetensors_index_path):
+                # Sharded safetensors model
+                import json
+                with open(safetensors_index_path, 'r') as f:
+                    index = json.load(f)
+                weight_map = index.get("weight_map", {})
+                
+                state_dict = {}
+                shard_files = set(weight_map.values())
+                for shard_file in shard_files:
+                    shard_path = os.path.join(local_model_path, shard_file)
+                    shard_dict = load_safetensors(shard_path)
+                    state_dict.update(shard_dict)
+            elif os.path.exists(safetensors_path):
+                # Single safetensors file
+                state_dict = load_safetensors(safetensors_path)
+            elif os.path.exists(pytorch_bin_path):
+                # Fall back to pytorch bin
+                state_dict = torch.load(pytorch_bin_path, map_location="cpu")
+            else:
+                raise FileNotFoundError(f"No model weights found in {local_model_path}")
+            
             backbone_state_dict = {k: v for k, v in state_dict.items() if k.startswith("backbone.")}
             
             # Load backbone weights

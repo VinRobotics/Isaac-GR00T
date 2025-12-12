@@ -488,7 +488,7 @@ class EDiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
-        use_relative_position_bias: bool = False,
+        use_relative_position_bias: bool = True,
         max_relative_position: int = 32,
     ):
         super().__init__()
@@ -525,7 +525,7 @@ class EDiT(ModelMixin, ConfigMixin):
         print(f"  Group: C{n_group}")
         print(f"  in_type size: {self.in_type.size}")
         print(f"  cross_attention_type size: {self.cross_attention_type.size}")
-        print(f"  inner_type size: {self.inner_type.size}")
+        print(f"  inner_type size: {self.ff_inner_type.size}")
 
         # Timestep encoder (non-equivariant, operates on trivial features)
         self.timestep_encoder = TimestepEncoder(
@@ -669,73 +669,3 @@ class EDiT(ModelMixin, ConfigMixin):
             return output, all_hidden_states
         else:
             return output
-
-
-
-class SelfAttentionTransformer(ModelMixin, ConfigMixin):
-    _supports_gradient_checkpointing = True
-
-    @register_to_config
-    def __init__(
-        self,
-        num_attention_heads: int = 8,
-        attention_head_dim: int = 64,
-        output_dim: int = 26,
-        num_layers: int = 12,
-        dropout: float = 0.1,
-        attention_bias: bool = True,
-        activation_fn: str = "gelu-approximate",
-        num_embeds_ada_norm: Optional[int] = 1000,
-        upcast_attention: bool = False,
-        max_num_positional_embeddings: int = 512,
-        compute_dtype=torch.float32,
-        final_dropout: bool = True,
-        positional_embeddings: Optional[str] = "sinusoidal",
-        interleave_self_attention=False,
-    ):
-        super().__init__()
-
-        self.attention_head_dim = attention_head_dim
-        self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
-        self.gradient_checkpointing = False
-
-        self.transformer_blocks = nn.ModuleList(
-            [
-                BasicTransformerBlock(
-                    self.inner_dim,
-                    self.config.num_attention_heads,
-                    self.config.attention_head_dim,
-                    dropout=self.config.dropout,
-                    activation_fn=self.config.activation_fn,
-                    attention_bias=self.config.attention_bias,
-                    upcast_attention=self.config.upcast_attention,
-                    positional_embeddings=positional_embeddings,
-                    num_positional_embeddings=self.config.max_num_positional_embeddings,
-                    final_dropout=final_dropout,
-                )
-                for _ in range(self.config.num_layers)
-            ]
-        )
-        print(
-            "Total number of SelfAttentionTransformer parameters: ",
-            sum(p.numel() for p in self.parameters() if p.requires_grad),
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,  # Shape: (B, T, D)
-        return_all_hidden_states: bool = False,
-    ):
-        # Process through transformer blocks - single pass through the blocks
-        hidden_states = hidden_states.contiguous()
-        all_hidden_states = [hidden_states]
-
-        # Process through transformer blocks
-        for idx, block in enumerate(self.transformer_blocks):
-            hidden_states = block(hidden_states)
-            all_hidden_states.append(hidden_states)
-
-        if return_all_hidden_states:
-            return hidden_states, all_hidden_states
-        else:
-            return hidden_states

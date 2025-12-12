@@ -41,7 +41,7 @@ from gr00t.model.action_head.action_encoder import (
 )
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
-# from .equivariant_cross_attention_dit import EDiT, SelfAttentionTransformer
+from .equivariant_cross_attention_dit import EDiT
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -295,7 +295,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     )
     model_dtype: str = field(default="float32", metadata={"help": "Model data type."})
     diffusion_model_cfg: dict = field(
-        default={
+        default_factory=lambda: {
             "n_group": 8,
             "attention_head_dim": 48,
             "cross_attention_dim": 2048,
@@ -371,7 +371,8 @@ class FlowmatchingActionHead(nn.Module):
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
-        self.model = DiT(**config.diffusion_model_cfg)
+        # self.model = DiT(**config.diffusion_model_cfg)
+        self.model = EDiT(**config.diffusion_model_cfg)
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
@@ -409,6 +410,16 @@ class FlowmatchingActionHead(nn.Module):
         )
         
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
+        self.future_tokens_in_type = enn.FieldType(
+            self.group, self.input_embedding_dim * [self.group.trivial_repr]
+        )
+        self.future_tokens_out_type = enn.FieldType(
+            self.group, int(self.input_embedding_dim / self.n_group) * [self.group.regular_repr]
+        )
+        self.future_tokens_equi_proj = enn.Linear(
+            self.future_tokens_in_type,
+            self.future_tokens_out_type
+        )
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
         self.vlln = (
@@ -418,6 +429,17 @@ class FlowmatchingActionHead(nn.Module):
             SelfAttentionTransformer(**config.vl_self_attention_cfg)
             if config.use_vlln
             else nn.Identity()
+        )
+        
+        self.vl_in_type = enn.FieldType(
+            self.group, self.config.diffusion_model_cfg["cross_attention_dim"] * [self.group.trivial_repr]
+        )
+        self.vl_out_type = enn.FieldType(
+            self.group, int(self.config.diffusion_model_cfg["cross_attention_dim"] / self.n_group) * [self.group.regular_repr]
+        )
+        self.vl_equi_proj = enn.Linear(
+            self.vl_in_type,
+            self.vl_out_type
         )
 
         if config.add_pos_embed:
@@ -576,7 +598,7 @@ class FlowmatchingActionHead(nn.Module):
         filtered_state_dict = {}
         for key, value in state_dict.items():
             # Skip old-style state_encoder weights
-            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key:
+            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key:
                 print(f"Skipping incompatible state_encoder weight: {key}")
                 continue
             filtered_state_dict[key] = value
@@ -649,11 +671,11 @@ class FlowmatchingActionHead(nn.Module):
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
-        b, t, _ = action_input.state.shape
+        B, T, _ = action_input.state.shape
         state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
         state_features = self.state_encoder(state_input, embodiment_id)
         state_features = state_features.tensor
-        state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=b, t=t)
+        state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=B, t=T)
         
         # Embed noised action trajectory.
         actions = action_input.action
@@ -685,16 +707,38 @@ class FlowmatchingActionHead(nn.Module):
             t=actions_gt.shape[1]
         )
 
-        # Maybe add position embedding.
-        if self.config.add_pos_embed:
-            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-            action_features = action_features + pos_embs
+        # # Maybe add position embedding.
+        # if self.config.add_pos_embed:
+        #     pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+        #     pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+        #     action_features = action_features + pos_embs
 
         # Join vision, language, state and action embedding along sequence dimension.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+        
+        future_tokens = einops.rearrange(
+            future_tokens, "b t d -> (b t) d"
+        )
+        future_tokens = enn.GeometricTensor(future_tokens, self.future_tokens_in_type)
+        future_tokens = self.future_tokens_equi_proj(future_tokens)
+        future_tokens = einops.rearrange(
+            future_tokens.tensor, "(b t) d -> b t d", b = B, t = self.config.num_target_vision_tokens
+        )
+        
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
-
+        B, T, C = sa_embs.shape
+        B, Tv, Cv = vl_embs.shape
+        # sa embs: B, T, G*D
+        # project vl embs to 2d space
+        vl_embs = einops.rearrange(
+            vl_embs, "b t d -> (b t) d"
+        )
+        vl_embs = enn.GeometricTensor(vl_embs, self.vl_in_type)
+        vl_embs = self.vl_equi_proj(vl_embs)
+        vl_embs = einops.rearrange(
+            vl_embs.tensor, "(b t) d -> b t d", b = B, t = Tv
+        )
+        
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         model_output = self.model(
@@ -748,14 +792,23 @@ class FlowmatchingActionHead(nn.Module):
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
+        Bv, Tv, D = vl_embs.shape
+        vl_embs = einops.rearrange(
+            vl_embs, "b t d -> (b t) d"
+        )
+        vl_embs = enn.GeometricTensor(vl_embs, self.vl_in_type)
+        vl_embs = self.vl_equi_proj(vl_embs)
+
+        vl_embs = einops.rearrange(vl_embs.tensor, "(b t) d -> b t d ", b=Bv)
+        
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
-        b, t, _ = action_input.state.shape
+        B, T, _ = action_input.state.shape
         state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
         state_features = self.state_encoder(state_input, embodiment_id)
         state_features = state_features.tensor
-        state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=b, t=t)
+        state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=B, t=T)
 
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
@@ -792,15 +845,28 @@ class FlowmatchingActionHead(nn.Module):
                 t=actions.shape[1]
             )
 
-            # Maybe add position embedding.
-            if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                action_features = action_features + pos_embs
+            # # Maybe add position embedding.
+            # if self.config.add_pos_embed:
+            #     pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+            #     pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+            #     action_features = action_features + pos_embs
 
             # Join vision, language, state and action embedding along sequence dimension.
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+                    
+            future_tokens = einops.rearrange(
+                future_tokens, "b t d -> (b t) d"
+            )
+            future_tokens = enn.GeometricTensor(future_tokens, self.future_tokens_in_type)
+            future_tokens = self.future_tokens_equi_proj(future_tokens)
+            future_tokens = einops.rearrange(
+                future_tokens.tensor, "(b t) d -> b t d", b = B, t = self.config.num_target_vision_tokens
+            )
             sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+            
+            B, T, C = sa_embs.shape
+            B, Tv, Cv = vl_embs.shape
+            # sa embs: B, T, G*D
 
             # Run model forward.
             model_output = self.model(
