@@ -42,6 +42,59 @@ from .equivariant_activation import (
 )
 
 
+class EquivariantLayerNorm(nn.Module):
+    """
+    Equivariant Layer Normalization that rearranges (B*T, D*G) to (B*T, G, D),
+    applies layer norm, then converts back to (B*T, D*G).
+    """
+    def __init__(self, field_type: enn.FieldType, affine=False, eps=1e-5):
+        super().__init__()
+        self.field_type = field_type
+        self.eps = eps
+        self.affine = affine
+        
+        # Get the group size
+        self.group_size = field_type.gspace.fibergroup.order()
+        
+        # Get the total dimension (D * G)
+        self.total_dim = field_type.size
+        
+        # Calculate D (dimension per group element)
+        assert self.total_dim % self.group_size == 0, \
+            f"Total dimension {self.total_dim} must be divisible by group size {self.group_size}"
+        self.dim_per_group = self.total_dim // self.group_size
+        
+        # LayerNorm is applied on the last dimension (D)
+        if self.affine:
+            self.layer_norm = nn.LayerNorm(self.dim_per_group, eps=eps, elementwise_affine=True)
+        else:
+            self.layer_norm = nn.LayerNorm(self.dim_per_group, eps=eps, elementwise_affine=False)
+    
+    def forward(self, x: enn.GeometricTensor) -> enn.GeometricTensor:
+        """
+        Args:
+            x: GeometricTensor with shape (B*T, D*G)
+        
+        Returns:
+            GeometricTensor with shape (B*T, D*G)
+        """
+        # Get the tensor from GeometricTensor
+        tensor = x.tensor  # Shape: (B*T, D*G)
+        batch_size = tensor.shape[0]
+        
+        # Rearrange from (B*T, D*G) to (B*T, G, D)
+        tensor_reshaped = tensor.view(batch_size, self.group_size, self.dim_per_group)
+        
+        # Apply layer norm on the last dimension (D)
+        tensor_normed = self.layer_norm(tensor_reshaped)
+        
+        # Rearrange back from (B*T, G, D) to (B*T, D*G)
+        tensor_output = tensor_normed.view(batch_size, self.total_dim)
+        
+        # Return as GeometricTensor
+        return enn.GeometricTensor(tensor_output, self.field_type)
+
+
 class TimestepEncoder(nn.Module):
     def __init__(self, embedding_dim, compute_dtype=torch.float32):
         super().__init__()
@@ -63,7 +116,7 @@ class EquivariantAdaLayerNorm(nn.Module):
         self.token_type = token_type
 
         # Representation-aware normalization
-        self.norm = enn.FieldNorm(token_type, affine=False)
+        self.norm = EquivariantLayerNorm(token_type, affine=False, eps=eps)
 
         # SiLU on trivial reps — SAFE
         self.silu = nn.SiLU()
@@ -361,7 +414,7 @@ class BasicTransformerBlock(nn.Module):
         if norm_type == "ada_norm":
             self.norm1 = EquivariantAdaLayerNorm(self.in_type)
         else:
-            self.norm1 = enn.FieldNorm(self.in_type, affine=False, eps=norm_eps)
+            self.norm1 = EquivariantLayerNorm(self.in_type, affine=False, eps=norm_eps)
 
         self.attn1 = EquivariantAttention(
             in_type=self.in_type,
@@ -376,7 +429,7 @@ class BasicTransformerBlock(nn.Module):
         )
 
         # 3. Feed-forward
-        self.norm3 = enn.FieldNorm(self.in_type, affine=False, eps=norm_eps)
+        self.norm3 = EquivariantLayerNorm(self.in_type, affine=False, eps=norm_eps)
         self.ff = EquivariantFeedForward(
             self.in_type,
             self.inner_type,
@@ -561,8 +614,8 @@ class EDiT(ModelMixin, ConfigMixin):
         self.transformer_blocks = nn.ModuleList(all_blocks)
 
         # Output blocks (operating on equivariant features)
-        # Use FieldNorm instead of LayerNorm for equivariance
-        self.norm_out = enn.FieldNorm(self.in_type, affine=False, eps=1e-6)
+        # Use EquivariantLayerNorm instead of LayerNorm for equivariance
+        self.norm_out = EquivariantLayerNorm(self.in_type, affine=False, eps=1e-6)
         
         # Project to output dimension using equivariant linear layers
         # First project to 2x for scale/shift (using in_type)
