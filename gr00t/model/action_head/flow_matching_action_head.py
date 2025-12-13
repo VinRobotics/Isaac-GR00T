@@ -219,8 +219,8 @@ class EquiCategorySpecificLinear(nn.Module):
         # Collect all outputs and their original indices
         all_outputs = []
         all_indices = []
-
         groups = self._group_indices(cat_ids)
+
         for cat, idx in groups.items():
             xb = x.tensor[idx]
             geom_xb = enn.GeometricTensor(xb, self.in_type)
@@ -255,6 +255,11 @@ class MultiEmbodimentActionEncoder(nn.Module):
         self.W2 = EquiCategorySpecificLinear(num_embodiments, self.hidden_type, self.out_type)  # (2w -> w)
         self.W3 = EquiCategorySpecificLinear(num_embodiments, self.out_type , self.out_type)  # (w -> w)
         self.pos_encoding = SinusoidalPositionalEncoding(self.out_type.size)
+        self.pos_type = enn.FieldType(self.out_type.gspace, [self.out_type.gspace.trivial_repr] * self.out_type.size)
+        self.pos_proj = enn.Linear(
+            self.pos_type, 
+            self.out_type
+        )
 
     def forward(self, actions, timesteps, cat_ids):
         """
@@ -276,6 +281,8 @@ class MultiEmbodimentActionEncoder(nn.Module):
 
         # 3) Get the sinusoidal encoding (B * T, w)
         tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.tensor.dtype)
+        tau_emb = enn.GeometricTensor(tau_emb, self.pos_type)
+        tau_emb = self.pos_proj(tau_emb).tensor  # (B * T, w)
         # 4) Concat along last dim => (B * T, 2w), then W2 => (B * T, w), swish
         x = torch.cat([a_emb.tensor, tau_emb], dim=-1)
         x = enn.GeometricTensor(x, self.hidden_type)
@@ -818,11 +825,10 @@ class FlowmatchingActionHead(nn.Module):
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
         actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim + 2 * 2),
-            dtype=vl_embs.dtype,
-            device=device,
-        )
-
+                    size=(batch_size, self.config.action_horizon, self.config.action_dim + 2 * 2),
+                    dtype=vl_embs.dtype,
+                    device=device,
+                )
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
 

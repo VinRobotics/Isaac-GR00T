@@ -21,8 +21,6 @@ from diffusers import ConfigMixin, ModelMixin
 from diffusers.configuration_utils import register_to_config
 from diffusers.models.attention import Attention, FeedForward
 from diffusers.models.embeddings import (
-    SinusoidalPositionalEmbedding,
-    TimestepEmbedding,
     Timesteps,
 )
 from torch import nn
@@ -35,7 +33,8 @@ from escnn.group import CyclicGroup
 import escnn
 from typing import Optional
 from .equivariant_activation import (
-    GeLU,
+    EquivariantGeLU,
+    EquivariantSiLU,
     ApproximateGELU,
     EquivariantGEGLU,
     EquivariantSwiGLU,
@@ -95,16 +94,59 @@ class EquivariantLayerNorm(nn.Module):
         return enn.GeometricTensor(tensor_output, self.field_type)
 
 
-class TimestepEncoder(nn.Module):
-    def __init__(self, embedding_dim, compute_dtype=torch.float32):
+class TimestepEmbedding(nn.Module):
+    def __init__(
+        self,
+        in_type: enn.FieldType,
+        out_type: enn.FieldType,
+        activation_fn: str = "silu",
+    ):
         super().__init__()
-        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=1)
-        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+        self.in_type = in_type
+        self.out_type = out_type
+        # Choose activation function based on the type
+        if activation_fn == "gelu":
+            self.act = EquivariantGeLU(self.in_type, self.out_type, bias=True)
+        elif activation_fn == "gelu-approximate":
+            self.act = ApproximateGELU(self.in_type, self.out_type, bias=True)
+        elif activation_fn in ["geglu", "geglu-approximate"]:
+            # GEGLU combines projection and activation, so no separate fc1 needed
+            self.act = EquivariantGEGLU(self.in_type, self.out_type, bias=True)
+        elif activation_fn == "swiglu":
+            # SwiGLU also combines projection and activation
+            self.act = EquivariantSwiGLU(self.in_type, self.out_type, bias=True)
+        elif activation_fn == "silu":
+            # Default to GELU
+            self.act = EquivariantSiLU(self.in_type, self.out_type, bias=True)
+        else:
+            # Default to GELU
+            self.act = EquivariantGeLU(self.in_type, self.out_type, bias=True)
+
+        self.linear_2 = enn.Linear(self.out_type, self.out_type)
+
+
+    def forward(self, sample):
+
+        sample = self.act(sample)
+
+        sample = self.linear_2(sample)
+
+        return sample
+
+class TimestepEncoder(nn.Module):
+    def __init__(self, in_type, out_type):
+        super().__init__()
+        self.in_type = in_type
+        self.out_type = out_type
+        self.time_proj = Timesteps(num_channels=self.in_type.size, flip_sin_to_cos=True, downscale_freq_shift=1)
+        self.timestep_embedder = TimestepEmbedding(self.in_type, self.out_type)
 
     def forward(self, timesteps):
         dtype = next(self.parameters()).dtype
         timesteps_proj = self.time_proj(timesteps).to(dtype)
+        timesteps_proj = enn.GeometricTensor(timesteps_proj, self.in_type)
         timesteps_emb = self.timestep_embedder(timesteps_proj)  # (N, D)
+        timesteps_emb = timesteps_emb.tensor
         return timesteps_emb
 
 
@@ -338,7 +380,7 @@ class EquivariantFeedForward(nn.Module):
         
         # Choose activation function based on the type
         if activation_fn == "gelu":
-            self.act = GeLU(in_type, inner_type, bias=bias)
+            self.act = EquivariantGeLU(in_type, inner_type, bias=bias)
         elif activation_fn == "gelu-approximate":
             self.act = ApproximateGELU(in_type, inner_type, bias=bias)
         elif activation_fn in ["geglu", "geglu-approximate"]:
@@ -349,7 +391,7 @@ class EquivariantFeedForward(nn.Module):
             self.act = EquivariantSwiGLU(in_type, inner_type, bias=bias)
         else:
             # Default to GELU
-            self.act = GeLU(in_type, inner_type, bias=bias)
+            self.act = EquivariantGeLU(in_type, inner_type, bias=bias)
         
         # Dropout
         self.dropout = enn.PointwiseDropout(inner_type, p=dropout) if dropout > 0.0 else None
@@ -391,7 +433,7 @@ class BasicTransformerBlock(nn.Module):
         dropout=0.0,
         activation_fn: str = "geglu",
         attention_bias: bool = False,
-        norm_type: str = "layer_norm",  # 'layer_norm', 'ada_norm', 'ada_norm_zero', 'ada_norm_single', 'ada_norm_continuous', 'layer_norm_i2vgen'
+        norm_type: str = "ada_norm",  # 'layer_norm', 'ada_norm', 'ada_norm_zero', 'ada_norm_single', 'ada_norm_continuous', 'layer_norm_i2vgen'
         norm_eps: float = 1e-5,
         final_dropout: bool = False,
         attention_out_bias: bool = True,
@@ -581,8 +623,12 @@ class EDiT(ModelMixin, ConfigMixin):
         print(f"  inner_type size: {self.ff_inner_type.size}")
 
         # Timestep encoder (non-equivariant, operates on trivial features)
+        self.time_in_type = enn.FieldType(
+            self.gspace, 
+            [self.gspace.trivial_repr] * int(self.inner_dim/8)
+        )
         self.timestep_encoder = TimestepEncoder(
-            embedding_dim=self.in_type.size, compute_dtype=self.config.compute_dtype
+            self.time_in_type, self.in_type
         )
 
         # Build equivariant transformer blocks

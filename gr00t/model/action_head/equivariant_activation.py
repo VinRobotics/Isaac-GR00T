@@ -5,31 +5,33 @@ from torch import nn
 
 import escnn.nn as enn
 
-class GeLU(nn.Module):
+class EquivariantGeLU(nn.Module):
     def __init__(self, in_type: enn.FieldType, out_type: enn.FieldType, bias=True):
         super().__init__()
         self.in_type = in_type
+        self.out_type = out_type
+        self.activation = nn.GELU()
+        self.proj = enn.Linear(in_type, out_type, bias=bias)
+
+    def forward(self, x: enn.GeometricTensor):
+        x = self.proj(x)
+        x = self.activation(x.tensor)
+        return enn.GeometricTensor(x, self.out_type)
+
+class EquivariantReLU(nn.Module):
+    def __init__(self, in_type: enn.FieldType, out_type: enn.FieldType, bias=True):
+        super().__init__()
+        self.in_type = in_type
+        self.activation = nn.ReLU()
         self.out_type = out_type
         self.proj = enn.Linear(in_type, out_type, bias=bias)
 
     def forward(self, x: enn.GeometricTensor):
         x = self.proj(x)
-        x = F.gelu(x.tensor)
+        x = self.activation(x.tensor)
         return enn.GeometricTensor(x, self.out_type)
 
-class ReLU(nn.Module):
-    def __init__(self, in_type: enn.FieldType, out_type: enn.FieldType, bias=True):
-        super().__init__()
-        self.in_type = in_type
-        self.out_type = out_type
-        self.proj = enn.Linear(in_type, out_type, bias=bias)
-
-    def forward(self, x: enn.GeometricTensor):
-        x = self.proj(x)
-        x = F.relu(x.tensor)
-        return enn.GeometricTensor(x, self.out_type)
-
-class SiLU(nn.Module):
+class EquivariantSiLU(nn.Module):
     def __init__(self, in_type: enn.FieldType, out_type: enn.FieldType, bias=True):
         super().__init__()
         self.proj = enn.Linear(in_type, out_type, bias=bias)
