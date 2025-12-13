@@ -85,7 +85,7 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
         delay = torch.randint(0, actions.shape[1], (actions.shape[0],), device=device)
         prefix_mask = torch.arange(actions.shape[1], device=device)[None, :] < delay[:, None]
         t = t.expand(actions.shape)
-        t = torch.where(prefix_mask[:, :, None], 0.0, t) # set time to 0.0 for the action prefix
+        t = torch.where(prefix_mask[:, :, None], 1.0, t) # set time to 1.0 for the action prefix
 
         #                                                                                                           #
         ##################################### training-time action conditioning #####################################
