@@ -603,9 +603,11 @@ class EDiT(ModelMixin, ConfigMixin):
             self.gspace, 
             [self.gspace.regular_repr] * int(self.inner_dim/8)
         )
+        # Cross-attention uses TRIVIAL representation for INVARIANT VL features
+        # This ensures the model is equivariant w.r.t. state/action regardless of VL content
         self.cross_attention_type = enn.FieldType(
             self.gspace,
-            [self.gspace.regular_repr] * int(self.config.cross_attention_dim/8)
+            [self.gspace.trivial_repr] * self.config.cross_attention_dim
         )
         self.ff_inner_type = enn.FieldType(
             self.gspace,
@@ -618,8 +620,8 @@ class EDiT(ModelMixin, ConfigMixin):
         
         print(f"EDiT Equivariant Configuration:")
         print(f"  Group: C{n_group}")
-        print(f"  in_type size: {self.in_type.size}")
-        print(f"  cross_attention_type size: {self.cross_attention_type.size}")
+        print(f"  in_type size: {self.in_type.size} (regular repr - equivariant)")
+        print(f"  cross_attention_type size: {self.cross_attention_type.size} (trivial repr - invariant)")
         print(f"  inner_type size: {self.ff_inner_type.size}")
 
         # Timestep encoder (non-equivariant, operates on trivial features)

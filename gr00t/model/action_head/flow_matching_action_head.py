@@ -417,16 +417,6 @@ class FlowmatchingActionHead(nn.Module):
         )
         
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
-        self.future_tokens_in_type = enn.FieldType(
-            self.group, self.input_embedding_dim * [self.group.trivial_repr]
-        )
-        self.future_tokens_out_type = enn.FieldType(
-            self.group, int(self.input_embedding_dim / self.n_group) * [self.group.regular_repr]
-        )
-        self.future_tokens_equi_proj = enn.Linear(
-            self.future_tokens_in_type,
-            self.future_tokens_out_type
-        )
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
         self.vlln = (
@@ -438,16 +428,6 @@ class FlowmatchingActionHead(nn.Module):
             else nn.Identity()
         )
         
-        self.vl_in_type = enn.FieldType(
-            self.group, self.config.diffusion_model_cfg["cross_attention_dim"] * [self.group.trivial_repr]
-        )
-        self.vl_out_type = enn.FieldType(
-            self.group, int(self.config.diffusion_model_cfg["cross_attention_dim"] / self.n_group) * [self.group.regular_repr]
-        )
-        self.vl_equi_proj = enn.Linear(
-            self.vl_in_type,
-            self.vl_out_type
-        )
 
         if config.add_pos_embed:
             self.position_embedding = nn.Embedding(config.max_seq_len, self.input_embedding_dim)
@@ -627,8 +607,6 @@ class FlowmatchingActionHead(nn.Module):
                 self.state_encoder.eval()
                 self.action_encoder.eval()
                 self.action_decoder.eval()
-                self.vl_equi_proj.eval()
-                self.future_tokens_equi_proj.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
             if not self.tune_diffusion_model:
@@ -725,31 +703,22 @@ class FlowmatchingActionHead(nn.Module):
         #     action_features = action_features + pos_embs
 
         # Join vision, language, state and action embedding along sequence dimension.
-        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+        # future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
         
-        future_tokens = einops.rearrange(
-            future_tokens, "b t d -> (b t) d"
-        )
-        future_tokens = enn.GeometricTensor(future_tokens, self.future_tokens_in_type)
-        future_tokens = self.future_tokens_equi_proj(future_tokens)
-        future_tokens = einops.rearrange(
-            future_tokens.tensor, "(b t) d -> b t d", b = B, t = self.config.num_target_vision_tokens
-        )
+        # future_tokens = einops.rearrange(
+        #     future_tokens, "b t d -> (b t) d"
+        # )
+        # future_tokens = enn.GeometricTensor(future_tokens, self.future_tokens_in_type)
+        # future_tokens = self.future_tokens_equi_proj(future_tokens)
+        # future_tokens = einops.rearrange(
+        #     future_tokens.tensor, "(b t) d -> b t d", b = B, t = self.config.num_target_vision_tokens
+        # )
         
-        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+        sa_embs = torch.cat((state_features, action_features), dim=1)
         B, T, C = sa_embs.shape
         B, Tv, Cv = vl_embs.shape
         # sa embs: B, T, G*D
         # project vl embs to 2d space
-        vl_embs = einops.rearrange(
-            vl_embs, "b t d -> (b t) d"
-        )
-        vl_embs = enn.GeometricTensor(vl_embs, self.vl_in_type)
-        vl_embs = self.vl_equi_proj(vl_embs)
-        vl_embs = einops.rearrange(
-            vl_embs.tensor, "(b t) d -> b t d", b = B, t = Tv
-        )
-        
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         model_output = self.model(
@@ -798,19 +767,15 @@ class FlowmatchingActionHead(nn.Module):
 
     @torch.no_grad()
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
-
+        self.model.eval()
+        self.action_decoder.eval()
+        self.state_encoder.eval()
+        self.action_encoder.eval()
+        
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
-        Bv, Tv, D = vl_embs.shape
-        vl_embs = einops.rearrange(
-            vl_embs, "b t d -> (b t) d"
-        )
-        vl_embs = enn.GeometricTensor(vl_embs, self.vl_in_type)
-        vl_embs = self.vl_equi_proj(vl_embs)
-
-        vl_embs = einops.rearrange(vl_embs.tensor, "(b t) d -> b t d ", b=Bv)
         
         embodiment_id = action_input.embodiment_id
 
@@ -862,17 +827,17 @@ class FlowmatchingActionHead(nn.Module):
             #     action_features = action_features + pos_embs
 
             # Join vision, language, state and action embedding along sequence dimension.
-            future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+            # future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
                     
-            future_tokens = einops.rearrange(
-                future_tokens, "b t d -> (b t) d"
-            )
-            future_tokens = enn.GeometricTensor(future_tokens, self.future_tokens_in_type)
-            future_tokens = self.future_tokens_equi_proj(future_tokens)
-            future_tokens = einops.rearrange(
-                future_tokens.tensor, "(b t) d -> b t d", b = B, t = self.config.num_target_vision_tokens
-            )
-            sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+            # future_tokens = einops.rearrange(
+            #     future_tokens, "b t d -> (b t) d"
+            # )
+            # future_tokens = enn.GeometricTensor(future_tokens, self.future_tokens_in_type)
+            # future_tokens = self.future_tokens_equi_proj(future_tokens)
+            # future_tokens = einops.rearrange(
+            #     future_tokens.tensor, "(b t) d -> b t d", b = B, t = self.config.num_target_vision_tokens
+            # )
+            sa_embs = torch.cat((state_features, action_features), dim=1)
             
             B, T, C = sa_embs.shape
             B, Tv, Cv = vl_embs.shape

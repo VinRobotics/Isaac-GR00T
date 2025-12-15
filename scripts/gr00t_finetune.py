@@ -265,8 +265,6 @@ def main(config: ArgsConfig):
     print_layer_weights(model.action_head.action_encoder.W1.layers[31])
     print_layer_weights(model.action_head.action_decoder.layer1.layers[31])
     print_layer_weights(model.action_head.model.proj_out_1)
-    print_layer_weights(model.action_head.future_tokens_equi_proj)
-    print_layer_weights(model.action_head.vl_equi_proj)
 
     # Set the model's compute_dtype to bfloat16
     model.compute_dtype = "bfloat16"

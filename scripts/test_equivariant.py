@@ -8,6 +8,7 @@ from escnn import gspaces, nn as enn
 from escnn.group import CyclicGroup 
 import einops
 import torch
+from copy import deepcopy
 
 
 data_config = load_data_config("vrh3_two_hand_1_cam_equi")
@@ -28,7 +29,7 @@ client = RobotInferenceClient(
 state = dataset[0]["state"]
 
 obs = {
-    "video.cam_front": np.random.randint(0, 256, (1, 480, 640, 3), dtype=np.uint8),
+    "video.cam_front": np.ones((1, 480, 640, 3), dtype=np.uint8),
     "state.left_hand": state[0, 14:20][None, :],
     "state.right_hand": state[0, 20:26][None, :],
     "state.l_ee_pos": state[0, :3][None, :],
@@ -102,7 +103,7 @@ def getActionOutput(pred):
             ee_cos3 = ee_pred[:, :, 6:7]
             ee_sin3 = ee_pred[:, :, 7:8]
 
-            rot_6d = torch.cat([ee_cos1, ee_sin1, ee_cos2, ee_sin2, ee_cos3, ee_sin3], dim=-1)
+            rot_6d = torch.cat([ee_cos1, ee_cos2, ee_cos3, ee_sin1, ee_sin2, ee_sin3], dim=-1)
             quat = getQuaternionFrom6D(rot_6d)
             return ee_xy, quat
 
@@ -138,14 +139,29 @@ action = np.concatenate(
     axis=-1
 )
 
+
 for element in group.testing_elements:
-    rotated_obs = obs.copy()
+    rotated_obs = deepcopy(obs)
 
     # Rotate state
-    rotated_state = getJointGeometricTensor(
-        group, torch.tensor(state).unsqueeze(1), is_action=False
+    rotated_state_tensor = getJointGeometricTensor(
+        group, torch.tensor(deepcopy(state)).unsqueeze(1), is_action=False
     )
-    rotated_state = rotated_state.transform(element).tensor.numpy()
+    rotated_state_tensor = rotated_state_tensor.transform(element)
+    rotated_state_tensor = einops.rearrange(
+        rotated_state_tensor.tensor, '(b t) c -> b t c', b=1
+    )
+    
+    rotated_state = getActionOutput(rotated_state_tensor).squeeze(0)
+    rotated_state = rotated_state.numpy()
+
+    print("element:", element)
+    print("state", state)
+    print("rotated state", rotated_state)
+    
+    # NOTE: video.cam_front is NOT rotated - this is intentional if 
+    # testing state-only equivariance, but the model must handle this correctly
+    
     rotated_obs["state.left_hand"] = rotated_state[0, 14:20][None, :]
     rotated_obs["state.right_hand"] = rotated_state[0, 20:26][None, :]
     rotated_obs["state.l_ee_pos"] = rotated_state[0, :3][None, :]
@@ -166,14 +182,14 @@ for element in group.testing_elements:
         axis=-1
     ))
     rotated_origin_action = getJointGeometricTensor(
-        group, torch.tensor(action).unsqueeze(1), is_action=True
+        group, torch.tensor(deepcopy(action)).unsqueeze(1), is_action=True
     )
     rotated_origin_action = rotated_origin_action.transform(element)
     rotated_origin_action = einops.rearrange(
         rotated_origin_action.tensor, '(b t) c -> b t c', b=1
     )
     
-    rotated_origin_action = getActionOutput(rotated_origin_action)
-    
+    rotated_origin_action = getActionOutput(rotated_origin_action).squeeze(0)
+    print(rotated_origin_action.shape, output_action.shape)
     err = (rotated_origin_action - output_action).abs().mean()
     print(torch.allclose(output_action, rotated_origin_action, atol=1e-4), element, err)
