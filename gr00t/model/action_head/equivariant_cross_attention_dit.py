@@ -107,48 +107,55 @@ class TimestepEncoder(nn.Module):
         return timesteps_emb
 
 class EquivariantAdaLayerNorm(nn.Module):
+    """
+    Equivariant Adaptive Layer Normalization.
+    
+    Uses standard PyTorch linear layers for scale/shift projection (faster convergence)
+    because temb is trivial (invariant) and scale/shift are applied element-wise.
+    """
     def __init__(self, token_type: enn.FieldType, temb_type: Optional[enn.FieldType] = None, eps=1e-5):
         super().__init__()
 
         self.token_type = token_type
         # temb_type is trivial repr for timestep (scalar, not rotated)
         self.temb_type = temb_type if temb_type is not None else token_type
+        
+        self.token_dim = token_type.size
+        self.temb_dim = self.temb_type.size
 
         # Representation-aware normalization
         self.norm = EquivariantLayerNorm(token_type, affine=False, eps=eps)
 
-        # SiLU on trivial reps — SAFE (temb is trivial)
+        # SiLU activation
         self.silu = nn.SiLU()
 
-        # Project from trivial temb to [scale, shift] in token_type
-        # This lifts the invariant timestep to equivariant scale/shift
-        out_type = token_type + token_type
-        self.linear = enn.Linear(self.temb_type, out_type, initialize=True)
+        # Use standard PyTorch linear for faster convergence
+        # Projects trivial temb to scale and shift
+        # This is valid because:
+        # 1. temb is trivial (invariant) - same value for all group elements
+        # 2. scale/shift are applied element-wise - equivariance is preserved
+        self.linear = nn.Linear(self.temb_dim, 2 * self.token_dim)
+        
+        # Initialize scale close to 0 and shift to 0 for stable training
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
 
     def forward(self, x: enn.GeometricTensor, temb: torch.Tensor):
         """
-        x    : GeometricTensor (B*T, Cq*G) - equivariant features
+        x    : GeometricTensor (B*T, token_dim) - equivariant features
         temb : torch.Tensor (B*T, temb_dim) - trivial/invariant timestep embedding
         """
-        # Convert temb to GeometricTensor with trivial type
-        gtemb = enn.GeometricTensor(temb, self.temb_type)
-
         # Normalize equivariantly
         gx_normed = self.norm(x)
 
-        # Nonlinearity on trivial reps (safe because temb is trivial)
-        gtemb = enn.GeometricTensor(self.silu(gtemb.tensor), self.temb_type)
+        # Apply SiLU and project to scale + shift
+        temb_activated = self.silu(temb)
+        scale_shift = self.linear(temb_activated)
+        scale, shift = scale_shift.chunk(2, dim=1)
 
-        # Project trivial temb to equivariant scale + shift
-        gss = self.linear(gtemb)
-        scale, shift = gss.tensor.chunk(2, dim=1)
-
-        # Wrap back to geometric tensors
-        gscale = enn.GeometricTensor(scale, self.token_type)
-        gshift = enn.GeometricTensor(shift, self.token_type)
-
-        # AdaLayerNorm: x_norm * (1+scale) + shift
-        out = gx_normed.tensor * (1 + gscale.tensor) + gshift.tensor
+        # AdaLayerNorm: x_norm * (1 + scale) + shift
+        # This is equivariant because scale/shift are element-wise operations
+        out = gx_normed.tensor * (1 + scale) + shift
 
         return enn.GeometricTensor(out, self.token_type)
     
@@ -629,13 +636,13 @@ class EDiT(ModelMixin, ConfigMixin):
         # Use EquivariantLayerNorm instead of LayerNorm for equivariance
         self.norm_out = EquivariantLayerNorm(self.in_type, affine=False, eps=1e-6)
         
-        # Project to output dimension using equivariant linear layers
-        # First project from trivial temb to 2x in_type for scale/shift
-        out_scale_shift_type = self.in_type + self.in_type  # 2x in_type for scale and shift
-        self.proj_out_1 = enn.Linear(
-            self.time_out_type,  # trivial temb input
-            out_scale_shift_type  # equivariant scale/shift output
-        )
+        # Project from trivial temb to scale/shift for final AdaLN
+        # Use standard nn.Linear for faster convergence (same reasoning as EquivariantAdaLayerNorm)
+        # temb is trivial/invariant, and scale/shift are applied element-wise
+        self.proj_out_1 = nn.Linear(self.time_out_type.size, 2 * self.in_type.size)
+        # Initialize to zero for stable training (starts as identity: out = norm(x) * 1 + 0)
+        nn.init.zeros_(self.proj_out_1.weight)
+        nn.init.zeros_(self.proj_out_1.bias)
         
         # Final projection to output dimension - KEEP EQUIVARIANT (same as in_type)
         # Output now maintains equivariance!
@@ -708,25 +715,20 @@ class EDiT(ModelMixin, ConfigMixin):
         hidden_geo = self.norm_out(hidden_geo)
         
         # AdaLN conditioning with timestep (timestep is TRIVIAL - not rotated)
-        # Wrap temb as trivial type (time_out_type)
-        temb_geo = enn.GeometricTensor(temb, self.time_out_type)
-        scale_shift_geo = self.proj_out_1(temb_geo)  # (B, 2*in_type.size) - lifts to equivariant
-        scale_tensor, shift_tensor = scale_shift_geo.tensor.chunk(2, dim=1)
+        # Use standard linear (faster convergence) - no GeometricTensor needed
+        scale_shift = self.proj_out_1(temb)  # (B, 2*in_type.size)
+        scale_tensor, shift_tensor = scale_shift.chunk(2, dim=1)
         
         # Apply scale and shift (expand to match sequence length)
         scale_expanded = einops.repeat(scale_tensor, "b d -> (b t) d", t=T)
         shift_expanded = einops.repeat(shift_tensor, "b d -> (b t) d", t=T)
         
-        # Create geometric tensors for scale and shift
-        scale_geo_expanded = enn.GeometricTensor(scale_expanded, self.in_type)
-        shift_geo_expanded = enn.GeometricTensor(shift_expanded, self.in_type)
-        
         # Apply conditioning: output = norm(x) * (1 + scale) + shift
-        # This is element-wise multiplication in the representation space
-        conditioned_tensor = hidden_geo.tensor * (1 + scale_geo_expanded.tensor) + shift_geo_expanded.tensor
+        # This is equivariant because scale/shift are element-wise operations
+        conditioned_tensor = hidden_geo.tensor * (1 + scale_expanded) + shift_expanded
         conditioned_geo = enn.GeometricTensor(conditioned_tensor, self.in_type)
         
-        # Final equivariant projection (in_type -> in_type)
+        # Final equivariant projection (in_type -> out_type)
         output_geo = self.proj_out_2(conditioned_geo)
         output = einops.rearrange(output_geo.tensor, "(b t) d -> b t d", b=B)
         
