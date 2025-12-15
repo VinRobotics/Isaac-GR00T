@@ -34,7 +34,7 @@ def test_edit_basic():
         dropout=0.0,
         attention_bias=True,
         activation_fn="gelu-approximate",
-        norm_type="layer_norm",
+        norm_type="ada_norm",
         interleave_self_attention=True,
         final_dropout=True,
         use_relative_position_bias=True,

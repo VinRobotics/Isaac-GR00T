@@ -22,6 +22,7 @@ from diffusers.configuration_utils import register_to_config
 from diffusers.models.attention import Attention, FeedForward
 from diffusers.models.embeddings import (
     Timesteps,
+    TimestepEmbedding,
 )
 from torch import nn
 
@@ -93,95 +94,52 @@ class EquivariantLayerNorm(nn.Module):
         # Return as GeometricTensor
         return enn.GeometricTensor(tensor_output, self.field_type)
 
-
-class TimestepEmbedding(nn.Module):
-    def __init__(
-        self,
-        in_type: enn.FieldType,
-        out_type: enn.FieldType,
-        activation_fn: str = "silu",
-    ):
-        super().__init__()
-        self.in_type = in_type
-        self.out_type = out_type
-        # Choose activation function based on the type
-        if activation_fn == "gelu":
-            self.act = EquivariantGeLU(self.in_type, self.out_type, bias=True)
-        elif activation_fn == "gelu-approximate":
-            self.act = ApproximateGELU(self.in_type, self.out_type, bias=True)
-        elif activation_fn in ["geglu", "geglu-approximate"]:
-            # GEGLU combines projection and activation, so no separate fc1 needed
-            self.act = EquivariantGEGLU(self.in_type, self.out_type, bias=True)
-        elif activation_fn == "swiglu":
-            # SwiGLU also combines projection and activation
-            self.act = EquivariantSwiGLU(self.in_type, self.out_type, bias=True)
-        elif activation_fn == "silu":
-            # Default to GELU
-            self.act = EquivariantSiLU(self.in_type, self.out_type, bias=True)
-        else:
-            # Default to GELU
-            self.act = EquivariantGeLU(self.in_type, self.out_type, bias=True)
-
-        self.linear_2 = enn.Linear(self.out_type, self.out_type)
-
-
-    def forward(self, sample):
-
-        sample = self.act(sample)
-
-        sample = self.linear_2(sample)
-
-        return sample
-
 class TimestepEncoder(nn.Module):
-    def __init__(self, in_type, out_type):
+    def __init__(self, embedding_dim, compute_dtype=torch.float32):
         super().__init__()
-        self.in_type = in_type
-        self.out_type = out_type
-        self.time_proj = Timesteps(num_channels=self.in_type.size, flip_sin_to_cos=True, downscale_freq_shift=1)
-        self.timestep_embedder = TimestepEmbedding(self.in_type, self.out_type)
+        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=1)
+        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
 
     def forward(self, timesteps):
         dtype = next(self.parameters()).dtype
         timesteps_proj = self.time_proj(timesteps).to(dtype)
-        timesteps_proj = enn.GeometricTensor(timesteps_proj, self.in_type)
         timesteps_emb = self.timestep_embedder(timesteps_proj)  # (N, D)
-        timesteps_emb = timesteps_emb.tensor
         return timesteps_emb
 
-
-
 class EquivariantAdaLayerNorm(nn.Module):
-    def __init__(self, token_type: enn.FieldType, eps=1e-5):
+    def __init__(self, token_type: enn.FieldType, temb_type: Optional[enn.FieldType] = None, eps=1e-5):
         super().__init__()
 
         self.token_type = token_type
+        # temb_type is trivial repr for timestep (scalar, not rotated)
+        self.temb_type = temb_type if temb_type is not None else token_type
 
         # Representation-aware normalization
         self.norm = EquivariantLayerNorm(token_type, affine=False, eps=eps)
 
-        # SiLU on trivial reps — SAFE
+        # SiLU on trivial reps — SAFE (temb is trivial)
         self.silu = nn.SiLU()
 
-        # out = [scale, shift] each in token_type
+        # Project from trivial temb to [scale, shift] in token_type
+        # This lifts the invariant timestep to equivariant scale/shift
         out_type = token_type + token_type
-        self.linear = enn.Linear(self.token_type, out_type, initialize=True)
+        self.linear = enn.Linear(self.temb_type, out_type, initialize=True)
 
     def forward(self, x: enn.GeometricTensor, temb: torch.Tensor):
         """
-        x    : GeometricTensor (B*T, Cq*G)
-        temb : torch.Tensor (B*T, Cq*G)
+        x    : GeometricTensor (B*T, Cq*G) - equivariant features
+        temb : torch.Tensor (B*T, temb_dim) - trivial/invariant timestep embedding
         """
-        # Convert temb to GeometricTensor
-        gtemb = enn.GeometricTensor(temb, self.token_type)
+        # Convert temb to GeometricTensor with trivial type
+        gtemb = enn.GeometricTensor(temb, self.temb_type)
 
         # Normalize equivariantly
         gx_normed = self.norm(x)
 
-        # Nonlinearity only applied to trivial reps
-        gtemb = enn.GeometricTensor(self.silu(gtemb.tensor), self.token_type)
+        # Nonlinearity on trivial reps (safe because temb is trivial)
+        gtemb = enn.GeometricTensor(self.silu(gtemb.tensor), self.temb_type)
 
-        # Project to scale + shift
+        # Project trivial temb to equivariant scale + shift
         gss = self.linear(gtemb)
         scale, shift = gss.tensor.chunk(2, dim=1)
 
@@ -427,9 +385,10 @@ class BasicTransformerBlock(nn.Module):
         in_type: enn.FieldType,
         cross_attention_type: enn.FieldType,
         inner_type: enn.FieldType,
+        temb_type: Optional[enn.FieldType] = None,  # trivial type for timestep embedding
         
-        num_attention_heads: int,
-        attention_head_dim: int,
+        num_attention_heads: int = 8,
+        attention_head_dim: int = 64,
         dropout=0.0,
         activation_fn: str = "geglu",
         attention_bias: bool = False,
@@ -447,6 +406,8 @@ class BasicTransformerBlock(nn.Module):
         self.cross_attention_type = cross_attention_type
         ## ff
         self.inner_type = inner_type
+        # temb_type for trivial timestep embedding
+        self.temb_type = temb_type
         
         # Store norm_type for forward pass
         self.norm_type = norm_type
@@ -454,7 +415,7 @@ class BasicTransformerBlock(nn.Module):
         # Define 3 blocks. Each block has its own normalization layer.
         # 1. Self-Attn
         if norm_type == "ada_norm":
-            self.norm1 = EquivariantAdaLayerNorm(self.in_type)
+            self.norm1 = EquivariantAdaLayerNorm(self.in_type, temb_type=self.temb_type)
         else:
             self.norm1 = EquivariantLayerNorm(self.in_type, affine=False, eps=norm_eps)
 
@@ -601,7 +562,7 @@ class EDiT(ModelMixin, ConfigMixin):
         # Each field type contains multiple regular representations
         self.in_type = enn.FieldType(
             self.gspace, 
-            [self.gspace.regular_repr] * int(self.inner_dim/8)
+            [self.gspace.regular_repr] * int(self.inner_dim/self.n_group)
         )
         # Cross-attention uses TRIVIAL representation for INVARIANT VL features
         # This ensures the model is equivariant w.r.t. state/action regardless of VL content
@@ -611,11 +572,11 @@ class EDiT(ModelMixin, ConfigMixin):
         )
         self.ff_inner_type = enn.FieldType(
             self.gspace,
-            [self.gspace.regular_repr] * int(self.inner_dim*4/8)
+            [self.gspace.regular_repr] * int(self.inner_dim*4/self.n_group)
         )
         self.out_type = enn.FieldType(
             self.gspace,
-            [self.gspace.regular_repr] * int(self.config.output_dim/8)
+            [self.gspace.regular_repr] * int(self.config.output_dim/self.n_group)
         )
         
         print(f"EDiT Equivariant Configuration:")
@@ -624,15 +585,17 @@ class EDiT(ModelMixin, ConfigMixin):
         print(f"  cross_attention_type size: {self.cross_attention_type.size} (trivial repr - invariant)")
         print(f"  inner_type size: {self.ff_inner_type.size}")
 
-        # Timestep encoder (non-equivariant, operates on trivial features)
-        self.time_in_type = enn.FieldType(
-            self.gspace, 
-            [self.gspace.trivial_repr] * int(self.inner_dim/8)
-        )
-        self.timestep_encoder = TimestepEncoder(
-            self.time_in_type, self.in_type
-        )
+        # Timestep encoder outputs TRIVIAL repr (time is scalar, not rotated)
 
+        self.time_out_type = enn.FieldType(
+            self.gspace, 
+            [self.gspace.trivial_repr] * int(self.in_type.size)
+        )
+        
+        self.timestep_encoder = TimestepEncoder(
+            embedding_dim=self.in_type.size, compute_dtype=self.config.compute_dtype
+        )
+        
         # Build equivariant transformer blocks
         all_blocks = []
         for idx in range(self.config.num_layers):
@@ -646,6 +609,7 @@ class EDiT(ModelMixin, ConfigMixin):
                     in_type=self.in_type,
                     cross_attention_type=curr_cross_type,
                     inner_type=self.ff_inner_type,
+                    temb_type=self.time_out_type,  # Pass trivial timestep type
                     
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
@@ -666,11 +630,11 @@ class EDiT(ModelMixin, ConfigMixin):
         self.norm_out = EquivariantLayerNorm(self.in_type, affine=False, eps=1e-6)
         
         # Project to output dimension using equivariant linear layers
-        # First project to 2x for scale/shift (using in_type)
+        # First project from trivial temb to 2x in_type for scale/shift
         out_scale_shift_type = self.in_type + self.in_type  # 2x in_type for scale and shift
         self.proj_out_1 = enn.Linear(
-            self.in_type,
-            out_scale_shift_type
+            self.time_out_type,  # trivial temb input
+            out_scale_shift_type  # equivariant scale/shift output
         )
         
         # Final projection to output dimension - KEEP EQUIVARIANT (same as in_type)
@@ -743,10 +707,10 @@ class EDiT(ModelMixin, ConfigMixin):
         hidden_geo = enn.GeometricTensor(hidden_states_flat, self.in_type)
         hidden_geo = self.norm_out(hidden_geo)
         
-        # AdaLN conditioning with timestep (timestep is non-equivariant)
-        # Wrap temb as in_type for the projection (even though it's non-equivariant data)
-        temb_geo = enn.GeometricTensor(temb, self.in_type)
-        scale_shift_geo = self.proj_out_1(temb_geo)  # (B, 2*in_type.size)
+        # AdaLN conditioning with timestep (timestep is TRIVIAL - not rotated)
+        # Wrap temb as trivial type (time_out_type)
+        temb_geo = enn.GeometricTensor(temb, self.time_out_type)
+        scale_shift_geo = self.proj_out_1(temb_geo)  # (B, 2*in_type.size) - lifts to equivariant
         scale_tensor, shift_tensor = scale_shift_geo.tensor.chunk(2, dim=1)
         
         # Apply scale and shift (expand to match sequence length)
@@ -770,3 +734,4 @@ class EDiT(ModelMixin, ConfigMixin):
             return output, all_hidden_states
         else:
             return output
+
