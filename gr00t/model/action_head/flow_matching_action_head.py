@@ -445,7 +445,8 @@ class FlowmatchingActionHead(nn.Module):
         prefix_attention_horizon: int,
         prefix_attention_schedule: str,
         max_guidance_weight: float,
-        sigma_d_o: float
+        sigma_d_o: float,
+        actual_action_dim: int,
     )  -> BatchFeature:
         torch.set_grad_enabled(True)
         num_steps = self.num_inference_timesteps
@@ -470,6 +471,9 @@ class FlowmatchingActionHead(nn.Module):
             dtype=vl_embs.dtype,
             device=device,
         )
+
+        actions_mask = torch.zeros_like(x_t, dtype=vl_embs.dtype, device=device)
+        actions_mask[:, :, :actual_action_dim] = True
 
         for t in range(num_steps):
             # weights: [horizon]
@@ -511,7 +515,8 @@ class FlowmatchingActionHead(nn.Module):
             
             (outputs, vjp_func) = torch.func.vjp(denoiser, x_t)
             (x_1_i_vjp, v_t_i_vjp) = outputs
-            error = (prev_action_chunk - x_1_i_vjp) * weights[:, None]
+            # error = (prev_action_chunk - x_1_i_vjp) * weights[:, None] * actions_mask
+            error = F.mse_loss(x_1_i_vjp, prev_action_chunk, reduction="none") / actions_mask.sum() * weights[:, None] * actions_mask
             
             pinv_correction = vjp_func((error, torch.zeros_like(x_t)))[0]
             if pinv_correction is None:
@@ -528,7 +533,8 @@ class FlowmatchingActionHead(nn.Module):
 
         assert x_t.shape == (batch_size, self.config.action_horizon, self.config.action_dim), x_t.shape
         x_t = x_t.clone().detach()
-        print("EACH DENOISING STEP: ", (x_t[:,:inference_delay,:] - prev_action_chunk[:,:inference_delay,:]).abs().mean())
+        print("EACH DENOISING STEP: ", (x_t[:,:inference_delay,:actual_action_dim] - prev_action_chunk[:,:inference_delay,:7]).abs().mean())
+        print(f"{self.config.action_horizon}")
         return BatchFeature(data={"action_pred": x_t})
     
     @torch.no_grad()

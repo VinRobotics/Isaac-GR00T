@@ -91,6 +91,9 @@ class ArgsConfig:
     sigma_d_o: float = 1.0
     """Sigma D/O to use."""
 
+    save_plot_path: str = None
+    """Path to save the plot."""
+
 
 def main(args: ArgsConfig):
     data_config = DATA_CONFIG_MAP[args.data_config]
@@ -159,7 +162,8 @@ def main(args: ArgsConfig):
             plot=args.plot,
             prefix_attention_schedule=args.prefix_attention_schedule,
             max_guidance_weight=args.max_guidance_weight,
-            sigma_d_o=args.sigma_d_o
+            sigma_d_o=args.sigma_d_o,
+            save_plot_path=args.save_plot_path,
         )
         print("MSE:", mse)
         all_mse.append(mse)

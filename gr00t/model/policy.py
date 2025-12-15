@@ -306,6 +306,7 @@ class Gr00tPolicy(BasePolicy):
             max_guidance_weight = obs_copy.get("max_guidance_weight", 5)
             sigma_d_o = obs_copy.get("sigma_d_o", 5)
             execute_horizon = obs_copy.get("execute_horizon", None)
+            actual_action_dim = obs_copy.get("actual_action_dim", None)
             obs_copy = obs_copy.get("observations", None)
 
             if self.prev_action_chunk is not None:
@@ -335,7 +336,8 @@ class Gr00tPolicy(BasePolicy):
             prefix_attention_horizon,
             prefix_attention_schedule,
             max_guidance_weight,
-            sigma_d_o
+            sigma_d_o,
+            actual_action_dim
         )
         if self.smooth_option == "rtc":
             normalized_action, self.prev_action_chunk = normalized_action
@@ -365,16 +367,19 @@ class Gr00tPolicy(BasePolicy):
                                                    prefix_attention_horizon: int,
                                                    prefix_attention_schedule: str,
                                                    max_guidance_weight: float,
-                                                   sigma_d_o: float) -> tuple[torch.Tensor, torch.Tensor]:
+                                                   sigma_d_o: float,
+                                                   actual_action_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
         # Set up autocast context if needed
         # with torch.inference_mode(False), torch.enable_grad(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-        model_pred, real_action = self.model.get_realtime_action(normalized_input,
-                                                        prev_action_chunk=prev_action_chunk,
-                                                        inference_delay=inference_delay,
-                                                        prefix_attention_horizon=prefix_attention_horizon,
-                                                        prefix_attention_schedule=prefix_attention_schedule,
-                                                        max_guidance_weight=max_guidance_weight,
-                                                        sigma_d_o=sigma_d_o)
+        with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+            model_pred, real_action = self.model.get_realtime_action(normalized_input,
+                                                            prev_action_chunk=prev_action_chunk,
+                                                            inference_delay=inference_delay,
+                                                            prefix_attention_horizon=prefix_attention_horizon,
+                                                            prefix_attention_schedule=prefix_attention_schedule,
+                                                            max_guidance_weight=max_guidance_weight,
+                                                            sigma_d_o=sigma_d_o,
+                                                            actual_action_dim=actual_action_dim)
 
         normalized_action = model_pred["action_pred"].float()
         real_action = real_action["action_pred"].float()
