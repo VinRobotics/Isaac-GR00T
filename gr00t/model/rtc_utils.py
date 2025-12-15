@@ -16,6 +16,9 @@ def plot_trajectory(
     prev_pred_action_across_time = info["prev_pred_action_across_time"]
     pred_action_across_time = info["pred_action_across_time"]
 
+    if prev_pred_action_across_time is None:
+        return
+
     # Adjust figure size and spacing to accommodate titles
     fig, axes = plt.subplots(nrows=action_dim, ncols=1, figsize=(10, 4 * action_dim + 2))
 

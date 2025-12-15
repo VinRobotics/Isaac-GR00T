@@ -130,6 +130,7 @@ def calc_mse_for_overlapping_trajectory(
     steps=300,
     action_horizon=16,
     plot=False,
+    save_plot_path=None,
 ):
     policy.reset()
     state_joints_across_time = []
@@ -222,35 +223,21 @@ def calc_mse_for_overlapping_trajectory(
     action_dim = gt_action_across_time.shape[1]
 
     if plot:
-        fig, axes = plt.subplots(nrows=action_dim, ncols=1, figsize=(8, 4 * action_dim))
-
-        # Add a global title showing the modality keys
-        fig.suptitle(
-            f"Trajectory {traj_id} - Modalities: {', '.join(modality_keys)}",
-            fontsize=16,
-            color="blue",
+        info = {
+            "state_joints_across_time": state_joints_across_time,
+            "gt_action_across_time": gt_action_across_time,
+            "pred_action_across_time": pred_action_across_time,
+            "modality_keys": modality_keys,
+            "traj_id": traj_id,
+            "mse": mse,
+            "action_dim": action_dim,
+            "action_horizon": action_horizon,
+            "steps": steps,
+        }
+        plot_trajectory(
+            info,
+            f"{save_plot_path}_{traj_id}_{max_guidance_weight}_{sigma_d_o}.png"
         )
-
-        for i, ax in enumerate(axes):
-            # The dimensions of state_joints and action are the same only when the robot uses actions directly as joint commands.
-            # Therefore, do not plot them if this is not the case.
-            if state_joints_across_time.shape == gt_action_across_time.shape:
-                ax.plot(state_joints_across_time[:, i], label="state joints")
-            ax.plot(gt_action_across_time[:, i], label="gt action")
-            ax.plot(pred_action_across_time[:, i], label="pred action")
-
-            # put a dot every ACTION_HORIZON
-            for j in range(0, steps, execute_horizon):
-                if j == 0:
-                    ax.plot(j, gt_action_across_time[j, i], "ro", label="inference point")
-                else:
-                    ax.plot(j, gt_action_across_time[j, i], "ro")
-
-            ax.set_title(f"Action {i}")
-            ax.legend()
-
-        plt.tight_layout()
-        plt.savefig(f"overlapping_trajectory_{traj_id}_mse_plot_sigma_{sigma_d_o}_mgw_{max_guidance_weight}.png")
         # plt.show()
 
     return mse
