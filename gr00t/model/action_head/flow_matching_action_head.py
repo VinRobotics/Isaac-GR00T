@@ -242,53 +242,58 @@ class EquiCategorySpecificLinear(nn.Module):
 
 
 class MultiEmbodimentActionEncoder(nn.Module):
-    def __init__(self, in_type, hidden_type, out_type, num_embodiments):
+    def __init__(self, in_type, out_type, num_embodiments):
         super().__init__()
         self.in_type = in_type
-        self.hidden_type = hidden_type
         self.out_type = out_type
         self.num_embodiments = num_embodiments
+        
+        # Get gspace for creating field types
+        gspace = out_type.gspace
+        
+        # Timestep embedding type - TRIVIAL because time doesn't rotate
+        self.time_type = enn.FieldType(gspace, [gspace.trivial_repr] * out_type.size)
+        
+        # Hidden type = action features (regular) + timestep features (trivial)
+        self.hidden_type = out_type + self.time_type
 
-
-        # W1: R^{w x d}, W2: R^{w x 2w}, W3: R^{w x w}
-        self.W1 = EquiCategorySpecificLinear(num_embodiments, self.in_type, self.out_type)  # (d -> w)
-        self.W2 = EquiCategorySpecificLinear(num_embodiments, self.hidden_type, self.out_type)  # (2w -> w)
-        self.W3 = EquiCategorySpecificLinear(num_embodiments, self.out_type , self.out_type)  # (w -> w)
+        # W1: action_dim -> out_dim (equivariant)
+        self.W1 = EquiCategorySpecificLinear(num_embodiments, self.in_type, self.out_type)
+        # W2: (out_dim + time_dim) -> out_dim (mixed input: regular + trivial)
+        self.W2 = EquiCategorySpecificLinear(num_embodiments, self.hidden_type, self.out_type)
+        # W3: out_dim -> out_dim (equivariant)
+        self.W3 = EquiCategorySpecificLinear(num_embodiments, self.out_type, self.out_type)
+        
+        # Sinusoidal encoding for timestep (outputs trivial features)
         self.pos_encoding = SinusoidalPositionalEncoding(self.out_type.size)
-        self.pos_type = enn.FieldType(self.out_type.gspace, [self.out_type.gspace.trivial_repr] * self.out_type.size)
-        self.pos_proj = enn.Linear(
-            self.pos_type, 
-            self.out_type
-        )
 
     def forward(self, actions, timesteps, cat_ids):
         """
-        actions:   shape (B, T, action_dim)
-        timesteps: shape (B,)  -- a single scalar per batch item
-        cat_ids:   shape (B,)
-        returns:   shape (B, T, hidden_size)
+        actions:   GeometricTensor with shape (B*T, action_dim)
+        timesteps: shape (B,) -- diffusion timestep per batch item
+        cat_ids:   shape (B*T,)
+        returns:   GeometricTensor with shape (B*T, out_type.size)
         """
-        B, _ = actions.shape
+        B = actions.tensor.shape[0]
 
-        # 1) Expand each batch's single scalar time 'tau' across all T steps
-        #    so that shape => (B, T)
-        #    e.g. if timesteps is (B,), replicate across T
-        timesteps = timesteps.repeat((B//timesteps.shape[0]))
-        
+        # Expand timesteps to match batch size if needed
+        timesteps = timesteps.repeat((B // timesteps.shape[0]))
 
-        # 2) Standard action MLP step for shape => (B * T, w)
-        a_emb = self.W1(actions, cat_ids)  
+        # 1) Embed actions: (B*T, action_dim) -> (B*T, out_dim)
+        a_emb = self.W1(actions, cat_ids)
 
-        # 3) Get the sinusoidal encoding (B * T, w)
+        # 2) Get sinusoidal timestep encoding (B*T, out_dim) - TRIVIAL
         tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.tensor.dtype)
-        tau_emb = enn.GeometricTensor(tau_emb, self.pos_type)
-        tau_emb = self.pos_proj(tau_emb).tensor  # (B * T, w)
-        # 4) Concat along last dim => (B * T, 2w), then W2 => (B * T, w), swish
+        
+        # 3) Concatenate: [action_features (regular), timestep_features (trivial)]
+        # This creates a tensor with hidden_type = out_type + time_type
         x = torch.cat([a_emb.tensor, tau_emb], dim=-1)
         x = enn.GeometricTensor(x, self.hidden_type)
+        
+        # 4) Project and apply swish: (B*T, out_dim + time_dim) -> (B*T, out_dim)
         x = swish(self.W2(x, cat_ids).tensor)
 
-        # 5) Finally W3 => (B * T, w)
+        # 5) Final projection: (B*T, out_dim) -> (B*T, out_dim)
         x = enn.GeometricTensor(x, self.out_type)
         x = self.W3(x, cat_ids)
         return x
@@ -399,12 +404,10 @@ class FlowmatchingActionHead(nn.Module):
         )
         
         self.action_type = self.getJointFieldType(is_action=True)
-        self.action_hidden_type = enn.FieldType(self.group, int(2 * self.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         self.action_out_type = enn.FieldType(self.group, int(self.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         
         self.action_encoder = MultiEmbodimentActionEncoder(
             in_type=self.action_type,
-            hidden_type=self.action_hidden_type,
             out_type=self.action_out_type,
             num_embodiments=config.max_num_embodiments,
         )
