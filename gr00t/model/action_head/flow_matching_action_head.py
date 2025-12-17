@@ -534,7 +534,10 @@ class FlowmatchingActionHead(nn.Module):
         assert x_t.shape == (batch_size, self.config.action_horizon, self.config.action_dim), x_t.shape
         x_t = x_t.clone().detach()
         print("EACH DENOISING STEP: ", (x_t[:,:inference_delay,:actual_action_dim] - prev_action_chunk[:,:inference_delay,:actual_action_dim]).abs().mean())
-        print(f"{self.config.action_horizon}")
+        use_prev_action = True
+        if use_prev_action:
+            x_t[:,:inference_delay,:actual_action_dim] = prev_action_chunk[:,:inference_delay,:actual_action_dim]
+            print("AFTER ASSIGN: ", (x_t[:,:inference_delay,:actual_action_dim] - prev_action_chunk[:,:inference_delay,:actual_action_dim]).abs().mean())
         return BatchFeature(data={"action_pred": x_t})
 
     @property
