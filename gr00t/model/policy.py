@@ -28,6 +28,7 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.schema import DatasetMetadata
 from gr00t.data.transform.base import ComposedModalityTransform
 from gr00t.model.gr00t_n1 import GR00T_N1_5
+from gr00t.model.rtc_utils import plot_trajectory
 
 COMPUTE_DTYPE = torch.bfloat16
 
@@ -142,6 +143,7 @@ class Gr00tPolicy(BasePolicy):
         elif self.smooth_option == "rtc":
             self.temporal_agg = False
             self.prev_action_chunk = None
+            self.cnt = 0
 
     def apply_transforms(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -173,6 +175,7 @@ class Gr00tPolicy(BasePolicy):
         self.ensembled_actions = None
         self.ensembled_actions_count = None
         self.prev_action_chunk = None
+        self.cnt = 0
 
     def process_output(self, actions):
         """
@@ -309,6 +312,7 @@ class Gr00tPolicy(BasePolicy):
             actual_action_dim = obs_copy.get("actual_action_dim", None)
             obs_copy = obs_copy.get("observations", None)
 
+            saved_prev_action_chunk = self.prev_action_chunk
             if self.prev_action_chunk is not None:
                 self.prev_action_chunk = torch.concat(
                     (self.prev_action_chunk[:, execute_horizon:],
@@ -340,7 +344,16 @@ class Gr00tPolicy(BasePolicy):
             actual_action_dim
         )
         if self.smooth_option == "rtc":
-            normalized_action, self.prev_action_chunk = normalized_action
+            normalized_action, self.prev_action_chunk = normalized_action        
+            self.cnt += 1
+            plot_trajectory(
+                {
+                    "prev_pred_action_across_time": saved_prev_action_chunk,
+                    "pred_action_across_time": normalized_action,
+                    "action_dim": actual_action_dim
+                },
+                save_plot_path=f"eval_mse_actionmask_{inference_delay}_{max_guidance_weight}_{sigma_d_o}_{self.cnt}.png"
+            )
 
         unnormalized_action = self._get_unnormalized_action(normalized_action)        
 
