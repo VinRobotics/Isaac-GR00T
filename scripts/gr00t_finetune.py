@@ -155,7 +155,6 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
-
 #####################################################################################
 # main training function
 #####################################################################################
@@ -233,6 +232,7 @@ def main(config: ArgsConfig):
         # Update the action head config
         new_action_head_config = model.action_head.config
         new_action_head_config.action_horizon = data_action_horizon
+        new_action_head_config.num_hand = getattr(data_config_cls, "num_hand", 2)
 
         # Import the FlowmatchingActionHead class
         from gr00t.model.action_head.flow_matching_action_head import (
@@ -251,6 +251,7 @@ def main(config: ArgsConfig):
         # Update model config AND the action_head_cfg dictionary that gets saved
         model.config.action_horizon = data_action_horizon
         model.action_horizon = data_action_horizon
+        model.config.action_head_cfg["num_hand"] = new_action_head_config.num_hand
         model.config.action_head_cfg["action_horizon"] = data_action_horizon
 
         # Set trainable parameters for the new action head

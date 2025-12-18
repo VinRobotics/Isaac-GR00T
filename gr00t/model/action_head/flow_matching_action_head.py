@@ -337,6 +337,9 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     num_target_vision_tokens: int = field(
         default=32, metadata={"help": "Number of target vision tokens."}
     )
+    num_hand: int = field(
+        default=2, metadata={"help": "Whether to use two hands (True) or one hand (False)."}
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -354,7 +357,9 @@ class FlowmatchingActionHead(nn.Module):
     ):
         super().__init__()
         self.config = config
-        
+
+        self.num_hand = self.config.num_hand
+
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
@@ -420,8 +425,8 @@ class FlowmatchingActionHead(nn.Module):
         max_dim = self.config.max_action_dim if is_action else self.config.max_state_dim
         return enn.FieldType(
             self.group,
-            2 * 4 * [self.group.irrep(1)] # pos xy, rot 6, left and right
-            + (max_dim - 14 + 2) * [self.group.trivial_repr], # gripper 1, z from both ee is 2
+            self.num_hand * 4 * [self.group.irrep(1)] # pos xy, rot 6, left and right
+            + (max_dim - self.num_hand * 6) * [self.group.trivial_repr], # gripper 1, z from both ee is 2
         )
         
     def getJointGeometricTensor(self, state, is_action):
@@ -444,17 +449,23 @@ class FlowmatchingActionHead(nn.Module):
                 dim=-1
             )
             return joint_features, pos_z
-        
-        l_ee_state = state[:, :, :7] # bs, t, 7 
-        r_ee_state = state[:, :, 7:14] # bs, t, 7  
-        hand_state = state[:, :, 14:]
-        
-        l_tf, l_pos_z = getJointGeometricTensorEachHand(l_ee_state)
-        r_tf, r_pos_z = getJointGeometricTensorEachHand(r_ee_state)
+        if self.num_hand == 2:
+            l_ee_state = state[:, :, :7] # bs, t, 7 
+            r_ee_state = state[:, :, 7:14] # bs, t, 7  
+            hand_state = state[:, :, 14:]
+            
+            l_tf, l_pos_z = getJointGeometricTensorEachHand(l_ee_state)
+            r_tf, r_pos_z = getJointGeometricTensorEachHand(r_ee_state)
 
-        state_features = torch.cat([l_tf, r_tf, l_pos_z, r_pos_z, hand_state], dim=-1)
+            state_features = torch.cat([l_tf, r_tf, l_pos_z, r_pos_z, hand_state], dim=-1)
+ 
+        else:
+            l_ee_state = state[:, :, :7] # bs, t, 7 
+            hand_state = state[:, :, 7:]
+            
+            l_tf, l_pos_z = getJointGeometricTensorEachHand(l_ee_state)
+            state_features = torch.cat([l_tf, l_pos_z, hand_state], dim=-1)      
         state_features = einops.rearrange(state_features, 'b t c -> (b t) c')
-
         return enn.GeometricTensor(state_features, self.getJointFieldType(is_action))
     
     def getActionGT(self, action):
@@ -477,15 +488,21 @@ class FlowmatchingActionHead(nn.Module):
                 dim=-1
             )
             return joint_features, pos_z
-        
-        l_ee_state = action[:, :, :7] # bs, t, 7 
-        r_ee_state = action[:, :, 7:14] # bs, t, 7  
-        hand_state = action[:, :, 14:]
-        
-        l_tf, l_pos_z = getActionGTEachHand(l_ee_state)
-        r_tf, r_pos_z = getActionGTEachHand(r_ee_state)
+        if self.num_hand == 2:
+            l_ee_state = action[:, :, :7] # bs, t, 7 
+            r_ee_state = action[:, :, 7:14] # bs, t, 7  
+            hand_state = action[:, :, 14:]
+            
+            l_tf, l_pos_z = getActionGTEachHand(l_ee_state)
+            r_tf, r_pos_z = getActionGTEachHand(r_ee_state)
 
-        state_features = torch.cat([l_tf, r_tf, l_pos_z, r_pos_z, hand_state], dim=-1)
+            state_features = torch.cat([l_tf, r_tf, l_pos_z, r_pos_z, hand_state], dim=-1)
+        else:
+            l_ee_state = action[:, :, :7] # bs, t, 7 
+            hand_state = action[:, :, 7:]
+            
+            l_tf, l_pos_z = getActionGTEachHand(l_ee_state)
+            state_features = torch.cat([l_tf, l_pos_z, hand_state], dim=-1)
         return state_features
     
     
@@ -502,18 +519,29 @@ class FlowmatchingActionHead(nn.Module):
             rot_6d = torch.cat([ee_cos1, ee_cos2, ee_cos3, ee_sin1, ee_sin2, ee_sin3], dim=-1)
             quat = self.getQuaternionFrom6D(rot_6d)
             return ee_xy, quat
-
-        l_xy, l_quat = getActionOutputEachHand(pred[:, :, :8]) # bs, t, 8
-        r_xy, r_quat = getActionOutputEachHand(pred[:, :, 8:16]) # bs, t, 8
         
-        l_z, r_z = pred[:, :, 16:17], pred[:, :, 17:18] # bs, t, 1
-        hand_state = pred[:, :, 18:] # bs, t, rest
-        
-        action_output = torch.cat(
-            [l_xy, l_z, l_quat, r_xy, r_z, r_quat, hand_state],
-            dim=-1
-        )
-        
+        if self.num_hand == 2:
+            l_xy, l_quat = getActionOutputEachHand(pred[:, :, :8]) # bs, t, 8
+            r_xy, r_quat = getActionOutputEachHand(pred[:, :, 8:16]) # bs, t, 8
+            
+            l_z, r_z = pred[:, :, 16:17], pred[:, :, 17:18] # bs, t, 1
+            hand_state = pred[:, :, 18:] # bs, t, rest
+            
+            action_output = torch.cat(
+                [l_xy, l_z, l_quat, r_xy, r_z, r_quat, hand_state],
+                dim=-1
+            )
+        else:
+            l_xy, l_quat = getActionOutputEachHand(pred[:, :, :8]) # bs, t, 8
+            
+            l_z = pred[:, :, 8:9] # bs, t, 1
+            hand_state = pred[:, :, 9:] # bs, t, rest
+            
+            action_output = torch.cat(
+                [l_xy, l_z, l_quat, hand_state],
+                dim=-1
+            )
+            
         return action_output
 
     def get6DRotation(self, quat):
