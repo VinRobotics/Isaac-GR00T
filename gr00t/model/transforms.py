@@ -122,6 +122,7 @@ class GR00TTransform(InvertibleModalityTransform):
     max_action_dim: int
     state_horizon: int
     action_horizon: int
+    num_hand: int = 2
 
     max_length: int = 512
     embodiment_tag: EmbodimentTag | None = None
@@ -295,7 +296,7 @@ class GR00TTransform(InvertibleModalityTransform):
         # Create mask: [T, max_action_dim]
         actions_mask = np.zeros((n_action_tokens, self.max_action_dim), dtype=bool)
         #TODO: hard code for 2 end effector
-        actions_mask[:, :n_action_dims + 2 * 2] = True 
+        actions_mask[:, :n_action_dims + 2 * self.num_hand] = True 
 
         return actions, actions_mask, n_action_tokens
 
