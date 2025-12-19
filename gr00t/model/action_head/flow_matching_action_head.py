@@ -682,8 +682,6 @@ class FlowmatchingActionHead(nn.Module):
         
         # Embed noised action trajectory.
         if self.torque_aware:
-            print("action shape", action_input.action.shape)
-            print("effort shape", action_input.effort.shape)
             actions = torch.concat([action_input.action, action_input.effort], dim=-1)
         else:
             actions = action_input.action
@@ -761,7 +759,7 @@ class FlowmatchingActionHead(nn.Module):
             
             # Copy original mask values
             action_mask[:, :, :original_action_dim] = action_input.action_mask
-            print("action mask", action_mask[0, 0])
+
         action_loss = F.mse_loss(pred_only_actions, velocity_actions, reduction="none") * action_mask
         loss = (action_loss.sum() / action_mask.sum())
         
@@ -770,7 +768,7 @@ class FlowmatchingActionHead(nn.Module):
             effort_mask = action_input.effort_mask
             pred_efforts = pred_actions[..., action_dim-self.effort_dim:]
             velocity_efforts = velocity[..., action_dim-self.effort_dim:]
-            print("effort_mask", effort_mask[0, 0])
+
             # Ensure masks and tensors broadcast correctly. effort_mask expected shape matches effort dims.
             effort_loss = F.mse_loss(pred_efforts, velocity_efforts, reduction="none") * effort_mask
             loss += 0.1 * (effort_loss.sum() / effort_mask.sum())    
