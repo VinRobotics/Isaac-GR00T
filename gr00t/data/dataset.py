@@ -307,7 +307,7 @@ class LeRobotSingleDataset(Dataset):
         simplified_modality_meta: dict[str, dict] = {}
         with open(modality_meta_path, "r") as f:
             le_modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
-        for modality in ["state", "action"]:
+        for modality in ["state", "action", "effort"]:
             simplified_modality_meta[modality] = {}
             le_state_action_meta: dict[str, LeRobotStateActionMetadata] = getattr(
                 le_modality_meta, modality
@@ -372,7 +372,7 @@ class LeRobotSingleDataset(Dataset):
             with open(stats_path, "w") as f:
                 json.dump(le_statistics, f, indent=4)
         dataset_statistics = {}
-        for our_modality in ["state", "action"]:
+        for our_modality in ["state", "action", "effort"]:
             dataset_statistics[our_modality] = {}
             for subkey in simplified_modality_meta[our_modality]:
                 dataset_statistics[our_modality][subkey] = {}
@@ -855,7 +855,7 @@ class LeRobotSingleDataset(Dataset):
         """
         if modality == "video":
             return self.get_video(trajectory_id, key, base_index)
-        elif modality == "state" or modality == "action":
+        elif modality == "state" or modality == "action" or modality == 'effort':
             return self.get_state_or_action(trajectory_id, modality, key, base_index)
         elif modality == "language":
             return self.get_language(trajectory_id, key, base_index)
@@ -1259,6 +1259,11 @@ class LeRobotMixtureDataset(Dataset):
         dataset_statistics = {}
         dataset_statistics["state"] = LeRobotMixtureDataset.compute_overall_statistics(
             per_task_stats=[m["statistics"]["state"] for m in metadata_dicts],
+            dataset_sampling_weights=dataset_sampling_weights,
+            percentile_mixing_method=percentile_mixing_method,
+        )
+        dataset_statistics["effort"] = LeRobotMixtureDataset.compute_overall_statistics(
+            per_task_stats=[m["statistics"]["effort"] for m in metadata_dicts],
             dataset_sampling_weights=dataset_sampling_weights,
             percentile_mixing_method=percentile_mixing_method,
         )

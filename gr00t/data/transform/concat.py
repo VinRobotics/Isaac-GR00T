@@ -45,6 +45,12 @@ class ConcatTransform(InvertibleModalityTransform):
         "Format: ['state.position', 'state.velocity', ...].",
     )
 
+    effort_concat_order: Optional[list[str]] = Field(
+        default=None,
+        description="Concatenation order for each effort modality. "
+        "Format: ['effort.position', 'effort.', ...].",
+    )
+
     action_concat_order: Optional[list[str]] = Field(
         default=None,
         description="Concatenation order for each action modality. "
@@ -59,6 +65,10 @@ class ConcatTransform(InvertibleModalityTransform):
         default_factory=dict,
         description="The dimensions of the state keys.",
     )
+    effort_dims: dict[str, int] = Field(
+        default_factory=dict,
+        description="The dimensions of the effort keys.",
+    )
 
     def model_dump(self, *args, **kwargs):
         if kwargs.get("mode", "python") == "json":
@@ -66,6 +76,7 @@ class ConcatTransform(InvertibleModalityTransform):
                 "apply_to",
                 "video_concat_order",
                 "state_concat_order",
+                "effort_concat_order",
                 "action_concat_order",
             }
         else:
@@ -133,6 +144,29 @@ class ConcatTransform(InvertibleModalityTransform):
             data["state"] = torch.cat(
                 [data.pop(key) for key in self.state_concat_order], dim=-1
             )  # [T, D_state]
+        
+        # "effort"
+        if "effort" in grouped_keys:
+            effort_keys = grouped_keys["effort"]
+            assert self.effort_concat_order is not None, f"{self.effort_concat_order=}"
+            assert all(
+                item in effort_keys for item in self.effort_concat_order
+            ), f"keys in effort_concat_order are misspecified, \n{effort_keys=}, \n{self.effort_concat_order=}"
+            # Check the effort dims
+            for key in self.effort_concat_order:
+                target_shapes = [self.effort_dims[key]]
+                if self.is_rotation_key(key):
+                    target_shapes.append(6)  # Allow for rotation_6d
+                # if key in ["effort.right_arm", "effort.right_hand"]:
+                target_shapes.append(self.effort_dims[key] * 2)  # Allow for sin-cos transform
+                assert (
+                    data[key].shape[-1] in target_shapes
+                ), f"Effort dim mismatch for {key=}, {data[key].shape[-1]=}, {target_shapes=}"
+            # Concatenate the effort keys
+            # We'll have effortActionToTensor before this transform, so here we use torch.cat
+            data["effort"] = torch.cat(
+                [data.pop(key) for key in self.effort_concat_order], dim=-1
+            )  # [T, D_effort]
 
         if "action" in grouped_keys:
             action_keys = grouped_keys["action"]
@@ -159,16 +193,17 @@ class ConcatTransform(InvertibleModalityTransform):
 
     def unapply(self, data: dict) -> dict:
         start_dim = 0
-        assert "action" in data, f"{data.keys()=}"
+        # assert "action" in data, f"{data.keys()=}"
         # For those dataset without actions (LAPA), we'll never run unapply
         assert self.action_concat_order is not None, f"{self.action_concat_order=}"
-        action_tensor = data.pop("action")
-        for key in self.action_concat_order:
-            if key not in self.action_dims:
-                raise ValueError(f"Action dim {key} not found in action_dims.")
-            end_dim = start_dim + self.action_dims[key]
-            data[key] = action_tensor[..., start_dim:end_dim]
-            start_dim = end_dim
+        if "action" in data:
+            action_tensor = data.pop("action")
+            for key in self.action_concat_order:
+                if key not in self.action_dims:
+                    raise ValueError(f"Action dim {key} not found in action_dims.")
+                end_dim = start_dim + self.action_dims[key]
+                data[key] = action_tensor[..., start_dim:end_dim]
+                start_dim = end_dim
         if "state" in data:
             assert self.state_concat_order is not None, f"{self.state_concat_order=}"
             start_dim = 0
@@ -176,6 +211,15 @@ class ConcatTransform(InvertibleModalityTransform):
             for key in self.state_concat_order:
                 end_dim = start_dim + self.state_dims[key]
                 data[key] = state_tensor[..., start_dim:end_dim]
+                start_dim = end_dim
+                
+        if "effort" in data:
+            assert self.effort_concat_order is not None, f"{self.effort_concat_order=}"
+            start_dim = 0
+            effort_tensor = data.pop("effort")
+            for key in self.effort_concat_order:
+                end_dim = start_dim + self.effort_dims[key]
+                data[key] = effort_tensor[..., start_dim:end_dim]
                 start_dim = end_dim
         return data
 
@@ -213,3 +257,6 @@ class ConcatTransform(InvertibleModalityTransform):
         if self.state_concat_order is not None:
             for key in self.state_concat_order:
                 self.state_dims[key] = self.get_state_action_dims(key)
+        if self.effort_concat_order is not None:
+            for key in self.effort_concat_order:
+                self.effort_dims[key] = self.get_state_action_dims(key)

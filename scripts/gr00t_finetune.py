@@ -155,6 +155,9 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+    # Torque aware
+    torque_aware: bool = False
+    """Whether to use torque-aware training."""
 
 #####################################################################################
 # main training function
@@ -224,35 +227,56 @@ def main(config: ArgsConfig):
         load_backbone_only=True,  # load backbone only, not the action head
     )
 
+    # Check if we need to recreate action head (either for action_horizon or torque_aware changes)
+    import copy
+    need_recreate = False
+    new_action_head_config = copy.deepcopy(model.action_head.config)
+
     # Update action_horizon to match data config
-    # Need to recreate action head with correct config since it was initialized with old config
     if data_action_horizon != model.action_head.config.action_horizon:
         print(
-            f"Recreating action head with action_horizon {data_action_horizon} (was {model.action_head.config.action_horizon})"
+            f"Action horizon mismatch: data has {data_action_horizon}, model has {model.action_head.config.action_horizon}"
         )
-
-        # Update the action head config
-        new_action_head_config = model.action_head.config
         new_action_head_config.action_horizon = data_action_horizon
+        need_recreate = True
+
+    # Handle torque-aware training
+    if config.torque_aware:
+        effort_dims = getattr(data_config_cls, 'effort_dims', None)
+        if effort_dims is None:
+            raise ValueError(f"Data config {config.data_config} does not have effort_dims defined, but torque_aware=True")
+        print(f"Enabling torque-aware training with effort_dim={effort_dims}")
+        new_action_head_config.effort_dim = effort_dims
+        new_action_head_config.torque_aware = True
+        need_recreate = True
+
+    # Need to recreate action head with correct config since it was initialized with old config
+    if need_recreate:
+        print(
+            f"Recreating action head with action_horizon={data_action_horizon}, torque_aware={config.torque_aware}"
+        )
 
         # Import the FlowmatchingActionHead class
         from gr00t.model.action_head.flow_matching_action_head import (
             FlowmatchingActionHead,
         )
 
-        # Create new action head with updated config
+        # Create new action head with updated config (fresh initialization)
         new_action_head = FlowmatchingActionHead(new_action_head_config)
-
-        # Copy the weights from the old action head to the new one
-        new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
 
         # Replace the action head
         model.action_head = new_action_head
 
         # Update model config AND the action_head_cfg dictionary that gets saved
+        model.config.action_head_cfg = new_action_head_config.to_dict()
         model.config.action_horizon = data_action_horizon
         model.action_horizon = data_action_horizon
         model.config.action_head_cfg["action_horizon"] = data_action_horizon
+
+        if config.torque_aware:
+            effort_dims = getattr(data_config_cls, 'effort_dims', None)
+            model.config.action_head_cfg["torque_aware"] = True
+            model.config.action_head_cfg["effort_dim"] = effort_dims
 
         # Set trainable parameters for the new action head
         model.action_head.set_trainable_parameters(
