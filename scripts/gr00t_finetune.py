@@ -261,10 +261,10 @@ def main(config: ArgsConfig):
     model.action_head.set_trainable_parameters(
         tune_projector=config.tune_projector, tune_diffusion_model=config.tune_diffusion_model
     )
-    print_layer_weights(model.action_head.state_encoder.layer1.layers[31])
-    print_layer_weights(model.action_head.action_encoder.W1.layers[31])
-    print_layer_weights(model.action_head.action_decoder.layer1.layers[31])
-    print_layer_weights(model.action_head.model.proj_out_1)
+    # print_layer_weights(model.action_head.state_encoder.layer1.layers[31])
+    # print_layer_weights(model.action_head.action_encoder.W1.layers[31])
+    # print_layer_weights(model.action_head.action_decoder.layer1.layers[31])
+    # print_layer_weights(model.action_head.model.proj_out_1)
 
     # Set the model's compute_dtype to bfloat16
     model.compute_dtype = "bfloat16"
