@@ -1702,9 +1702,10 @@ class EquiFractalDataConfig(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 
 
-# NOTE: we use the default so100 with minmax norm for all commponents
-#       using different normalization mode can sometimes lead to better performance
-class BridgeDataConfig(So100DataConfig):
+# NOTE: BridgeDataConfig converts euler angles (roll/pitch/yaw) to quaternion (xyzw)
+#       Your modality.json should combine roll/pitch/yaw into a single "state.rotation" key
+#       and "action.rotation" key with shape [3] containing [roll, pitch, yaw] in radians
+class BridgeDataConfig(BaseDataConfig):
     video_keys = [
         "video.image_0",
     ]
@@ -1712,9 +1713,7 @@ class BridgeDataConfig(So100DataConfig):
         "state.x",
         "state.y",
         "state.z",
-        "state.roll",
-        "state.pitch",
-        "state.yaw",
+        "state.rotation",  # Combined [roll, pitch, yaw] -> converted to quaternion
         "state.pad",
         "state.gripper",
     ]
@@ -1722,14 +1721,71 @@ class BridgeDataConfig(So100DataConfig):
         "action.x",
         "action.y",
         "action.z",
-        "action.roll",
-        "action.pitch",
-        "action.yaw",
+        "action.rotation",  # Combined [roll, pitch, yaw] -> converted to quaternion
         "action.gripper",
     ]
     language_keys = ["annotation.human.action.task_description"]
     observation_indices = [0]
     action_indices = list(range(16))
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms - convert euler_angles_rpy to quaternion
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.x": "min_max",
+                    "state.y": "min_max",
+                    "state.z": "min_max",
+                    "state.pad": "min_max",
+                    "state.gripper": "min_max",
+                },
+                target_rotations={
+                    "state.rotation": "quaternion",  # euler_angles_rpy -> quaternion (xyzw)
+                },
+            ),
+            # action transforms - convert euler_angles_rpy to quaternion
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.x": "min_max",
+                    "action.y": "min_max",
+                    "action.z": "min_max",
+                    "action.gripper": "min_max",
+                },
+                target_rotations={
+                    "action.rotation": "quaternion",  # euler_angles_rpy -> quaternion (xyzw)
+                },
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
 
 
 ###########################################################################################

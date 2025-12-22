@@ -12,17 +12,10 @@
             "start": 2,
             "end": 3
         },
-        "roll": {
+        "rotation": {
             "start": 3,
-            "end": 4
-        },
-        "pitch": {
-            "start": 4,
-            "end": 5
-        },
-        "yaw": {
-            "start": 5,
-            "end": 6
+            "end": 6,
+            "rotation_type": "euler_angles_rpy"
         },
         "pad": {
             "start": 6,
@@ -46,17 +39,10 @@
             "start": 2,
             "end": 3
         },
-        "roll": {
+        "rotation": {
             "start": 3,
-            "end": 4
-        },
-        "pitch": {
-            "start": 4,
-            "end": 5
-        },
-        "yaw": {
-            "start": 5,
-            "end": 6
+            "end": 6,
+            "rotation_type": "euler_angles_rpy"
         },
         "gripper": {
             "start": 6,
