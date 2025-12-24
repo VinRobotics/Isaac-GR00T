@@ -1727,6 +1727,7 @@ class BridgeDataConfig(BaseDataConfig):
     language_keys = ["annotation.human.action.task_description"]
     observation_indices = [0]
     action_indices = list(range(16))
+    num_hand=1
 
     def transform(self) -> ModalityTransform:
         transforms = [
