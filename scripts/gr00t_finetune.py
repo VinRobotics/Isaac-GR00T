@@ -278,7 +278,8 @@ def main(config: ArgsConfig):
         new_action_head = FlowmatchingActionHeadActionCondition(
             config=model.action_head.config
         )
-        model.action_head = new_action_head    
+        new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
+        model.action_head = new_action_head
 
     # Update action_horizon and max_action_dim to match data config
     # Need to recreate action head with correct config since it was initialized with old config

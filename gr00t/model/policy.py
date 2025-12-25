@@ -111,7 +111,7 @@ class Gr00tPolicy(BasePolicy):
             self.embodiment_tag = embodiment_tag
 
         # Load model
-        self._load_model(model_path)
+        self._load_model(model_path) if (not smooth_option == "training-time-rtc") else self._load_model_action_condition(model_path)
         # Load transforms
         self._load_metadata(self.model_path / "experiment_cfg")
         # Load horizons
@@ -230,7 +230,7 @@ class Gr00tPolicy(BasePolicy):
         # Create a copy to avoid mutating input
         obs_copy = observations.copy()
 
-        if self.smooth_option == "rtc":
+        if self.smooth_option in ["rtc", "training-time-rtc"]:
             inference_delay = obs_copy.get("inference_delay", None)
             prefix_attention_horizon = obs_copy.get("prefix_attention_horizon", None)
             prefix_attention_schedule = obs_copy.get("prefix_attention_schedule", None)
@@ -261,7 +261,7 @@ class Gr00tPolicy(BasePolicy):
                 obs_copy[k] = np.array(v)
 
         normalized_input = self.apply_transforms(obs_copy)
-        normalized_action = self._get_action_from_normalized_input(normalized_input) if self.smooth_option != "rtc" else self._get_realtime_action_from_normalized_input(
+        normalized_action = self._get_action_from_normalized_input(normalized_input) if self.smooth_option not in ["rtc", "training-time-rtc"] else self._get_realtime_action_from_normalized_input(
             normalized_input,
             self.prev_action_chunk,
             inference_delay,
@@ -271,7 +271,7 @@ class Gr00tPolicy(BasePolicy):
             sigma_d_o,
             actual_action_dim
         )
-        if self.smooth_option == "rtc":
+        if self.smooth_option in ["rtc", "training-time-rtc"]:
             normalized_action, self.prev_action_chunk = normalized_action        
             self.cnt += 1
             plot_trajectory(
@@ -393,6 +393,64 @@ class Gr00tPolicy(BasePolicy):
 
             # Create new action head with updated config
             new_action_head = FlowmatchingActionHead(new_action_head_config)
+
+            # Copy the weights from the old action head to the new one
+            new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
+
+            # Replace the action head
+            model.action_head = new_action_head
+
+            # Update model config AND the action_head_cfg dictionary that gets saved
+            model.config.action_horizon = expected_action_horizon
+            model.action_horizon = expected_action_horizon
+            model.config.action_head_cfg["action_horizon"] = expected_action_horizon
+
+        model.to(device=self.device)  # type: ignore
+
+        self.model = model
+
+    def _load_model_action_condition(self, model_path):
+        model = GR00T_N1_5.from_pretrained(model_path, torch_dtype=COMPUTE_DTYPE)
+        model.eval()  # Set model to eval mode
+
+        print(
+            "Policy: Recreating action head with FlowmatchingActionHeadActionCondition (was FlowmatchingActionHeadActionCondition)"
+        )
+        
+        # Import the FlowmatchingActionHeadActionCondition class
+        from gr00t.model.action_head.flow_matching_action_head_action_condition import (
+            FlowmatchingActionHeadActionCondition,
+        )
+
+        # Create new action head with updated config
+        new_action_head = FlowmatchingActionHeadActionCondition(model.action_head.config)
+
+        # Copy the weights from the old action head to the new one
+        new_action_head.load_state_dict(model.action_head.state_dict(), strict=True)
+
+        # Replace the action head
+        model.action_head = new_action_head
+
+        # Update action_horizon to match modality config
+        # Get the expected action horizon from the modality config
+        expected_action_horizon = len(self._modality_config["action"].delta_indices)
+
+        if expected_action_horizon != model.action_head.config.action_horizon:
+            print(
+                f"Policy: Recreating action head with action_horizon {expected_action_horizon} (was {model.action_head.config.action_horizon})"
+            )
+
+            # Update the action head config
+            new_action_head_config = model.action_head.config
+            new_action_head_config.action_horizon = expected_action_horizon
+
+            # Import the FlowmatchingActionHeadActionCondition class
+            from gr00t.model.action_head.flow_matching_action_head_action_condition import (
+                FlowmatchingActionHeadActionCondition,
+            )
+
+            # Create new action head with updated config
+            new_action_head = FlowmatchingActionHeadActionCondition(new_action_head_config)
 
             # Copy the weights from the old action head to the new one
             new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
