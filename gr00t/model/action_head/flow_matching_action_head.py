@@ -111,6 +111,8 @@ class MultiEmbodimentActionEncoder(nn.Module):
         if timesteps.dim() == 1 and timesteps.shape[0] == B:
             # shape (B,) => (B,T)
             timesteps = timesteps.unsqueeze(1).expand(-1, T)
+        if timesteps.dim() == 2 and timesteps.shape == (B, T):
+            pass  # already in desired shape
         else:
             raise ValueError(
                 "Expected `timesteps` to have shape (B,) so we can replicate across T."

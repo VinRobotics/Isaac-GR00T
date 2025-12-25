@@ -24,6 +24,7 @@ from transformers.feature_extraction_utils import BatchFeature
 
 from gr00t.model.action_head.action_encoder import SinusoidalPositionalEncoding, swish
 from gr00t.model.action_head.flow_matching_action_head import FlowmatchingActionHeadConfig, FlowmatchingActionHead
+from .cross_attention_dit_action_condition import DiT, SelfAttentionTransformer
 
 
 class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
@@ -35,6 +36,8 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
         config: FlowmatchingActionHeadConfig,
     ):
         super().__init__(config=config)
+        self.model = DiT(**config.diffusion_model_cfg)
+        self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
@@ -75,26 +78,25 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
         actions = action_input.action
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
-        t = t[:, None, None]  # shape (B,1,1) for broadcast
+        t = t[:, None].expand(actions.shape[0], actions.shape[1])  # shape (B,T) for broadcast
 
         ##################################### training-time action conditioning #####################################
         #                                                                                                           #
         
         # sample delays from some distribution of choice
         # here, we use Unif[0, max_delay), as in our real-world experiments
-        delay = torch.randint(0, actions.shape[1], (actions.shape[0],), device=device)
+        delay = torch.randint(0, actions.shape[1] // 2, (actions.shape[0],), device=device)
         prefix_mask = torch.arange(actions.shape[1], device=device)[None, :] < delay[:, None]
-        t = t.expand(actions.shape)
-        t = torch.where(prefix_mask[:, :, None], 1.0, t) # set time to 1.0 for the action prefix
+        t = torch.where(prefix_mask, 1.0, t) # set time to 1.0 for the action prefix
 
         #                                                                                                           #
         ##################################### training-time action conditioning #####################################
 
-        noisy_trajectory = (1 - t) * noise + t * actions
+        noisy_trajectory = (1 - t[:, :, None]) * noise + t[:, :, None] * actions
         velocity = actions - noise
 
         # Convert (continuous) t -> discrete if needed
-        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+        t_discretized = (t * self.num_timestep_buckets).long()
         action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
 
         # Maybe add position embedding.
@@ -108,6 +110,9 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
         vl_attn_mask = backbone_output.backbone_attention_mask
+
+        t_discretized_expand = t_discretized[:, -1][:, None].expand(sa_embs.shape[0], sa_embs.shape[1] - t_discretized.shape[1])
+        t_discretized = torch.cat([t_discretized_expand, t_discretized], dim=1)
 
         model_output = self.model(
             hidden_states=sa_embs,
@@ -131,13 +136,37 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
         return BatchFeature(data=output_dict)
     
     @torch.no_grad()
-    def get_actioncondition_action(
+    def get_action(self, backbone_output, action_input):
+        prev_action_chunk = torch.zeros((
+                backbone_output.backbone_features.shape[0], self.config.action_horizon, self.config.action_dim
+            ), device=backbone_output.backbone_features.device
+        )
+        inference_delay = 0
+        return self.get_realtime_action(
+            action_input,
+            backbone_output,
+            prev_action_chunk=prev_action_chunk,
+            inference_delay=inference_delay,
+            prefix_attention_horizon=None,
+            prefix_attention_schedule=None,
+            max_guidance_weight=None,
+            sigma_d_o=None,
+            actual_action_dim=None,
+        )
+    
+    @torch.no_grad()
+    def get_realtime_action(
         self,
-        backbone_output: BatchFeature,
         action_input: BatchFeature,
+        backbone_output:BatchFeature,
         prev_action_chunk: torch.Tensor,  # [batch, horizon, action_dim]
-        inference_delay: int
-    ) -> BatchFeature:
+        inference_delay: int,
+        prefix_attention_horizon: int,
+        prefix_attention_schedule: str,
+        max_guidance_weight: float,
+        sigma_d_o: float,
+        actual_action_dim: int,
+    )  -> BatchFeature:
 
         backbone_output = self.process_backbone_output(backbone_output)
 
@@ -166,15 +195,14 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
         # Run denoising steps.
         for t in range(num_steps):
             t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
-            t_discretized = int(t_cont * self.num_timestep_buckets)
+            t_cont = torch.tensor([t_cont], device=device)
+            t_cont_expand = t_cont.expand(actions.shape[0], actions.shape[1])
+            t_cont_expand = torch.where(prefix_mask, 1.0, t_cont_expand).to(device) # set time to 1.0 for the action prefix
+            t_discretized = t_cont_expand * self.num_timestep_buckets
 
-            actions = torch.where(prefix_mask[:, :, None], prev_action_chunk, actions)
+            actions = torch.where(prefix_mask[:, :, None], prev_action_chunk, actions).to(device)
 
-            # Embed noised action trajectory.
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
-            )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+            action_features = self.action_encoder(actions, t_discretized, embodiment_id)
             # Maybe add position embedding.
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
@@ -185,11 +213,14 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
+            t_discretized_expand = t_discretized[:, -1][:, None].expand(sa_embs.shape[0], sa_embs.shape[1] - t_discretized.shape[1])
+            t_discretized = torch.cat([t_discretized_expand, t_discretized], dim=1)
+
             # Run model forward.
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
-                timestep=timesteps_tensor,
+                timestep=t_discretized,
             )
             pred = self.action_decoder(model_output, embodiment_id)
 
@@ -197,4 +228,6 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
+
+        actions = torch.where(prefix_mask[:, :, None], prev_action_chunk, actions).to(device)
         return BatchFeature(data={"action_pred": actions})
