@@ -1819,4 +1819,6 @@ DATA_CONFIG_MAP = {
     "aloha_right_arm_only": AlohaRightArmConfig(),
     "vrh3_two_hand_1_cam_equi": VRH3TwotHand1CamEquiConfig(),
     "equi_libero": EquiLiberoConfig(),
+    "equi_bridge": BridgeDataConfig(),
+    "equi_fractal": EquiFractalDataConfig(),
 }
