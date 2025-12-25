@@ -1632,24 +1632,21 @@ class EquiFractalDataConfig(BaseDataConfig):
         "state.x",
         "state.y",
         "state.z",
-        "state.rx",
-        "state.ry",
-        "state.rz",
-        "state.rw",
+        "state.rotation",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "state.pad",
         "state.gripper",
     ]
     action_keys = [
         "action.x",
         "action.y",
         "action.z",
-        "action.roll",
-        "action.pitch",
-        "action.yaw",
+        "action.rotation",  # Combined [roll, pitch, yaw] -> converted to quaternion
         "action.gripper",
     ]
     language_keys = ["annotation.human.action.task_description"]
     observation_indices = [0]
     action_indices = list(range(16))
+    num_hand=1
 
     def transform(self) -> ModalityTransform:
         transforms = [
@@ -1665,7 +1662,7 @@ class EquiFractalDataConfig(BaseDataConfig):
                 hue=0.08,
             ),
             VideoToNumpy(apply_to=self.video_keys),
-            # state transforms
+            # state transforms - convert euler_angles_rpy to quaternion
             StateActionToTensor(apply_to=self.state_keys),
             StateActionTransform(
                 apply_to=self.state_keys,
@@ -1673,10 +1670,14 @@ class EquiFractalDataConfig(BaseDataConfig):
                     "state.x": "min_max",
                     "state.y": "min_max",
                     "state.z": "min_max",
+                    "state.pad": "min_max",
                     "state.gripper": "min_max",
                 },
+                target_rotations={
+                    "state.rotation": "quaternion",  # euler_angles_rpy -> quaternion (xyzw)
+                },
             ),
-            # action transforms
+            # action transforms - convert euler_angles_rpy to quaternion
             StateActionToTensor(apply_to=self.action_keys),
             StateActionTransform(
                 apply_to=self.action_keys,
@@ -1686,12 +1687,17 @@ class EquiFractalDataConfig(BaseDataConfig):
                     "action.z": "min_max",
                     "action.gripper": "min_max",
                 },
+                target_rotations={
+                    "action.rotation": "quaternion",  # euler_angles_rpy -> quaternion (xyzw)
+                },
             ),
+            # concat transforms
             ConcatTransform(
                 video_concat_order=self.video_keys,
                 state_concat_order=self.state_keys,
                 action_concat_order=self.action_keys,
             ),
+            # model-specific transform
             GR00TTransform(
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
