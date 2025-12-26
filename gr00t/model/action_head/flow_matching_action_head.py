@@ -449,6 +449,7 @@ class FlowmatchingActionHead(nn.Module):
         max_guidance_weight: float,
         sigma_d_o: float,
         actual_action_dim: int,
+        use_prev_action: bool = True
     )  -> BatchFeature:
         torch.set_grad_enabled(True)
         num_steps = self.num_inference_timesteps
@@ -477,12 +478,13 @@ class FlowmatchingActionHead(nn.Module):
         actions_mask = torch.zeros_like(x_t, dtype=vl_embs.dtype, device=device)
         actions_mask[:, :, :actual_action_dim] = True
 
+        # weights: [horizon]
+        weights = get_prefix_weights(
+            inference_delay, prefix_attention_horizon, self.config.action_horizon, prefix_attention_schedule
+        )
+        weights = weights.to(device)
+
         for t in range(num_steps):
-            # weights: [horizon]
-            weights = get_prefix_weights(
-                inference_delay, prefix_attention_horizon, self.config.action_horizon, prefix_attention_schedule
-            )
-            weights = weights.to(device)
 
             t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
             
@@ -536,9 +538,8 @@ class FlowmatchingActionHead(nn.Module):
         assert x_t.shape == (batch_size, self.config.action_horizon, self.config.action_dim), x_t.shape
         x_t = x_t.clone().detach()
         print("EACH DENOISING STEP: ", (x_t[:,:inference_delay,:actual_action_dim] - prev_action_chunk[:,:inference_delay,:actual_action_dim]).abs().mean())
-        use_prev_action = True
         if use_prev_action:
-            x_t[:,:inference_delay,:actual_action_dim] = prev_action_chunk[:,:inference_delay,:actual_action_dim]
+            x_t = prev_action_chunk * weights[:, None] + x_t * (1 - weights[:, None])
             print("AFTER ASSIGN: ", (x_t[:,:inference_delay,:actual_action_dim] - prev_action_chunk[:,:inference_delay,:actual_action_dim]).abs().mean())
         return BatchFeature(data={"action_pred": x_t})
     

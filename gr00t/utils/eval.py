@@ -114,7 +114,7 @@ def calc_mse_for_single_trajectory(
             "action_horizon": action_horizon,
             "steps": steps,
         }
-        plot_trajectory(info, save_plot_path)
+        plot_trajectory(info, f"{save_plot_path}.png")
 
     return mse
 
@@ -138,8 +138,8 @@ def calc_mse_for_overlapping_trajectory(
     pred_action_chunk_across_time = []
     action_chunk = None
 
-    inference_delay = 3
-    execute_horizon = 5
+    inference_delay = 2
+    execute_horizon = 3
     prefix_attention_horizon = action_horizon - execute_horizon
 
 
@@ -259,8 +259,8 @@ def calc_mse_for_action_condition_trajectory(
     pred_action_chunk_across_time = []
     action_chunk = None
 
-    inference_delay = 3
-    execute_horizon = 5
+    inference_delay = 2
+    execute_horizon = 3
 
 
     for step_count in range(steps):
@@ -352,7 +352,7 @@ def calc_mse_for_action_condition_trajectory(
         }
         plot_trajectory(
             info,
-            f"{save_plot_path}_{traj_id}.png"
+            f"{save_plot_path}_{inference_delay}_{execute_horizon}_{traj_id}.png"
         )
         # plt.show()
 
