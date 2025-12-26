@@ -278,9 +278,10 @@ class Gr00tPolicy(BasePolicy):
                 {
                     "prev_pred_action_across_time": saved_prev_action_chunk,
                     "pred_action_across_time": normalized_action,
-                    "action_dim": actual_action_dim
+                    "action_dim": actual_action_dim,
+                    "executed_horizon": execute_horizon
                 },
-                save_plot_path=f"eval_mse_actionmask_{inference_delay}_{max_guidance_weight}_{sigma_d_o}_{self.cnt}.png"
+                save_plot_path=f"eval_{self.smooth_option}_{inference_delay}_{max_guidance_weight}_{sigma_d_o}_{self.cnt}.png"
             )
 
         unnormalized_action = self._get_unnormalized_action(normalized_action)        

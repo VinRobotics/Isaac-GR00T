@@ -13,6 +13,7 @@ def plot_trajectory(
         matplotlib.use("Agg")
 
     action_dim = info["action_dim"]
+    executed_horizon = info["executed_horizon"]
     prev_pred_action_across_time = info["prev_pred_action_across_time"]
     pred_action_across_time = info["pred_action_across_time"]
 
@@ -29,7 +30,6 @@ def plot_trajectory(
 
     # Combine all modality keys into a single string
     # add new line if total length is more than 60 chars
-    executed_horizon = 5
 
     x = np.arange(0,pred_action_across_time.shape[1] + executed_horizon)
 
