@@ -170,6 +170,8 @@ class ConcatTransform(InvertibleModalityTransform):
             if key not in self.action_dims:
                 raise ValueError(f"Action dim {key} not found in action_dims.")
             end_dim = start_dim + self.action_dims[key]
+            if self.is_rotation_key(key):
+                end_dim += 1
             data[key] = action_tensor[..., start_dim:end_dim]
             start_dim = end_dim
         if "state" in data:

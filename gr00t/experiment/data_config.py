@@ -1436,6 +1436,7 @@ class VRH3TwotHand1CamEquiConfig(BaseDataConfig):
     state_indices = [0]
     action_indices = list(range(16))
     num_hand = 2
+    rot_type="quaternion"
 
     def modality_config(self):
         video_modality = ModalityConfig(
@@ -1543,6 +1544,7 @@ class EquiLiberoConfig(BaseDataConfig):
     state_indices = [0]
     action_indices = list(range(16))
     num_hand = 1
+    rot_type="quaternion"
 
     def modality_config(self):
         video_modality = ModalityConfig(
@@ -1647,6 +1649,7 @@ class EquiFractalDataConfig(BaseDataConfig):
     observation_indices = [0]
     action_indices = list(range(16))
     num_hand=1
+    rot_type="euler_angles"
 
     def transform(self) -> ModalityTransform:
         transforms = [
@@ -1734,6 +1737,7 @@ class BridgeDataConfig(BaseDataConfig):
     observation_indices = [0]
     action_indices = list(range(16))
     num_hand=1
+    rot_type="euler_angles"
 
     def transform(self) -> ModalityTransform:
         transforms = [
