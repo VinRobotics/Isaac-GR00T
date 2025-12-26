@@ -399,13 +399,13 @@ class FlowmatchingActionHead(nn.Module):
         self.num_inference_timesteps = config.num_inference_timesteps
 
         # equi state
+        self.ee_dim = 7 if self.config.rot_type == "quaternion" else 6
         self.group = gspaces.no_base_space(CyclicGroup(self.n_group))
         self.state_in_type = self.getJointFieldType(is_action=False)
         self.state_hidden_type = enn.FieldType(self.group, int(config.hidden_size / self.n_group) * [self.group.regular_repr])
         self.state_out_type = enn.FieldType(self.group, int(config.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
         self.eulerangle_to_sixd = RotationTransformer('euler_angles', 'rotation_6d', from_convention="XYZ")
-        self.ee_dim = 7 if self.config.rot_type == "quaternion" else 6
 
         self.state_encoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
