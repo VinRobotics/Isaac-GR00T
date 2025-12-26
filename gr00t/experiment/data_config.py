@@ -1635,7 +1635,6 @@ class EquiFractalDataConfig(BaseDataConfig):
         "state.y",
         "state.z",
         "state.rotation",  # Combined [roll, pitch, yaw] -> converted to quaternion
-        "state.pad",
         "state.gripper",
     ]
     action_keys = [
@@ -1673,7 +1672,6 @@ class EquiFractalDataConfig(BaseDataConfig):
                     "state.x": "min_max",
                     "state.y": "min_max",
                     "state.z": "min_max",
-                    "state.pad": "min_max",
                     "state.gripper": "min_max",
                 },
                 target_rotations={
@@ -1723,7 +1721,6 @@ class BridgeDataConfig(BaseDataConfig):
         "state.y",
         "state.z",
         "state.rotation",  # Combined [roll, pitch, yaw] -> converted to quaternion
-        "state.pad",
         "state.gripper",
     ]
     action_keys = [
@@ -1761,11 +1758,7 @@ class BridgeDataConfig(BaseDataConfig):
                     "state.x": "min_max",
                     "state.y": "min_max",
                     "state.z": "min_max",
-                    "state.pad": "min_max",
                     "state.gripper": "min_max",
-                },
-                target_rotations={
-                    "state.rotation": "quaternion",  # euler_angles_rpy -> quaternion (xyzw)
                 },
             ),
             # action transforms - convert euler_angles_rpy to quaternion
@@ -1777,9 +1770,6 @@ class BridgeDataConfig(BaseDataConfig):
                     "action.y": "min_max",
                     "action.z": "min_max",
                     "action.gripper": "min_max",
-                },
-                target_rotations={
-                    "action.rotation": "quaternion",  # euler_angles_rpy -> quaternion (xyzw)
                 },
             ),
             # concat transforms
