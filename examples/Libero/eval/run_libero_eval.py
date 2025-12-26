@@ -255,6 +255,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 success=done,
                 task_description=task_description,
                 log_file=log_file,
+                prefix_name=cfg.task_suite_name
             )
 
             # Log current results
