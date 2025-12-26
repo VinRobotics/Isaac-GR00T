@@ -456,7 +456,7 @@ class FlowmatchingActionHead(nn.Module):
         return enn.FieldType(
             self.group,
             self.num_hand * 4 * [self.group.irrep(1)] # pos xy, rot 6, left and right
-            + (max_dim - self.num_hand * 6) * [self.group.trivial_repr], # gripper 1, z from both ee is 2
+            + (max_dim - ((self.ee_dim - 1) * self.num_hand)) * [self.group.trivial_repr], # gripper 1, z from both ee is 2
         )
         
     def getJointGeometricTensor(self, state, is_action):
