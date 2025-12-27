@@ -90,7 +90,7 @@ class Gr00tPolicy_ACG(Gr00tPolicy):
 
     def get_action(
         self, observations: Dict[str, Any],
-        scale: float = 3.0,
+        scale: float = 1.30,
         skip_blocks: List[int] = [7, 9, 11],
         num_inference_timesteps: int = 16,
         **kwargs,

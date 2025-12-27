@@ -55,6 +55,7 @@ See deployment_scripts/README.md for instructions on building TensorRT engines.
 """
 
 import time
+import types
 from dataclasses import dataclass
 from typing import Literal
 
@@ -65,6 +66,7 @@ from gr00t.data.embodiment_tags import EMBODIMENT_TAG_MAPPING
 from gr00t.eval.robot import RobotInferenceClient, RobotInferenceServer
 from gr00t.experiment.data_config import load_data_config
 from gr00t.model.policy import Gr00tPolicy
+from gr00t.wrapper.acg.gr00t_acg import Gr00tPolicy_ACG, GR00T_N1_ACG, FlowmatchingActionHead_ACG
 
 
 @dataclass
@@ -97,8 +99,11 @@ class ArgsConfig:
     client: bool = False
     """Whether to run the client."""
 
-    smooth_option: Literal["te", "rtc", ""] = ""
-    """Smooth option for the action generation. Options are 'te' for temporal encoding, 'rtc' for real-time chunking, or empty string for no smoothing."""
+    guidance_option: Literal["acg", ""] = ""
+    """Guidance option for the action generation. Options are 'acg' for action coherent guidance or empty string for no guidance"""
+
+    smooth_option: Literal["te", "rtc", "training-time-rtc", ""] = ""
+    """Smooth option for the action generation. Options are 'te' for temporal encoding, 'rtc' for real-time chunking, 'training-time-rtc' for training-time rtc or empty string for no smoothing."""
 
     denoising_steps: int = 4
     """The number of denoising steps to use."""
@@ -195,6 +200,12 @@ def main(args: ArgsConfig):
             denoising_steps=args.denoising_steps,
             smooth_option=args.smooth_option
         )
+
+        if args.guidance_option == "acg":
+            policy.get_action = types.MethodType(Gr00tPolicy_ACG.get_action, policy)
+            policy._get_action_from_normalized_input = types.MethodType(Gr00tPolicy_ACG._get_action_from_normalized_input, policy)
+            policy.model.get_action = types.MethodType(GR00T_N1_ACG.get_action, policy.model)
+            policy.model.action_head.get_action = types.MethodType(FlowmatchingActionHead_ACG.get_action, policy.model.action_head)
 
         # Setup TensorRT if requested
         if args.use_tensorrt:
