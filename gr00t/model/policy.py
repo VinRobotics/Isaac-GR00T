@@ -133,7 +133,7 @@ class Gr00tPolicy(BasePolicy):
                 self.ensemble_weights = torch.exp(-self.k * torch.arange(self.num_queries)).cuda()
                 self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0).cuda()
                 self.reset()
-        elif self.smooth_option == "rtc":
+        elif self.smooth_option in ["rtc", "training-time-rtc"]:
             self.temporal_agg = False
             self.prev_action_chunk = None
             self.cnt = 0

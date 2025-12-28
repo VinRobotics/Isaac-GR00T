@@ -25,6 +25,11 @@ from gr00t.data.transform.state_action import (
     StateActionToTensor,
     StateActionTransform,
 )
+from gr00t.data.transform.action_quantization import (
+    ActionQuantizationTransform,
+    VelocityQuantizationTransform,
+    HigherOrderDerivativeTransform,
+)
 from gr00t.data.transform.video import (
     VideoColorJitter,
     VideoCrop,
@@ -1596,6 +1601,372 @@ class AlohaRightArm30Config(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 
 ###########################################################################################
+# VLASH-style Action Quantization Configs
+###########################################################################################
+
+
+class VRH3TwotHandQuantizedConfig(BaseDataConfig):
+    """
+    VRH3 config with VLASH-style action quantization.
+    
+    This config applies uniform quantization to actions, which can improve
+    training stability by reducing the effective action space.
+    """
+    video_keys = ["video.cam_front"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+    
+    # Quantization parameters
+    num_action_bins = 256  # VLASH default
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms with quantization
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # VLASH-style action quantization (applied after normalization)
+            ActionQuantizationTransform(
+                apply_to=self.action_keys,
+                num_bins=self.num_action_bins,
+                quantization_mode="uniform",
+                range_min=-1.0,
+                range_max=1.0,
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
+
+
+class VRH3TwotHandVelocityQuantizedConfig(BaseDataConfig):
+    """
+    VRH3 config with velocity-level action quantization.
+    
+    This config computes action velocities (first-order derivatives) and applies
+    quantization at the velocity level, which can provide smoother action predictions
+    and better handling of action discontinuities.
+    """
+    video_keys = ["video.cam_front"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+    
+    # Quantization parameters
+    num_action_bins = 256
+    dt = 0.02  # Assuming 50Hz control frequency
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # Velocity-level quantization (computes derivatives internally)
+            VelocityQuantizationTransform(
+                apply_to=self.action_keys,
+                num_bins=self.num_action_bins,
+                quantization_mode="uniform",
+                dt=self.dt,
+                range_min=-1.0,
+                range_max=1.0,
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
+
+
+class VRH3TwotHandHigherOrderConfig(BaseDataConfig):
+    """
+    VRH3 config that adds higher-order derivative features to the state.
+    
+    This config computes velocity and acceleration of state features and
+    includes them as additional state dimensions. This is useful for:
+    1. Providing richer temporal context to the model
+    2. Enabling smoother trajectory prediction
+    3. Better handling of dynamics-aware control
+    """
+    video_keys = ["video.cam_front"]
+    # Base state keys (position-level)
+    base_state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+    ]
+    # Additional state keys that already have velocity/effort
+    additional_state_keys = [
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+    
+    # Higher-order derivative parameters
+    compute_derivatives_for = ["state.left_arm", "state.right_arm", "state.left_hand", "state.right_hand"]
+    derivative_orders = [1, 2]  # Velocity and acceleration
+    dt = 0.02
+
+    @property
+    def state_keys(self):
+        """Combined state keys including computed derivatives."""
+        return self.base_state_keys + self.additional_state_keys
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # Compute higher-order derivatives for base state keys
+            # Note: This adds new keys like "state.left_arm_velocity", "state.left_arm_acceleration"
+            HigherOrderDerivativeTransform(
+                apply_to=self.compute_derivatives_for,
+                derivative_orders=self.derivative_orders,
+                dt=self.dt,
+            ),
+            # action transforms with quantization
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            ActionQuantizationTransform(
+                apply_to=self.action_keys,
+                num_bins=256,
+                quantization_mode="uniform",
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=128,  # Increased to accommodate derivative features
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
 
 DATA_CONFIG_MAP = {
     "fourier_gr1_arms_waist": FourierGr1ArmsWaistDataConfig(),
@@ -1618,5 +1989,9 @@ DATA_CONFIG_MAP = {
     "vrh2_two_hand_2_cam_vel_eff": VRH2TwotHand2CamVelEffConfig(),
     "vrh3_two_hand": VRH3TwotHandConfig(),
     "aloha_right_arm_only": AlohaRightArmConfig(),
-    "aloha_right_arm_30_only": AlohaRightArm30Config()
+    "aloha_right_arm_30_only": AlohaRightArm30Config(),
+    # VLASH-style quantized configs
+    "vrh3_two_hand_quantized": VRH3TwotHandQuantizedConfig(),
+    "vrh3_two_hand_velocity_quantized": VRH3TwotHandVelocityQuantizedConfig(),
+    "vrh3_two_hand_higher_order": VRH3TwotHandHigherOrderConfig(),
 }

@@ -23,7 +23,7 @@ import tyro
 from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.data.embodiment_tags import EMBODIMENT_TAG_MAPPING
 from gr00t.eval.robot import RobotInferenceClient
-from gr00t.experiment.data_config import DATA_CONFIG_MAP
+from gr00t.experiment.data_config import load_data_config
 from gr00t.model.policy import BasePolicy, Gr00tPolicy
 from gr00t.utils.eval import calc_mse_for_overlapping_trajectory
 
@@ -55,8 +55,14 @@ class ArgsConfig:
     modality_keys: List[str] = field(default_factory=lambda: ["left_arm", "right_arm"])
     """Modality keys to evaluate."""
 
-    data_config: Literal[tuple(DATA_CONFIG_MAP.keys())] = "fourier_gr1_arms_only"
-    """Data config to use."""
+    data_config: str = "fourier_gr1_arms_only"
+    """
+    Data configuration to use for evaluation.
+    Options:
+    - Built-in configs: 'so100', 'fourier_gr1_arms_only', 'unitree_g1', etc.
+    - External configs: Use 'module:ClassName' format for custom configs.
+    - VLASH quantized configs: 'vrh3_two_hand_quantized', 'vrh3_two_hand_velocity_quantized', etc.
+    """
 
     steps: int = 150
     """Number of steps to evaluate."""
@@ -96,7 +102,7 @@ class ArgsConfig:
 
 
 def main(args: ArgsConfig):
-    data_config = DATA_CONFIG_MAP[args.data_config]
+    data_config = load_data_config(args.data_config)
     if args.model_path is not None:
         import torch
 

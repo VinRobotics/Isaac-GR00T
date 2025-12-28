@@ -49,6 +49,7 @@ class ArgsConfig:
     Data configuration to use for training.
     Options:
     - Built-in configs: Use predefined config names like 'so100', 'fourier_gr1_arms_only', 'unitree_g1'.
+    - VLASH quantized configs: 'vrh3_two_hand_quantized', 'vrh3_two_hand_velocity_quantized', 'vrh3_two_hand_higher_order'.
     - External configs: Use 'module:ClassName' format to load custom configs from external files. e.g. 'my_dir.my_configs:RobotConfig'
     See gr00t/experiment/data_config.py for more details.
     """
@@ -86,7 +87,13 @@ class ArgsConfig:
     """Whether to resume from a checkpoint."""
 
     use_action_conditioning: bool = False
-    """Whether to use action conditioning in the flow matching action head."""
+    """
+    Whether to use training-time Real-Time Action Chunking (RTC).
+    When True, uses FlowmatchingActionHeadActionCondition which:
+    - Conditions on previous action chunks during training
+    - Enables smoother action prediction at inference time
+    - Recommended for real-time control applications
+    """
 
     # Advanced training parameters
     learning_rate: float = 1e-4

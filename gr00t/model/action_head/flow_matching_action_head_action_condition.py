@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -158,20 +159,22 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
     def get_realtime_action(
         self,
         action_input: BatchFeature,
-        backbone_output:BatchFeature,
+        backbone_output: BatchFeature,
         prev_action_chunk: torch.Tensor,  # [batch, horizon, action_dim]
         inference_delay: int,
-        prefix_attention_horizon: int,
-        prefix_attention_schedule: str,
-        max_guidance_weight: float,
-        sigma_d_o: float,
-        actual_action_dim: int,
-    )  -> BatchFeature:
+        prefix_attention_horizon: Optional[int] = None,
+        prefix_attention_schedule: Optional[str] = None,
+        max_guidance_weight: Optional[float] = None,
+        sigma_d_o: Optional[float] = None,
+        actual_action_dim: Optional[int] = None,
+        use_prev_action: bool = True,
+    ) -> BatchFeature:
 
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
+        vl_attn_mask = backbone_output.backbone_attention_mask
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
@@ -198,7 +201,7 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
             t_cont = torch.tensor([t_cont], device=device)
             t_cont_expand = t_cont.expand(actions.shape[0], actions.shape[1])
             t_cont_expand = torch.where(prefix_mask, 1.0, t_cont_expand).to(device) # set time to 1.0 for the action prefix
-            t_discretized = t_cont_expand * self.num_timestep_buckets
+            t_discretized = (t_cont_expand * self.num_timestep_buckets).long()
 
             actions = torch.where(prefix_mask[:, :, None], prev_action_chunk, actions).to(device)
 
@@ -220,6 +223,7 @@ class FlowmatchingActionHeadActionCondition(FlowmatchingActionHead):
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
+                encoder_attention_mask=vl_attn_mask,
                 timestep=t_discretized,
             )
             pred = self.action_decoder(model_output, embodiment_id)

@@ -26,6 +26,12 @@ from .state_action import (
     StateActionToTensor,
     StateActionTransform,
 )
+from .action_quantization import (
+    ActionQuantizationTransform,
+    VelocityQuantizationTransform,
+    AccelerationQuantizationTransform,
+    HigherOrderDerivativeTransform,
+)
 from .video import (
     VideoColorJitter,
     VideoCrop,
