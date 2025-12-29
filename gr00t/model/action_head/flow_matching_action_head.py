@@ -519,8 +519,8 @@ class FlowmatchingActionHead(nn.Module):
             
             (outputs, vjp_func) = torch.func.vjp(denoiser, x_t)
             (x_1_i_vjp, v_t_i_vjp) = outputs
-            # error = (prev_action_chunk - x_1_i_vjp) * weights[:, None] * actions_mask
-            error = F.mse_loss(x_1_i_vjp, prev_action_chunk, reduction="none") / actions_mask.sum() * weights[:, None] * actions_mask
+            error = (prev_action_chunk - x_1_i_vjp) * weights[:, None] * actions_mask
+            # error = F.mse_loss(x_1_i_vjp, prev_action_chunk, reduction="none") / actions_mask.sum() * weights[:, None] * actions_mask
             
             pinv_correction = vjp_func((error, torch.zeros_like(x_t)))[0]
             if pinv_correction is None:
