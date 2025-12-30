@@ -155,7 +155,6 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
-
 #####################################################################################
 # main training function
 #####################################################################################
@@ -211,8 +210,10 @@ def main(config: ArgsConfig):
         print(f"Loaded {len(single_datasets)} datasets, with {config.dataset_path} ")
 
     # ------------ step 2: load model ------------
-    # First, get the data config to determine action horizon
+    # First, get the data config to determine action horizon and num_hand
     data_action_horizon = len(data_config_cls.action_indices)
+    data_num_hand = getattr(data_config_cls, "num_hand", 2)
+    data_rot_type = getattr(data_config_cls, "rot_type", "quaternion")
 
     # Load model
     model = GR00T_N1_5.from_pretrained(
@@ -222,18 +223,28 @@ def main(config: ArgsConfig):
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
         load_backbone_only=True,  # load backbone only, not the action head
+        
     )
 
-    # Update action_horizon to match data config
+    # Update action_horizon and num_hand to match data config
     # Need to recreate action head with correct config since it was initialized with old config
-    if data_action_horizon != model.action_head.config.action_horizon:
+    action_horizon_changed = data_action_horizon != model.action_head.config.action_horizon
+    num_hand_changed = data_num_hand != model.action_head.config.num_hand
+    rot_type_changed = data_rot_type != model.action_head.config.num_hand
+    
+    if action_horizon_changed or num_hand_changed or rot_type_changed:
         print(
-            f"Recreating action head with action_horizon {data_action_horizon} (was {model.action_head.config.action_horizon})"
+            f"Recreating action head with action_horizon {data_action_horizon} (was {model.action_head.config.action_horizon}), "
+            f"num_hand {data_num_hand} (was {model.action_head.config.num_hand}), "
+            f"rot_type {data_rot_type} (was {model.action_head.config.rot_type}), "
         )
+        
 
         # Update the action head config
         new_action_head_config = model.action_head.config
         new_action_head_config.action_horizon = data_action_horizon
+        new_action_head_config.num_hand = data_num_hand
+        new_action_head_config.rot_type = data_rot_type
 
         # Import the FlowmatchingActionHead class
         from gr00t.model.action_head.flow_matching_action_head import (
@@ -252,6 +263,8 @@ def main(config: ArgsConfig):
         # Update model config AND the action_head_cfg dictionary that gets saved
         model.config.action_horizon = data_action_horizon
         model.action_horizon = data_action_horizon
+        model.config.action_head_cfg["num_hand"] = new_action_head_config.num_hand
+        model.config.action_head_cfg["rot_type"] = new_action_head_config.rot_type
         model.config.action_head_cfg["action_horizon"] = data_action_horizon
 
         # Set trainable parameters for the new action head

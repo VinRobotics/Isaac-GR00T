@@ -122,6 +122,7 @@ class ConcatTransform(InvertibleModalityTransform):
             for key in self.state_concat_order:
                 target_shapes = [self.state_dims[key]]
                 if self.is_rotation_key(key):
+                    target_shapes.append(4)  # Allow for quaternion
                     target_shapes.append(6)  # Allow for rotation_6d
                 # if key in ["state.right_arm", "state.right_hand"]:
                 target_shapes.append(self.state_dims[key] * 2)  # Allow for sin-cos transform
@@ -146,9 +147,11 @@ class ConcatTransform(InvertibleModalityTransform):
                 target_shapes = [self.action_dims[key]]
                 if self.is_rotation_key(key):
                     target_shapes.append(3)  # Allow for axis angle
+                    target_shapes.append(4)  # Allow for quaternion
+                    target_shapes.append(6)  # Allow for rotation_6d
                 assert (
-                    self.action_dims[key] == data[key].shape[-1]
-                ), f"Action dim mismatch for {key=}, {self.action_dims[key]=}, {data[key].shape[-1]=}"
+                    data[key].shape[-1] in target_shapes
+                ), f"Action dim mismatch for {key=}, {data[key].shape[-1]=}, {target_shapes=}"
             # Concatenate the action keys
             # We'll have StateActionToTensor before this transform, so here we use torch.cat
             data["action"] = torch.cat(

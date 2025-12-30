@@ -186,6 +186,13 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     num_target_vision_tokens: int = field(
         default=32, metadata={"help": "Number of target vision tokens."}
     )
+    num_hand: int = field(
+        default=2, metadata={"help": "Whether to use two hands (True) or one hand (False)."}
+    )
+    
+    rot_type: str = field(
+        default="quaternion", metadata={"help": "Define rot type: quaternion, euler_angles"}
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -202,6 +209,11 @@ class FlowmatchingActionHead(nn.Module):
         config: FlowmatchingActionHeadConfig,
     ):
         super().__init__()
+        self.config = config
+        self.n_group = 8
+
+        self.num_hand = self.config.num_hand
+
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
@@ -210,7 +222,16 @@ class FlowmatchingActionHead(nn.Module):
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
 
-        self.state_encoder = CategorySpecificMLP(
+        # equi state
+        self.ee_dim = 7 if self.config.rot_type == "quaternion" else 6
+        self.group = gspaces.no_base_space(CyclicGroup(self.n_group))
+        self.state_in_type = self.getJointFieldType(is_action=False)
+        self.state_hidden_type = enn.FieldType(self.group, int(config.hidden_size / self.n_group) * [self.group.regular_repr])
+        self.state_out_type = enn.FieldType(self.group, int(config.input_embedding_dim / self.n_group) * [self.group.regular_repr])
+        self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
+        self.eulerangle_to_sixd = RotationTransformer('euler_angles', 'rotation_6d', from_convention="ZYX")
+
+        self.state_encoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
             input_dim=config.max_state_dim,
             hidden_dim=self.hidden_size,
@@ -247,6 +268,146 @@ class FlowmatchingActionHead(nn.Module):
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+    
+    def getJointFieldType(self, is_action):
+        max_dim = self.config.max_action_dim if is_action else self.config.max_state_dim
+        return enn.FieldType(
+            self.group,
+            self.num_hand * 4 * [self.group.irrep(1)] # pos xy, rot 6, left and right
+            + (max_dim - ((self.ee_dim - 1) * self.num_hand)) * [self.group.trivial_repr], # gripper 1, z from both ee is 2
+        )
+        
+    def getJointGeometricTensor(self, state, is_action):
+        def getJointGeometricTensorEachHand(ee_state):
+            ee_pos = ee_state[:, :, :3] # (bs, t, 3)
+            ee_quat = ee_state[:, :, 3:self.ee_dim] # (bs, t, 4)
+            ee_rot = self.get6DRotation(ee_quat)
+            pos_xy = ee_pos[:, :, 0:2] # 2
+            pos_z = ee_pos[:, :, 2:3] # 1
+            joint_features = torch.cat(
+                [
+                    pos_xy,
+                    ee_rot[:, :, 0:1], # 1
+                    ee_rot[:, :, 3:4], # 1
+                    ee_rot[:, :, 1:2], # 1
+                    ee_rot[:, :, 4:5], # 1
+                    ee_rot[:, :, 2:3], # 1
+                    ee_rot[:, :, 5:6], # 1
+                ],
+                dim=-1
+            )
+            return joint_features, pos_z
+        if self.num_hand == 2:
+            l_ee_state = state[:, :, :self.ee_dim] # bs, t, 7 
+            r_ee_state = state[:, :, self.ee_dim:self.ee_dim*2] # bs, t, 7  
+            hand_state = state[:, :, self.ee_dim*2:]
+            
+            l_tf, l_pos_z = getJointGeometricTensorEachHand(l_ee_state)
+            r_tf, r_pos_z = getJointGeometricTensorEachHand(r_ee_state)
+
+            state_features = torch.cat([l_tf, r_tf, l_pos_z, r_pos_z, hand_state], dim=-1)
+ 
+        else:
+            l_ee_state = state[:, :, :self.ee_dim] # bs, t, 7 
+            hand_state = state[:, :, self.ee_dim:]
+            
+            l_tf, l_pos_z = getJointGeometricTensorEachHand(l_ee_state)
+            state_features = torch.cat([l_tf, l_pos_z, hand_state], dim=-1)      
+        state_features = einops.rearrange(state_features, 'b t c -> (b t) c')
+        return enn.GeometricTensor(state_features, self.getJointFieldType(is_action))
+    
+    def getActionGT(self, action):
+        def getActionGTEachHand(ee_state):
+            ee_pos = ee_state[:, :, :3] # (bs, t, 3)
+            ee_quat = ee_state[:, :, 3:self.ee_dim] # (bs, t, 4)
+            ee_rot = self.get6DRotation(ee_quat)
+            pos_xy = ee_pos[:, :, 0:2] # 2
+            pos_z = ee_pos[:, :, 2:3] # 1
+            joint_features = torch.cat(
+                [
+                    pos_xy,
+                    ee_rot[:, :, 0:1], # 1
+                    ee_rot[:, :, 3:4], # 1
+                    ee_rot[:, :, 1:2], # 1
+                    ee_rot[:, :, 4:5], # 1
+                    ee_rot[:, :, 2:3], # 1
+                    ee_rot[:, :, 5:6], # 1
+                ],
+                dim=-1
+            )
+            return joint_features, pos_z
+        if self.num_hand == 2:
+            l_ee_state = action[:, :, :self.ee_dim] # bs, t, 7 
+            r_ee_state = action[:, :, self.ee_dim:self.ee_dim*2] # bs, t, 7  
+            hand_state = action[:, :, self.ee_dim*2:]
+            
+            l_tf, l_pos_z = getActionGTEachHand(l_ee_state)
+            r_tf, r_pos_z = getActionGTEachHand(r_ee_state)
+
+            state_features = torch.cat([l_tf, r_tf, l_pos_z, r_pos_z, hand_state], dim=-1)
+        else:
+            l_ee_state = action[:, :, :self.ee_dim] # bs, t, 7 
+            hand_state = action[:, :, self.ee_dim:]
+            
+            l_tf, l_pos_z = getActionGTEachHand(l_ee_state)
+            state_features = torch.cat([l_tf, l_pos_z, hand_state], dim=-1)
+        return state_features
+    
+    
+    def getActionOutput(self, pred):
+        def getActionOutputEachHand(ee_pred):
+            ee_xy = ee_pred[:, :, 0:2] # (bs, t, 3)
+            ee_cos1 = ee_pred[:, :, 2:3]
+            ee_sin1 = ee_pred[:, :, 3:4]
+            ee_cos2 = ee_pred[:, :, 4:5]
+            ee_sin2 = ee_pred[:, :, 5:6]
+            ee_cos3 = ee_pred[:, :, 6:7]
+            ee_sin3 = ee_pred[:, :, 7:8]
+
+            rot_6d = torch.cat([ee_cos1, ee_cos2, ee_cos3, ee_sin1, ee_sin2, ee_sin3], dim=-1)
+            quat = self.getQuaternionFrom6D(rot_6d)
+            return ee_xy, quat
+        
+        if self.num_hand == 2:
+            l_xy, l_quat = getActionOutputEachHand(pred[:, :, :8]) # bs, t, 8
+            r_xy, r_quat = getActionOutputEachHand(pred[:, :, 8:16]) # bs, t, 8
+            
+            l_z, r_z = pred[:, :, 16:17], pred[:, :, 17:18] # bs, t, 1
+            hand_state = pred[:, :, 18:] # bs, t, rest
+            
+            action_output = torch.cat(
+                [l_xy, l_z, l_quat, r_xy, r_z, r_quat, hand_state],
+                dim=-1
+            )
+        else:
+            l_xy, l_quat = getActionOutputEachHand(pred[:, :, :8]) # bs, t, 8
+            
+            l_z = pred[:, :, 8:9] # bs, t, 1
+            hand_state = pred[:, :, 9:] # bs, t, rest
+            
+            action_output = torch.cat(
+                [l_xy, l_z, l_quat, hand_state],
+                dim=-1
+            )
+            
+        return action_output
+
+    def get6DRotation(self, quat):
+        # data is in xyzw, but rotation transformer takes wxyz
+        if quat.shape[-1] == 4:
+            return self.quaternion_to_sixd.forward(quat[:, :, [3, 0, 1, 2]]) 
+        else:
+            return self.eulerangle_to_sixd.forward(quat)
+    
+    def getQuaternionFrom6D(self, rot_6d):
+        if self.ee_dim == 7:
+            quat = self.quaternion_to_sixd.inverse(rot_6d)
+            return quat[:, :, [1, 2, 3, 0]]  # xyzw
+        else:
+            return self.eulerangle_to_sixd.inverse(rot_6d)
+
+
+
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -396,11 +557,10 @@ class FlowmatchingActionHead(nn.Module):
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
         actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
-            dtype=vl_embs.dtype,
-            device=device,
-        )
-
+                    size=(batch_size, self.config.action_horizon, self.config.action_dim + 2 * self.num_hand),
+                    dtype=vl_embs.dtype,
+                    device=device,
+                )
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
 
