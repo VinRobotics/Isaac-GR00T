@@ -575,7 +575,7 @@ class EDiT(ModelMixin, ConfigMixin):
         # This ensures the model is equivariant w.r.t. state/action regardless of VL content
         self.cross_attention_type = enn.FieldType(
             self.gspace,
-            [self.gspace.regular_repr] * int(self.config.cross_attention_dim / self.n_group)
+            [self.gspace.trivial_repr] * self.config.cross_attention_dim
         )
         self.ff_inner_type = enn.FieldType(
             self.gspace,
@@ -737,3 +737,101 @@ class EDiT(ModelMixin, ConfigMixin):
         else:
             return output
 
+
+class SelfAttentionTransformer(ModelMixin, ConfigMixin):
+    _supports_gradient_checkpointing = True
+
+    @register_to_config
+    def __init__(
+        self,
+        n_group: int = 8,
+        num_attention_heads: int = 8,
+        attention_head_dim: int = 64,
+        output_dim: int = 26,
+        num_layers: int = 12,
+        dropout: float = 0.1,
+        attention_bias: bool = True,
+        activation_fn: str = "gelu-approximate",
+        num_embeds_ada_norm: Optional[int] = 1000,
+        upcast_attention: bool = False,
+        max_num_positional_embeddings: int = 512,
+        compute_dtype=torch.float32,
+        final_dropout: bool = True,
+        positional_embeddings: Optional[str] = "sinusoidal",
+        interleave_self_attention=False,
+        use_relative_position_bias: bool = True,
+        max_relative_position: int = 32,
+    ):
+        super().__init__()
+        self.attention_head_dim = attention_head_dim
+        self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
+        self.gradient_checkpointing = False
+        self.n_group = n_group
+        
+        # Setup ESCNN group space
+        G = CyclicGroup(n_group)
+        self.gspace = escnn.gspaces.no_base_space(G)
+        
+        # Define field types for equivariant layers
+        # Each field type contains multiple regular representations
+        self.in_type = enn.FieldType(
+            self.gspace, 
+            [self.gspace.regular_repr] * int(self.inner_dim/self.n_group)
+        )
+        # Cross-attention uses TRIVIAL representation for INVARIANT VL features
+        # This ensures the model is equivariant w.r.t. state/action regardless of VL content
+        self.cross_attention_type = enn.FieldType(
+            self.gspace,
+            [self.gspace.trivial_repr] * self.config.cross_attention_dim
+        )
+        self.ff_inner_type = enn.FieldType(
+            self.gspace,
+            [self.gspace.regular_repr] * int(self.inner_dim*4/self.n_group)
+        )
+        self.out_type = enn.FieldType(
+            self.gspace,
+            [self.gspace.regular_repr] * int(self.config.output_dim/self.n_group)
+        )
+
+        self.transformer_blocks = nn.ModuleList(
+            [
+                BasicTransformerBlock(
+                    in_type=self.in_type,
+                    cross_attention_type=self.in_type,
+                    inner_type=self.ff_inner_type,
+
+                    num_attention_heads=self.config.num_attention_heads,
+                    attention_head_dim=self.config.attention_head_dim,
+                    dropout=self.config.dropout,
+                    activation_fn=self.config.activation_fn,
+                    attention_bias=self.config.attention_bias,
+                    final_dropout=final_dropout,
+                    use_relative_position_bias=use_relative_position_bias,
+                    max_relative_position=max_relative_position,
+                )
+                for _ in range(self.config.num_layers)
+            ]
+        )
+        print(
+            "Total number of SelfAttentionTransformer parameters: ",
+            sum(p.numel() for p in self.parameters() if p.requires_grad),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # Shape: (B, T, D)
+        return_all_hidden_states: bool = False,
+    ):
+        # Process through transformer blocks - single pass through the blocks
+        hidden_states = hidden_states.contiguous()
+        all_hidden_states = [hidden_states]
+
+        # Process through transformer blocks
+        for idx, block in enumerate(self.transformer_blocks):
+            hidden_states = block(hidden_states)
+            all_hidden_states.append(hidden_states)
+
+        if return_all_hidden_states:
+            return hidden_states, all_hidden_states
+        else:
+            return hidden_states

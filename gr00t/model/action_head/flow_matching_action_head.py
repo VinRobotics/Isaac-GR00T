@@ -40,8 +40,7 @@ from gr00t.model.action_head.action_encoder import (
     swish,
 )
 
-from .cross_attention_dit import DiT, SelfAttentionTransformer
-from .equivariant_cross_attention_dit import EDiT
+from .equivariant_cross_attention_dit import EDiT, SelfAttentionTransformer
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
