@@ -356,7 +356,16 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     expand_batch: int = field(default=None)
     use_vlln: bool = field(default=True)
 
-    vl_self_attention_cfg: dict = field(default=None)
+    vl_self_attention_cfg: dict = field(
+        default_factory=lambda: {
+        "attention_head_dim": 64,
+        "dropout": 0.2,
+        "final_dropout": True,
+        "num_attention_heads": 32,
+        "num_layers": 4,
+        "positional_embeddings": None
+        }, metadata={"help": "Diffusion model configuration."}
+    )
     num_target_vision_tokens: int = field(
         default=32, metadata={"help": "Number of target vision tokens."}
     )

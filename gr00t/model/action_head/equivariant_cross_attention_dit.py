@@ -780,10 +780,6 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
         )
         # Cross-attention uses TRIVIAL representation for INVARIANT VL features
         # This ensures the model is equivariant w.r.t. state/action regardless of VL content
-        self.cross_attention_type = enn.FieldType(
-            self.gspace,
-            [self.gspace.trivial_repr] * self.config.cross_attention_dim
-        )
         self.ff_inner_type = enn.FieldType(
             self.gspace,
             [self.gspace.regular_repr] * int(self.inner_dim*4/self.n_group)
