@@ -225,7 +225,7 @@ class EagleBackboneFA(nn.Module):
             if k.startswith(eagle_prefix)
         }
         del eagle_input["image_sizes"]
-        B, _, _, _ = eagle_input["pixel_values"].shape
+        B, _, _, _ = eagle_input["input_ids"].shape
         rotated_vl_input = self.rotate_rgb_batch(eagle_input)
         
         for k, v in eagle_input.items():
