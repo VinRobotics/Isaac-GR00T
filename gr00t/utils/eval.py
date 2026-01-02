@@ -303,11 +303,11 @@ def plot_trajectory(
         ax.plot(pred_action_across_time[:, i], label="pred action", linewidth=2)
 
         # put a dot every ACTION_HORIZON
-        for j in range(0, steps, action_horizon):
-            if j == 0:
-                ax.plot(j, gt_action_across_time[j, i], "ro", label="inference point", markersize=6)
-            else:
-                ax.plot(j, gt_action_across_time[j, i], "ro", markersize=4)
+        # for j in range(0, steps, action_horizon):
+        #     if j == 0:
+        #         ax.plot(j, gt_action_across_time[j, i], "ro", label="inference point", markersize=6)
+        #     else:
+        #         ax.plot(j, gt_action_across_time[j, i], "ro", markersize=4)
 
         ax.set_title(f"Action Dimension {i}", fontsize=12, fontweight="bold", pad=10)
         ax.legend(loc="upper right", framealpha=0.9)

@@ -56,6 +56,13 @@ class BasePolicy(ABC):
         Return the modality config of the policy.
         """
         raise NotImplementedError
+    
+    @abstractmethod
+    def get_input_rep(self):
+        """
+        Return the Eagle(VLM) hidden‐state representations for images + language 
+        """
+        raise NotImplemented
 
 
 class Gr00tPolicy(BasePolicy):
@@ -201,6 +208,27 @@ class Gr00tPolicy(BasePolicy):
         )
         print("PROCESS OUTPUT", action.shape)
         return action
+    
+    def get_input_rep(self, observations: Dict[str, Any]):
+        """
+        Returns the Eagle(VLM) hidden‐state representations for images + language.
+        """
+        # Create a copy to avoid mutating input
+        obs_copy = observations.copy()
+
+        is_batch = self._check_state_is_batched(obs_copy)
+        if not is_batch:
+            obs_copy = unsqueeze_dict_values(obs_copy)
+
+        # Convert to numpy arrays
+        for k, v in obs_copy.items():
+            if not isinstance(v, np.ndarray):
+                obs_copy[k] = np.array(v)
+
+        normalized_input = self.apply_transforms(obs_copy)
+
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+            return self.model.get_input_rep(normalized_input)
     
     def get_dsrl_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """
