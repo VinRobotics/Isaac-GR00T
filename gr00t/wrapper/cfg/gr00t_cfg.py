@@ -1,11 +1,8 @@
 import copy
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from diffusers.models.attention import Attention
-from diffusers.models.attention_processor import AttnProcessor2_0
 from gr00t.model.action_head.flow_matching_action_head import FlowmatchingActionHead
 from gr00t.model.gr00t_n1 import GR00T_N1_5
 from gr00t.model.policy import Gr00tPolicy, squeeze_dict_values, unsqueeze_dict_values
@@ -14,85 +11,11 @@ from transformers.feature_extraction_utils import BatchFeature
 COMPUTE_DTYPE = torch.bfloat16
 
 
-class ACGAttnProcessor2_0:
-    r"""
-    Processor for implementing the Incoherent Variant of ACG using scaled dot-product attention (enabled by default in PyTorch 2.0).
-    ACG reference: https://arxiv.org/abs/xxxx.xxxxx
-
-    We also sincerely appreciate the excellent work on PAG, from which this implementation is derived.
-    PAG reference: https://arxiv.org/abs/2403.17377
-    """
-
-    def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
-
-    def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        if attn.spatial_norm is not None:
-            hidden_states = attn.spatial_norm(hidden_states, temb)
-
-        input_ndim = hidden_states.ndim
-
-        if input_ndim == 4:  # False
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-
-        batch_size, sequence_length, _ = (
-            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-        )
-
-        if attention_mask is not None:
-            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
-            # scaled_dot_product_attention expects attention_mask shape to be
-            # (batch, heads, source_length, target_length)
-            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
-
-        if attn.group_norm is not None:
-            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
-
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-        elif attn.norm_cross:
-            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
-
-        value = attn.to_v(encoder_hidden_states)
-
-        hidden_states = attn.to_v(encoder_hidden_states)
-        hidden_states = hidden_states.to(value.dtype)
-
-        # linear proj
-        hidden_states = attn.to_out[0](hidden_states)
-        # dropout
-        hidden_states = attn.to_out[1](hidden_states)
-
-        if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
-
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
-
-        hidden_states = hidden_states / attn.rescale_output_factor
-
-        return hidden_states
-
-
-class Gr00tPolicy_ACG(Gr00tPolicy):
+class Gr00tPolicy_CFG(Gr00tPolicy):
 
     def get_action(
         self, observations: Dict[str, Any],
-        scale: float = 1.30,
-        skip_blocks: List[int] = [7, 9, 11],
-        num_inference_timesteps: int = 16,
+        scale: float = 1.3,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -127,13 +50,17 @@ class Gr00tPolicy_ACG(Gr00tPolicy):
             if not isinstance(v, np.ndarray):
                 obs_copy[k] = np.array(v)
 
+        # prepare uncond
+        observations_uncond = copy.deepcopy(obs_copy)
+        observations_uncond["annotation.human.task_description"] = " "
+
         # Apply transforms
         normalized_input = self.apply_transforms(obs_copy)
+        normalized_input_uncond = self.apply_transforms(observations_uncond)
+
         normalized_action = self._get_action_from_normalized_input(
-            normalized_input,
+            normalized_input, normalized_input_uncond,
             scale=scale,
-            skip_blocks=skip_blocks,
-            num_inference_timesteps=num_inference_timesteps,
         )
         unnormalized_action = self._get_unnormalized_action(normalized_action)
 
@@ -145,18 +72,14 @@ class Gr00tPolicy_ACG(Gr00tPolicy):
         return unnormalized_action
 
     def _get_action_from_normalized_input(
-        self, normalized_input: Dict[str, Any],
-        scale: float = 3.0,
-        skip_blocks: List[int] = [7, 9, 11],
-        num_inference_timesteps: int = 16,
+        self, normalized_input: Dict[str, Any], normalized_input_uncond: Dict[str, Any],
+        scale: float = 1.0,
     ) -> torch.Tensor:
         # Set up autocast context if needed
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
             model_pred = self.model.get_action(
-                normalized_input,
+                normalized_input, normalized_input_uncond,
                 scale=scale,
-                skip_blocks=skip_blocks,
-                num_inference_timesteps=num_inference_timesteps,
             )
 
         normalized_action = model_pred["action_pred"].float()
@@ -165,55 +88,43 @@ class Gr00tPolicy_ACG(Gr00tPolicy):
         return normalized_action
 
 
-class GR00T_N1_ACG(GR00T_N1_5):
+class GR00T_N1_CFG(GR00T_N1_5):
 
     def get_action(
         self,
         inputs: dict,
-        scale: float = 3.0,
-        skip_blocks: List[int] = [7, 9, 11],
-        num_inference_timesteps: int = 16,
+        inputs_uncond: dict,
+        scale: float = 1.0,
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
+        backbone_inputs_uncond, _ = self.prepare_input(inputs_uncond)
         # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
         backbone_outputs = self.backbone(backbone_inputs)
+        backbone_outputs_uncond = self.backbone(backbone_inputs_uncond)
         action_head_outputs = self.action_head.get_action(
             backbone_outputs, action_inputs,
+            backbone_outputs_uncond,
             scale=scale,
-            skip_blocks=skip_blocks,
-            num_inference_timesteps=num_inference_timesteps,
         )
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
 
 
-class FlowmatchingActionHead_ACG(FlowmatchingActionHead):
+class FlowmatchingActionHead_CFG(FlowmatchingActionHead):
 
     @torch.no_grad()
     def get_action(
-        self, backbone_output: BatchFeature,
-        action_input: BatchFeature,
-        scale: float = 3.0,
-        skip_blocks: List[int] = [7, 9, 11],
-        num_inference_timesteps: int = 16,
+        self, backbone_output: BatchFeature, action_input: BatchFeature,
+        backbone_output_uncond: BatchFeature,
+        scale: float,
     ) -> BatchFeature:
-
-        def convert_to_bad_model(skip_blocks: List[int] = []) -> None:
-            n_blocks = len(self.model.transformer_blocks)
-            for i in range(n_blocks):
-                if i in skip_blocks:
-                    self.model.transformer_blocks[i].attn1.processor = ACGAttnProcessor2_0()
-
-        def convert_to_original_model(skip_blocks: List[int] = []) -> None:
-            n_blocks = len(self.model.transformer_blocks)
-            for i in range(n_blocks):
-                if i in skip_blocks:
-                    self.model.transformer_blocks[i].attn1.processor = AttnProcessor2_0()
-
+        
         backbone_output = self.process_backbone_output(backbone_output)
+        backbone_output_uncond = self.process_backbone_output(backbone_output_uncond)
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
+        vl_embs_uncond = backbone_output_uncond.backbone_features
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
@@ -259,18 +170,14 @@ class FlowmatchingActionHead_ACG(FlowmatchingActionHead):
             )
             pred = self.action_decoder(model_output, embodiment_id)
 
-            pred_perturb = torch.zeros_like(pred)
             if scale != 1.0:
-                convert_to_bad_model(skip_blocks)
-                model_output_perturb = self.model(
+                model_output_uncond = self.model(
                     hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embs,
+                    encoder_hidden_states=vl_embs_uncond,
                     timestep=timesteps_tensor,
                 )
-                pred_perturb = self.action_decoder(model_output_perturb, embodiment_id)
-                convert_to_original_model(skip_blocks)
-
-            pred = pred + (scale - 1) * (pred - pred_perturb)
+                pred_uncond = self.action_decoder(model_output_uncond, embodiment_id)
+                pred = pred + (scale - 1) * (pred - pred_uncond)
 
             pred_velocity = pred[:, -self.action_horizon:]
 
