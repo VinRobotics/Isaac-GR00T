@@ -228,9 +228,6 @@ class EagleBackboneFA(nn.Module):
         B, _ = eagle_input["input_ids"].shape
         rotated_vl_input = self.rotate_rgb_batch(eagle_input)
         
-        for k, v in eagle_input.items():
-            if isinstance(v, torch.Tensor):
-                print(k, v.shape, v.dtype, v.device)
 
         eagle_output = self.eagle_model(**rotated_vl_input, output_hidden_states=True, return_dict=True)
         eagle_features = eagle_output.hidden_states[self.select_layer]
