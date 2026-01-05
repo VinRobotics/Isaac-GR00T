@@ -795,12 +795,14 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
                     in_type=self.in_type,
                     cross_attention_type=self.in_type,
                     inner_type=self.ff_inner_type,
-
+                    temb_type=None,  # No timestep embedding for self-attention transformer
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
                     dropout=self.config.dropout,
                     activation_fn=self.config.activation_fn,
                     attention_bias=self.config.attention_bias,
+                    norm_type="layer_norm",  # Use layer_norm, not ada_norm (no timestep)
+                    norm_eps=1e-5,
                     final_dropout=final_dropout,
                     use_relative_position_bias=use_relative_position_bias,
                     max_relative_position=max_relative_position,
