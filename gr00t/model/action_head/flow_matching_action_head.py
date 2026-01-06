@@ -40,7 +40,7 @@ from gr00t.model.action_head.action_encoder import (
     swish,
 )
 
-from .equivariant_cross_attention_dit import EDiT, SelfAttentionTransformer
+from .equivariant_cross_attention_dit import EDiT, SelfAttentionTransformer, EquivariantLayerNorm
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -441,14 +441,8 @@ class FlowmatchingActionHead(nn.Module):
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
-        self.vlln = (
-            nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
-        )
-        self.vl_self_attention = (
-            SelfAttentionTransformer(**config.vl_self_attention_cfg)
-            if config.use_vlln
-            else nn.Identity()
-        )
+        self.vl_self_attention = SelfAttentionTransformer(**config.vl_self_attention_cfg)
+        self.vlln = EquivariantLayerNorm(self.vl_self_attention.in_type)
         
 
         if config.add_pos_embed:
@@ -609,8 +603,6 @@ class FlowmatchingActionHead(nn.Module):
             self.state_encoder.requires_grad_(False)
             self.action_encoder.requires_grad_(False)
             self.action_decoder.requires_grad_(False)
-            self.vl_equi_proj.requires_grad_(False)
-            self.future_tokens_equi_proj.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
         if not tune_diffusion_model:
@@ -641,7 +633,7 @@ class FlowmatchingActionHead(nn.Module):
         filtered_state_dict = {}
         for key, value in state_dict.items():
             # Skip old-style state_encoder weights
-            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key:
+            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key or "vlln" in key or "vl_self_attention" in key:
                 print(f"Skipping incompatible state_encoder weight: {key}")
                 continue
             filtered_state_dict[key] = value
@@ -676,7 +668,8 @@ class FlowmatchingActionHead(nn.Module):
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
-        backbone_features = self.vlln(backbone_features)
+        backbone_features = enn.GeometricTensor(backbone_features, self.vl_self_attention.in_type)
+        backbone_features = self.vlln(backbone_features).tensor
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
