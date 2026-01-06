@@ -836,7 +836,7 @@ class FlowmatchingActionHead(nn.Module):
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
         actions = torch.randn(
-                    size=(batch_size, self.config.action_horizon, self.config.action_dim + 2 * self.num_hand),
+                    size=(batch_size, self.config.action_horizon, self.action_type.size),
                     dtype=vl_embs.dtype,
                     device=device,
                 )
