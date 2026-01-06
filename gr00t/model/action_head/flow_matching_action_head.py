@@ -668,8 +668,11 @@ class FlowmatchingActionHead(nn.Module):
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
+        B, T, D = backbone_features.shape
+        backbone_features = einops.rearrange(backbone_features, "b t d -> (b t) d")
         backbone_features = enn.GeometricTensor(backbone_features, self.vl_self_attention.in_type)
         backbone_features = self.vlln(backbone_features).tensor
+        backbone_features = einops.rearrange(backbone_features, "(b t) d -> b t d", b = B, t = T)
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
