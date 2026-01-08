@@ -307,7 +307,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     model_dtype: str = field(default="float32", metadata={"help": "Model data type."})
     diffusion_model_cfg: dict = field(
         default_factory=lambda: {
-            "n_group": 8,
+            "n_group": 4,
             "attention_head_dim": 48,
             "cross_attention_dim": 2048,
             "dropout": 0.2,
@@ -393,7 +393,7 @@ class FlowmatchingActionHead(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.n_group = 8
+        self.n_group = 4
 
         self.num_hand = self.config.num_hand
 

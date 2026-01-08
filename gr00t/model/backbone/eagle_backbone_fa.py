@@ -44,20 +44,35 @@ class EagleBackboneFA(nn.Module):
         load_bf16: bool = False,
         eagle_path: str | None = None,
         project_to_dim: int = 1536,
+        num_images_per_sample: int = 1,
+        rotate_image_indices: list[int] | None = None,
     ):
         """
         Args:
             tune_llm: whether to tune the LLM model (default: True)
             tune_visual: whether to tune the visual model (default: False)
+            num_images_per_sample: number of images per sample (e.g., 2 for two camera views)
+            rotate_image_indices: list of indices (0-based) indicating which images should be 
+                                  rotated. Images not in this list will be duplicated like input_ids.
+                                  If None, all images will be rotated.
         """
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
+        
+        self.num_images_per_sample = num_images_per_sample
+        # Default: rotate all images if not specified
+        if rotate_image_indices is None:
+            self.rotate_image_indices = list(range(num_images_per_sample))
+        else:
+            self.rotate_image_indices = rotate_image_indices
+        # Indices of images to duplicate (not rotate)
+        self.duplicate_image_indices = [i for i in range(num_images_per_sample) if i not in self.rotate_image_indices]
 
         config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
         
         # Frame Average
-        self.n_group = 8 # hardcode
+        self.n_group = 4 # hardcode
         self.group = gspaces.no_base_space(CyclicGroup(self.n_group))
         self.init_rotation_matrices()
         
@@ -157,58 +172,72 @@ class EagleBackboneFA(nn.Module):
     def rotate_rgb_batch(self, vl_batch):
         """
         Apply all N rotations to a batch of images efficiently in a single operation.
+        Handles multiple images per sample, rotating only specified image indices.
         
         Args:
-            img_batch: [B, C, H, W] tensor of RGB images
+            vl_batch: dict containing:
+                - pixel_values: [B*num_images_per_sample, C, H, W] tensor of RGB images
+                - input_ids: [B, seq_len] tensor
+                - attention_mask: [B, seq_len] tensor
             
         Returns:
-            Batch of rotated images with shape [B*N, C, H, W], where N is the number of rotations
-            The output is organized as [img0_rot0, img0_rot1, ..., img0_rotN-1, img1_rot0, ...]
+            Modified vl_batch with:
+                - pixel_values: [B*num_images_per_sample*N, C, H, W] for rotated images
+                - input_ids: [B*N, seq_len] duplicated
+                - attention_mask: [B*N, seq_len] duplicated
+                
+        For images at rotate_image_indices: apply N rotations
+        For images at duplicate_image_indices: duplicate N times (like input_ids)
         """
-        for k, v in vl_batch.items():
-            if isinstance(v, torch.Tensor):
-                print(k, v.shape, v.dtype, v.device)
         input_ids_batch = vl_batch["input_ids"]
         attn_mask_batch = vl_batch["attention_mask"]
         img_batch = vl_batch["pixel_values"]
-        B, C, H, W = img_batch.shape
         
-        # Create an expanded batch by repeating each image N times
-        # We need to ensure images and their rotations are grouped together
-        # [B, C, H, W] -> [B*N, C, H, W] where each block of N images contains all rotations of a single input
+        total_imgs, C, H, W = img_batch.shape
+        B = total_imgs // self.num_images_per_sample
         
-        # First, expand each image to N copies
-        # This creates [B, N, C, H, W] where each original image is repeated N times
-        expanded = img_batch.unsqueeze(1).expand(-1, self.n_group, -1, -1, -1)
+        # Reshape to [B, num_images_per_sample, C, H, W]
+        img_batch_reshaped = img_batch.reshape(B, self.num_images_per_sample, C, H, W)
         
-        # Reshape to [B*N, C, H, W]
-        img_batch_expanded = expanded.reshape(B*self.n_group, C, H, W)
-
-        # Now create the rotation matrices
-        # For each image block of N copies, we need to apply a different rotation to each copy
+        # Process each image index separately
+        processed_images = []
         
-        # Create pattern of indices for the N rotations, repeated for each image in the batch
-        # For B=2, N=3 this would be [0,1,2, 0,1,2]
-        rotation_indices = torch.arange(self.n_group, device=img_batch.device).repeat(B)
+        for img_idx in range(self.num_images_per_sample):
+            # Get all images at this index across the batch: [B, C, H, W]
+            imgs_at_idx = img_batch_reshaped[:, img_idx, :, :, :]
+            
+            if img_idx in self.rotate_image_indices:
+                # Apply rotations: [B, C, H, W] -> [B*N, C, H, W]
+                rotated = self._apply_rotations(imgs_at_idx)
+                processed_images.append(rotated)
+            else:
+                # Duplicate N times: [B, C, H, W] -> [B*N, C, H, W]
+                # Expand each image to N copies, keeping them grouped together
+                expanded = imgs_at_idx.unsqueeze(1).expand(-1, self.n_group, -1, -1, -1)
+                duplicated = expanded.reshape(B * self.n_group, C, H, W)
+                processed_images.append(duplicated)
         
-        # Use these indices to select the correct rotation matrix for each image
-        # [B*N, 2, 3]
-        rotation_matrices = self.rotation_matrices_buffer[rotation_indices]
+        # Stack processed images: [num_images_per_sample, B*N, C, H, W]
+        # Then rearrange to [B*N*num_images_per_sample, C, H, W]
+        # We want the order to be: [sample0_img0_rot0, sample0_img1_rot0, ..., sample0_img0_rot1, sample0_img1_rot1, ...]
+        # Which is: for each rotation, for each sample, all images
         
-        # Generate sampling grid for all rotations at once
-        grid = torch.nn.functional.affine_grid(
-            rotation_matrices, 
-            size=(B*self.n_group, C, H, W),
-            align_corners=True
-        )
+        # Current: each processed_images[i] has shape [B*N, C, H, W]
+        # where the order is [sample0_rot0, sample0_rot1, ..., sample0_rotN-1, sample1_rot0, ...]
         
-        # Apply all transformations in a single grid_sample operation
-        rotated_imgs = torch.nn.functional.grid_sample(
-            img_batch_expanded, 
-            grid, 
-            align_corners=True,
-            padding_mode='zeros'
-        )
+        # Reshape each to [B, N, C, H, W]
+        processed_images_reshaped = [img.reshape(B, self.n_group, C, H, W) for img in processed_images]
+        
+        # Stack along new dimension: [num_images_per_sample, B, N, C, H, W]
+        stacked = torch.stack(processed_images_reshaped, dim=0)
+        
+        # Rearrange to [B, N, num_images_per_sample, C, H, W]
+        stacked = stacked.permute(1, 2, 0, 3, 4, 5)
+        
+        # Final reshape to [B*N*num_images_per_sample, C, H, W]
+        rotated_imgs = stacked.reshape(B * self.n_group * self.num_images_per_sample, C, H, W)
+        
+        # Duplicate input_ids and attention_mask N times
         input_ids_batch_expanded = input_ids_batch.repeat((self.n_group, 1))
         attn_mask_batch_expanded = attn_mask_batch.repeat((self.n_group, 1))
         
@@ -216,6 +245,47 @@ class EagleBackboneFA(nn.Module):
         vl_batch["input_ids"] = input_ids_batch_expanded
         vl_batch["attention_mask"] = attn_mask_batch_expanded
         return vl_batch
+    
+    def _apply_rotations(self, img_batch):
+        """
+        Apply all N rotations to a batch of images.
+        
+        Args:
+            img_batch: [B, C, H, W] tensor
+            
+        Returns:
+            [B*N, C, H, W] tensor with each image rotated N times
+        """
+        B, C, H, W = img_batch.shape
+        
+        # Expand each image to N copies: [B, N, C, H, W]
+        expanded = img_batch.unsqueeze(1).expand(-1, self.n_group, -1, -1, -1)
+        
+        # Reshape to [B*N, C, H, W]
+        img_batch_expanded = expanded.reshape(B * self.n_group, C, H, W)
+        
+        # Create rotation indices: [0,1,2,...,N-1, 0,1,2,...,N-1, ...]
+        rotation_indices = torch.arange(self.n_group, device=img_batch.device).repeat(B)
+        
+        # Get rotation matrices: [B*N, 2, 3]
+        rotation_matrices = self.rotation_matrices_buffer[rotation_indices]
+        
+        # Generate sampling grid
+        grid = torch.nn.functional.affine_grid(
+            rotation_matrices, 
+            size=(B * self.n_group, C, H, W),
+            align_corners=True
+        )
+        
+        # Apply transformations
+        rotated_imgs = torch.nn.functional.grid_sample(
+            img_batch_expanded, 
+            grid, 
+            align_corners=True,
+            padding_mode='zeros'
+        )
+        
+        return rotated_imgs
 
     def forward_eagle(self, vl_input: BatchFeature) -> BatchFeature:
         eagle_prefix = "eagle_"

@@ -214,7 +214,11 @@ def main(config: ArgsConfig):
     data_action_horizon = len(data_config_cls.action_indices)
     data_num_hand = getattr(data_config_cls, "num_hand", 2)
     data_rot_type = getattr(data_config_cls, "rot_type", "quaternion")
-
+    
+    # Get rotation config for frame averaging backbone
+    rotation_config = data_config_cls.get_rotation_config() if hasattr(data_config_cls, "get_rotation_config") else None
+    print(rotation_config)
+    print(rotation_config.get("num_images_per_sample", 1), rotation_config.get("rotate_image_indices", None))
     # Load model
     model = GR00T_N1_5.from_pretrained(
         pretrained_model_name_or_path=config.base_model_path,
@@ -225,6 +229,37 @@ def main(config: ArgsConfig):
         load_backbone_only=True,  # load backbone only, not the action head
         
     )
+    
+    # Update backbone with rotation config if available (for frame averaging)
+    if rotation_config is not None:
+        num_images_per_sample = rotation_config.get("num_images_per_sample", 1)
+        rotate_image_indices = rotation_config.get("rotate_image_indices", None)
+        
+        # Check if backbone needs to be updated with rotation config
+        backbone_needs_update = (
+            model.backbone.num_images_per_sample != num_images_per_sample or
+            model.backbone.rotate_image_indices != rotate_image_indices
+        )
+        
+        if backbone_needs_update:
+            print(f"Updating backbone with rotation config: "
+                  f"num_images_per_sample={num_images_per_sample}, "
+                  f"rotate_image_indices={rotate_image_indices}")
+            
+            # Update backbone config
+            model.backbone.num_images_per_sample = num_images_per_sample
+            if rotate_image_indices is None:
+                model.backbone.rotate_image_indices = list(range(num_images_per_sample))
+            else:
+                model.backbone.rotate_image_indices = rotate_image_indices
+            model.backbone.duplicate_image_indices = [
+                i for i in range(num_images_per_sample) 
+                if i not in model.backbone.rotate_image_indices
+            ]
+            
+            # Update the model config for saving
+            model.config.backbone_cfg["num_images_per_sample"] = num_images_per_sample
+            model.config.backbone_cfg["rotate_image_indices"] = rotate_image_indices
 
     # Update action_horizon and num_hand to match data config
     # Need to recreate action head with correct config since it was initialized with old config

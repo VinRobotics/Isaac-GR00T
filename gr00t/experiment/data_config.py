@@ -37,6 +37,10 @@ from gr00t.model.transforms import GR00TTransform
 
 @dataclass
 class BaseDataConfig(ABC):
+    # Override these in subclasses to specify which video keys should be rotated
+    # If None, all video keys will be rotated (default behavior)
+    # If a list, only video keys in this list will be rotated, others will be duplicated
+    
     def modality_config(self) -> dict[str, ModalityConfig]:
         video_modality = ModalityConfig(
             delta_indices=self.observation_indices,
@@ -59,6 +63,31 @@ class BaseDataConfig(ABC):
             "state": state_modality,
             "action": action_modality,
             "language": language_modality,
+        }
+
+    def get_rotation_config(self) -> dict:
+        """
+        Returns configuration for image rotation in the backbone.
+        
+        Returns:
+            dict with:
+                - num_images_per_sample: number of video keys (images per sample)
+                - rotate_image_indices: list of indices for images that should be rotated
+        """
+        num_images = len(self.video_keys)
+        if self.rotate_video_keys is None:
+            # Rotate all images
+            rotate_indices = list(range(num_images))
+        else:
+            # Only rotate specified video keys
+            rotate_indices = [
+                i for i, key in enumerate(self.video_keys) 
+                if key in self.rotate_video_keys
+            ]
+        
+        return {
+            "num_images_per_sample": num_images,
+            "rotate_image_indices": rotate_indices,
         }
 
     @abstractmethod
@@ -1519,6 +1548,8 @@ class VRH3TwotHand1CamEquiConfig(BaseDataConfig):
     
 class EquiLiberoConfig(BaseDataConfig):
     video_keys = ["video.image", "video.wrist_image"]
+    # Only rotate exterior image, wrist image is duplicated (not rotated)
+    rotate_video_keys = ["video.image"]
     state_keys = [
         "state.x",
         "state.y",
