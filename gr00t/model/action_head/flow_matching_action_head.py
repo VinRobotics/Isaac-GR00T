@@ -358,6 +358,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
 
     vl_self_attention_cfg: dict = field(
         default_factory=lambda: {
+        "n_group": 4
         "attention_head_dim": 64,
         "dropout": 0.2,
         "final_dropout": True,
