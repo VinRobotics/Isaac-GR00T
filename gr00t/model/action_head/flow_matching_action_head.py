@@ -301,13 +301,15 @@ class MultiEmbodimentActionEncoder(nn.Module):
 class FlowmatchingActionHeadConfig(PretrainedConfig):
     """NOTE: N1.5 uses XEmbFlowmatchingPolicyHeadConfig as action head"""
 
+    n_group: int = field(
+        default=4, metadata={"help": "Number of groups for equivariant operations (cyclic group order)."}
+    )
     add_pos_embed: bool = field(
         default=True, metadata={"help": "Whether to add positional embedding"}
     )
     model_dtype: str = field(default="float32", metadata={"help": "Model data type."})
     diffusion_model_cfg: dict = field(
         default_factory=lambda: {
-            "n_group": 4,
             "attention_head_dim": 48,
             "cross_attention_dim": 2048,
             "dropout": 0.2,
@@ -317,7 +319,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
             "num_attention_heads": 32,
             "num_layers": 16,
             "output_dim": 1024,
-        }, metadata={"help": "Diffusion model configuration."}
+        }, metadata={"help": "Diffusion model configuration (n_group is injected from top-level)."}
     )
     input_embedding_dim: int = field(
         default=1536, metadata={"help": "Input embedding channel dimension."}
@@ -358,14 +360,13 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
 
     vl_self_attention_cfg: dict = field(
         default_factory=lambda: {
-        "n_group": 4,
         "attention_head_dim": 64,
         "dropout": 0.2,
         "final_dropout": True,
         "num_attention_heads": 32,
         "num_layers": 4,
         "positional_embeddings": None
-        }, metadata={"help": "Diffusion model configuration."}
+        }, metadata={"help": "VL self-attention configuration (n_group is injected from top-level)."}
     )
     num_target_vision_tokens: int = field(
         default=32, metadata={"help": "Number of target vision tokens."}
@@ -394,15 +395,16 @@ class FlowmatchingActionHead(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.n_group = 4
+        self.n_group = config.n_group
 
         self.num_hand = self.config.num_hand
 
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
-        # self.model = DiT(**config.diffusion_model_cfg)
-        self.model = EDiT(**config.diffusion_model_cfg)
+        # Inject n_group into diffusion model config
+        diffusion_cfg = {**config.diffusion_model_cfg, "n_group": self.n_group}
+        self.model = EDiT(**diffusion_cfg)
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
@@ -442,7 +444,9 @@ class FlowmatchingActionHead(nn.Module):
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
-        self.vl_self_attention = SelfAttentionTransformer(**config.vl_self_attention_cfg)
+        # Inject n_group into vl_self_attention config
+        vl_self_attention_cfg = {**config.vl_self_attention_cfg, "n_group": self.n_group}
+        self.vl_self_attention = SelfAttentionTransformer(**vl_self_attention_cfg)
         self.vlln = EquivariantLayerNorm(self.vl_self_attention.in_type)
         
 

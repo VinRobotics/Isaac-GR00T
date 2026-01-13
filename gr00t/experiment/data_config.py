@@ -1438,6 +1438,7 @@ class AlohaRightArmConfig(BaseDataConfig):
 
 class VRH3TwotHand1CamEquiConfig(BaseDataConfig):
     video_keys = ["video.cam_front"]
+    rotate_video_keys = ["video.cam_front"]
     state_keys = [
         "state.left_hand",
         "state.right_hand",
