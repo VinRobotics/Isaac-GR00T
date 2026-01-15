@@ -359,3 +359,150 @@ class GR00TTransform(InvertibleModalityTransform):
 
     def __call__(self, data: dict) -> dict:
         return self.apply(data)
+
+
+class GR00TTransformFA(GR00TTransform):
+    """
+    Frame Averaging version of GR00TTransform.
+    
+    Applies N rotations to images before VLM processing to enable 
+    equivariant frame averaging in the backbone.
+    
+    Based on the Frame Averaging paper:
+    Ψ(x) = (1/|G|) Σ_{g∈G} ρ_y(g) Φ(ρ_x(g)^{-1} x)
+    
+    For cyclic group C_N, we rotate images by multiples of 2π/N.
+    """
+    
+    n_group: int = Field(default=4, description="Number of rotations for frame averaging (C_N group)")
+    rotate_image_indices: Optional[List[int]] = Field(
+        default=None, 
+        description="Which image indices to rotate. None means rotate all."
+    )
+    
+    _rotation_angles: Optional[np.ndarray] = PrivateAttr(default=None)
+    
+    def model_post_init(self, __context):
+        """Initialize rotation angles after model creation."""
+        super().model_post_init(__context) if hasattr(super(), 'model_post_init') else None
+        # Precompute rotation angles: 0, 2π/N, 4π/N, ..., 2π(N-1)/N
+        self._rotation_angles = np.linspace(0, 2 * np.pi, self.n_group + 1)[:-1]
+    
+    def _rotate_image_np(self, image: np.ndarray, angle: float) -> np.ndarray:
+        """
+        Rotate a numpy image by the given angle (in radians).
+        
+        Args:
+            image: [C, H, W] numpy array
+            angle: rotation angle in radians (counter-clockwise)
+            
+        Returns:
+            Rotated image [C, H, W]
+        """
+        from scipy.ndimage import rotate as scipy_rotate
+        
+        if angle == 0:
+            return image
+        
+        # Convert angle to degrees for scipy
+        angle_deg = np.degrees(angle)
+        
+        # Rotate each channel - scipy expects [H, W] or [H, W, C]
+        # Our image is [C, H, W], so transpose, rotate, transpose back
+        image_hwc = np.transpose(image, (1, 2, 0))  # [H, W, C]
+        rotated_hwc = scipy_rotate(image_hwc, angle_deg, reshape=False, order=1, mode='constant', cval=0)
+        rotated = np.transpose(rotated_hwc, (2, 0, 1))  # [C, H, W]
+        
+        return rotated.astype(image.dtype)
+    
+    def _apply_vlm_processing(self, batch: dict) -> BatchFeature:
+        """
+        Apply VLM processing with frame averaging - creates N rotated versions of images.
+        
+        Args:
+            batch:
+                images: [V, T, C, H, W] - V views, T timesteps
+                language: str
+                
+        Returns:
+            eagle_content with N times more images (one set per rotation)
+        """
+        images = batch["images"]  # [V, T, C, H, W]
+        V, T, C, H, W = images.shape
+        
+        # Determine which image indices to rotate
+        num_images = V  # number of camera views
+        if self.rotate_image_indices is None:
+            rotate_indices = list(range(num_images))
+        else:
+            rotate_indices = self.rotate_image_indices
+        
+        # Rearrange to [T*V, C, H, W] for processing
+        np_images = rearrange(images, "v t c h w -> (t v) c h w")  # [T*V, C, H, W]
+        
+        # Ensure rotation angles are initialized
+        if self._rotation_angles is None:
+            self._rotation_angles = np.linspace(0, 2 * np.pi, self.n_group + 1)[:-1]
+        
+        # Create N rotated versions
+        all_rotated_images = []
+        for rot_idx, angle in enumerate(self._rotation_angles):
+            rotated_batch = []
+            for img_idx, img in enumerate(np_images):
+                # Determine the view index (img_idx % V gives the view for each timestep)
+                view_idx = img_idx % V
+                
+                if view_idx in rotate_indices:
+                    # Apply rotation (negative angle for inverse rotation ρ_x(g)^{-1})
+                    rotated_img = self._rotate_image_np(img, -angle)
+                else:
+                    # Don't rotate this view, just copy
+                    rotated_img = img.copy()
+                rotated_batch.append(rotated_img)
+            all_rotated_images.append(rotated_batch)
+        
+        # Handle language
+        lang = batch["language"]
+        if isinstance(lang, list):
+            lang = lang[0]
+        text_content = [{"type": "text", "text": lang}]
+        
+        # Create N separate conversations, one for each rotation
+        all_image_inputs = []
+        all_text_list = []
+        
+        for rot_idx in range(self.n_group):
+            rotated_batch = all_rotated_images[rot_idx]
+            
+            # Convert to PIL images
+            eagle_images = [Image.fromarray(np.transpose(v, (1, 2, 0))) for v in rotated_batch]
+            eagle_image = [{"type": "image", "image": img} for img in eagle_images]
+            
+            eagle_conversation = [
+                {
+                    "role": "user",
+                    "content": eagle_image + text_content,
+                }
+            ]
+            
+            text_list = [
+                self.eagle_processor.apply_chat_template(
+                    eagle_conversation, tokenize=False, add_generation_prompt=True
+                )
+            ]
+            
+            image_inputs, _ = self.eagle_processor.process_vision_info(eagle_conversation)
+            
+            all_image_inputs.extend(image_inputs)
+            all_text_list.extend(text_list)
+        
+        eagle_content = {
+            "image_inputs": all_image_inputs,
+            "video_inputs": None,
+            "text_list": all_text_list,
+            "n_group": self.n_group,  # Pass this so backbone knows how many rotations
+        }
+        
+        inputs = {}
+        inputs["eagle_content"] = eagle_content
+        return inputs

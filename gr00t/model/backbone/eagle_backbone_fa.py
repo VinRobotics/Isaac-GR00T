@@ -288,6 +288,12 @@ class EagleBackboneFA(nn.Module):
         return rotated_imgs
 
     def forward_eagle(self, vl_input: BatchFeature) -> BatchFeature:
+        """
+        Forward pass through Eagle model with frame averaging.
+        
+        Expects images to already be rotated by the transform (GR00TTransformFA).
+        Input has B*N samples where N is n_group rotations per original sample.
+        """
         eagle_prefix = "eagle_"
         eagle_input = {
             k.removeprefix(eagle_prefix): v
@@ -295,22 +301,31 @@ class EagleBackboneFA(nn.Module):
             if k.startswith(eagle_prefix)
         }
         del eagle_input["image_sizes"]
-        B, _ = eagle_input["input_ids"].shape
-        rotated_vl_input = self.rotate_rgb_batch(eagle_input)
         
-
-        eagle_output = self.eagle_model(**rotated_vl_input, output_hidden_states=True, return_dict=True)
+        # The input now has B*N samples (N rotations per original sample)
+        B_times_N, seq_len = eagle_input["input_ids"].shape
+        B = B_times_N // self.n_group
+        
+        # Images are already rotated by GR00TTransformFA, no need to rotate here
+        # Just forward through the Eagle model
+        eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
         eagle_features = eagle_output.hidden_states[self.select_layer]
 
         eagle_features = self.eagle_linear(eagle_features)
+        
+        # Rearrange from [B*N, T, D] to [B*T, N, D] for frame averaging
         eagle_features = einops.rearrange(eagle_features, "(b n) t d -> (b t) n d", b=B, n=self.n_group)
 
         Bt, _, _ = eagle_features.shape
         
         avg_feature = self._apply_frame_averaging(eagle_features, Bt)
         avg_feature = einops.rearrange(avg_feature, "(b t) d -> b t d", b=B,)
+        
+        # Get the attention mask from the first rotation (they should all be the same)
+        # Original mask shape is [B*N, seq_len], we need [B, seq_len]
+        original_attention_mask = eagle_input["attention_mask"][:B]
 
-        return avg_feature, eagle_input["attention_mask"]
+        return avg_feature, original_attention_mask
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
@@ -338,20 +353,36 @@ class EagleBackboneFA(nn.Module):
         Apply frame averaging to features using permutation matrices.
         
         Args:
-            features: Tensor of shape [B, N, feature_dim]
-            batch_size: Batch size
+            features: Tensor of shape [B, N, feature_dim] where N is n_group
+            batch_size: Batch size (B)
             
         Returns:
             Tensor of shape [B, feature_dim] with frame averaging applied
         """
-        # Regular representation - use permutation matrices
+        # features shape: [B, N, feature_dim]
         feature_dim = features.shape[2]
         blocks = feature_dim // self.n_group
+        
+        # Reshape: [B, N, blocks, N] - each feature vector is split into blocks of size N
         features = features.reshape(batch_size, self.n_group, blocks, self.n_group)
-
-        all_features_flat = features.reshape(-1, blocks, self.n_group)
-        selected_perm_matrices = self.selected_perm_matrices_template.repeat(batch_size, 1, 1)
+        
+        # For each rotation r, apply permutation matrix P_r to align the output
+        # all_features_flat: [B*N, blocks, N]
+        all_features_flat = features.reshape(batch_size * self.n_group, blocks, self.n_group)
+        
+        # selected_perm_matrices needs shape [B*N, N, N]
+        # Repeat the template for each batch element
+        selected_perm_matrices = self.selected_perm_matrices_template.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        selected_perm_matrices = selected_perm_matrices.reshape(batch_size * self.n_group, self.n_group, self.n_group)
+        
+        # Apply permutation: [B*N, blocks, N] @ [B*N, N, N] -> [B*N, blocks, N]
         aligned_features_flat = torch.bmm(all_features_flat, selected_perm_matrices)
+        
+        # Reshape back: [B, N, blocks, N]
         aligned_features = aligned_features_flat.reshape(batch_size, self.n_group, blocks, self.n_group)
-        avg_features = torch.mean(aligned_features, dim=1)  # [B, blocks, N]
+        
+        
+        # Average over the group dimension: [B, blocks, N]
+        avg_features = torch.mean(aligned_features, dim=1)
+        
         return avg_features.reshape(batch_size, blocks * self.n_group)
