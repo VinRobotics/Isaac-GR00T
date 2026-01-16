@@ -155,6 +155,19 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+    # Improved architecture options for large-scale training
+    use_deep_encoder: bool = False
+    """Use deeper encoder/decoder with residual connections. Recommended for large-scale datasets."""
+
+    encoder_num_layers: int = 3
+    """Number of layers in deep encoder/decoder. Only used if use_deep_encoder=True."""
+
+    encoder_dropout: float = 0.1
+    """Dropout rate in encoder/decoder. Only used if use_deep_encoder=True."""
+
+    use_state_vl_fusion: bool = False
+    """Use cross-attention to fuse state features with VL features before DiT."""
+
 #####################################################################################
 # main training function
 #####################################################################################
@@ -245,6 +258,17 @@ def main(config: ArgsConfig):
         new_action_head_config.action_horizon = data_action_horizon
         new_action_head_config.num_hand = data_num_hand
         new_action_head_config.rot_type = data_rot_type
+        
+        # Apply improved architecture options for large-scale training
+        new_action_head_config.use_deep_encoder = config.use_deep_encoder
+        new_action_head_config.encoder_num_layers = config.encoder_num_layers
+        new_action_head_config.encoder_dropout = config.encoder_dropout
+        new_action_head_config.use_state_vl_fusion = config.use_state_vl_fusion
+        
+        if config.use_deep_encoder:
+            print(f"Using DEEP equivariant encoder with {config.encoder_num_layers} layers, dropout={config.encoder_dropout}")
+        if config.use_state_vl_fusion:
+            print("Using State-VL fusion with cross-attention")
 
         # Import the FlowmatchingActionHead class
         from gr00t.model.action_head.flow_matching_action_head import (
@@ -266,6 +290,10 @@ def main(config: ArgsConfig):
         model.config.action_head_cfg["num_hand"] = new_action_head_config.num_hand
         model.config.action_head_cfg["rot_type"] = new_action_head_config.rot_type
         model.config.action_head_cfg["action_horizon"] = data_action_horizon
+        model.config.action_head_cfg["use_deep_encoder"] = config.use_deep_encoder
+        model.config.action_head_cfg["encoder_num_layers"] = config.encoder_num_layers
+        model.config.action_head_cfg["encoder_dropout"] = config.encoder_dropout
+        model.config.action_head_cfg["use_state_vl_fusion"] = config.use_state_vl_fusion
 
         # Set trainable parameters for the new action head
         model.action_head.set_trainable_parameters(

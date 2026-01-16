@@ -42,6 +42,12 @@ from gr00t.model.action_head.action_encoder import (
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
 from .equivariant_cross_attention_dit import EDiT
+from .improved_equivariant_modules import (
+    DeepEquiCategorySpecificMLP,
+    ImprovedMultiEmbodimentActionEncoder,
+    ImprovedActionDecoder,
+    StateFeatureFusion,
+)
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -368,6 +374,20 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     rot_type: str = field(
         default="quaternion", metadata={"help": "Define rot type: quaternion, euler_angles"}
     )
+    
+    # New options for improved architecture
+    use_deep_encoder: bool = field(
+        default=False, metadata={"help": "Use deeper encoder/decoder with residual connections for large-scale training."}
+    )
+    encoder_num_layers: int = field(
+        default=3, metadata={"help": "Number of layers in deep encoder/decoder. Only used if use_deep_encoder=True."}
+    )
+    encoder_dropout: float = field(
+        default=0.1, metadata={"help": "Dropout rate in encoder/decoder. Only used if use_deep_encoder=True."}
+    )
+    use_state_vl_fusion: bool = field(
+        default=False, metadata={"help": "Use cross-attention to fuse state features with VL features before DiT."}
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -407,28 +427,76 @@ class FlowmatchingActionHead(nn.Module):
         self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
         self.eulerangle_to_sixd = RotationTransformer('euler_angles', 'rotation_6d', from_convention="ZYX")
 
-        self.state_encoder = EquiCategorySpecificMLP(
-            num_categories=config.max_num_embodiments,
-            in_type=self.state_in_type,
-            hidden_type=self.state_hidden_type,
-            out_type=self.state_out_type,
-        )
+        # Use improved deep encoder/decoder for large-scale training
+        use_deep = getattr(config, 'use_deep_encoder', False)
+        encoder_layers = getattr(config, 'encoder_num_layers', 3)
+        encoder_dropout = getattr(config, 'encoder_dropout', 0.1)
+        
+        if use_deep:
+            print(f"Using DEEP equivariant encoder/decoder with {encoder_layers} layers, dropout={encoder_dropout}")
+            self.state_encoder = DeepEquiCategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                in_type=self.state_in_type,
+                hidden_type=self.state_hidden_type,
+                out_type=self.state_out_type,
+                num_layers=encoder_layers,
+                use_gating=True,
+                dropout=encoder_dropout,
+            )
+        else:
+            self.state_encoder = EquiCategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                in_type=self.state_in_type,
+                hidden_type=self.state_hidden_type,
+                out_type=self.state_out_type,
+            )
         
         self.action_type = self.getJointFieldType(is_action=True)
         self.action_out_type = enn.FieldType(self.group, int(self.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         
-        self.action_encoder = MultiEmbodimentActionEncoder(
-            in_type=self.action_type,
-            out_type=self.action_out_type,
-            num_embodiments=config.max_num_embodiments,
-        )
+        if use_deep:
+            self.action_encoder = ImprovedMultiEmbodimentActionEncoder(
+                in_type=self.action_type,
+                out_type=self.action_out_type,
+                num_embodiments=config.max_num_embodiments,
+                num_layers=encoder_layers,
+                dropout=encoder_dropout,
+            )
+            
+            self.action_decoder = ImprovedActionDecoder(
+                num_categories=config.max_num_embodiments,
+                in_type=self.state_hidden_type,
+                hidden_type=self.state_hidden_type,
+                out_type=self.action_type,
+                num_layers=encoder_layers,
+                dropout=encoder_dropout,
+            )
+        else:
+            self.action_encoder = MultiEmbodimentActionEncoder(
+                in_type=self.action_type,
+                out_type=self.action_out_type,
+                num_embodiments=config.max_num_embodiments,
+            )
+            
+            self.action_decoder = EquiCategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                in_type=self.state_hidden_type,
+                hidden_type=self.state_hidden_type,
+                out_type=self.action_type,
+            )
         
-        self.action_decoder = EquiCategorySpecificMLP(
-            num_categories=config.max_num_embodiments,
-            in_type=self.state_hidden_type,
-            hidden_type=self.state_hidden_type,
-            out_type=self.action_type,
-        )
+        # Optional: State-VL fusion before DiT
+        use_fusion = getattr(config, 'use_state_vl_fusion', False)
+        if use_fusion:
+            print("Using State-VL fusion with cross-attention")
+            self.state_vl_fusion = StateFeatureFusion(
+                state_type=self.state_out_type,
+                vl_dim=config.backbone_embedding_dim,
+                num_heads=8,
+                dropout=encoder_dropout,
+            )
+        else:
+            self.state_vl_fusion = None
         
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
@@ -709,6 +777,13 @@ class FlowmatchingActionHead(nn.Module):
         B, T, _ = action_input.state.shape
         state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
         state_features = self.state_encoder(state_input, embodiment_id)
+        
+        # Optional: Fuse state features with VL features using cross-attention
+        if self.state_vl_fusion is not None:
+            state_features = self.state_vl_fusion(
+                state_features, vl_embs, batch_size=B, seq_len=T
+            )
+        
         state_features = state_features.tensor
         state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=B, t=T)
         
@@ -829,6 +904,13 @@ class FlowmatchingActionHead(nn.Module):
         B, T, _ = action_input.state.shape
         state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
         state_features = self.state_encoder(state_input, embodiment_id)
+        
+        # Optional: Fuse state features with VL features using cross-attention
+        if self.state_vl_fusion is not None:
+            state_features = self.state_vl_fusion(
+                state_features, vl_embs, batch_size=B, seq_len=T
+            )
+        
         state_features = state_features.tensor
         state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=B, t=T)
 
