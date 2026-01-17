@@ -442,6 +442,7 @@ class FlowmatchingActionHead(nn.Module):
                 num_layers=encoder_layers,
                 use_gating=True,
                 dropout=encoder_dropout,
+                use_input_norm=False
             )
         else:
             self.state_encoder = EquiCategorySpecificMLP(

@@ -148,6 +148,8 @@ class DeepEquiCategorySpecificMLP(nn.Module):
         num_layers: int = 3,  # Deeper than original 2-layer
         use_gating: bool = True,
         dropout: float = 0.1,
+        use_input_norm = True,
+        use_output_norm = True,
     ):
         super().__init__()
         self.in_type = in_type
@@ -181,9 +183,16 @@ class DeepEquiCategorySpecificMLP(nn.Module):
             
             self.category_layers.append(layers)
         
-        # Normalization
+        # 
+        self.use_input_norm = use_input_norm
+        if self.use_input_norm:
+            self.input_norm = EquivariantLayerNorm(in_type, affine=False)
+        
         self.hidden_norm = EquivariantLayerNorm(hidden_type, affine=False)
-        self.output_norm = EquivariantLayerNorm(out_type, affine=False)
+        
+        self.use_output_norm = use_output_norm
+        if self.use_output_norm:
+            self.output_norm = EquivariantLayerNorm(out_type, affine=False)
         
         # Input-to-output skip connection (if dimensions match)
         if in_type.size == out_type.size:
@@ -248,7 +257,8 @@ class DeepEquiCategorySpecificMLP(nn.Module):
         
         # Final normalization
         out_geo = enn.GeometricTensor(out_tensor, self.out_type)
-        out_geo = self.output_norm(out_geo)
+        if self.use_output_norm:
+            out_geo = self.output_norm(out_geo)
         
         return out_geo
 
@@ -288,6 +298,7 @@ class ImprovedMultiEmbodimentActionEncoder(nn.Module):
             num_layers=num_layers,
             use_gating=True,
             dropout=dropout,
+            use_input_norm=False,
         )
         
         # FiLM conditioning from timestep
@@ -366,6 +377,7 @@ class ImprovedActionDecoder(nn.Module):
             num_layers=num_layers,
             use_gating=True,
             dropout=dropout,
+            use_output_norm=False
         )
         
         # Refinement head (additional 1-layer refinement)
