@@ -383,7 +383,7 @@ class ImprovedActionDecoder(nn.Module):
         
         # Refinement head (additional 1-layer refinement)
         self.refine = enn.Linear(out_type, out_type, bias=True)
-        self.refine_norm = EquivariantLayerNorm(out_type, affine=False)
+        # self.refine_norm = EquivariantLayerNorm(out_type, affine=False)
     
     def forward(self, x: enn.GeometricTensor, cat_ids) -> enn.GeometricTensor:
         # Main decoding
@@ -391,7 +391,7 @@ class ImprovedActionDecoder(nn.Module):
         
         # Refinement with residual
         refined = self.refine(decoded)
-        refined = self.refine_norm(refined)
+        # refined = self.refine_norm(refined)
         
         # Residual connection
         out_tensor = decoded.tensor + refined.tensor * 0.1
