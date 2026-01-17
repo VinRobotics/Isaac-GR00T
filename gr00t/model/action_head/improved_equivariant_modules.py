@@ -211,13 +211,14 @@ class DeepEquiCategorySpecificMLP(nn.Module):
     def forward(self, x: enn.GeometricTensor, cat_ids) -> enn.GeometricTensor:
         B = x.tensor.shape[0]
         device = x.tensor.device
-        
+        # Normalize input
+        x_normed = self.input_norm(x) if self.use_input_norm else x
         all_outputs = []
         all_indices = []
         groups = self._group_indices(cat_ids)
         
         for cat, idx in groups.items():
-            xb = x.tensor[idx]
+            xb = x_normed.tensor[idx]
             x_skip = x.tensor[idx]  # For skip connection
             
             geom_xb = enn.GeometricTensor(xb, self.in_type)
