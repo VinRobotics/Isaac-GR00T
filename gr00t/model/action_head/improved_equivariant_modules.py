@@ -182,7 +182,6 @@ class DeepEquiCategorySpecificMLP(nn.Module):
             self.category_layers.append(layers)
         
         # Normalization
-        self.input_norm = EquivariantLayerNorm(in_type, affine=False)
         self.hidden_norm = EquivariantLayerNorm(hidden_type, affine=False)
         self.output_norm = EquivariantLayerNorm(out_type, affine=False)
         
@@ -204,15 +203,12 @@ class DeepEquiCategorySpecificMLP(nn.Module):
         B = x.tensor.shape[0]
         device = x.tensor.device
         
-        # Normalize input
-        x_normed = self.input_norm(x)
-        
         all_outputs = []
         all_indices = []
         groups = self._group_indices(cat_ids)
         
         for cat, idx in groups.items():
-            xb = x_normed.tensor[idx]
+            xb = x.tensor[idx]
             x_skip = x.tensor[idx]  # For skip connection
             
             geom_xb = enn.GeometricTensor(xb, self.in_type)
