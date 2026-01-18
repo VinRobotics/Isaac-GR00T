@@ -374,7 +374,7 @@ class GR00TTransformFA(GR00TTransform):
     For cyclic group C_N, we rotate images by multiples of 2π/N.
     """
     
-    n_group: int = Field(default=4, description="Number of rotations for frame averaging (C_N group)")
+    n_group: int = Field(default=8, description="Number of rotations for frame averaging (C_N group)")
     rotate_image_indices: Optional[List[int]] = Field(
         default=None, 
         description="Which image indices to rotate. None means rotate all."
@@ -388,6 +388,46 @@ class GR00TTransformFA(GR00TTransform):
         # Precompute rotation angles: 0, 2π/N, 4π/N, ..., 2π(N-1)/N
         self._rotation_angles = np.linspace(0, 2 * np.pi, self.n_group + 1)[:-1]
     
+    def _get_rotation_descriptors(self) -> List[str]:
+        """
+        Generate rotation-invariant language descriptors for symmetric conditioning.
+        
+        These descriptors help the model maintain focus on the language task while
+        being aware of the viewpoint rotation. The descriptors are designed to be:
+        1. Rotation-invariant (describe relative viewpoint, not absolute)
+        2. Consistent across training (same angle always gets same descriptor)
+        3. Natural language that the VLM can understand
+        
+        Returns:
+            List of N descriptor strings, one for each rotation angle
+        """
+        descriptors = []
+        for rot_idx in range(self.n_group):
+            angle_deg = int(360 * rot_idx / self.n_group)
+            
+            if rot_idx == 0:
+                # Original viewpoint
+                desc = "Observed from the original viewpoint."
+            elif self.n_group == 4:
+                # Cardinal directions for C4 group
+                cardinal = ["original viewpoint", "90 degrees rotated view", 
+                           "180 degrees rotated view", "270 degrees rotated view"]
+                desc = f"Observed from {cardinal[rot_idx]}."
+            elif self.n_group == 8:
+                # 8 directions for C8 group
+                directions = ["original viewpoint", "45 degrees rotated view",
+                             "90 degrees rotated view", "135 degrees rotated view",
+                             "180 degrees rotated view", "225 degrees rotated view",
+                             "270 degrees rotated view", "315 degrees rotated view"]
+                desc = f"Observed from {directions[rot_idx]}."
+            else:
+                # Generic description for other group sizes
+                desc = f"Observed from a {angle_deg} degree rotated viewpoint."
+            
+            descriptors.append(desc)
+        
+        return descriptors
+
     def _rotate_image_np(self, image: np.ndarray, angle: float) -> np.ndarray:
         """
         Rotate a numpy image by the given angle (in radians).
@@ -465,13 +505,20 @@ class GR00TTransformFA(GR00TTransform):
         lang = batch["language"]
         if isinstance(lang, list):
             lang = lang[0]
-        text_content = [{"type": "text", "text": lang}]
         
         # Create N separate conversations, one for each rotation
         all_image_inputs = []
         all_text_list = []
         
+        # Rotation-invariant language descriptors for symmetric conditioning
+        # This helps the model maintain focus on the language task while being rotation-aware
+        rotation_descriptors = self._get_rotation_descriptors()
+        
         for rot_idx in range(self.n_group):
+            # Symmetric language conditioning: append rotation-invariant text descriptors
+            rotation_desc = rotation_descriptors[rot_idx]
+            text_content = [{"type": "text", "text": f"Execute task: {lang}. {rotation_desc}"}]
+            
             rotated_batch = all_rotated_images[rot_idx]
             
             # Convert to PIL images
@@ -484,7 +531,6 @@ class GR00TTransformFA(GR00TTransform):
                     "content": eagle_image + text_content,
                 }
             ]
-            
             text_list = [
                 self.eagle_processor.apply_chat_template(
                     eagle_conversation, tokenize=False, add_generation_prompt=True

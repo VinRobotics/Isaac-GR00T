@@ -72,7 +72,7 @@ class EagleBackboneFA(nn.Module):
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
         
         # Frame Average
-        self.n_group = 4 # hardcode
+        self.n_group = 8 # hardcode
         self.group = gspaces.no_base_space(CyclicGroup(self.n_group))
         self.init_rotation_matrices()
         
