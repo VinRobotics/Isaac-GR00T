@@ -672,14 +672,14 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
-        backbone_features = backbone_output["backbone_features"]
+        backbone_features = backbone_output.backbone_features
         B, T, D = backbone_features.shape
         backbone_features = einops.rearrange(backbone_features, "b t d -> (b t) d")
         backbone_features = enn.GeometricTensor(backbone_features, self.vl_self_attention.in_type)
         backbone_features = self.vlln(backbone_features).tensor
         backbone_features = einops.rearrange(backbone_features, "(b t) d -> b t d", b = B, t = T)
         backbone_features = self.vl_self_attention(backbone_features)
-        backbone_output["backbone_features"] = backbone_features
+        backbone_output.data["backbone_features"] = backbone_features
         return backbone_output
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
@@ -750,24 +750,6 @@ class FlowmatchingActionHead(nn.Module):
             b=actions_gt.shape[0],
             t=actions_gt.shape[1]
         )
-
-        # # Maybe add position embedding.
-        # if self.config.add_pos_embed:
-        #     pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-        #     pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-        #     action_features = action_features + pos_embs
-
-        # Join vision, language, state and action embedding along sequence dimension.
-        # future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-        
-        # future_tokens = einops.rearrange(
-        #     future_tokens, "b t d -> (b t) d"
-        # )
-        # future_tokens = enn.GeometricTensor(future_tokens, self.future_tokens_in_type)
-        # future_tokens = self.future_tokens_equi_proj(future_tokens)
-        # future_tokens = einops.rearrange(
-        #     future_tokens.tensor, "(b t) d -> b t d", b = B, t = self.config.num_target_vision_tokens
-        # )
         
         sa_embs = torch.cat((state_features, action_features), dim=1)
         B, T, C = sa_embs.shape
