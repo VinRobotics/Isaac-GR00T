@@ -449,6 +449,17 @@ class FlowmatchingActionHead(nn.Module):
         self.vl_self_attention = SelfAttentionTransformer(**vl_self_attention_cfg)
         self.vlln = EquivariantLayerNorm(self.vl_self_attention.in_type)
         
+        # Learnable projection from VLM features to regular representation
+        # This is placed in action head (instead of backbone) because backbone is typically frozen
+        # It learns to map VLM features to regular repr structure for frame averaging
+        # Output dim must match vl_self_attention.inner_dim (num_attention_heads * attention_head_dim)
+        vl_inner_dim = self.vl_self_attention.inner_dim  # e.g., 32 * 64 = 2048
+        self.regular_repr_blocks = vl_inner_dim // self.n_group  # e.g., 2048 / 8 = 256 blocks
+        self.to_regular_repr = nn.Linear(config.backbone_embedding_dim, vl_inner_dim)
+        
+        # Permutation matrices for frame averaging (if FA backbone is used)
+        self._init_permutation_matrices()
+        
 
         if config.add_pos_embed:
             self.position_embedding = nn.Embedding(config.max_seq_len, self.input_embedding_dim)
@@ -595,7 +606,98 @@ class FlowmatchingActionHead(nn.Module):
         else:
             return self.eulerangle_to_sixd.inverse(rot_6d)
 
+    def _init_permutation_matrices(self):
+        """
+        Initialize permutation matrices for frame averaging.
+        These are used to align features from different rotations before averaging.
+        """
+        import math
+        
+        # Permutation matrices for cyclic group C_n
+        # P_r[i,j] = 1 if j = (i + r) mod n, else 0
+        permutation_matrices = torch.zeros(self.n_group, self.n_group, self.n_group)
+        for r in range(self.n_group):
+            for i in range(self.n_group):
+                j = (i + r) % self.n_group
+                permutation_matrices[r, i, j] = 1.0
+        
+        # Register as buffer (not trainable, but moves with model to GPU)
+        self.register_buffer("permutation_matrices", permutation_matrices)
+        
+        # Pre-compute the flattened permutation matrices for batch operations
+        perm_matrices_flat = permutation_matrices.reshape(self.n_group, -1)
+        self.register_buffer("perm_matrices_flat", perm_matrices_flat)
+        
+        # Pre-compute indices template
+        indices_template = torch.arange(self.n_group)
+        self.register_buffer("indices_template", indices_template)
+        
+        # Pre-compute the selected permutation matrices template
+        selected_perm_matrices_template = perm_matrices_flat[indices_template].reshape(
+            self.n_group, self.n_group, self.n_group
+        )
+        self.register_buffer("selected_perm_matrices_template", selected_perm_matrices_template)
 
+    def apply_frame_averaging_with_projection(self, features):
+        """
+        Apply full frame averaging with learned projection to regular representation.
+        
+        Frame Averaging formula: Ψ(x) = (1/|G|) Σ_{g∈G} ρ_y(g) Φ(ρ_x(g)^{-1} x)
+        
+        The backbone now outputs all N rotations (NOT averaged), and this method:
+        1. Projects each rotation's features to regular representation structure
+        2. Applies permutation matrices ρ_y(g) to align the regular repr blocks
+        3. Averages over the group to produce equivariant output
+        
+        Args:
+            features: [B, N, T, D] - backbone features for all N rotations
+                     where N = n_group (e.g., 8 for C8)
+            
+        Returns:
+            [B, T, D_out] - frame-averaged features with proper equivariant structure
+                           D_out = vl_inner_dim (matches vl_self_attention.in_type)
+        """
+        B, N, T, D = features.shape
+        assert N == self.n_group, f"Expected N={self.n_group} rotations, got {N}"
+        
+        # Step 1: Project each rotation's features to regular representation
+        # features: [B, N, T, D] -> [B*N*T, D] -> [B*N*T, vl_inner_dim] -> [B, N, T, blocks, N]
+        features_flat = features.reshape(B * N * T, D)
+        projected = self.to_regular_repr(features_flat)  # [B*N*T, vl_inner_dim]
+        projected = projected.reshape(B, N, T, self.regular_repr_blocks, self.n_group)
+        
+        # Step 2: Apply permutation matrices ρ_y(g) for each rotation g
+        # For rotation r, apply P_r to each regular repr block
+        # P_r permutes indices by: new_idx = (old_idx - r) % N  (for inverse action)
+        # This aligns all rotated features to the same reference frame
+        
+        # permutation_matrices: [N, N, N] - one NxN permutation matrix per rotation
+        # We need to apply P_r to the last dimension for each rotation r
+        
+        averaged_features = []
+        for r in range(self.n_group):
+            # Get features for rotation r: [B, T, blocks, N]
+            feat_r = projected[:, r, :, :, :]  # [B, T, blocks, N]
+            
+            # Apply permutation matrix P_r to align to canonical frame
+            # P_r: [N, N] permutation matrix
+            P_r = self.permutation_matrices[r]  # [N, N]
+            
+            # Apply permutation: feat_r @ P_r^T (permute last dim)
+            # feat_r: [B, T, blocks, N], P_r: [N, N] -> result: [B, T, blocks, N]
+            feat_r_permuted = torch.einsum('btbn,mn->btbm', feat_r, P_r)
+            
+            averaged_features.append(feat_r_permuted)
+        
+        # Step 3: Average over the group
+        # Stack: [N, B, T, blocks, N] -> mean over first dim -> [B, T, blocks, N]
+        stacked = torch.stack(averaged_features, dim=0)  # [N, B, T, blocks, N]
+        averaged = stacked.mean(dim=0)  # [B, T, blocks, N]
+        
+        # Reshape to final output: [B, T, vl_inner_dim]
+        output = averaged.reshape(B, T, self.regular_repr_blocks * self.n_group)
+        
+        return output
 
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
@@ -637,8 +739,8 @@ class FlowmatchingActionHead(nn.Module):
         # Filter out old state_encoder weights that don't match the new ESCNN architecture
         filtered_state_dict = {}
         for key, value in state_dict.items():
-            # Skip old-style state_encoder weights
-            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key or "vlln" in key or "vl_self_attention" in key:
+            # Skip old-style state_encoder weights and new FA-specific weights not in old checkpoints
+            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key or "vlln" in key or "vl_self_attention" in key or "to_regular_repr" in key or "permutation_matrices" in key or "perm_matrices_flat" in key or "indices_template" in key or "selected_perm_matrices_template" in key:
                 print(f"Skipping incompatible state_encoder weight: {key}")
                 continue
             filtered_state_dict[key] = value
@@ -673,7 +775,15 @@ class FlowmatchingActionHead(nn.Module):
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output.backbone_features
-        B, T, D = backbone_features.shape
+
+        # FA backbone output: [B, N, T, D] - all N rotations
+        B, N, T, D = backbone_features.shape
+        
+        # Apply full frame averaging with projection and permutation
+        # This implements: Ψ(x) = (1/|G|) Σ_{g∈G} ρ_y(g) Φ(ρ_x(g)^{-1} x)
+        backbone_features = self.apply_frame_averaging_with_projection(backbone_features)
+        # Now backbone_features: [B, T, D_out] where D_out = num_regular_blocks * N
+
         backbone_features = einops.rearrange(backbone_features, "b t d -> (b t) d")
         backbone_features = enn.GeometricTensor(backbone_features, self.vl_self_attention.in_type)
         backbone_features = self.vlln(backbone_features).tensor
