@@ -1550,7 +1550,7 @@ class VRH3TwotHand1CamEquiConfig(BaseDataConfig):
 class EquiLiberoConfig(BaseDataConfig):
     video_keys = ["video.image", "video.wrist_image"]
     # Only rotate exterior image, wrist image is duplicated (not rotated)
-    rotate_video_keys = ["video.image"]
+    rotate_video_keys = ["video.image", "video.wrist_image"]
     state_keys = [
         "state.x",
         "state.y",
@@ -1655,7 +1655,7 @@ class EquiLiberoConfig(BaseDataConfig):
                 max_action_dim=32,
                 num_hand=self.num_hand,
                 n_group=8,  # C4 group (90 degree rotations)
-                rotate_image_indices=[0],  # Only rotate exterior image (index 0)
+                rotate_image_indices=[0, 1],  # Only rotate exterior image (index 0)
             ),
         ]
 
