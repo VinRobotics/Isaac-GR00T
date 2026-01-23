@@ -684,8 +684,8 @@ class FlowmatchingActionHead(nn.Module):
             P_r = self.permutation_matrices[r]  # [N, N]
             
             # Apply permutation: feat_r @ P_r^T (permute last dim)
-            # feat_r: [B, T, blocks, N], P_r: [N, N] -> result: [B, T, blocks, N]
-            feat_r_permuted = torch.einsum('btbn,mn->btbm', feat_r, P_r)
+            # feat_r: [B, T, blocks, N] (b,t,k,n), P_r: [N, N] (m,n) -> result: [B, T, blocks, N] (b,t,k,m)
+            feat_r_permuted = torch.einsum('btkn,mn->btkm', feat_r, P_r)
             
             averaged_features.append(feat_r_permuted)
         
