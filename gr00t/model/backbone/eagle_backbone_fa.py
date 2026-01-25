@@ -92,12 +92,17 @@ class EagleBackboneFA(nn.Module):
         
     def init_rotation_matrices(self):
         # Precompute rotation matrices for grid_sample
+        # IMPORTANT: Use POSITIVE angles to match ESCNN's counter-clockwise rotation convention
+        # ESCNN's irrep(1) for CyclicGroup(N) rotates vectors counter-clockwise by 2π*r/N for element r
+        # So we must rotate images counter-clockwise as well for equivariance to hold
         angles = torch.linspace(0, 2 * math.pi, self.n_group+1)[:-1]  # N angles from 0 to 2π
         self.rotation_matrices = torch.zeros(self.n_group, 2, 3)
 
         for i, angle in enumerate(angles):
-            cos_val = math.cos(-angle.item())
-            sin_val = math.sin(-angle.item())
+            # Use POSITIVE angle for counter-clockwise rotation (matching ESCNN)
+            # Previously used -angle which caused clockwise rotation - WRONG!
+            cos_val = math.cos(angle.item())
+            sin_val = math.sin(angle.item())
             
             self.rotation_matrices[i, 0, 0] = cos_val
             self.rotation_matrices[i, 0, 1] = -sin_val
