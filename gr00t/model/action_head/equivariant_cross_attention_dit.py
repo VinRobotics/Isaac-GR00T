@@ -44,8 +44,15 @@ from .equivariant_activation import (
 
 class EquivariantLayerNorm(nn.Module):
     """
-    Equivariant Layer Normalization that rearranges (B*T, D*G) to (B*T, G, D),
-    applies layer norm, then converts back to (B*T, D*G).
+    Equivariant Layer Normalization for regular representations.
+    
+    ESCNN memory layout for regular repr: (num_blocks, G) where G is group size.
+    Example with 2 blocks of C4: [b0_g0, b0_g1, b0_g2, b0_g3, b1_g0, b1_g1, b1_g2, b1_g3]
+    
+    Rotation PERMUTES within each block (across the G dimension).
+    For equivariance, we normalize within each block (across G), making statistics invariant.
+    
+    Shape: (B*T, num_blocks*G) -> reshape to (B*T, num_blocks, G) -> normalize over G -> reshape back
     """
     def __init__(self, field_type: enn.FieldType, affine=False, eps=1e-5):
         super().__init__()
@@ -56,39 +63,43 @@ class EquivariantLayerNorm(nn.Module):
         # Get the group size
         self.group_size = field_type.gspace.fibergroup.order()
         
-        # Get the total dimension (D * G)
+        # Get the total dimension (num_blocks * G)
         self.total_dim = field_type.size
         
-        # Calculate D (dimension per group element)
+        # Calculate num_blocks (number of regular repr copies)
         assert self.total_dim % self.group_size == 0, \
             f"Total dimension {self.total_dim} must be divisible by group size {self.group_size}"
-        self.dim_per_group = self.total_dim // self.group_size
+        self.num_blocks = self.total_dim // self.group_size
         
-        # LayerNorm is applied on the last dimension (D)
+        # LayerNorm is applied on the G dimension (last dimension after reshape)
+        # This makes the normalization equivariant because rotation permutes within each block
+        # and normalizing over the permuted dimension gives invariant statistics
         if self.affine:
-            self.layer_norm = nn.LayerNorm(self.dim_per_group, eps=eps, elementwise_affine=True)
+            self.layer_norm = nn.LayerNorm(self.group_size, eps=eps, elementwise_affine=True)
         else:
-            self.layer_norm = nn.LayerNorm(self.dim_per_group, eps=eps, elementwise_affine=False)
+            self.layer_norm = nn.LayerNorm(self.group_size, eps=eps, elementwise_affine=False)
     
     def forward(self, x: enn.GeometricTensor) -> enn.GeometricTensor:
         """
         Args:
-            x: GeometricTensor with shape (B*T, D*G)
+            x: GeometricTensor with shape (B*T, num_blocks*G)
         
         Returns:
-            GeometricTensor with shape (B*T, D*G)
+            GeometricTensor with shape (B*T, num_blocks*G)
         """
         # Get the tensor from GeometricTensor
-        tensor = x.tensor  # Shape: (B*T, D*G)
+        tensor = x.tensor  # Shape: (B*T, num_blocks*G)
         batch_size = tensor.shape[0]
         
-        # Rearrange from (B*T, D*G) to (B*T, G, D)
-        tensor_reshaped = tensor.view(batch_size, self.group_size, self.dim_per_group)
+        # Rearrange from (B*T, num_blocks*G) to (B*T, num_blocks, G)
+        # ESCNN memory layout: [b0_g0, b0_g1, ..., b0_gN-1, b1_g0, ...]
+        tensor_reshaped = tensor.view(batch_size, self.num_blocks, self.group_size)
         
-        # Apply layer norm on the last dimension (D)
+        # Apply layer norm on the G dimension (last dimension)
+        # Since rotation permutes G, normalizing over G gives invariant mean/std
         tensor_normed = self.layer_norm(tensor_reshaped)
         
-        # Rearrange back from (B*T, G, D) to (B*T, D*G)
+        # Rearrange back from (B*T, num_blocks, G) to (B*T, num_blocks*G)
         tensor_output = tensor_normed.view(batch_size, self.total_dim)
         
         # Return as GeometricTensor
