@@ -50,6 +50,10 @@ class GR00T_N1_5_Config(PretrainedConfig):
 
     action_dim: int = field(init=False, metadata={"help": "Action dimension."})
     compute_dtype: str = field(default="float32", metadata={"help": "Compute dtype."})
+    
+    # Velocity head configuration
+    use_velocity_head: bool = field(default=False, metadata={"help": "Whether to use velocity head."})
+    velocity_dim: int = field(default=None, metadata={"help": "Velocity dimension."})
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -60,6 +64,8 @@ class GR00T_N1_5_Config(PretrainedConfig):
 # real model
 class GR00T_N1_5(PreTrainedModel):
     supports_gradient_checkpointing = True
+    _supports_sdpa = True  # Enable SDPA attention when flash_attn is not available
+    _supports_flash_attn_2 = True
     config_class = GR00T_N1_5_Config
     """
     we expect the backbone output to have a key 'backbone_features' with shape (batch_size, n, hidden_size)
@@ -86,6 +92,10 @@ class GR00T_N1_5(PreTrainedModel):
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+        
+        # Velocity head configuration
+        self.use_velocity_head = getattr(config, 'use_velocity_head', False)
+        self.velocity_dim = getattr(config, 'velocity_dim', None) or config.action_dim
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -106,6 +116,22 @@ class GR00T_N1_5(PreTrainedModel):
                 detected_error = True
             if not shape_ok:
                 error_msg += f"\n{action.shape=}"
+                detected_error = True
+        
+        # Validate velocity inputs if velocity head is enabled
+        if self.use_velocity_head and "velocity" in inputs:
+            velocity = inputs["velocity"]
+            type_ok = isinstance(velocity, torch.Tensor)
+            shape_ok = (
+                len(velocity.shape) == 3
+                and velocity.shape[1] == self.action_horizon
+                and velocity.shape[2] == self.velocity_dim
+            )
+            if not type_ok:
+                error_msg += f"\nvelocity type error: {type(velocity)=}"
+                detected_error = True
+            if not shape_ok:
+                error_msg += f"\nvelocity shape error: {velocity.shape=}, expected (B, {self.action_horizon}, {self.velocity_dim})"
                 detected_error = True
 
         if "video" in inputs:
@@ -158,6 +184,21 @@ class GR00T_N1_5(PreTrainedModel):
             error_msg += f"\n{self.action_horizon=}"
             error_msg += f"\n{self.action_dim=}"
             raise ValueError(error_msg)
+        
+        # Validate velocity output if velocity head is enabled and not training
+        if self.use_velocity_head and not is_training:
+            velocity_key = "velocity_pred"
+            if velocity_key in action_head_outputs:
+                velocity_pred = action_head_outputs[velocity_key]
+                fail_velocity = (
+                    velocity_pred.shape[1] != self.action_horizon
+                    or velocity_pred.shape[2] != self.velocity_dim
+                )
+                if fail_velocity:
+                    error_msg = ERROR_MSG
+                    error_msg += f"\nvelocity_pred shape error: {velocity_pred.shape=}"
+                    error_msg += f"\nexpected: (B, {self.action_horizon}, {self.velocity_dim})"
+                    raise ValueError(error_msg)
 
     def forward(
         self,

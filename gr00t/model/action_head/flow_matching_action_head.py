@@ -186,6 +186,23 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=32, metadata={"help": "Number of target vision tokens."}
     )
 
+    # Velocity head configuration for PD-complete action chunks
+    use_velocity_head: bool = field(
+        default=False, metadata={"help": "Whether to use dual-head velocity output."}
+    )
+    velocity_dim: int = field(
+        default=None, metadata={"help": "Velocity dimension. Defaults to action_dim if None."}
+    )
+    lambda_vel: float = field(
+        default=1.0, metadata={"help": "Weight for velocity flow-matching loss."}
+    )
+    lambda_consistency: float = field(
+        default=0.1, metadata={"help": "Weight for position-velocity consistency loss."}
+    )
+    freeze_position_head: bool = field(
+        default=False, metadata={"help": "Freeze position head for velocity adapter training."}
+    )
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
@@ -226,6 +243,22 @@ class FlowmatchingActionHead(nn.Module):
             hidden_dim=self.hidden_size,
             output_dim=self.action_dim,
         )
+        
+        # Velocity head for PD-complete action chunks
+        self.use_velocity_head = config.use_velocity_head
+        self.velocity_dim = config.velocity_dim if config.velocity_dim is not None else config.action_dim
+        self.lambda_vel = config.lambda_vel
+        self.lambda_consistency = config.lambda_consistency
+        self.freeze_position_head = config.freeze_position_head
+        
+        if self.use_velocity_head:
+            self.velocity_decoder = CategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                input_dim=self.hidden_size,
+                hidden_dim=self.hidden_size,
+                output_dim=self.velocity_dim,
+            )
+        
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
@@ -260,8 +293,28 @@ class FlowmatchingActionHead(nn.Module):
                 self.position_embedding.requires_grad_(False)
         if not tune_diffusion_model:
             self.model.requires_grad_(False)
+        
+        # Handle two-stage training: freeze position head for velocity adapter training
+        if self.freeze_position_head:
+            self.state_encoder.requires_grad_(False)
+            self.action_encoder.requires_grad_(False)
+            self.action_decoder.requires_grad_(False)
+            self.model.requires_grad_(False)
+            if self.config.add_pos_embed:
+                self.position_embedding.requires_grad_(False)
+            self.future_tokens.requires_grad_(False)
+            self.vlln.requires_grad_(False)
+            self.vl_self_attention.requires_grad_(False)
+            print("Stage 1: Position head frozen, training velocity decoder only")
+            
+            # Ensure velocity decoder is trainable
+            if self.use_velocity_head:
+                self.velocity_decoder.requires_grad_(True)
+        
         print(f"Tune action head projector: {self.tune_projector}")
         print(f"Tune action head diffusion model: {self.tune_diffusion_model}")
+        if self.use_velocity_head:
+            print(f"Velocity head enabled: lambda_vel={self.lambda_vel}, lambda_consistency={self.lambda_consistency}")
         # Check if any parameters are still trainable. If not, print a warning.
         if not tune_projector and not tune_diffusion_model:
             for name, p in self.named_parameters():
@@ -277,14 +330,17 @@ class FlowmatchingActionHead(nn.Module):
         need to call model.eval() for the frozen modules.
         """
         if self.training:
-            if not self.tune_projector:
+            if not self.tune_projector or self.freeze_position_head:
                 self.state_encoder.eval()
                 self.action_encoder.eval()
                 self.action_decoder.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
-            if not self.tune_diffusion_model:
+            if not self.tune_diffusion_model or self.freeze_position_head:
                 self.model.eval()
+            if self.freeze_position_head:
+                self.vlln.eval()
+                self.vl_self_attention.eval()
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
@@ -372,11 +428,63 @@ class FlowmatchingActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
-        loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = loss.sum() / action_mask.sum()
+        loss_pos = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+        loss_pos = loss_pos.sum() / action_mask.sum()
+        
         output_dict = {
-            "loss": loss,
+            "loss": loss_pos,
+            "loss_pos": loss_pos.detach(),
         }
+        
+        # Dual-head velocity loss
+        if self.use_velocity_head:
+            # Get ground truth velocity from input (computed by BSplineVelocityTransform)
+            gt_velocity = action_input.velocity  # [B, horizon, velocity_dim]
+            velocity_mask = action_input.velocity_mask  # [B, horizon, velocity_dim]
+            
+            # Predict velocity using velocity decoder on same model output
+            pred_vel = self.velocity_decoder(model_output, embodiment_id)
+            pred_vel_actions = pred_vel[:, -actions.shape[1] :]
+            
+            # Velocity target for flow matching: velocity_gt - noise_vel
+            # For simplicity, we use the same noise as position (can be different)
+            noise_vel = torch.randn(gt_velocity.shape, device=gt_velocity.device, dtype=gt_velocity.dtype)
+            velocity_target = gt_velocity - noise_vel
+            
+            # Velocity flow-matching loss
+            loss_vel = F.mse_loss(pred_vel_actions, velocity_target, reduction="none") * velocity_mask
+            loss_vel = loss_vel.sum() / velocity_mask.sum()
+            
+            # Position-velocity consistency loss
+            # The predicted velocity should match finite difference of predicted position
+            # We use the denoised position prediction for consistency
+            # Position at t=1 is: x_1 = x_t + (1-t) * v_pred where v_pred = pred_actions
+            # So x_1 = noisy_trajectory + (1-t) * pred_actions
+            denoised_pos = noisy_trajectory + (1 - t) * pred_actions
+            
+            # Finite difference of denoised position
+            # v_fd[i] = (pos[i+1] - pos[i]) / dt, use central difference for interior
+            pos_diff = torch.zeros_like(denoised_pos)
+            pos_diff[:, :-1, :] = denoised_pos[:, 1:, :] - denoised_pos[:, :-1, :]
+            pos_diff[:, -1, :] = pos_diff[:, -2, :]  # Replicate last difference
+            
+            # Denoised velocity prediction
+            denoised_vel = noisy_trajectory + (1 - t) * pred_vel_actions  # Using same trajectory for velocity
+            
+            # Consistency: predicted velocity chunk should match position finite difference
+            loss_consistency = F.mse_loss(denoised_vel, pos_diff, reduction="none") * velocity_mask
+            loss_consistency = loss_consistency.sum() / velocity_mask.sum()
+            loss_consistency = self.lambda_consistency * loss_consistency
+            
+            # Total loss
+            total_loss = loss_pos + self.lambda_vel * loss_vel + loss_consistency
+            
+            output_dict.update({
+                "loss": total_loss,
+                "loss_vel": loss_vel.detach(),
+                "loss_consistency": loss_consistency.detach(),
+            })
+        
         return BatchFeature(data=output_dict)
 
     @torch.no_grad()
@@ -399,6 +507,14 @@ class FlowmatchingActionHead(nn.Module):
             dtype=vl_embs.dtype,
             device=device,
         )
+        
+        # Initialize velocity trajectory if using velocity head
+        if self.use_velocity_head:
+            velocities = torch.randn(
+                size=(batch_size, self.config.action_horizon, self.velocity_dim),
+                dtype=vl_embs.dtype,
+                device=device,
+            )
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
@@ -435,7 +551,19 @@ class FlowmatchingActionHead(nn.Module):
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
-        return BatchFeature(data={"action_pred": actions})
+            
+            # Update velocity trajectory if using velocity head
+            if self.use_velocity_head:
+                pred_vel = self.velocity_decoder(model_output, embodiment_id)
+                pred_vel_velocity = pred_vel[:, -self.action_horizon :]
+                velocities = velocities + dt * pred_vel_velocity
+        
+        # Return separate tensors for PD controller
+        output_data = {"action_pred": actions}
+        if self.use_velocity_head:
+            output_data["velocity_pred"] = velocities
+        
+        return BatchFeature(data=output_data)
     
     @torch.enable_grad()
     def get_realtime_action(
@@ -541,7 +669,36 @@ class FlowmatchingActionHead(nn.Module):
         if use_prev_action:
             x_t = prev_action_chunk * weights[:, None] + x_t * (1 - weights[:, None])
             print("AFTER ASSIGN: ", (x_t[:,:inference_delay,:actual_action_dim] - prev_action_chunk[:,:inference_delay,:actual_action_dim]).abs().mean())
-        return BatchFeature(data={"action_pred": x_t})
+        
+        output_data = {"action_pred": x_t}
+        
+        # Compute velocity prediction if using velocity head
+        if self.use_velocity_head:
+            # Run one more forward pass to get velocity from the final denoised position
+            with torch.no_grad():
+                t_discretized = int(0.99 * self.num_timestep_buckets)  # Near-final timestep
+                timesteps_tensor = torch.full(
+                    size=(batch_size,), fill_value=t_discretized, device=device
+                )
+                action_features = self.action_encoder(x_t, timesteps_tensor, embodiment_id)
+                if self.config.add_pos_embed:
+                    pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+                    pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+                    action_features = action_features + pos_embs
+                
+                future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+                sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+                
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs,
+                    timestep=timesteps_tensor,
+                )
+                pred_vel = self.velocity_decoder(model_output, embodiment_id)
+                velocity_pred = pred_vel[:, -self.action_horizon :]
+                output_data["velocity_pred"] = velocity_pred
+        
+        return BatchFeature(data=output_data)
 
     @property
     def device(self):

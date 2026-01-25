@@ -26,6 +26,11 @@ from .state_action import (
     StateActionToTensor,
     StateActionTransform,
 )
+from .velocity import (
+    BSplineVelocityTransform,
+    FiniteDifferenceVelocityTransform,
+    VelocityNormalizationTransform,
+)
 from .video import (
     VideoColorJitter,
     VideoCrop,

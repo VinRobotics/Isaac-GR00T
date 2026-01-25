@@ -48,7 +48,37 @@ class EagleBackbone(nn.Module):
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
 
         config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
-        self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+        
+        # Check if flash_attn is available (not a stub)
+        try:
+            import flash_attn
+            # Check if it's a real flash_attn (version > 0.0.0)
+            if hasattr(flash_attn, '__version__') and flash_attn.__version__ != "0.0.0":
+                attn_impl = "flash_attention_2"
+            else:
+                attn_impl = "sdpa"
+        except ImportError:
+            attn_impl = "sdpa"
+        
+        # Set attn_implementation in the config directly and all sub-configs
+        config._attn_implementation = attn_impl
+        config._attn_implementation_autoset = True
+        
+        # Also set on vision_config if it exists (for SigLIP)
+        if hasattr(config, 'vision_config') and config.vision_config is not None:
+            config.vision_config._attn_implementation = attn_impl
+            config.vision_config._attn_implementation_autoset = True
+        
+        # Also set on text_config if it exists (for LLM)
+        if hasattr(config, 'text_config') and config.text_config is not None:
+            config.text_config._attn_implementation = attn_impl
+            config.text_config._attn_implementation_autoset = True
+            
+        self.eagle_model = AutoModel.from_config(
+            config, 
+            trust_remote_code=True,
+            attn_implementation=attn_impl,
+        )
 
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)

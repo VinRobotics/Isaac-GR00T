@@ -122,6 +122,16 @@ class GR00TTransform(InvertibleModalityTransform):
     max_action_dim: int
     state_horizon: int
     action_horizon: int
+    
+    # Velocity head arguments
+    max_velocity_dim: int = Field(
+        default=None,
+        description="Max velocity dimension. Defaults to max_action_dim if None.",
+    )
+    use_velocity: bool = Field(
+        default=False,
+        description="Whether to include velocity in the transform output.",
+    )
 
     max_length: int = 512
     embodiment_tag: EmbodimentTag | None = None
@@ -298,6 +308,40 @@ class GR00TTransform(InvertibleModalityTransform):
 
         return actions, actions_mask, n_action_tokens
 
+    def _prepare_velocity(self, data: dict):
+        """
+        Prepare velocity data for dual-head training.
+        Velocity should be computed by BSplineVelocityTransform before this transform.
+        Pad to max_velocity_dim, return masks.
+        """
+        # Determine max velocity dim (default to max_action_dim)
+        max_vel_dim = self.max_velocity_dim if self.max_velocity_dim is not None else self.max_action_dim
+        
+        if "velocity" not in data:
+            velocity = np.zeros((self.action_horizon, max_vel_dim))
+            velocity_mask = np.zeros((self.action_horizon, max_vel_dim), dtype=bool)
+            n_velocity_tokens = self.action_horizon
+            return velocity, velocity_mask, n_velocity_tokens
+
+        velocity = data["velocity"]
+        assert velocity.shape[0] == self.action_horizon, f"{velocity.shape=}, {self.action_horizon=}"
+
+        n_velocity_tokens = velocity.shape[0]  # T
+        n_velocity_dims = velocity.shape[1]
+
+        assert (
+            n_velocity_dims <= max_vel_dim
+        ), f"Velocity dim {n_velocity_dims} exceeds max allowed {max_vel_dim}."
+
+        # Pad the channel dimension
+        velocity = np.pad(velocity, ((0, 0), (0, max_vel_dim - n_velocity_dims)), "constant")
+
+        # Create mask: [T, max_velocity_dim]
+        velocity_mask = np.zeros((n_velocity_tokens, max_vel_dim), dtype=bool)
+        velocity_mask[:, :n_velocity_dims] = True
+
+        return velocity, velocity_mask, n_velocity_tokens
+
     def apply_single(self, data: dict) -> dict:
         transformed_data = {}
 
@@ -321,6 +365,12 @@ class GR00TTransform(InvertibleModalityTransform):
             actions, actions_mask, _ = self._prepare_action(data)
             transformed_data["action"] = actions
             transformed_data["action_mask"] = actions_mask
+            
+            # 4) Prepare velocity if enabled
+            if self.use_velocity:
+                velocity, velocity_mask, _ = self._prepare_velocity(data)
+                transformed_data["velocity"] = velocity
+                transformed_data["velocity_mask"] = velocity_mask
 
         for k, v in vlm_outputs.items():
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."
@@ -334,6 +384,14 @@ class GR00TTransform(InvertibleModalityTransform):
                 transformed_data[key].shape == transformed_data["action"].shape
                 for key in action_and_mask_keys
             ), f"Shape mismatch: {[(key, transformed_data[key].shape) for key in action_and_mask_keys]}"
+            
+            # Validate velocity shapes if enabled
+            if self.use_velocity:
+                velocity_keys = ["velocity", "velocity_mask"]
+                assert all(
+                    transformed_data[key].shape == transformed_data["velocity"].shape
+                    for key in velocity_keys
+                ), f"Velocity shape mismatch: {[(key, transformed_data[key].shape) for key in velocity_keys]}"
 
         return transformed_data
 

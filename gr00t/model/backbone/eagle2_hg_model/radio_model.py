@@ -41,15 +41,30 @@ from transformers.utils import ModelOutput
 
 ####
 
-
-try:  # v1
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
-except ImportError:  # v2
-    from flash_attn.flash_attn_interface import (
-        flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func,
+# Try to import flash_attn, fall back to PyTorch's native SDPA if not available
+FLASH_ATTN_AVAILABLE = False
+try:
+    import flash_attn as _flash_attn_module
+    # Check if it's a real flash_attn (version > 0.0.0)
+    if hasattr(_flash_attn_module, '__version__') and _flash_attn_module.__version__ != "0.0.0":
+        try:  # v1
+            from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
+        except ImportError:  # v2
+            from flash_attn.flash_attn_interface import (
+                flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func,
+            )
+        from flash_attn.bert_padding import pad_input, unpad_input
+        FLASH_ATTN_AVAILABLE = True
+    else:
+        raise ImportError("flash_attn stub detected")
+except ImportError:
+    warnings.warn(
+        "flash_attn not available, falling back to PyTorch's native scaled_dot_product_attention. "
+        "This may be slower but should produce equivalent results."
     )
-
-from flash_attn.bert_padding import pad_input, unpad_input
+    flash_attn_unpadded_qkvpacked_func = None
+    pad_input = None
+    unpad_input = None
 
 
 class FlashAttention(nn.Module):
@@ -167,17 +182,54 @@ def forward(self, x: torch.Tensor) -> torch.Tensor:
     return result
 
 
+def _sdpa_attn(self, x: torch.Tensor) -> torch.Tensor:
+    """Native PyTorch SDPA fallback when flash_attn is not available."""
+    B, N, C = x.shape
+
+    qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+    q, k, v = qkv.unbind(dim=2)  # [B, N, num_heads, head_dim] each
+
+    if not isinstance(self.q_norm, nn.Identity):
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+    # Transpose for SDPA: [B, num_heads, N, head_dim]
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    # Use PyTorch's native scaled_dot_product_attention
+    context = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0 if not self.training else self.attn_drop.p)
+
+    # Reshape back: [B, N, C]
+    x = context.transpose(1, 2).reshape(B, N, -1)
+    x = self.proj(x)
+    x = self.proj_drop(x)
+    return x
+
+
+def forward_sdpa(self, x: torch.Tensor) -> torch.Tensor:
+    """Forward using native PyTorch SDPA."""
+    return self._sdpa_attn(x)
+
+
 def replace_vit_attn_with_flash_attn():
     cuda_major, cuda_minor = torch.cuda.get_device_capability()
-    if cuda_major < 8:
-        warnings.warn(
-            "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
-            "ref: https://github.com/HazyResearch/flash-attention/issues/190#issuecomment-1523359593"
-        )
-
-    Attention.forward = forward
-    Attention.inner_attn = FlashAttention(attention_dropout=0.0)
-    Attention._flash_attn = _flash_attn
+    
+    if FLASH_ATTN_AVAILABLE and cuda_major >= 8:
+        # Use flash attention
+        Attention.forward = forward
+        Attention.inner_attn = FlashAttention(attention_dropout=0.0)
+        Attention._flash_attn = _flash_attn
+    else:
+        # Fallback to native PyTorch SDPA
+        if cuda_major < 8:
+            warnings.warn(
+                "Flash attention requires compute capability >= 8.0. "
+                "Falling back to PyTorch's native scaled_dot_product_attention."
+            )
+        Attention.forward = forward_sdpa
+        Attention._sdpa_attn = _sdpa_attn
 
 
 replace_vit_attn_with_flash_attn()
