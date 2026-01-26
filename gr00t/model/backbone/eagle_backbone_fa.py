@@ -311,6 +311,11 @@ class EagleBackboneFA(nn.Module):
         B_times_N, seq_len = eagle_input["input_ids"].shape
         B = B_times_N // self.n_group
         
+        # Create image token mask: True for image tokens, False for language tokens
+        # This is needed to apply FA only to image tokens
+        input_ids = eagle_input["input_ids"][:B]  # [B, seq_len] - same for all rotations
+        image_token_mask = (input_ids == self.eagle_model.image_token_index)  # [B, seq_len]
+        
         # Images are already rotated by GR00TTransformFA, no need to rotate here
         # Just forward through the Eagle model
         eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
@@ -329,12 +334,12 @@ class EagleBackboneFA(nn.Module):
         # Original mask shape is [B*N, seq_len], we need [B, seq_len]
         original_attention_mask = eagle_input["attention_mask"][:B]
 
-        return eagle_features, original_attention_mask
+        return eagle_features, original_attention_mask, image_token_mask
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
 
-        eagle_embeds, eagle_mask = self.forward_eagle(vl_input)
+        eagle_embeds, eagle_mask, image_token_mask = self.forward_eagle(vl_input)
 
         # YL (TODO HACK): to resolve DDP issue when tune_visual=True
         # Ensure all trainable parameters in vision_model are used in the forward pass for DDP compatibility
@@ -348,5 +353,9 @@ class EagleBackboneFA(nn.Module):
             eagle_embeds = eagle_embeds + dummy_term
 
         return BatchFeature(
-            data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
-        )  # [B, N, T, D] - includes all N rotations for action head to process
+            data={
+                "backbone_features": eagle_embeds,  # [B, N, T, D] - all N rotations
+                "backbone_attention_mask": eagle_mask,  # [B, T]
+                "image_token_mask": image_token_mask,  # [B, T] - True for image tokens
+            }
+        )
