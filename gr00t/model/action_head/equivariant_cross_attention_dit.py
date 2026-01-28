@@ -739,6 +739,12 @@ class EDiT(ModelMixin, ConfigMixin):
 
 
 class SelfAttentionTransformer(ModelMixin, ConfigMixin):
+    """
+    Equivariant Self-Attention Transformer.
+    
+    All tokens are treated as regular representation. The backbone (TAFA/EFS)
+    already handles the FA properly, so we just process uniformly here.
+    """
     _supports_gradient_checkpointing = True
 
     @register_to_config
@@ -772,14 +778,11 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
         G = CyclicGroup(n_group)
         self.gspace = escnn.gspaces.no_base_space(G)
         
-        # Define field types for equivariant layers
-        # Each field type contains multiple regular representations
+        # All tokens use regular representation
         self.in_type = enn.FieldType(
             self.gspace, 
             [self.gspace.regular_repr] * int(self.inner_dim/self.n_group)
         )
-        # Cross-attention uses TRIVIAL representation for INVARIANT VL features
-        # This ensures the model is equivariant w.r.t. state/action regardless of VL content
         self.ff_inner_type = enn.FieldType(
             self.gspace,
             [self.gspace.regular_repr] * int(self.inner_dim*4/self.n_group)
@@ -820,11 +823,20 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
         hidden_states: torch.Tensor,  # Shape: (B, T, D)
         return_all_hidden_states: bool = False,
     ):
-        # Process through transformer blocks - single pass through the blocks
+        """
+        Forward pass through equivariant self-attention transformer.
+        
+        Args:
+            hidden_states: (B, T, D) tensor - all tokens in regular representation
+            return_all_hidden_states: Whether to return intermediate states
+            
+        Returns:
+            Output tensor (B, T, D) in regular representation
+        """
+        # Process through transformer blocks
         hidden_states = hidden_states.contiguous()
         all_hidden_states = [hidden_states]
 
-        # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
             hidden_states = block(hidden_states)
             all_hidden_states.append(hidden_states)

@@ -92,17 +92,12 @@ class EagleBackboneFA(nn.Module):
         
     def init_rotation_matrices(self):
         # Precompute rotation matrices for grid_sample
-        # IMPORTANT: Use POSITIVE angles to match ESCNN's counter-clockwise rotation convention
-        # ESCNN's irrep(1) for CyclicGroup(N) rotates vectors counter-clockwise by 2π*r/N for element r
-        # So we must rotate images counter-clockwise as well for equivariance to hold
         angles = torch.linspace(0, 2 * math.pi, self.n_group+1)[:-1]  # N angles from 0 to 2π
         self.rotation_matrices = torch.zeros(self.n_group, 2, 3)
 
         for i, angle in enumerate(angles):
-            # Use POSITIVE angle for counter-clockwise rotation (matching ESCNN)
-            # Previously used -angle which caused clockwise rotation - WRONG!
-            cos_val = math.cos(angle.item())
-            sin_val = math.sin(angle.item())
+            cos_val = math.cos(-angle.item())
+            sin_val = math.sin(-angle.item())
             
             self.rotation_matrices[i, 0, 0] = cos_val
             self.rotation_matrices[i, 0, 1] = -sin_val
@@ -311,11 +306,6 @@ class EagleBackboneFA(nn.Module):
         B_times_N, seq_len = eagle_input["input_ids"].shape
         B = B_times_N // self.n_group
         
-        # Create image token mask: True for image tokens, False for language tokens
-        # This is needed to apply FA only to image tokens
-        input_ids = eagle_input["input_ids"][:B]  # [B, seq_len] - same for all rotations
-        image_token_mask = (input_ids == self.eagle_model.image_token_index)  # [B, seq_len]
-        
         # Images are already rotated by GR00TTransformFA, no need to rotate here
         # Just forward through the Eagle model
         eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
@@ -323,23 +313,24 @@ class EagleBackboneFA(nn.Module):
 
         eagle_features = self.eagle_linear(eagle_features)
         
-        # DON'T average here - pass all N rotations to action head
-        # Action head will do proper frame averaging with permutation matrices
-        # Rearrange from [B*N, T, D] to [B, N, T, D]
-        T = eagle_features.shape[1]
-        D = eagle_features.shape[2]
-        eagle_features = einops.rearrange(eagle_features, "(b n) t d -> b n t d", b=B, n=self.n_group)
+        # Rearrange from [B*N, T, D] to [B*T, N, D] for frame averaging
+        eagle_features = einops.rearrange(eagle_features, "(b n) t d -> (b t) n d", b=B, n=self.n_group)
+
+        Bt, _, _ = eagle_features.shape
+        
+        avg_feature = self._apply_frame_averaging(eagle_features, Bt)
+        avg_feature = einops.rearrange(avg_feature, "(b t) d -> b t d", b=B,)
         
         # Get the attention mask from the first rotation (they should all be the same)
         # Original mask shape is [B*N, seq_len], we need [B, seq_len]
         original_attention_mask = eagle_input["attention_mask"][:B]
 
-        return eagle_features, original_attention_mask, image_token_mask
+        return avg_feature, original_attention_mask
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
 
-        eagle_embeds, eagle_mask, image_token_mask = self.forward_eagle(vl_input)
+        eagle_embeds, eagle_mask = self.forward_eagle(vl_input)
 
         # YL (TODO HACK): to resolve DDP issue when tune_visual=True
         # Ensure all trainable parameters in vision_model are used in the forward pass for DDP compatibility
@@ -353,9 +344,45 @@ class EagleBackboneFA(nn.Module):
             eagle_embeds = eagle_embeds + dummy_term
 
         return BatchFeature(
-            data={
-                "backbone_features": eagle_embeds,  # [B, N, T, D] - all N rotations
-                "backbone_attention_mask": eagle_mask,  # [B, T]
-                "image_token_mask": image_token_mask,  # [B, T] - True for image tokens
-            }
-        )
+            data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
+        )  # [B, T2, hidden_size]
+
+
+    def _apply_frame_averaging(self, features, batch_size):
+        """
+        Apply frame averaging to features using permutation matrices.
+        
+        Args:
+            features: Tensor of shape [B, N, feature_dim] where N is n_group
+            batch_size: Batch size (B)
+            
+        Returns:
+            Tensor of shape [B, feature_dim] with frame averaging applied
+        """
+        # features shape: [B, N, feature_dim]
+        feature_dim = features.shape[2]
+        blocks = feature_dim // self.n_group
+        
+        # Reshape: [B, N, blocks, N] - each feature vector is split into blocks of size N
+        features = features.reshape(batch_size, self.n_group, blocks, self.n_group)
+        
+        # For each rotation r, apply permutation matrix P_r to align the output
+        # all_features_flat: [B*N, blocks, N]
+        all_features_flat = features.reshape(batch_size * self.n_group, blocks, self.n_group)
+        
+        # selected_perm_matrices needs shape [B*N, N, N]
+        # Repeat the template for each batch element
+        selected_perm_matrices = self.selected_perm_matrices_template.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        selected_perm_matrices = selected_perm_matrices.reshape(batch_size * self.n_group, self.n_group, self.n_group)
+        
+        # Apply permutation: [B*N, blocks, N] @ [B*N, N, N] -> [B*N, blocks, N]
+        aligned_features_flat = torch.bmm(all_features_flat, selected_perm_matrices)
+        
+        # Reshape back: [B, N, blocks, N]
+        aligned_features = aligned_features_flat.reshape(batch_size, self.n_group, blocks, self.n_group)
+        
+        
+        # Average over the group dimension: [B, blocks, N]
+        avg_features = torch.mean(aligned_features, dim=1)
+        
+        return avg_features.reshape(batch_size, blocks * self.n_group)
