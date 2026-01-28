@@ -19,3 +19,4 @@ from .eagle_backbone_fa_v2 import EagleBackboneFAv2  # noqa: F401
 from .eagle_backbone_fa_v3 import EagleBackboneFAv3  # noqa: F401
 from .eagle_backbone_efs import EagleBackboneEFS  # noqa: F401
 from .eagle_backbone_tafa import EagleBackboneTAFA  # noqa: F401
+from .eagle_backbone_fa_sa import EagleBackboneFASA  # noqa: F401

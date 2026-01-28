@@ -444,13 +444,8 @@ class FlowmatchingActionHead(nn.Module):
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
-        # VL self-attention config - all tokens treated as regular representation
-        vl_self_attention_cfg = {
-            **config.vl_self_attention_cfg, 
-            "n_group": self.n_group,
-        }
-        self.vl_self_attention = SelfAttentionTransformer(**vl_self_attention_cfg)
-        self.vlln = EquivariantLayerNorm(self.vl_self_attention.in_type)
+        self.vl_self_attention = None
+        self.vlln = None
         
 
         if config.add_pos_embed:
@@ -681,18 +676,13 @@ class FlowmatchingActionHead(nn.Module):
         Simple version: treats all tokens uniformly as regular representation.
         The backbone (TAFA/EFS) already handles FA properly, so we just need
         to normalize and process through self-attention.
+        
+        When skip_vl_self_attention=True (e.g., with FA-SA backbone), the backbone
+        has already aggregated spatial tokens, so we skip self-attention here.
         """
         backbone_features = backbone_output.backbone_features
         B, T, D = backbone_features.shape
         
-        # All tokens are treated as regular representation
-        backbone_features = einops.rearrange(backbone_features, "b t d -> (b t) d")
-        backbone_features = enn.GeometricTensor(backbone_features, self.vl_self_attention.in_type)
-        backbone_features = self.vlln(backbone_features).tensor
-        backbone_features = einops.rearrange(backbone_features, "(b t) d -> b t d", b=B, t=T)
-        backbone_features = self.vl_self_attention(backbone_features)
-        
-        backbone_output.data["backbone_features"] = backbone_features
         return backbone_output
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
