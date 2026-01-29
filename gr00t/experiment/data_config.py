@@ -1654,7 +1654,7 @@ class EquiLiberoConfig(BaseDataConfig):
                 max_state_dim=64,
                 max_action_dim=32,
                 num_hand=self.num_hand,
-                n_group=8,  # C4 group (90 degree rotations)
+                n_group=4,  # C4 group (90 degree rotations)
                 rotate_image_indices=[0],  # Only rotate exterior image (index 0)
             ),
         ]

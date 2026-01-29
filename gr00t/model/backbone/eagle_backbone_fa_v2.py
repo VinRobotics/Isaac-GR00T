@@ -94,7 +94,7 @@ class EagleBackboneFAv2(nn.Module):
         project_to_dim: int = 1536,
         num_images_per_sample: int = 1,
         rotate_image_indices: list[int] | None = None,
-        n_group: int = 8,
+        n_group: int = 4,
         output_type: Literal['reg', 'std'] = 'reg',
     ):
         super().__init__()

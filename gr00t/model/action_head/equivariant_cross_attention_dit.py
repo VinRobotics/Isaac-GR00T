@@ -532,7 +532,7 @@ class EDiT(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(
         self,
-        n_group: int = 8,
+        n_group: int = 4,
         num_attention_heads: int = 8,
         attention_head_dim: int = 64,
         output_dim: int = 26,
@@ -750,7 +750,7 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(
         self,
-        n_group: int = 8,
+        n_group: int = 4,
         num_attention_heads: int = 8,
         attention_head_dim: int = 64,
         output_dim: int = 26,

@@ -239,7 +239,7 @@ class RotationAwarePositionalEncoding(nn.Module):
     using rotation-equivariant features (like Fourier features rotated).
     """
     
-    def __init__(self, d_model: int, max_h: int = 32, max_w: int = 32, n_group: int = 8):
+    def __init__(self, d_model: int, max_h: int = 32, max_w: int = 32, n_group: int = 4):
         super().__init__()
         self.d_model = d_model
         self.n_group = n_group
@@ -327,7 +327,7 @@ class EagleBackboneTAFA(nn.Module):
         project_to_dim: int = 1536,
         num_images_per_sample: int = 1,
         rotate_image_indices: list[int] | None = None,
-        n_group: int = 8,
+        n_group: int = 4,
         output_type: Literal['invariant', 'reg', 'std'] = 'reg',
         fa_interpolation: str = 'bilinear',
         use_weighted_fa: bool = False,

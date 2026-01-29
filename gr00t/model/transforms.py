@@ -374,7 +374,7 @@ class GR00TTransformFA(GR00TTransform):
     For cyclic group C_N, we rotate images by multiples of 2π/N.
     """
     
-    n_group: int = Field(default=8, description="Number of rotations for frame averaging (C_N group)")
+    n_group: int = Field(default=4, description="Number of rotations for frame averaging (C_N group)")
     rotate_image_indices: Optional[List[int]] = Field(
         default=None, 
         description="Which image indices to rotate. None means rotate all."
