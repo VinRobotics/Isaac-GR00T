@@ -107,6 +107,7 @@ class SelfAttentionAggregator(nn.Module):
             self.cls_token = nn.Parameter(torch.randn(1, 1, self.inner_dim) * 0.02)
         
         # Use the original SelfAttentionTransformer (non-equivariant)
+        # Set positional_embeddings=None to avoid dimension mismatch with variable token counts
         self.self_attention = SelfAttentionTransformer(
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
@@ -117,7 +118,7 @@ class SelfAttentionAggregator(nn.Module):
             activation_fn=activation_fn,
             max_num_positional_embeddings=max_num_positional_embeddings,
             final_dropout=True,
-            positional_embeddings="sinusoidal",
+            positional_embeddings=None,  # Disable positional embeddings to handle variable token counts
         )
         
         # Final layer norm
@@ -198,14 +199,14 @@ class EagleBackboneFASA(nn.Module):
         project_to_dim: int = 1536,
         num_images_per_sample: int = 1,
         rotate_image_indices: list[int] | None = None,
-        # Self-attention aggregation config
-        sa_num_layers: int = 2,
-        sa_num_attention_heads: int = 8,
+        # Self-attention aggregation config (matches vl_self_attention_cfg)
+        sa_num_layers: int = 4,
+        sa_num_attention_heads: int = 32,
         sa_attention_head_dim: int = 64,
-        sa_dropout: float = 0.1,
+        sa_dropout: float = 0.2,
         sa_aggregation_mode: str = "mean",
         sa_activation_fn: str = "gelu-approximate",
-        sa_max_num_positional_embeddings: int = 512,
+        sa_max_num_positional_embeddings: int = 1024,  # Not used when positional_embeddings=None
     ):
         """
         Args:
