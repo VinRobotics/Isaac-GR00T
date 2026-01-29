@@ -73,7 +73,7 @@ class SelfAttentionAggregator(nn.Module):
     This module:
     1. Takes [B*N, num_tokens, D] spatial features from rotated images
     2. Applies self-attention layers to aggregate information
-    3. Outputs [B*N, D] global features (via mean pooling or CLS token)
+    3. Outputs [B*N, num_equi_token, D] global features (via mean pooling, CLS token, or learnable queries)
     
     After aggregation, frame averaging can be applied without TAFA
     because the features no longer have spatial structure.
@@ -85,14 +85,16 @@ class SelfAttentionAggregator(nn.Module):
         num_attention_heads: int = 8,
         attention_head_dim: int = 64,
         dropout: float = 0.1,
-        aggregation_mode: str = "mean",  # "mean" or "cls"
+        aggregation_mode: str = "mean",  # "mean", "cls", or "query"
         activation_fn: str = "gelu-approximate",
         max_num_positional_embeddings: int = 512,
+        num_equi_token: int = 1,  # Number of output tokens to aggregate to
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.aggregation_mode = aggregation_mode
         self.inner_dim = num_attention_heads * attention_head_dim
+        self.num_equi_token = num_equi_token
         
         # Project to inner_dim if different from feature_dim
         if feature_dim != self.inner_dim:
@@ -102,9 +104,9 @@ class SelfAttentionAggregator(nn.Module):
             self.input_proj = nn.Identity()
             self.output_proj = nn.Identity()
         
-        # Optional CLS token for aggregation
-        if aggregation_mode == "cls":
-            self.cls_token = nn.Parameter(torch.randn(1, 1, self.inner_dim) * 0.02)
+        # Learnable tokens for aggregation (CLS or query tokens)
+        if aggregation_mode == "cls" or aggregation_mode == "query":
+            self.agg_tokens = nn.Parameter(torch.randn(1, num_equi_token, self.inner_dim) * 0.02)
         
         # Use the original SelfAttentionTransformer (non-equivariant)
         # Set positional_embeddings=None to avoid dimension mismatch with variable token counts
@@ -129,6 +131,7 @@ class SelfAttentionAggregator(nn.Module):
         print(f"  inner_dim: {self.inner_dim}")
         print(f"  num_layers: {num_layers}")
         print(f"  aggregation_mode: {aggregation_mode}")
+        print(f"  num_equi_token: {num_equi_token}")
         
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """
@@ -136,31 +139,42 @@ class SelfAttentionAggregator(nn.Module):
             features: [B*N, num_tokens, D] spatial features from rotated images
             
         Returns:
-            [B*N, D] global features ready for frame averaging
+            [B*N, num_equi_token, D] global features ready for frame averaging
         """
         B_N, num_tokens, D = features.shape
         
         # Project to inner_dim
         features = self.input_proj(features)  # [B*N, num_tokens, inner_dim]
         
-        # Optionally prepend CLS token
-        if self.aggregation_mode == "cls":
-            cls_tokens = self.cls_token.expand(B_N, -1, -1)
-            features = torch.cat([cls_tokens, features], dim=1)
+        # Prepend learnable tokens if using cls or query mode
+        if self.aggregation_mode == "cls" or self.aggregation_mode == "query":
+            agg_tokens = self.agg_tokens.expand(B_N, -1, -1)
+            features = torch.cat([agg_tokens, features], dim=1)
         
         # Apply self-attention layers
-        features = self.self_attention(features)  # [B*N, num_tokens(+1), inner_dim]
+        features = self.self_attention(features)  # [B*N, num_equi_token + num_tokens, inner_dim]
         
-        # Aggregate to global feature
-        if self.aggregation_mode == "cls":
-            # Use CLS token
-            global_features = features[:, 0, :]  # [B*N, inner_dim]
+        # Aggregate to global features
+        if self.aggregation_mode == "cls" or self.aggregation_mode == "query":
+            # Use the first num_equi_token tokens (the learnable aggregation tokens)
+            global_features = features[:, :self.num_equi_token, :]  # [B*N, num_equi_token, inner_dim]
         else:
-            # Mean pooling over spatial tokens
-            global_features = features.mean(dim=1)  # [B*N, inner_dim]
+            # Mean pooling: divide tokens into num_equi_token groups and pool each
+            if self.num_equi_token == 1:
+                global_features = features.mean(dim=1, keepdim=True)  # [B*N, 1, inner_dim]
+            else:
+                # Split tokens into num_equi_token groups and mean pool each group
+                tokens_per_group = num_tokens // self.num_equi_token
+                global_features_list = []
+                for i in range(self.num_equi_token):
+                    start_idx = i * tokens_per_group
+                    end_idx = start_idx + tokens_per_group if i < self.num_equi_token - 1 else num_tokens
+                    group_features = features[:, start_idx:end_idx, :].mean(dim=1)  # [B*N, inner_dim]
+                    global_features_list.append(group_features)
+                global_features = torch.stack(global_features_list, dim=1)  # [B*N, num_equi_token, inner_dim]
         
         # Project back to feature_dim
-        global_features = self.output_proj(global_features)  # [B*N, D]
+        global_features = self.output_proj(global_features)  # [B*N, num_equi_token, D]
         
         # Apply final norm
         global_features = self.final_norm(global_features)
@@ -204,9 +218,10 @@ class EagleBackboneFASA(nn.Module):
         sa_num_attention_heads: int = 32,
         sa_attention_head_dim: int = 64,
         sa_dropout: float = 0.2,
-        sa_aggregation_mode: str = "mean",
+        sa_aggregation_mode: str = "query",
         sa_activation_fn: str = "gelu-approximate",
         sa_max_num_positional_embeddings: int = 1024,  # Not used when positional_embeddings=None
+        sa_num_equi_token: int = 16,  # Number of output tokens to aggregate to
     ):
         """
         Args:
@@ -218,9 +233,10 @@ class EagleBackboneFASA(nn.Module):
             sa_num_attention_heads: number of attention heads
             sa_attention_head_dim: dimension per attention head
             sa_dropout: dropout rate
-            sa_aggregation_mode: "mean" for mean pooling, "cls" for CLS token
+            sa_aggregation_mode: "mean" for mean pooling, "cls" for CLS token, "query" for learnable queries
             sa_activation_fn: activation function for self-attention
             sa_max_num_positional_embeddings: max positional embeddings
+            sa_num_equi_token: number of output tokens to aggregate to
         """
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here"
@@ -249,6 +265,7 @@ class EagleBackboneFASA(nn.Module):
             self.eagle_linear = torch.nn.Identity()
         
         self.project_to_dim = project_to_dim if project_to_dim else 2048
+        self.num_equi_token = sa_num_equi_token
         
         # Self-attention aggregator (using original non-equivariant transformer)
         self.sa_aggregator = SelfAttentionAggregator(
@@ -260,6 +277,7 @@ class EagleBackboneFASA(nn.Module):
             aggregation_mode=sa_aggregation_mode,
             activation_fn=sa_activation_fn,
             max_num_positional_embeddings=sa_max_num_positional_embeddings,
+            num_equi_token=sa_num_equi_token,
         )
 
         # Remove unused LLM layers
@@ -411,8 +429,8 @@ class EagleBackboneFASA(nn.Module):
         
         Pipeline:
         1. Eagle encoder -> [B*N, T, D] spatial tokens
-        2. Self-attention aggregation -> [B*N, D] global features
-        3. Frame averaging -> [B, D] equivariant features
+        2. Self-attention aggregation -> [B*N, num_equi_token, D] global features
+        3. Frame averaging -> [B, num_equi_token, D] equivariant features
         """
         eagle_prefix = "eagle_"
         eagle_input = {
@@ -432,24 +450,24 @@ class EagleBackboneFASA(nn.Module):
         eagle_features = eagle_output.hidden_states[self.select_layer]
         eagle_features = self.eagle_linear(eagle_features)  # [B*N, T, D]
         
-        # Self-attention aggregation: [B*N, T, D] -> [B*N, D]
-        global_features = self.sa_aggregator(eagle_features)  # [B*N, D]
+        # Self-attention aggregation: [B*N, T, D] -> [B*N, num_equi_token, D]
+        global_features = self.sa_aggregator(eagle_features)  # [B*N, num_equi_token, D]
         
-        # Reshape for frame averaging: [B*N, D] -> [B, N, D]
+        # Reshape for frame averaging: [B*N, num_equi_token, D] -> [B, N, num_equi_token * D]
         global_features = global_features.reshape(B, self.n_group, -1)
         
-        # Apply frame averaging: [B, N, D] -> [B, D]
+        # Apply frame averaging: [B, N, num_equi_token * D] -> [B, num_equi_token * D]
         avg_features = self._apply_frame_averaging(global_features, B)
         
-        # Reshape back to [B, 1, D] for compatibility
-        avg_features = avg_features.unsqueeze(1)
+        # Reshape back to [B, num_equi_token, D] for compatibility
+        avg_features = avg_features.reshape(B, self.num_equi_token, self.project_to_dim)
         
         # Get attention mask from first rotation
         original_attention_mask = eagle_input["attention_mask"][:B]
-        # Create a single-token attention mask
-        single_token_mask = torch.ones(B, 1, device=original_attention_mask.device)
+        # Create attention mask with num_equi_token tokens
+        token_mask = torch.ones(B, self.num_equi_token, device=original_attention_mask.device)
 
-        return avg_features, single_token_mask
+        return avg_features, token_mask
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
