@@ -1662,6 +1662,119 @@ class EquiLiberoConfig(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
     
     
+class EquiLibero2RotConfig(BaseDataConfig):
+    video_keys = ["video.image", "video.wrist_image"]
+    # Only rotate exterior image, wrist image is duplicated (not rotated)
+    rotate_video_keys = ["video.image", "video.wrist_image"]
+    state_keys = [
+        "state.x",
+        "state.y",
+        "state.z",
+        "state.rx",
+        "state.ry",
+        "state.rz",
+        "state.rw",
+        "state.gripper",
+    ]
+    action_keys = [
+        "action.x",
+        "action.y",
+        "action.z",
+        "action.rx",
+        "action.ry",
+        "action.rz",
+        "action.rw",
+        "action.gripper",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+    num_hand = 1
+    rot_type="quaternion"
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.x": "min_max",
+                    "state.y": "min_max",
+                    "state.z": "min_max",
+                    "state.gripper": "min_max",
+                },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.x": "min_max",
+                    "action.y": "min_max",
+                    "action.z": "min_max",
+                    "action.gripper": "min_max",
+                },
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # Use GR00TTransformFA for frame averaging
+            # rotate_image_indices=[0] means only the first image (exterior) is rotated
+            # The second image (wrist) will be duplicated N times
+            GR00TTransformFA(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+                num_hand=self.num_hand,
+                n_group=4,  # C4 group (90 degree rotations)
+                rotate_image_indices=[0, 1],  # Only rotate exterior image (index 0)
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
 
 class EquiFractalDataConfig(BaseDataConfig):
     video_keys = [
@@ -1850,6 +1963,7 @@ DATA_CONFIG_MAP = {
     "aloha_right_arm_only": AlohaRightArmConfig(),
     "vrh3_two_hand_1_cam_equi": VRH3TwotHand1CamEquiConfig(),
     "equi_libero": EquiLiberoConfig(),
+    "equi_libero_2rot": EquiLibero2RotConfig(),
     "equi_bridge": BridgeDataConfig(),
     "equi_fractal": EquiFractalDataConfig(),
 }
