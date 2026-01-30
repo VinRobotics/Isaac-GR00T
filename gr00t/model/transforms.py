@@ -514,20 +514,13 @@ class GR00TTransformFA(GR00TTransform):
         lang = batch["language"]
         if isinstance(lang, list):
             lang = lang[0]
+        text_content = [{"type": "text", "text": lang}]
         
         # Create N separate conversations, one for each rotation
         all_image_inputs = []
         all_text_list = []
         
-        # Rotation-invariant language descriptors for symmetric conditioning
-        # This helps the model maintain focus on the language task while being rotation-aware
-        rotation_descriptors = self._get_rotation_descriptors()
-        
         for rot_idx in range(self.n_group):
-            # Symmetric language conditioning: append rotation-invariant text descriptors
-            rotation_desc = rotation_descriptors[rot_idx]
-            text_content = [{"type": "text", "text": f"Execute task: {lang}. {rotation_desc}"}]
-            
             rotated_batch = all_rotated_images[rot_idx]
             
             # Convert to PIL images
@@ -540,6 +533,7 @@ class GR00TTransformFA(GR00TTransform):
                     "content": eagle_image + text_content,
                 }
             ]
+            
             text_list = [
                 self.eagle_processor.apply_chat_template(
                     eagle_conversation, tokenize=False, add_generation_prompt=True
