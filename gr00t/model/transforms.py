@@ -415,16 +415,10 @@ class GR00TTransformFA(GR00TTransform):
                 desc = f"Observed from {cardinal[rot_idx]}."
             elif self.n_group == 8:
                 # 8 directions for C8 group
-                directions =  [
-                    "from canonical front view.",      # 0°
-                    "from slightly right viewpoint.",  # 45°
-                    "from right side viewpoint.",      # 90°
-                    "from slightly rear-right view.",  # 135°
-                    "from rear viewpoint.",            # 180°
-                    "from slightly rear-left view.",   # 225°
-                    "from left side viewpoint.",       # 270°
-                    "from slightly front-left view."   # 315°
-                ]
+                directions = ["original viewpoint", "45 degrees rotated view",
+                             "90 degrees rotated view", "135 degrees rotated view",
+                             "180 degrees rotated view", "225 degrees rotated view",
+                             "270 degrees rotated view", "315 degrees rotated view"]
                 desc = f"Observed from {directions[rot_idx]}."
             else:
                 # Generic description for other group sizes
