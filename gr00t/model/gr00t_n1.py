@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Tuple
 import copy
 
+from gr00t.model.backbone.eagle_backbone_late_fa import EagleBackboneLateFa
 import numpy as np
 import torch
 import tree
@@ -79,7 +80,7 @@ class GR00T_N1_5(PreTrainedModel):
         super().__init__(config)
         self.local_model_path = local_model_path
 
-        self.backbone = EagleBackboneFA(**config.backbone_cfg)
+        self.backbone = EagleBackboneLateFa(**config.backbone_cfg)
         action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
         self.action_head = FlowmatchingActionHead(action_head_cfg)
 
