@@ -302,7 +302,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     """NOTE: N1.5 uses XEmbFlowmatchingPolicyHeadConfig as action head"""
 
     n_group: int = field(
-        default=8, metadata={"help": "Number of groups for equivariant operations (cyclic group order)."}
+        default=4, metadata={"help": "Number of groups for equivariant operations (cyclic group order)."}
     )
     add_pos_embed: bool = field(
         default=True, metadata={"help": "Whether to add positional embedding"}
