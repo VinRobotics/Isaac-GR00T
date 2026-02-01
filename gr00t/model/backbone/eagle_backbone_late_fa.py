@@ -341,6 +341,10 @@ class EagleBackboneLateFa(nn.Module):
         """
         Apply frame averaging to features in regular representation.
         
+        Uses the same convention as C8EquivariantTimmObsEncoder:
+        - Apply P_r (forward permutation) to features from rotation r
+        - This convention defines ρ(g_r^{-1}) = P_r in the fiber space
+        
         Args:
             features: [B*N, T, D] features from N rotations
             batch_size: original batch size B
@@ -360,32 +364,20 @@ class EagleBackboneLateFa(nn.Module):
         # Reshape: [B*N, T, D] -> [B, N, T, blocks, N]
         features = features.reshape(B, N, T, blocks, N)
         
-        # For frame averaging with regular representation:
-        # f_avg = (1/N) * sum_{i=0}^{N-1} P_{-i} @ f_i
-        # where P_{-i} is the inverse permutation matrix for rotation i
-        
         # Flatten for batch matrix multiplication
         # [B, N, T, blocks, N] -> [B*N*T, blocks, N]
         features_flat = features.reshape(B * N * T, blocks, N)
         
         # Get permutation matrices for each rotation
-        # We need P_{-r} for rotation r, which is the same as P_{N-r mod N}
-        # For simplicity, we use P_r^T (transpose) which equals P_{-r}
-        # Actually for cyclic groups: P_{-r} = P_{N-r} = P_r^T
-        
-        # Create indices for selecting the correct permutation matrix
-        # For each of B*T samples, we have N rotations [0, 1, 2, ..., N-1]
+        # For rotation r, we apply P_r (same as C8EquivariantTimmObsEncoder)
+        # Create indices: [0,1,...,N-1, 0,1,...,N-1, ...] repeated B*T times
         rotation_indices = torch.arange(N, device=features.device).repeat(B * T)
         
-        # Get the permutation matrices (using transpose for inverse)
-        # [N, N, N] -> [B*N*T, N, N]
-        perm_matrices = self.permutation_matrices[rotation_indices]  # [B*N*T, N, N]
+        # Select P_r for each element: [B*N*T, N, N]
+        perm_matrices = self.permutation_matrices[rotation_indices]
         
-        # Transpose to get inverse permutation
-        perm_matrices_inv = perm_matrices.transpose(-1, -2)  # [B*N*T, N, N]
-        
-        # Apply inverse permutation: [B*N*T, blocks, N] @ [B*N*T, N, N] -> [B*N*T, blocks, N]
-        aligned_features_flat = torch.bmm(features_flat, perm_matrices_inv)
+        # Apply permutation: features @ P_r (NOT transposed, matching C8EquivariantTimmObsEncoder)
+        aligned_features_flat = torch.bmm(features_flat, perm_matrices)
         
         # Reshape back: [B*N*T, blocks, N] -> [B, N, T, blocks, N]
         aligned_features = aligned_features_flat.reshape(B, N, T, blocks, N)
@@ -574,12 +566,12 @@ class EagleBackboneLateFaMemoryEfficient(EagleBackboneLateFa):
         # Reshape for permutation: [B, N, T, blocks, N]
         features = stacked_features.reshape(B, N, T, blocks, N)
         
-        # Apply inverse permutations
+        # Apply permutations (matching C8EquivariantTimmObsEncoder convention)
         features_flat = features.reshape(B * N * T, blocks, N)
         rotation_indices = torch.arange(N, device=device).repeat(B * T)
         perm_matrices = self.permutation_matrices[rotation_indices]
-        perm_matrices_inv = perm_matrices.transpose(-1, -2)
-        aligned_features_flat = torch.bmm(features_flat, perm_matrices_inv)
+        # NO transpose - use P_r directly like C8EquivariantTimmObsEncoder
+        aligned_features_flat = torch.bmm(features_flat, perm_matrices)
         aligned_features = aligned_features_flat.reshape(B, N, T, blocks, N)
         
         # Average
