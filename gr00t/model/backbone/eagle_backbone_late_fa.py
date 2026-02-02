@@ -75,7 +75,7 @@ class EagleBackboneLateFa(nn.Module):
         eagle_path: str | None = None,
         project_to_dim: int = 1536,
         # Late FA specific parameters
-        n_group: int = 4,  # Number of rotations (C4 = 4, C8 = 8)
+        n_group: int = 8,  # Number of rotations (C4 = 4, C8 = 8)
         num_images_per_sample: int = 1,
         rotate_image_indices: List[int] | None = None,  # Which images to rotate (None = all)
         output_type: str = 'reg',  # 'reg' for regular representation

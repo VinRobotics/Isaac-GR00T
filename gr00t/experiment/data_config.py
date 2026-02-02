@@ -1648,14 +1648,12 @@ class EquiLiberoConfig(BaseDataConfig):
             # Use GR00TTransformFA for frame averaging
             # rotate_image_indices=[0] means only the first image (exterior) is rotated
             # The second image (wrist) will be duplicated N times
-            GR00TTransformFA(
+            GR00TTransform(
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
                 max_state_dim=64,
                 max_action_dim=32,
                 num_hand=self.num_hand,
-                n_group=4,  # C4 group (90 degree rotations)
-                rotate_image_indices=[0],  # Only rotate exterior image (index 0)
             ),
         ]
 
