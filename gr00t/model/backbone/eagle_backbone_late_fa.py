@@ -454,12 +454,14 @@ class EagleBackboneLateFa(nn.Module):
 
         eagle_embeds, eagle_mask = self.forward_eagle(vl_input)
 
-        # DDP compatibility hack
-        if self.training and self.tune_visual:
+        # DDP compatibility hack - ensure all trainable parameters participate in loss
+        # This is needed because some parameters might not be used in certain forward paths
+        if self.training:
             dummy_term = torch.tensor(
                 0.0, device=eagle_embeds.device, dtype=eagle_embeds.dtype, requires_grad=True
             )
-            for param in self.eagle_model.vision_model.parameters():
+            # Add all trainable parameters to the computation graph with zero contribution
+            for param in self.parameters():
                 if param.requires_grad:
                     dummy_term = dummy_term + 0.0 * param.sum()
             eagle_embeds = eagle_embeds + dummy_term
