@@ -356,6 +356,28 @@ class FlowmatchingActionHead(nn.Module):
                 self.vlln.eval()
                 self.vl_self_attention.eval()
 
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """
+        Custom load_state_dict that handles the transition from old state_encoder (simple linear)
+        to new state_encoder (ESCNN equivariant).
+        
+        Old checkpoint has: action_head.state_encoder.layer1.W, action_head.state_encoder.layer1.b
+        New model has: action_head.state_encoder.layer1.layers.*.* (ESCNN linear layers)
+        
+        This method filters out incompatible state_encoder keys to prevent weight mismatches.
+        """
+        # Filter out old state_encoder weights that don't match the new ESCNN architecture
+        filtered_state_dict = {}
+        for key, value in state_dict.items():
+            # Skip old-style state_encoder weights
+            if "task_completion_detection" in key:
+                print(f"Skipping incompatible state_encoder weight: {key}")
+                continue
+            filtered_state_dict[key] = value
+        # print(filtered_state_dict)
+        # Call parent's load_state_dict with filtered state
+        return super().load_state_dict(filtered_state_dict, strict=False, assign=assign)
+
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         return (self.config.noise_s - sample) / self.config.noise_s
@@ -400,7 +422,6 @@ class FlowmatchingActionHead(nn.Module):
         vl_task_completion_embs = vl_task_completion_embs.mean(dim=1)
         
         vl_task_completion_logits = self.task_completion_detection(vl_task_completion_embs).squeeze()
-        print(vl_task_completion_logits)
         vl_task_completion_loss = self.task_completion_detection_loss(vl_task_completion_logits, task_completion)
 
         # Get vision and language embeddings.
@@ -514,7 +535,11 @@ class FlowmatchingActionHead(nn.Module):
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
 
         backbone_output = self.process_backbone_output(backbone_output)
-
+        vl_task_completion_embs = backbone_output.backbone_features.detach()
+        vl_task_completion_embs = vl_task_completion_embs.mean(dim=1)
+        
+        vl_task_completion_logits = self.task_completion_detection(vl_task_completion_embs).squeeze()
+        vl_task_completion_pred = F.sigmoid(vl_task_completion_logits)
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
         embodiment_id = action_input.embodiment_id
@@ -582,7 +607,7 @@ class FlowmatchingActionHead(nn.Module):
                 velocities = velocities + dt * pred_vel_velocity
         
         # Return separate tensors for PD controller
-        output_data = {"action_pred": actions}
+        output_data = {"action_pred": actions, "task_completion": vl_task_completion_pred}
         if self.use_velocity_head:
             output_data["velocity_pred"] = velocities
         
