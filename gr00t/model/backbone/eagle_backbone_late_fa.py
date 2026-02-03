@@ -121,7 +121,7 @@ class EagleBackboneLateFa(nn.Module):
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
         # Projection layer
-        self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
+        self.eagle_linear = torch.nn.Linear(2048, self.project_to_dim)
         
         # Remove unused LLM layers
         while len(self.eagle_model.language_model.model.layers) > select_layer:
