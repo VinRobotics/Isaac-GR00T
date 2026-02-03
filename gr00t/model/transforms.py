@@ -132,6 +132,12 @@ class GR00TTransform(InvertibleModalityTransform):
         default=False,
         description="Whether to include velocity in the transform output.",
     )
+    
+    # Task completion prediction arguments
+    use_task_completion: bool = Field(
+        default=False,
+        description="Whether to include task completion in the transform output for training.",
+    )
 
     max_length: int = 512
     embodiment_tag: EmbodimentTag | None = None
@@ -342,6 +348,27 @@ class GR00TTransform(InvertibleModalityTransform):
 
         return velocity, velocity_mask, n_velocity_tokens
 
+    def _prepare_task_completion(self, data: dict):
+        """
+        Prepare task completion labels for training.
+        Task completion is a binary label (0 or 1) for each timestep in the action horizon.
+        Returns (task_completion, task_completion_mask).
+        """
+        if "task_completion" not in data:
+            # Return zeros with no mask if task completion data not available
+            task_completion = np.zeros((1, 1), dtype=np.uint8)
+            return task_completion
+
+        task_completion = data["task_completion"]
+        
+        # Handle different input shapes
+        if task_completion.ndim == 1:
+            task_completion = task_completion[:, np.newaxis]  # [T] -> [T, 1]
+        
+        task_completion = task_completion.astype(np.uint8)
+
+        return task_completion
+
     def apply_single(self, data: dict) -> dict:
         transformed_data = {}
 
@@ -371,6 +398,11 @@ class GR00TTransform(InvertibleModalityTransform):
                 velocity, velocity_mask, _ = self._prepare_velocity(data)
                 transformed_data["velocity"] = velocity
                 transformed_data["velocity_mask"] = velocity_mask
+            
+            # 5) Prepare task completion if enabled
+            if self.use_task_completion:
+                task_completion = self._prepare_task_completion(data)
+                transformed_data["task_completion"] = task_completion
 
         for k, v in vlm_outputs.items():
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."

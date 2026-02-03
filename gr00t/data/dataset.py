@@ -489,12 +489,15 @@ class LeRobotSingleDataset(Dataset):
         """Use the config to check if the keys are valid and detect silent data corruption."""
         ERROR_MSG_HEADER = f"Error occurred in initializing dataset {self.dataset_name}:\n"
 
-        for modality_config in self.modality_configs.values():
+        for modality_name, modality_config in self.modality_configs.items():
             for key in modality_config.modality_keys:
                 if key == "lapa_action" or key == "dream_actions":
                     continue  # no need for any metadata for lapa actions because it comes normalized
                 # Check if the key is valid
                 if key == "action.task_progress":
+                    continue
+                # Skip task completion keys - they are loaded directly from parquet
+                if modality_name == "task_completion":
                     continue
 
                 try:
@@ -859,8 +862,62 @@ class LeRobotSingleDataset(Dataset):
             return self.get_state_or_action(trajectory_id, modality, key, base_index)
         elif modality == "language":
             return self.get_language(trajectory_id, key, base_index)
+        elif modality == "task_completion":
+            return self.get_task_completion(trajectory_id, key, base_index)
         else:
             raise ValueError(f"Invalid modality: {modality}")
+
+    def get_task_completion(
+        self,
+        trajectory_id: int,
+        key: str,
+        base_index: int,
+    ) -> np.ndarray:
+        """Get the task completion data for a trajectory by step indices.
+
+        Args:
+            trajectory_id (int): The ID of the trajectory.
+            key (str): The key of the task completion data - directly the parquet column name
+                       (e.g., "observation.tasks.done")
+            base_index (int): The base index of the trajectory.
+
+        Returns:
+            np.ndarray: The task completion data for the trajectory and step indices. Shape: (T, 1)
+        """
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        
+        # Get the step indices
+        step_indices = self.delta_indices[key] + base_index
+        # Get the trajectory index
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        # Get the maximum length of the trajectory
+        max_length = self.trajectory_lengths[trajectory_index]
+        
+        # The key is directly the parquet column name
+        le_key = key
+        
+        if le_key not in self.curr_traj_data.columns:
+            # Return zeros if task completion data is not available
+            print(f"Warning: Task completion column '{le_key}' not found in dataset. Returning zeros.")
+            return np.zeros((len(step_indices), 1), dtype=np.float32)
+        
+        # Get the data array, shape: (T,) or (T, 1)
+        data_array: np.ndarray = np.array(self.curr_traj_data[le_key].tolist())
+        if data_array.ndim == 1:
+            data_array = data_array.reshape(-1, 1)
+        
+        # Pad the data using first_last strategy (task completion is absolute)
+        result = self.retrieve_data_and_pad(
+            array=data_array,
+            step_indices=step_indices,
+            max_length=max_length,
+            padding_strategy="first_last",
+        )
+        
+        # Ensure output shape is (batch, 1)
+        if result.ndim == 1:
+            result = result.reshape(-1, 1)
+        return result
 
 
 class CachedLeRobotSingleDataset(LeRobotSingleDataset):

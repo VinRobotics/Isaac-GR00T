@@ -244,6 +244,20 @@ class FlowmatchingActionHead(nn.Module):
             output_dim=self.action_dim,
         )
         
+        # done detection
+        self.task_completion_detection = nn.Sequential(
+            
+                nn.Linear(
+                    config.hidden_size*2, config.hidden_size
+                ),
+                nn.GELU(),
+                nn.Linear(
+                    config.hidden_size, 1
+                ),
+            
+        )
+        self.task_completion_detection_loss = nn.BCEWithLogitsLoss()
+        
         # Velocity head for PD-complete action chunks
         self.use_velocity_head = config.use_velocity_head
         self.velocity_dim = config.velocity_dim if config.velocity_dim is not None else config.action_dim
@@ -380,6 +394,14 @@ class FlowmatchingActionHead(nn.Module):
                 factors = tuple(factors)
                 expanded = v.repeat(*factors)
                 action_input[k] = expanded
+        # get task completion
+        task_completion = action_input.task_completion.squeeze().float()
+        vl_task_completion_embs = backbone_output.backbone_features.detach()
+        vl_task_completion_embs = vl_task_completion_embs.mean(dim=1)
+        
+        vl_task_completion_logits = self.task_completion_detection(vl_task_completion_embs).squeeze()
+        print(vl_task_completion_logits)
+        vl_task_completion_loss = self.task_completion_detection_loss(vl_task_completion_logits, task_completion)
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
@@ -430,10 +452,11 @@ class FlowmatchingActionHead(nn.Module):
         action_mask = action_input.action_mask
         loss_pos = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss_pos = loss_pos.sum() / action_mask.sum()
-        
+        loss_pos += vl_task_completion_loss * 0.1
         output_dict = {
             "loss": loss_pos,
             "loss_pos": loss_pos.detach(),
+            "loss_vl_task_completion": vl_task_completion_loss.detach()
         }
         
         # Dual-head velocity loss
