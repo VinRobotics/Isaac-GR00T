@@ -456,7 +456,7 @@ class EagleBackboneLateFa(nn.Module):
 
         # DDP compatibility hack - ensure all trainable parameters participate in loss
         # This is needed because some parameters might not be used in certain forward paths
-        if self.training:
+        if self.training and self.tune_visual:
             dummy_term = torch.tensor(
                 0.0, device=eagle_embeds.device, dtype=eagle_embeds.dtype, requires_grad=True
             )

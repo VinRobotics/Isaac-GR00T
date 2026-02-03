@@ -359,7 +359,7 @@ def main(config: ArgsConfig):
         report_to=config.report_to,
         seed=42,
         do_eval=False,
-        ddp_find_unused_parameters=False,
+        ddp_find_unused_parameters=True,  # Required for equivariant models with unused parameters
         ddp_bucket_cap_mb=100,
         torch_compile_mode=None,
     )
