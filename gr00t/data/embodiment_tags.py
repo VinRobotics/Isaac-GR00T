@@ -44,6 +44,11 @@ class EmbodimentTag(Enum):
     The Open-X-Embodiment WidowX robot.
     """
 
+    OXE_DROID = "oxe_droid"
+    """
+    The Open-X-Embodiment DROID robot with relative joint position actions.
+    """
+
     BEHAVIOR_R1_PRO = "behavior_r1_pro"
     """
     The Behavior R1 Pro robot.
