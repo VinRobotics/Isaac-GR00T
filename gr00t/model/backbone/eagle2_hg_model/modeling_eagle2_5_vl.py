@@ -234,7 +234,7 @@ class Eagle2_5_VLForConditionalGeneration(Eagle2_5_VLPreTrainedModel, Generation
 
         input_embeds = self.language_model.get_input_embeddings()(input_ids)
 
-        vit_embeds = self.extract_feature(pixel_values)
+        vit_embeds, _ = self.extract_feature(pixel_values)
 
         if image_flags is not None:
             image_flags = image_flags.view(-1)
@@ -293,6 +293,66 @@ class Eagle2_5_VLForConditionalGeneration(Eagle2_5_VLPreTrainedModel, Generation
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+    
+    def extract_language_feature(
+        self,
+        pixel_values: torch.FloatTensor,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        image_flags: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        num_tiles_list: Optional[List[torch.Tensor]] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        input_embeds = self.language_model.get_input_embeddings()(input_ids)
+
+        B, N, C = input_embeds.shape
+        input_embeds = input_embeds.reshape(B * N, C)
+
+        input_ids = input_ids.reshape(B * N)
+
+        input_embeds = input_embeds.reshape(B, N, C)
+
+        outputs = self.language_model(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+        logits = outputs.logits
+
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.language_model.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
@@ -309,17 +369,16 @@ class Eagle2_5_VLForConditionalGeneration(Eagle2_5_VLPreTrainedModel, Generation
         return x
 
     def extract_feature(self, pixel_values):
-        if self.select_layer == -1:
-            vit_embeds = self.vision_model(
-                pixel_values=pixel_values, output_hidden_states=False, return_dict=True
-            )
-            if hasattr(vit_embeds, "last_hidden_state"):
-                vit_embeds = vit_embeds.last_hidden_state
+        vit_outputs = self.vision_model(pixel_values=pixel_values, output_hidden_states=True, return_dict=True)
 
+        ########################Fixed##########################
+        image_pooled_output = vit_outputs.pooler_output  # [B, V, 1152] 
+        ######################Fixed##########################
+
+        if self.select_layer == -1:
+            vit_embeds = vit_outputs.last_hidden_state
         else:
-            vit_embeds = self.vision_model(
-                pixel_values=pixel_values, output_hidden_states=True, return_dict=True
-            ).hidden_states[self.select_layer]
+            vit_embeds = vit_outputs.hidden_states[self.select_layer]
 
         if self.use_pixel_shuffle:
             h = w = int(vit_embeds.shape[1] ** 0.5)
@@ -336,7 +395,7 @@ class Eagle2_5_VLForConditionalGeneration(Eagle2_5_VLPreTrainedModel, Generation
         else:
             vit_embeds = self.mlp1(vit_embeds)
 
-        return vit_embeds
+        return vit_embeds, image_pooled_output
 
     @torch.no_grad()
     def generate(

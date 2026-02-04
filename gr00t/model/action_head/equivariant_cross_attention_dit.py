@@ -575,7 +575,8 @@ class EDiT(ModelMixin, ConfigMixin):
         # This ensures the model is equivariant w.r.t. state/action regardless of VL content
         self.cross_attention_type = enn.FieldType(
             self.gspace,
-            [self.gspace.regular_repr] * int(self.config.cross_attention_dim / self.n_group)
+            [self.gspace.trivial_repr] * int(self.config.cross_attention_dim)
+            # [self.gspace.regular_repr] * int(self.config.cross_attention_dim / self.n_group)
         )
         self.ff_inner_type = enn.FieldType(
             self.gspace,

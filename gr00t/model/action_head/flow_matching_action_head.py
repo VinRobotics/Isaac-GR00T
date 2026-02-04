@@ -40,8 +40,8 @@ from gr00t.model.action_head.action_encoder import (
     swish,
 )
 
-from .equivariant_cross_attention_dit import EDiT, SelfAttentionTransformer, EquivariantLayerNorm
-
+from .equivariant_cross_attention_dit import EDiT, EquivariantLayerNorm
+from .cross_attention_dit import SelfAttentionTransformer
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
     """
@@ -375,6 +375,14 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=2, metadata={"help": "Whether to use two hands (True) or one hand (False)."}
     )
     
+    # Separate vision and language feature dimensions
+    vision_embedding_dim: int = field(
+        default=1152, metadata={"help": "Vision embedding dimension from backbone (regular repr, equivariant)."}
+    )
+    language_embedding_dim: int = field(
+        default=2048, metadata={"help": "Language embedding dimension from backbone (trivial repr, invariant)."}
+    )
+    
     rot_type: str = field(
         default="quaternion", metadata={"help": "Define rot type: quaternion, euler_angles"}
     )
@@ -444,11 +452,17 @@ class FlowmatchingActionHead(nn.Module):
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
-        # Inject n_group into vl_self_attention config
-        vl_self_attention_cfg = {**config.vl_self_attention_cfg, "n_group": self.n_group}
-        self.vl_self_attention = SelfAttentionTransformer(**vl_self_attention_cfg)
-        self.vlln = EquivariantLayerNorm(self.vl_self_attention.in_type)
+        # Vision projection: projects vision features (regular repr) to match sa_embs dimension
+        # Vision features are equivariant in regular repr from frame averaging
+        self.vision_in_type = enn.FieldType(
+            self.group, 
+            int(config.vision_embedding_dim / self.n_group) * [self.group.regular_repr]
+        )
+        self.vision_projection = enn.Linear(self.vision_in_type, self.state_out_type)
         
+        # Language projection: projects language features (trivial repr) for cross-attention
+        # Language features are invariant (trivial repr) - used for cross-attention conditioning
+        self.language_projection = nn.Linear(config.language_embedding_dim, config.diffusion_model_cfg.get("cross_attention_dim", 2048))
 
         if config.add_pos_embed:
             self.position_embedding = nn.Embedding(config.max_seq_len, self.input_embedding_dim)
@@ -638,7 +652,7 @@ class FlowmatchingActionHead(nn.Module):
         filtered_state_dict = {}
         for key, value in state_dict.items():
             # Skip old-style state_encoder weights
-            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key or "vlln" in key or "vl_self_attention" in key:
+            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key or "vlln" in key or "vl_self_attention" in key or "vision_projection" in key or "language_projection" in key:
                 print(f"Skipping incompatible state_encoder weight: {key}")
                 continue
             filtered_state_dict[key] = value
@@ -672,14 +686,28 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
-        backbone_features = backbone_output.backbone_features
-        B, T, D = backbone_features.shape
-        backbone_features = einops.rearrange(backbone_features, "b t d -> (b t) d")
-        backbone_features = enn.GeometricTensor(backbone_features, self.vl_self_attention.in_type)
-        backbone_features = self.vlln(backbone_features).tensor
-        backbone_features = einops.rearrange(backbone_features, "(b t) d -> b t d", b = B, t = T)
-        backbone_features = self.vl_self_attention(backbone_features)
-        backbone_output.data["backbone_features"] = backbone_features
+        """
+        Process backbone output to separate vision and language features.
+        
+        Vision features (regular repr, equivariant): Used in self-attention with state/action
+        Language features (trivial repr, invariant): Used for cross-attention conditioning
+        """
+        # Get separated features from backbone
+        vision_features = backbone_output["backbone_vision_features"]  # (B, num_imgs, vision_dim)
+        language_features = backbone_output["backbone_language_features"]  # (B, T_lang, lang_dim)
+        
+        # Project vision features through equivariant linear (regular repr -> regular repr)
+        B, num_imgs, _ = vision_features.shape
+        vision_flat = einops.rearrange(vision_features, "b n d -> (b n) d")
+        vision_geo = enn.GeometricTensor(vision_flat, self.vision_in_type)
+        vision_projected = self.vision_projection(vision_geo)
+        vision_features = einops.rearrange(vision_projected.tensor, "(b n) d -> b n d", b=B, n=num_imgs)
+        
+        # Project language features through standard linear (trivial repr for cross-attention)
+        language_features = self.language_projection(language_features)
+        
+        backbone_output["vision_features"] = vision_features  # Equivariant, for self-attention
+        backbone_output["language_features"] = language_features  # Invariant, for cross-attention
         return backbone_output
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
@@ -707,9 +735,10 @@ class FlowmatchingActionHead(nn.Module):
                 expanded = v.repeat(*factors)
                 action_input[k] = expanded
 
-        # Get vision and language embeddings.
-        vl_embs = backbone_output.backbone_features
-        device = vl_embs.device
+        # Get vision features (equivariant, regular repr) and language features (invariant, trivial repr)
+        vision_features = backbone_output["vision_features"]  # (B, num_imgs, D) - for self-attention
+        language_features = backbone_output["language_features"]  # (B, T_lang, D) - for cross-attention
+        device = vision_features.device
 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
@@ -751,38 +780,42 @@ class FlowmatchingActionHead(nn.Module):
             t=actions_gt.shape[1]
         )
         
-        sa_embs = torch.cat((state_features, action_features), dim=1)
-        B, T, C = sa_embs.shape
-        B, Tv, Cv = vl_embs.shape
-        # sa embs: B, T, G*D
-        # project vl embs to 2d space
-        vl_attn_mask = backbone_output.backbone_attention_mask
+        # Self-attention embeddings: vision (equivariant) + state (equivariant) + action (equivariant)
+        # All in regular repr for equivariant self-attention
+        sa_embs = torch.cat((vision_features, state_features, action_features), dim=1)
+        B, T_sa, C = sa_embs.shape
+        
+        # Language features for cross-attention (invariant conditioning)
+        lang_attn_mask = backbone_output.backbone_attention_mask
 
         model_output = self.model(
             hidden_states=sa_embs,
-            encoder_hidden_states=vl_embs,
-            encoder_attention_mask=vl_attn_mask,
+            encoder_hidden_states=language_features,  # Language for cross-attention (trivial repr)
+            encoder_attention_mask=lang_attn_mask,
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
         )
         
-        action_decoder_embodiment_id = embodiment_id.repeat((model_output.shape[1]))
+        # Only decode the action portion (exclude vision and state tokens)
+        num_vision_tokens = vision_features.shape[1]
+        num_state_tokens = state_features.shape[1]
+        action_output = model_output[:, num_vision_tokens + num_state_tokens:, :]  # Only action tokens
+        
+        action_decoder_embodiment_id = embodiment_id.repeat((action_output.shape[1]))
 
-        model_output = einops.rearrange(
-            model_output,
+        action_output = einops.rearrange(
+            action_output,
             'b t c -> (b t) c',
         )
-        model_output = enn.GeometricTensor(model_output, self.state_hidden_type)
-        pred = self.action_decoder(model_output, action_decoder_embodiment_id)
+        action_output = enn.GeometricTensor(action_output, self.state_hidden_type)
+        pred = self.action_decoder(action_output, action_decoder_embodiment_id)
 
-        pred = einops.rearrange(
+        pred_actions = einops.rearrange(
             pred.tensor,
             '(b t) c -> b t c',
-            b=sa_embs.shape[0],
-            t=sa_embs.shape[1]
+            b=B,
+            t=actions_gt.shape[1]
         )
-
-        pred_actions = pred[:, -actions_gt.shape[1] :, :]
 
         # pred_actions = self.getActionOutput(pred_actions)
         # Slice out only the action portion of pred and target.
@@ -811,8 +844,9 @@ class FlowmatchingActionHead(nn.Module):
         
         backbone_output = self.process_backbone_output(backbone_output)
 
-        # Get vision and language embeddings.
-        vl_embs = backbone_output.backbone_features
+        # Get vision features (equivariant, regular repr) and language features (invariant, trivial repr)
+        vision_features = backbone_output["vision_features"]  # (B, num_imgs, D) - for self-attention
+        language_features = backbone_output["language_features"]  # (B, T_lang, D) - for cross-attention
         
         embodiment_id = action_input.embodiment_id
 
@@ -824,11 +858,11 @@ class FlowmatchingActionHead(nn.Module):
         state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=B, t=T)
 
         # Set initial actions as the sampled noise.
-        batch_size = vl_embs.shape[0]
-        device = vl_embs.device
+        batch_size = vision_features.shape[0]
+        device = vision_features.device
         actions = torch.randn(
                     size=(batch_size, self.config.action_horizon, self.action_type.size),
-                    dtype=vl_embs.dtype,
+                    dtype=vision_features.dtype,
                     device=device,
                 )
         num_steps = self.num_inference_timesteps
@@ -857,53 +891,37 @@ class FlowmatchingActionHead(nn.Module):
                 t=actions.shape[1]
             )
 
-            # # Maybe add position embedding.
-            # if self.config.add_pos_embed:
-            #     pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-            #     pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-            #     action_features = action_features + pos_embs
+            # Self-attention embeddings: vision (equivariant) + state (equivariant) + action (equivariant)
+            sa_embs = torch.cat((vision_features, state_features, action_features), dim=1)
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            # future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-                    
-            # future_tokens = einops.rearrange(
-            #     future_tokens, "b t d -> (b t) d"
-            # )
-            # future_tokens = enn.GeometricTensor(future_tokens, self.future_tokens_in_type)
-            # future_tokens = self.future_tokens_equi_proj(future_tokens)
-            # future_tokens = einops.rearrange(
-            #     future_tokens.tensor, "(b t) d -> b t d", b = B, t = self.config.num_target_vision_tokens
-            # )
-            sa_embs = torch.cat((state_features, action_features), dim=1)
-            
-            B, T, C = sa_embs.shape
-            B, Tv, Cv = vl_embs.shape
-            # sa embs: B, T, G*D
-
-            # Run model forward.
+            # Run model forward with language for cross-attention
             model_output = self.model(
                 hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
+                encoder_hidden_states=language_features,  # Language for cross-attention (trivial repr)
                 timestep=timesteps_tensor,
             )
             
-            action_decoder_embodiment_id = embodiment_id.repeat((model_output.shape[1]))
+            # Only decode the action portion (exclude vision and state tokens)
+            num_vision_tokens = vision_features.shape[1]
+            num_state_tokens = state_features.shape[1]
+            action_output = model_output[:, num_vision_tokens + num_state_tokens:, :]
+            
+            action_decoder_embodiment_id = embodiment_id.repeat((action_output.shape[1]))
 
-            model_output = einops.rearrange(
-                model_output,
+            action_output = einops.rearrange(
+                action_output,
                 'b t c -> (b t) c',
             )
-            model_output = enn.GeometricTensor(model_output, self.state_hidden_type)
-            pred = self.action_decoder(model_output, action_decoder_embodiment_id)
+            action_output = enn.GeometricTensor(action_output, self.state_hidden_type)
+            pred = self.action_decoder(action_output, action_decoder_embodiment_id)
 
-            pred = einops.rearrange(
+            pred_velocity = einops.rearrange(
                 pred.tensor,
                 '(b t) c -> b t c',
-                b=sa_embs.shape[0],
-                t=sa_embs.shape[1]
+                b=batch_size,
+                t=self.action_horizon
             )
 
-            pred_velocity = pred[:, -self.action_horizon :]
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
             
@@ -929,21 +947,30 @@ class FlowmatchingActionHead(nn.Module):
 
         backbone_output = self.process_backbone_output(backbone_output)
 
-        # Get vision and language embeddings.
-        vl_embeds      = backbone_output.backbone_features          # [B, T_vl, D]
+        # Get vision features (equivariant, regular repr) and language features (invariant, trivial repr)
+        vision_features = backbone_output["vision_features"]  # (B, num_imgs, D) - for self-attention
+        language_features = backbone_output["language_features"]  # (B, T_lang, D) - for cross-attention
         embodiment_id  = action_input.embodiment_id
 
         # Embed state.
-        state_features = self.state_encoder(action_input.state, embodiment_id)
+        B, T_state, _ = action_input.state.shape
+        state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
+        state_features = self.state_encoder(state_input, embodiment_id)
+        state_features = state_features.tensor
+        state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=B, t=T_state)
 
         # Set initial actions as the sampled noise.
-        batch_size = vl_embeds.shape[0]
-        device = vl_embeds.device
+        batch_size = vision_features.shape[0]
+        device = vision_features.device
         x_t = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
-            dtype=vl_embeds.dtype,
+            size=(batch_size, self.config.action_horizon, self.action_type.size),
+            dtype=vision_features.dtype,
             device=device,
         )
+
+        # Store token counts for decoding
+        num_vision_tokens = vision_features.shape[1]
+        num_state_tokens = state_features.shape[1]
 
         for t in range(num_steps):
             # weights: [horizon]
@@ -961,27 +988,42 @@ class FlowmatchingActionHead(nn.Module):
                 timesteps_tensor = torch.full(
                     size=(batch_size,), fill_value=t_discretized, device=device
                 )
-                action_features = self.action_encoder(x_t_, timesteps_tensor, embodiment_id)
-                # Maybe add position embedding.
-                if self.config.add_pos_embed:
-                    pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                    pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                    action_features = action_features + pos_embs
+                action_encoder_embodiment_id = embodiment_id.repeat((x_t_.shape[1]))
+                noisy_trajectory = einops.rearrange(x_t_, "b t c -> (b t) c")
+                noisy_trajectory = enn.GeometricTensor(noisy_trajectory, self.getJointFieldType(True))
+                action_features = self.action_encoder(noisy_trajectory, timesteps_tensor, action_encoder_embodiment_id)
+                action_features = action_features.tensor
+                action_features = einops.rearrange(
+                    action_features,
+                    '(b t) c -> b t c',
+                    b=x_t_.shape[0],
+                    t=x_t_.shape[1]
+                )
 
-                vl_embs = vl_embeds
+                # Self-attention embeddings: vision (equivariant) + state (equivariant) + action (equivariant)
+                sa_embs = torch.cat((vision_features, state_features, action_features), dim=1)
 
-                # Join vision, language, state and action embedding along sequence dimension.
-                sa_embs = torch.cat((state_features, action_features), dim=1)
-
-                # Run model forward.
+                # Run model forward with language for cross-attention
                 model_output = self.model(
                     hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embs,
+                    encoder_hidden_states=language_features,  # Language for cross-attention (trivial repr)
                     timestep=timesteps_tensor,
                 )
-                pred = self.action_decoder(model_output, embodiment_id)
+                
+                # Only decode the action portion (exclude vision and state tokens)
+                action_output = model_output[:, num_vision_tokens + num_state_tokens:, :]
+                
+                action_decoder_embodiment_id = embodiment_id.repeat((action_output.shape[1]))
+                action_output = einops.rearrange(action_output, 'b t c -> (b t) c')
+                action_output = enn.GeometricTensor(action_output, self.state_hidden_type)
+                pred = self.action_decoder(action_output, action_decoder_embodiment_id)
 
-                pred_velocity = pred[:, -self.action_horizon :]
+                pred_velocity = einops.rearrange(
+                    pred.tensor,
+                    '(b t) c -> b t c',
+                    b=batch_size,
+                    t=self.action_horizon
+                )
                 return x_t_ + pred_velocity * (1 - t_cont), pred_velocity
             
             (outputs, vjp_func) = torch.func.vjp(denoiser, x_t)
@@ -1001,7 +1043,7 @@ class FlowmatchingActionHead(nn.Module):
 
             x_t = x_t + dt * v_t_corr
 
-        assert x_t.shape == (batch_size, self.config.action_horizon, self.config.action_dim), x_t.shape
+        x_t = self.getActionOutput(x_t)
         x_t = x_t.clone().detach()
         return BatchFeature(data={"action_pred": x_t})
 
