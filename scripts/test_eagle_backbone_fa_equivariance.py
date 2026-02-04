@@ -134,9 +134,12 @@ def transform_regular_repr(features: torch.Tensor, group_element: int, n_group: 
 
 def create_test_input(batch_size: int, num_images: int, img_size: int = 224, 
                       seq_len: int = 64, device: torch.device = None,
-                      dtype: torch.dtype = torch.bfloat16) -> dict:
+                      dtype: torch.dtype = torch.bfloat16,
+                      save_visualization: bool = False,
+                      save_path: str = "test_input_image.png") -> dict:
     """
     Create test vision-language input with structured (non-symmetric) pattern.
+    Each batch sample and each image within a sample has a unique pattern.
     
     Args:
         batch_size: batch size
@@ -145,6 +148,8 @@ def create_test_input(batch_size: int, num_images: int, img_size: int = 224,
         seq_len: sequence length for text tokens
         device: torch device
         dtype: torch dtype
+        save_visualization: if True, save the test image as PNG
+        save_path: path to save the visualization
         
     Returns:
         Dictionary with eagle_ prefixed keys
@@ -156,22 +161,83 @@ def create_test_input(batch_size: int, num_images: int, img_size: int = 224,
     pixel_values = torch.zeros(batch_size * num_images, 3, img_size, img_size, 
                                device=device, dtype=dtype)
     
-    # Create a distinctive pattern: gradient + asymmetric shapes
-    for i in range(img_size):
-        for j in range(img_size):
-            # Horizontal gradient in red channel
-            pixel_values[:, 0, i, j] = j / img_size
-            # Vertical gradient in green channel  
-            pixel_values[:, 1, i, j] = i / img_size
-            # Diagonal pattern in blue channel
-            if i > j:
-                pixel_values[:, 2, i, j] = 0.8
-            elif i < j - img_size // 4:
-                pixel_values[:, 2, i, j] = 0.3
+    # Create different patterns for each batch and each image
+    for img_idx in range(batch_size * num_images):
+        batch_idx = img_idx // num_images  # Which batch sample
+        image_idx = img_idx % num_images   # Which image within the sample
+        
+        # Use batch_idx to create different base patterns
+        # Use image_idx to create variations within each batch
+        
+        center = img_size // 2
+        
+        if image_idx == 0:
+            # First image in each batch: gradient + diagonal pattern
+            # Vary by batch_idx
+            for i in range(img_size):
+                for j in range(img_size):
+                    # Horizontal gradient in red channel (shifted by batch)
+                    pixel_values[img_idx, 0, i, j] = ((j + batch_idx * 30) % img_size) / img_size
+                    # Vertical gradient in green channel (shifted by batch)
+                    pixel_values[img_idx, 1, i, j] = ((i + batch_idx * 50) % img_size) / img_size
+                    # Diagonal pattern in blue channel (different angle per batch)
+                    threshold = j + batch_idx * 20
+                    if i > threshold % img_size:
+                        pixel_values[img_idx, 2, i, j] = 0.8
+                    elif i < (threshold - img_size // 4) % img_size:
+                        pixel_values[img_idx, 2, i, j] = 0.3
+        else:
+            # Second+ image in each batch: circle + stripe pattern
+            # Vary by batch_idx and image_idx
+            circle_radius = img_size // 4 + batch_idx * 10
+            stripe_width = 15 + image_idx * 5 + batch_idx * 3
+            
+            # Offset circle center by batch
+            cx = center + batch_idx * 15
+            cy = center - batch_idx * 10
+            
+            for i in range(img_size):
+                for j in range(img_size):
+                    # Circle pattern in red channel (different size/position per batch)
+                    dist = math.sqrt((i - cy)**2 + (j - cx)**2)
+                    if dist < circle_radius:
+                        pixel_values[img_idx, 0, i, j] = 0.9 - batch_idx * 0.1
+                    else:
+                        pixel_values[img_idx, 0, i, j] = 0.2 + batch_idx * 0.1
+                    
+                    # Stripe pattern in green channel (different width per batch/image)
+                    if j % stripe_width < stripe_width // 2:
+                        pixel_values[img_idx, 1, i, j] = 0.7
+                    else:
+                        pixel_values[img_idx, 1, i, j] = 0.3
+                    
+                    # Corner marker in blue channel (different corner per batch)
+                    corner_size = img_size // 4
+                    if batch_idx % 4 == 0:
+                        # Top-right corner
+                        in_corner = i < corner_size and j > img_size - corner_size
+                    elif batch_idx % 4 == 1:
+                        # Top-left corner
+                        in_corner = i < corner_size and j < corner_size
+                    elif batch_idx % 4 == 2:
+                        # Bottom-left corner
+                        in_corner = i > img_size - corner_size and j < corner_size
+                    else:
+                        # Bottom-right corner
+                        in_corner = i > img_size - corner_size and j > img_size - corner_size
+                    
+                    if in_corner:
+                        pixel_values[img_idx, 2, i, j] = 1.0
+                    else:
+                        pixel_values[img_idx, 2, i, j] = 0.1
     
-    # Add small random noise for numerical stability
+    # Add small random noise for numerical stability (different seed per image)
     pixel_values = pixel_values + 0.05 * torch.randn_like(pixel_values)
     pixel_values = torch.clamp(pixel_values, 0, 1)
+    
+    # Save visualization if requested
+    if save_visualization:
+        save_test_image(pixel_values, save_path)
     
     # Create dummy text tokens (same for all rotations to isolate vision equivariance)
     input_ids = torch.randint(0, 32000, (batch_size, seq_len), device=device)
@@ -183,6 +249,45 @@ def create_test_input(batch_size: int, num_images: int, img_size: int = 224,
         "eagle_attention_mask": attention_mask,
         "attention_mask": attention_mask,
     }
+
+
+def save_test_image(pixel_values: torch.Tensor, save_path: str = "test_input_image.png"):
+    """
+    Save test images as PNG for visualization.
+    
+    Args:
+        pixel_values: [B, C, H, W] tensor with values in [0, 1]
+        save_path: path to save the image
+    """
+    from PIL import Image
+    
+    # Convert to numpy and handle multiple images
+    imgs = pixel_values.float().cpu().numpy()
+    num_images = imgs.shape[0]
+    
+    if num_images == 1:
+        # Single image: save directly
+        img = imgs[0].transpose(1, 2, 0)  # CHW -> HWC
+        img = (img * 255).clip(0, 255).astype(np.uint8)
+        Image.fromarray(img).save(save_path)
+        print(f"Saved test image to: {save_path}")
+    else:
+        # Multiple images: create a grid
+        H, W = imgs.shape[2], imgs.shape[3]
+        cols = min(4, num_images)
+        rows = (num_images + cols - 1) // cols
+        
+        grid = np.zeros((rows * H, cols * W, 3), dtype=np.uint8)
+        
+        for idx in range(num_images):
+            row = idx // cols
+            col = idx % cols
+            img = imgs[idx].transpose(1, 2, 0)  # CHW -> HWC
+            img = (img * 255).clip(0, 255).astype(np.uint8)
+            grid[row*H:(row+1)*H, col*W:(col+1)*W, :] = img
+        
+        Image.fromarray(grid).save(save_path)
+        print(f"Saved {num_images} test images as grid to: {save_path}")
 
 
 def check_equivariance(
@@ -222,8 +327,10 @@ def check_equivariance(
     n_group = model.n_group
 
     
-    # Create base input
-    base_input = create_test_input(batch_size, num_images, device=device)
+    # Create base input and save visualization
+    base_input = create_test_input(batch_size, num_images, device=device, 
+                                   save_visualization=True, 
+                                   save_path="test_input_image.png")
     
     errors = []
     all_passed = True
@@ -256,6 +363,9 @@ def check_equivariance(
                 base_input["eagle_pixel_values"],
                 angle
             )
+            
+            # Save rotated image for visualization
+            save_test_image(rotated_pixel_values, f"test_rotated_image_g{k.value}.png")
             
             rotated_input = {
                 **base_input,
@@ -590,7 +700,7 @@ def main():
     
     # Test parameters
     n_group = 8  # C8 group
-    batch_size = 1
+    batch_size = 2
     num_images = 2
     
     # Tolerances for equivariance check
