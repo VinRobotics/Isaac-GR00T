@@ -139,9 +139,8 @@ class EagleBackboneFATokens(nn.Module):
 
         # Remove unused LLM layers (only if layers exist and select_layer is positive)
         # select_layer=-1 means keep all layers, select_layer=N means keep first N layers
-        if select_layer > 0:
-            while len(self.eagle_model.language_model.model.layers) > select_layer:
-                self.eagle_model.language_model.model.layers.pop(-1)
+        while len(self.eagle_model.language_model.model.layers) > select_layer:
+            self.eagle_model.language_model.model.layers.pop(-1)
 
         self.select_layer = select_layer
         
