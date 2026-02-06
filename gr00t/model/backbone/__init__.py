@@ -15,4 +15,5 @@
 
 from .eagle_backbone import EagleBackbone  # noqa: F401
 from .eagle_backbone_fa import EagleBackboneFA  # noqa: F401
+from .eagle_backbone_fa_tokens import EagleBackboneFATokens  # noqa: F401
 from .eagle_backbone_late_fa import EagleBackboneLateFa, EagleBackboneLateFaMemoryEfficient  # noqa: F401
