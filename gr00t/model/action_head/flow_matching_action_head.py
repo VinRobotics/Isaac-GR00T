@@ -454,7 +454,7 @@ class FlowmatchingActionHead(nn.Module):
         
         # For lifting language (trivial repr) to regular repr format
         # We project to D_per_group, then replicate G times to get full regular repr dimension
-        self.D_per_group = self.input_embedding_dim // self.n_group
+        self.D_per_group = config.backbone_embedding_dim // self.n_group
         self.language_proj = nn.Linear(config.backbone_embedding_dim, self.D_per_group)
 
         if config.add_pos_embed:
