@@ -305,7 +305,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=8, metadata={"help": "Number of groups for equivariant operations (cyclic group order)."}
     )
     add_pos_embed: bool = field(
-        default=True, metadata={"help": "Whether to add positional embedding"}
+        default=False, metadata={"help": "Whether to add positional embedding"}
     )
     model_dtype: str = field(default="float32", metadata={"help": "Model data type."})
     diffusion_model_cfg: dict = field(
@@ -447,15 +447,15 @@ class FlowmatchingActionHead(nn.Module):
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
-        # Inject n_group into vl_self_attention config
-        vl_self_attention_cfg = {**config.vl_self_attention_cfg, "n_group": self.n_group}
-        self.vl_self_attention = SelfAttentionTransformer(**vl_self_attention_cfg)
-        self.vlln = EquivariantLayerNorm(self.vl_self_attention.in_type)
+        # # Inject n_group into vl_self_attention config
+        # vl_self_attention_cfg = {**config.vl_self_attention_cfg, "n_group": self.n_group}
+        # self.vl_self_attention = SelfAttentionTransformer(**vl_self_attention_cfg)
+        # self.vlln = EquivariantLayerNorm(self.vl_self_attention.in_type)
         
-        # For lifting language (trivial repr) to regular repr format
-        # We project to D_per_group, then replicate G times to get full regular repr dimension
-        self.D_per_group = config.backbone_embedding_dim // self.n_group
-        self.language_proj = nn.Linear(config.backbone_embedding_dim, self.D_per_group)
+        # # For lifting language (trivial repr) to regular repr format
+        # # We project to D_per_group, then replicate G times to get full regular repr dimension
+        # self.D_per_group = config.backbone_embedding_dim // self.n_group
+        # self.language_proj = nn.Linear(config.backbone_embedding_dim, self.D_per_group)
 
         if config.add_pos_embed:
             self.position_embedding = nn.Embedding(config.max_seq_len, self.input_embedding_dim)
@@ -761,7 +761,7 @@ class FlowmatchingActionHead(nn.Module):
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
 
-        backbone_output = self.process_backbone_output(backbone_output)
+        # backbone_output = self.process_backbone_output(backbone_output)
 
         if self.config.expand_batch is not None:
             for k, v in backbone_output.items():
@@ -783,7 +783,7 @@ class FlowmatchingActionHead(nn.Module):
                 action_input[k] = expanded
 
         # Get vision and language embeddings.
-        vl_embs = backbone_output.backbone_features
+        vl_embs = torch.cat([backbone_output.backbone_vision_features, backbone_output.backbone_language_features], dim=1)
         device = vl_embs.device
 
         # Get embodiment ID.
@@ -887,7 +887,7 @@ class FlowmatchingActionHead(nn.Module):
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
-        vl_embs = backbone_output.backbone_features
+        vl_embs = torch.cat([backbone_output.backbone_vision_features, backbone_output.backbone_language_features], dim=1)
         
         embodiment_id = action_input.embodiment_id
 

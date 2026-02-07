@@ -576,7 +576,7 @@ class EDiT(ModelMixin, ConfigMixin):
         self.cross_attention_type = enn.FieldType(
             self.gspace,
             # [self.gspace.trivial_repr] * int(self.config.cross_attention_dim)
-            [self.gspace.regular_repr] * int(self.config.cross_attention_dim / self.n_group)
+            [self.gspace.regular_repr] * int(self.config.cross_attention_dim / self.n_group) + [self.gspace.trivial_repr] * (self.config.cross_attention_dim)
         )
         self.ff_inner_type = enn.FieldType(
             self.gspace,
