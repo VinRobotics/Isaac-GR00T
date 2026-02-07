@@ -63,6 +63,7 @@ class GenerateConfig:
     port: int = 5555
     """Headless mode (no GUI)."""
     headless: bool = False
+    action_horizon: int = 16
 
 
 class GR00TPolicy:
@@ -81,20 +82,29 @@ class GR00TPolicy:
         },
     }
 
-    def __init__(self, host="localhost", port=5555, headless=False):
+    def __init__(self, host="localhost", port=5555, headless=False, max_action_horizon=16):
         from gr00t.eval.service import ExternalRobotInferenceClient
 
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.config = self.LIBERO_CONFIG
         self.action_keys = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
         self.headless = headless
+        self.actions = None
+        self.curr_idx = 0
+        self.max_action_horizon = max_action_horizon
 
     def get_action(self, observation_dict, lang: str):
         """Get action from GR00T policy given observation and language instruction."""
-        obs_dict = self._process_observation(observation_dict, lang)
         # summarize_obs(obs_dict)
-        action_chunk = self.policy.get_action(obs_dict)
-        return self._convert_to_libero_action(action_chunk, 0)
+        if self.actions is None:
+            obs_dict = self._process_observation(observation_dict, lang)
+            self.actions = self.policy.get_action(obs_dict)
+        action = self._convert_to_libero_action(self.actions, self.curr_idx)
+        self.curr_idx += 1
+        if self.curr_idx >= self.max_action_horizon:
+            self.actions = None
+            self.curr_idx = 0
+        return action
 
     def _process_observation(self, obs, lang: str):
         """Convert Libero observation to GR00T format."""
@@ -178,7 +188,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
         # Initialize LIBERO environment and task description
         env, task_description = get_libero_env(task, resolution=256)
 
-        gr00t_policy = GR00TPolicy(host="localhost", port=cfg.port, headless=cfg.headless)
+        gr00t_policy = GR00TPolicy(host="localhost", port=cfg.port, headless=cfg.headless, max_action_horizon=cfg.action_horizon)
 
         # Start episodes
         task_episodes, task_successes = 0, 0
