@@ -761,7 +761,7 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         use_relative_position_bias: bool = True,
-        max_relative_position: int = 32,
+        max_relative_position: int = 512,
     ):
         super().__init__()
         self.attention_head_dim = attention_head_dim
