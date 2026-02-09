@@ -783,7 +783,8 @@ class FlowmatchingActionHead(nn.Module):
                 action_input[k] = expanded
 
         # Get vision and language embeddings.
-        vl_embs = torch.cat([backbone_output.backbone_vision_features, backbone_output.backbone_language_features], dim=1)
+        v_embs = einops.rearrange(backbone_output.backbone_vision_features, "b n t c -> b (n t) c")
+        vl_embs = torch.cat([v_embs, backbone_output.backbone_language_features], dim=1)
         device = vl_embs.device
 
         # Get embodiment ID.
@@ -887,7 +888,8 @@ class FlowmatchingActionHead(nn.Module):
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
-        vl_embs = torch.cat([backbone_output.backbone_vision_features, backbone_output.backbone_language_features], dim=1)
+        v_embs = einops.rearrange(backbone_output.backbone_vision_features, "b n t c -> b (n t) c")
+        vl_embs = torch.cat([v_embs, backbone_output.backbone_language_features], dim=1)
         
         embodiment_id = action_input.embodiment_id
 
