@@ -738,14 +738,6 @@ class FlowmatchingActionHead(nn.Module):
         # [B, T_vision + T_text, D_hidden]
         backbone_features = torch.cat([vision_flat, language_regular], dim=1)
         
-        # Step 4: Apply equivariant layer norm and self-attention
-        B_combined, T_combined, D_combined = backbone_features.shape
-        backbone_features = einops.rearrange(backbone_features, "b t d -> (b t) d")
-        backbone_features = enn.GeometricTensor(backbone_features, self.vl_self_attention.in_type)
-        backbone_features = self.vlln(backbone_features).tensor
-        backbone_features = einops.rearrange(backbone_features, "(b t) d -> b t d", b=B_combined, t=T_combined)
-        backbone_features = self.vl_self_attention(backbone_features)
-        
         # Create combined attention mask
         T_lang = language_features.shape[1]
         vision_mask = torch.ones(B, num_imgs * T_vision, device=vision_features.device)
