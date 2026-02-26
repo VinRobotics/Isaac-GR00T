@@ -27,37 +27,6 @@ from gr00t.model.action_head.action_encoder import SinusoidalPositionalEncoding,
 from .cross_attention_dit import DiT, SelfAttentionTransformer
 
 
-def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
-    """
-    With start=2, end=6, total=10, the output will be:
-    1  1  4/5 3/5 2/5 1/5 0  0  0  0
-           ^              ^
-         start           end
-    `start` (inclusive) is where the chunk starts being allowed to change. `end` (exclusive) is where the chunk stops
-    paying attention to the prefix. if start == 0, then the entire chunk is allowed to change. if end == total, then the
-    entire prefix is attended to.
-
-    `end` takes precedence over `start` in the sense that, if `end < start`, then `start` is pushed down to `end`. Thus,
-    if `end` is 0, then the entire prefix will always be ignored.
-    """
-    assert schedule in ["ones", "zeros", "linear", "exp"], f"Invalid schedule: {schedule}"
-    start = min(start, end)
-    idx = torch.arange(total, dtype=torch.float32)
-    if schedule == "ones":
-        w = torch.ones(total, dtype=torch.float32)
-    elif schedule == "zeros":
-        w = (idx < start).float()
-    elif schedule == "linear" or schedule == "exp":
-        w = torch.clamp((start - 1 - idx) / (end - start + 1) + 1, min=0, max=1)
-        if schedule == "exp":
-            # torch.expm1(x) = exp(x) - 1, torch.e = math.e
-            w = w * torch.expm1(w) / (torch.tensor(torch.e) - 1)
-    else:
-        raise ValueError(f"Invalid schedule: {schedule}")
-    w = torch.where(idx >= end, torch.tensor(0.0, dtype=w.dtype), w)
-    return w
-
-
 class CategorySpecificLinear(nn.Module):
     def __init__(self, num_categories, input_dim, hidden_dim):
         super().__init__()
@@ -111,8 +80,6 @@ class MultiEmbodimentActionEncoder(nn.Module):
         if timesteps.dim() == 1 and timesteps.shape[0] == B:
             # shape (B,) => (B,T)
             timesteps = timesteps.unsqueeze(1).expand(-1, T)
-        if timesteps.dim() == 2 and timesteps.shape == (B, T):
-            pass  # already in desired shape
         else:
             raise ValueError(
                 "Expected `timesteps` to have shape (B,) so we can replicate across T."
@@ -300,6 +267,123 @@ class FlowmatchingActionHead(nn.Module):
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
+    def forward_shared_observation(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+        # Set frozen modules to eval
+        self.set_frozen_modules_to_eval_mode()
+
+        backbone_output = self.process_backbone_output(backbone_output)
+
+        if self.config.expand_batch is not None:
+            for k, v in backbone_output.items():
+                ndim = len(v.shape)
+                factors = [self.config.expand_batch]
+                while len(factors) < ndim:
+                    factors.append(1)
+                factors = tuple(factors)
+                expanded = v.repeat(*factors)
+                backbone_output[k] = expanded
+
+            for k, v in action_input.items():
+                ndim = len(v.shape)
+                factors = [self.config.expand_batch]
+                while len(factors) < ndim:
+                    factors.append(1)
+                factors = tuple(factors)
+                expanded = v.repeat(*factors)
+                action_input[k] = expanded
+
+        batch_size, num_offsets, _ = action_input.state.shape
+
+        # Get vision and language embeddings.
+        vl_embs = backbone_output.backbone_features
+        device = vl_embs.device
+
+        # Get embodiment ID.
+        embodiment_id = action_input.embodiment_id
+
+        # Embed state.
+        state_flat = action_input.state.view(batch_size * num_offsets, -1)  # [B*num_offsets, state_dim]
+        state_flat_features = self.state_encoder(state_flat, embodiment_id)
+
+        state_T = state_flat_features.shape[1]
+        state_D = state_flat_features.shape[2]
+
+        state_features = state_flat_features.view(batch_size, num_offsets, state_T, state_D)
+
+
+        # Embed noised action trajectory.
+
+        actions = action_input.action
+        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+        t = t[:, :, None, None]  # shape (B,N,1,1) for broadcast
+
+        noisy_trajectory = (1 - t) * noise + t * actions
+        velocity = actions - noise
+
+        # Convert (continuous) t -> discrete if needed
+        t_discretized = (t[:, :, 0, 0] * self.num_timestep_buckets).long()
+        
+
+        noisy_trajectory_flat = noisy_trajectory.view(batch_size * num_offsets, actions.shape[2], -1)  # [B*num_offsets, T, action_dim]
+        t_discretized_flat = t_discretized.view(batch_size * num_offsets)  # [B*num_offsets]
+
+        action_flat_features = self.action_encoder(noisy_trajectory_flat, t_discretized_flat, embodiment_id)
+
+        action_T = action_flat_features.shape[1]
+        action_D = action_flat_features.shape[2]
+
+        action_features = action_flat_features.view(
+            batch_size,
+            num_offsets,
+            action_T,
+            action_D,
+        )
+
+        # concatenate suffixes
+        suffix_embs = action_features.reshape(
+            batch_size,
+            num_offsets * T,
+            D,
+        )
+
+        hidden_states = torch.cat(
+            (prefix_embs, suffix_embs),
+            dim=1,
+        )
+
+
+        # Maybe add position embedding.
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(action_flat_features.shape[1], dtype=torch.long, device=device)
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+            action_flat_features = action_flat_features + pos_embs
+
+        # Join vision, language, state and action embedding along sequence dimension.
+        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+
+        vl_attn_mask = backbone_output.backbone_attention_mask
+
+        model_output = self.model(
+            hidden_states=sa_embs,
+            encoder_hidden_states=vl_embs,
+            encoder_attention_mask=vl_attn_mask,
+            timestep=t_discretized,
+            return_all_hidden_states=False,  # NOTE (YL): not using flare now
+        )
+        pred = self.action_decoder(model_output, embodiment_id)
+        pred_actions = pred[:, -actions.shape[1] :]
+
+        # Slice out only the action portion of pred and target.
+        action_mask = action_input.action_mask
+        loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+        loss = loss.sum() / action_mask.sum()
+        output_dict = {
+            "loss": loss,
+        }
+        return BatchFeature(data=output_dict)
+
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
@@ -436,112 +520,6 @@ class FlowmatchingActionHead(nn.Module):
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
         return BatchFeature(data={"action_pred": actions})
-    
-    @torch.enable_grad()
-    def get_realtime_action(
-        self,
-        action_input: BatchFeature,
-        backbone_output:BatchFeature,
-        prev_action_chunk: torch.Tensor,  # [batch, horizon, action_dim]
-        inference_delay: int,
-        prefix_attention_horizon: int,
-        prefix_attention_schedule: str,
-        max_guidance_weight: float,
-        sigma_d_o: float,
-        actual_action_dim: int,
-        use_prev_action: bool = True
-    )  -> BatchFeature:
-        torch.set_grad_enabled(True)
-        num_steps = self.num_inference_timesteps
-        self.sigma_d_o = sigma_d_o
-        dt = 1.0 / num_steps
-        prev_action_chunk = torch.as_tensor(prev_action_chunk, device=self.device, dtype=self.dtype)
-
-        backbone_output = self.process_backbone_output(backbone_output)
-
-        # Get vision and language embeddings.
-        vl_embs = backbone_output.backbone_features
-        embodiment_id = action_input.embodiment_id
-
-        # Embed state.
-        state_features = self.state_encoder(action_input.state, embodiment_id)
-
-        # Set initial actions as the sampled noise.
-        batch_size = vl_embs.shape[0]
-        device = vl_embs.device
-        x_t = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
-            dtype=vl_embs.dtype,
-            device=device,
-        )
-
-        actions_mask = torch.zeros_like(x_t, dtype=vl_embs.dtype, device=device)
-        actions_mask[:, :, :actual_action_dim] = True
-
-        # weights: [horizon]
-        weights = get_prefix_weights(
-            inference_delay, prefix_attention_horizon, self.config.action_horizon, prefix_attention_schedule
-        )
-        weights = weights.to(device)
-
-        for t in range(num_steps):
-
-            t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
-            
-            def denoiser(x_t_):
-                t_discretized = int(t_cont * self.num_timestep_buckets)
-
-                # Embed noised action trajectory.
-                timesteps_tensor = torch.full(
-                    size=(batch_size,), fill_value=t_discretized, device=device
-                )
-                action_features = self.action_encoder(x_t_, timesteps_tensor, embodiment_id)
-                # Maybe add position embedding.
-                if self.config.add_pos_embed:
-                    pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                    pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                    action_features = action_features + pos_embs
-
-                # Join vision, language, state and action embedding along sequence dimension.
-                future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-                sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
-
-                # Run model forward.
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embs,
-                    timestep=timesteps_tensor,
-                )
-                pred = self.action_decoder(model_output, embodiment_id)
-
-                pred_velocity = pred[:, -self.action_horizon :]
-                return x_t_ + pred_velocity * dt, pred_velocity
-            
-            (outputs, vjp_func) = torch.func.vjp(denoiser, x_t)
-            (x_1_i_vjp, v_t_i_vjp) = outputs
-            error = (prev_action_chunk - x_1_i_vjp) * weights[:, None] * actions_mask
-            # error = F.mse_loss(x_1_i_vjp, prev_action_chunk, reduction="none") / actions_mask.sum() * weights[:, None] * actions_mask
-            
-            pinv_correction = vjp_func((error, torch.zeros_like(x_t)))[0]
-            if pinv_correction is None:
-                pinv_correction = torch.zeros_like(x_1_i_vjp)
-            inv_r2 = (self.sigma_d_o**2 * t_cont**2 + (1 - t_cont)**2) / (self.sigma_d_o**2 * (1 - t_cont)**2)
-            # inv_r2 = (t_cont**2 + (1 - t_cont) ** 2) / ((1 - t_cont) ** 2)
-            c = torch.nan_to_num(torch.tensor((1 - t_cont) / max(t_cont, 1e-12), device=self.device, dtype=self.dtype),  # Avoid division by zero
-                                 nan=0.0, posinf=max_guidance_weight)
-            
-            guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
-            guidance_weight = torch.minimum(guidance_weight, torch.tensor(max_guidance_weight, device=device))
-            v_t_corr = v_t_i_vjp + guidance_weight * pinv_correction
-            x_t = x_t + v_t_corr * dt
-
-        assert x_t.shape == (batch_size, self.config.action_horizon, self.config.action_dim), x_t.shape
-        x_t = x_t.clone().detach()
-        print("EACH DENOISING STEP: ", (x_t[:,:inference_delay,:actual_action_dim] - prev_action_chunk[:,:inference_delay,:actual_action_dim]).abs().mean())
-        if use_prev_action:
-            x_t = prev_action_chunk * weights[:, None] + x_t * (1 - weights[:, None])
-            print("AFTER ASSIGN: ", (x_t[:,:inference_delay,:actual_action_dim] - prev_action_chunk[:,:inference_delay,:actual_action_dim]).abs().mean())
-        return BatchFeature(data={"action_pred": x_t})
 
     @property
     def device(self):
