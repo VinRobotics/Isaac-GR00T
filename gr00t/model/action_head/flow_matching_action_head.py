@@ -364,7 +364,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         "dropout": 0.2,
         "final_dropout": True,
         "num_attention_heads": 32,
-        "num_layers": 4,
+        "num_layers": 12,
         "positional_embeddings": None
         }, metadata={"help": "VL self-attention configuration (n_group is injected from top-level)."}
     )
@@ -401,11 +401,11 @@ class FlowmatchingActionHead(nn.Module):
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
-        # Inject n_group and use_regular_cross_attention into diffusion model config
-        # Use regular cross-attention when using full vision tokens (equivariant VL features)
+        # Inject n_group and language_cross_attention_dim into diffusion model config
         diffusion_cfg = {
-            **config.diffusion_model_cfg, 
+            **config.diffusion_model_cfg,
             "n_group": self.n_group,
+            "language_cross_attention_dim": config.backbone_embedding_dim,
         }
         self.model = EDiT(**diffusion_cfg)
         self.action_dim = config.action_dim
@@ -452,10 +452,8 @@ class FlowmatchingActionHead(nn.Module):
         self.vl_self_attention = SelfAttentionTransformer(**vl_self_attention_cfg)
         self.vlln = EquivariantLayerNorm(self.vl_self_attention.in_type)
         
-        # For lifting language (trivial repr) to regular repr format
-        # We project to D_per_group, then replicate G times to get full regular repr dimension
-        self.D_per_group = config.backbone_embedding_dim // self.n_group
-        self.language_proj = nn.Linear(config.backbone_embedding_dim, self.D_per_group)
+        # Project language features (full dim preserved — no information bottleneck)
+        self.language_proj = nn.Linear(config.backbone_embedding_dim, config.backbone_embedding_dim)
 
         if config.add_pos_embed:
             self.position_embedding = nn.Embedding(config.max_seq_len, self.input_embedding_dim)
@@ -704,49 +702,43 @@ class FlowmatchingActionHead(nn.Module):
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         """
-        Process backbone output to create features for cross-attention.
-        
-        Handles two modes:
-        1. Standard mode (use_full_vision_tokens=False):
-           - backbone_features: [B, T, D] already combined VL features
-           
-        2. Full vision tokens mode (use_full_vision_tokens=True):
-           - backbone_vision_features: [B, num_imgs, 256, D_vision] - REGULAR repr (equivariant)
-           - backbone_language_features: [B, T_text, D_text] - TRIVIAL repr (invariant)
-           
-           Processing:
-           a) Flatten vision tokens: [B, num_imgs, 256, D] → [B, num_imgs*256, D_hidden]
-           b) Lift language to regular repr: [B, T_text, D_text] → [B, T_text, D_hidden]
-           c) Concatenate and apply self-attention
+        Process backbone output to create separate vision and language contexts for EDiT.
+
+        - backbone_vision_features: [B, num_imgs, T_vis, D] - equivariant (regular repr)
+        - backbone_language_features: [B, T_text, D] - invariant (trivial repr, full dim)
+
+        Processing:
+          1. Flatten vision: [B, num_imgs, T_vis, D] → [B, num_imgs*T_vis, D]
+          2. Apply equivariant LN + SA on vision only (no language in SA)
+          3. Project language at full dim (no info bottleneck): [B, T_text, D] → [B, T_text, D]
+          4. Store vision context and language context separately for EDiT cross-attention
         """
-        vision_features = backbone_output.backbone_vision_features  # [B, n_img, 256, D_vision]
+        vision_features = backbone_output.backbone_vision_features  # [B, n_img, T_vis, D_vision]
         language_features = backbone_output.backbone_language_features  # [B, T_text, D_text]
-        
+
         B = vision_features.shape[0]
         num_imgs = vision_features.shape[1]
-        T_vision = vision_features.shape[2]  # 256 tokens per image
-        
-        # Step 1: Flatten vision tokens and project to input_embedding_dim
-        # [B, n_img, 256, D_vision] → [B, n_img * 256, D_vision]
+        T_vision = vision_features.shape[2]
+
+        # Step 1: Flatten vision tokens: [B, n_img, T_vis, D] → [B, n_img*T_vis, D]
         vision_flat = vision_features.reshape(B, num_imgs * T_vision, -1)
-        
-        # Step 2: Lift language from trivial to regular repr format
-        # [B, T_text, D_text] → [B, T_text, input_embedding_dim]
-        language_regular = self.lift_trivial_to_regular(language_features)
-        
-        # Step 3: Concatenate vision (equivariant) and language (invariant in regular format)
-        # [B, T_vision + T_text, D_hidden]
-        backbone_features = torch.cat([vision_flat, language_regular], dim=1)
-        
-        # Create combined attention mask
-        T_lang = language_features.shape[1]
-        vision_mask = torch.ones(B, num_imgs * T_vision, device=vision_features.device)
-        lang_mask = backbone_output.backbone_attention_mask  # [B, T_text]
-        combined_mask = torch.cat([vision_mask, lang_mask], dim=1)
-        
-        backbone_output.data["backbone_features"] = backbone_features
-        backbone_output.data["backbone_attention_mask"] = combined_mask
-        
+
+        # Step 2: Apply equivariant LN + self-attention on vision only
+        T_vis_flat = vision_flat.shape[1]
+        vision_flat_2d = einops.rearrange(vision_flat, "b t d -> (b t) d")
+        vision_geo = enn.GeometricTensor(vision_flat_2d, self.vl_self_attention.in_type)
+        vision_geo = self.vlln(vision_geo).tensor
+        vision_for_sa = einops.rearrange(vision_geo, "(b t) d -> b t d", b=B, t=T_vis_flat)
+        vision_context = self.vl_self_attention(vision_for_sa)  # [B, T_vis_flat, D_vision]
+
+        # Step 3: Project language at full dimension (preserves all language information)
+        language_context = self.language_proj(language_features)  # [B, T_text, D_text]
+
+        # Store results — language attention mask kept separately for EDiT
+        backbone_output.data["backbone_features"] = vision_context
+        backbone_output.data["backbone_language_features"] = language_context
+        # backbone_attention_mask already holds the language mask [B, T_text]
+
         return backbone_output
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
@@ -774,8 +766,10 @@ class FlowmatchingActionHead(nn.Module):
                 expanded = v.repeat(*factors)
                 action_input[k] = expanded
 
-        # Get vision and language embeddings.
-        vl_embs = backbone_output.backbone_features
+        # Get vision context (for equivariant cross-attn) and language context (for standard cross-attn).
+        vl_embs = backbone_output.backbone_features          # [B, T_vis, D]
+        lang_embs = backbone_output.backbone_language_features  # [B, T_lang, D_lang]
+        lang_mask = backbone_output.backbone_attention_mask      # [B, T_lang], 1=valid 0=pad
         device = vl_embs.device
 
         # Get embodiment ID.
@@ -821,14 +815,12 @@ class FlowmatchingActionHead(nn.Module):
         sa_embs = torch.cat((state_features, action_features), dim=1)
         B, T, C = sa_embs.shape
         B, Tv, Cv = vl_embs.shape
-        # sa embs: B, T, G*D
-        # project vl embs to 2d space
-        vl_attn_mask = backbone_output.backbone_attention_mask
 
         model_output = self.model(
             hidden_states=sa_embs,
             encoder_hidden_states=vl_embs,
-            encoder_attention_mask=vl_attn_mask,
+            language_hidden_states=lang_embs,
+            language_attention_mask=lang_mask,
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
         )
@@ -878,9 +870,11 @@ class FlowmatchingActionHead(nn.Module):
         
         backbone_output = self.process_backbone_output(backbone_output)
 
-        # Get vision and language embeddings.
-        vl_embs = backbone_output.backbone_features
-        
+        # Get vision context (equivariant cross-attn) and language context (standard cross-attn).
+        vl_embs = backbone_output.backbone_features              # [B, T_vis, D]
+        lang_embs = backbone_output.backbone_language_features   # [B, T_lang, D_lang]
+        lang_mask = backbone_output.backbone_attention_mask       # [B, T_lang], 1=valid 0=pad
+
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
@@ -951,6 +945,8 @@ class FlowmatchingActionHead(nn.Module):
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
+                language_hidden_states=lang_embs,
+                language_attention_mask=lang_mask,
                 timestep=timesteps_tensor,
             )
             
@@ -996,8 +992,10 @@ class FlowmatchingActionHead(nn.Module):
 
         backbone_output = self.process_backbone_output(backbone_output)
 
-        # Get vision and language embeddings.
-        vl_embeds      = backbone_output.backbone_features          # [B, T_vl, D]
+        # Get vision context (equivariant cross-attn) and language context (standard cross-attn).
+        vl_embeds      = backbone_output.backbone_features              # [B, T_vis, D]
+        lang_embeds    = backbone_output.backbone_language_features     # [B, T_lang, D_lang]
+        lang_mask_rt   = backbone_output.backbone_attention_mask        # [B, T_lang]
         embodiment_id  = action_input.embodiment_id
 
         # Embed state.
@@ -1035,15 +1033,15 @@ class FlowmatchingActionHead(nn.Module):
                     pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                     action_features = action_features + pos_embs
 
-                vl_embs = vl_embeds
-
                 # Join vision, language, state and action embedding along sequence dimension.
                 sa_embs = torch.cat((state_features, action_features), dim=1)
 
                 # Run model forward.
                 model_output = self.model(
                     hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embs,
+                    encoder_hidden_states=vl_embeds,
+                    language_hidden_states=lang_embeds,
+                    language_attention_mask=lang_mask_rt,
                     timestep=timesteps_tensor,
                 )
                 pred = self.action_decoder(model_output, embodiment_id)

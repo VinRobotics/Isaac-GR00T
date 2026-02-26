@@ -541,80 +541,66 @@ class EagleBackboneFATokens(nn.Module):
     def forward_eagle(self, vl_input: BatchFeature) -> tuple:
         """
         Forward through Eagle model with frame averaging on full vision tokens.
-        
-        Frame Averaging for COVARIANT equivariance:
-        
-        FA(x) = (1/|G|) * Σ_h ρ(h⁻¹) · f(h·x)
-        
-        Using ρ(h⁻¹) instead of ρ(h) gives the covariant property:
-        FA(g·x) = ρ(g) · FA(x)
-        
-        Where:
-        - h·x = image rotated by h
-        - f(h·x) = features from rotated image  
-        - ρ(h⁻¹) = inverse representation = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹)
-        
+
+        Option A: Late FA with cross-modal LLM fusion.
+
+        Stage 1 - Equivariant vision (FA formula):
+            FA(x) = (1/|G|) * Σ_h ρ(h⁻¹) · f(h·x)
+            Applied on vision encoder output → equivariant vision tokens.
+
+        Stage 2 - Language conditioned on equivariant vision (invariant):
+            The FA-averaged vision tokens are injected into the LLM input at
+            image_token_index positions, and the LLM runs once to produce
+            language features that are cross-modally grounded and approximately
+            invariant (the LLM sees a rotation-averaged visual representation).
+
+        This replaces the prior `extract_language_feature` call which was
+        completely blind to vision content.
+
         Args:
             vl_input: Input batch with eagle_ prefixed keys
-            
+
         Returns:
-            (vision_features, language_features, attention_mask) tuple
+            (vision_features, language_features, language_attention_mask) tuple
+            - vision_features:  [B, num_imgs, T_vision, D_vision]  equivariant
+            - language_features: [B, T_text, D_llm]                invariant
+            - language_attention_mask: [B, T_text]
         """
         eagle_prefix = "eagle_"
-        
-        # Get original batch size before rotation
-        original_input_ids = vl_input.get(f"{eagle_prefix}input_ids")
+
+        original_input_ids = vl_input.get(f"{eagle_prefix}input_ids")      # [B, T_seq]
+        original_attention_mask = vl_input.get(f"{eagle_prefix}attention_mask")  # [B, T_seq]
         B = original_input_ids.shape[0]
-        
-        # Rotate images by all group elements
+
+        # ── Stage 1: Equivariant vision features via FA ──────────────────────
         rotated_pixel_values = self.rotate_vl_batch(dict(vl_input))
-        
-        # Prepare eagle input
-        eagle_input = {
-            k.removeprefix(eagle_prefix): v
-            for k, v in vl_input.items()
-            if k.startswith(eagle_prefix)
-        }
-        
-        # Remove image_sizes if present
-        if "image_sizes" in eagle_input:
-            del eagle_input["image_sizes"]
-            
-        ## Extract vision features (full tokens, not pooled)
-        # vision_features: [B * num_imgs * N, T_vision, D_vision]
+
+        # vision_features: [B * num_imgs * N, T_vision, D_vision=2048]
         vision_features, _ = self.eagle_model.extract_feature(rotated_pixel_values)
-        
-        # Get dimensions
-        num_vision_tokens = vision_features.shape[1]   # T_vision (256)
-        vision_dim = vision_features.shape[2]          # D_vision (2048)
-        
-        # Reshape to [B * num_imgs, N, T_vision, D_vision]
+
+        num_vision_tokens = vision_features.shape[1]  # T_vision (256)
+        vision_dim = vision_features.shape[2]         # D_vision (2048)
+
+        # [B * num_imgs, N, T_vision, D_vision]
         vision_features_grouped = vision_features.reshape(
             B * self.num_images_per_sample, self.n_group, num_vision_tokens, vision_dim
         )
-        
-        # Apply ρ(h⁻¹) = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹) to each f(h·x)
-        # Using ρ(h⁻¹) instead of ρ(h) gives covariant output: FA(g·x) = ρ(g)·FA(x)
-        # Then average over h
-        
+
+        # Apply ρ(h⁻¹) = π(h⁻¹) ⊗ ρ_reg(h⁻¹) to each f(h·x), then average
         transformed_features = []
         for h in range(self.n_group):
-            # f(h·x): features from rotation h
             feat_h = vision_features_grouped[:, h, :, :]  # [B * num_imgs, T, D]
-            
+
             if h == 0:
-                # Identity - no transformation needed (h⁻¹ = 0)
                 feat_transformed = feat_h
             else:
-                # Apply ρ(h⁻¹) = π(h⁻¹) ⊗ ρ_reg(h⁻¹)
                 h_inv = (self.n_group - h) % self.n_group
-                
-                # Step 1: Spatial permutation π(h⁻¹)
+
+                # Spatial permutation π(h⁻¹)
                 spatial_perm = self.token_perm_indices[h_inv]
-                feat_permuted = feat_h[:, spatial_perm, :]  # [B * num_imgs, T, D]
-                
-                # Step 2: Feature permutation ρ_reg(h⁻¹)
-                # Regular representation: cyclically shift blocks by h_inv
+                feat_permuted = feat_h[:, spatial_perm, :]
+
+                # Feature permutation ρ_reg(h⁻¹): cyclic block shift by h_inv
                 blocks = vision_dim // self.n_group
                 feat_blocks = feat_permuted.reshape(
                     B * self.num_images_per_sample, num_vision_tokens, self.n_group, blocks
@@ -623,29 +609,67 @@ class EagleBackboneFATokens(nn.Module):
                 feat_transformed = feat_shifted.reshape(
                     B * self.num_images_per_sample, num_vision_tokens, vision_dim
                 )
-            
+
             transformed_features.append(feat_transformed)
-        
-        # Stack and average: [B * num_imgs, N, T, D] -> [B * num_imgs, T, D]
-        transformed_features = torch.stack(transformed_features, dim=1)
-        avg_vision_features = torch.mean(transformed_features, dim=1)
-        
-        # Reshape to [B, num_imgs, T_vision, D_vision]
+
+        # [B * num_imgs, N, T, D] → average → [B * num_imgs, T_vision, D_vision]
+        avg_vision_features = torch.mean(
+            torch.stack(transformed_features, dim=1), dim=1
+        )
+
+        # ── Stage 2: Language features conditioned on equivariant vision ─────
+        # The LLM normally replaces image_token_index positions with mlp1(vision)
+        # embeddings. Here we inject the FA-averaged equivariant vision features
+        # directly, so language attends to a rotation-invariant visual context.
+
+        # Identify image token positions in the combined input sequence
+        image_token_idx = self.eagle_model.image_token_index
+        image_mask = (original_input_ids == image_token_idx)  # [B, T_seq]
+
+        # Build input embeddings: start from text embeddings, replace image positions
+        input_embeds = self.eagle_model.language_model.get_input_embeddings()(
+            original_input_ids
+        )  # [B, T_seq, D_llm]
+        B_b, T_seq, D_llm = input_embeds.shape
+
+        # Flatten for masked scatter
+        input_embeds_flat = input_embeds.reshape(B_b * T_seq, D_llm).clone()
+        image_mask_flat = image_mask.reshape(B_b * T_seq)
+
+        # Equivariant vision at LLM dim: [B * num_imgs * T_vision, D_llm]
+        equi_vision_flat = avg_vision_features.reshape(-1, vision_dim)
+        assert image_mask_flat.sum() == equi_vision_flat.shape[0], (
+            f"Image token count mismatch: mask has {image_mask_flat.sum()} positions "
+            f"but vision features have {equi_vision_flat.shape[0]} tokens. "
+            "Check num_images_per_sample and T_vision."
+        )
+        input_embeds_flat[image_mask_flat] = equi_vision_flat.to(input_embeds_flat.dtype)
+        input_embeds = input_embeds_flat.reshape(B_b, T_seq, D_llm)
+
+        # Single LLM forward with equivariant vision injected
+        llm_outputs = self.eagle_model.language_model(
+            inputs_embeds=input_embeds,
+            attention_mask=original_attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        # Hidden states at select_layer: [B, T_seq, D_llm]
+        hidden = llm_outputs.hidden_states[self.select_layer]
+
+        # Extract text-only positions (exclude image token positions)
+        # T_text = T_seq - num_imgs * T_vision (uniform across batch)
+        text_mask = ~image_mask  # [B, T_seq]
+        T_text = int(text_mask[0].sum().item())
+        language_features = hidden[text_mask].reshape(B, T_text, -1)       # [B, T_text, D_llm]
+        language_attention_mask = original_attention_mask[text_mask].reshape(B, T_text)
+
+        # Reshape vision output: [B * num_imgs, T_vision, D] → [B, num_imgs, T_vision, D]
         avg_vision_features = avg_vision_features.reshape(
             B, self.num_images_per_sample, num_vision_tokens, vision_dim
         )
-        
-        # Forward through Eagle language model to get language features
-        language_features = self.eagle_model.extract_language_feature(
-            **eagle_input, 
-            output_hidden_states=True, 
-            return_dict=True
-        )
-        
-        # Get features from selected layer
-        language_features = language_features.hidden_states[self.select_layer]  # [B, T_text, 2048]
-        
-        return avg_vision_features, language_features, eagle_input["attention_mask"]
+
+        return avg_vision_features, language_features, language_attention_mask
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         """
