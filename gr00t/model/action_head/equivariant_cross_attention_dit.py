@@ -453,20 +453,32 @@ class BasicTransformerBlock(nn.Module):
         else:
             self.final_dropout = None
 
-        # Standard (non-equivariant) language cross-attention
+        # Equivariant language cross-attention:
+        # Q comes from equivariant hidden_states (in_type), projected to scalars via enn.Linear.
+        # K/V come from trivial lang_embs (trivial_repr * lang_dim), also projected to scalars.
+        # Attention weights are therefore invariant, lang_out is equivariant (via o_proj),
+        # and hidden_states + lang_out preserves equivariance.
         if language_cross_attention_dim is not None:
-            self.norm2_lang = nn.LayerNorm(in_type.size, eps=norm_eps)
-            self.lang_cross_attn = nn.MultiheadAttention(
-                embed_dim=in_type.size,
-                num_heads=num_attention_heads,
-                kdim=language_cross_attention_dim,
-                vdim=language_cross_attention_dim,
+            self.norm2_lang = EquivariantLayerNorm(in_type, affine=False, eps=norm_eps)
+            lang_trivial_type = enn.FieldType(
+                in_type.gspace,
+                [in_type.gspace.trivial_repr] * language_cross_attention_dim,
+            )
+            self.lang_trivial_type = lang_trivial_type
+            self.lang_cross_attn = EquivariantAttention(
+                in_type=in_type,
+                cross_attention_type=lang_trivial_type,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
                 dropout=dropout,
-                batch_first=True,
+                bias=attention_bias,
+                out_bias=attention_out_bias,
+                use_relative_position_bias=False,  # no meaningful relative pos for lang
             )
         else:
             self.norm2_lang = None
             self.lang_cross_attn = None
+            self.lang_trivial_type = None
 
     def forward(
         self,
@@ -518,20 +530,30 @@ class BasicTransformerBlock(nn.Module):
         # Residual connection
         hidden_states = attn_output + hidden_states
 
-        # 2. Language cross-attention (standard, non-equivariant)
-        # Equivariance is preserved: action queries are equivariant, language KV are invariant,
-        # so attn_weight * invariant_V is invariant, and equivariant + invariant = equivariant.
+        # 2. Language cross-attention (equivariant):
+        # Q from equivariant hidden_states → scalar via enn.Linear (equivariant projection).
+        # K/V from trivial lang_embs → scalar via enn.Linear (trivially equivariant).
+        # Attention weights are invariant scalars; lang_out is equivariant via o_proj.
         if self.lang_cross_attn is not None and language_hidden_states is not None:
-            norm_for_lang = self.norm2_lang(hidden_states)  # (B, T, in_type.size)
-            key_padding_mask = None
+            assert self.norm2_lang is not None
+            # Equivariant layer norm on hidden_states
+            hidden_states_flat_lang = einops.rearrange(hidden_states, "b t d -> (b t) d")
+            hidden_geo_lang = enn.GeometricTensor(hidden_states_flat_lang, self.in_type)
+            norm_hidden_geo_lang = self.norm2_lang(hidden_geo_lang)
+            norm_for_lang = einops.rearrange(norm_hidden_geo_lang.tensor, "(b t) d -> b t d", b=B)
+
+            # Convert language_attention_mask to additive mask for EquivariantAttention.
+            # language_attention_mask: (B, T_lang), 1=valid 0=pad
+            # Additive mask: 0 where valid, -1e9 where pad, shape (B, T, T_lang)
+            lang_mask_additive = None
             if language_attention_mask is not None:
-                # nn.MHA key_padding_mask: True = ignore, so invert (1=valid → False=attend)
-                key_padding_mask = ~language_attention_mask.bool()
-            lang_out, _ = self.lang_cross_attn(
-                query=norm_for_lang,
-                key=language_hidden_states,
-                value=language_hidden_states,
-                key_padding_mask=key_padding_mask,
+                lang_mask_additive = (1.0 - language_attention_mask.float()) * (-1e9)  # (B, T_lang)
+                lang_mask_additive = lang_mask_additive.unsqueeze(1).expand(-1, T, -1)  # (B, T, T_lang)
+
+            lang_out = self.lang_cross_attn(
+                norm_for_lang,
+                encoder_hidden_states=language_hidden_states,
+                attention_mask=lang_mask_additive,
             )
             hidden_states = lang_out + hidden_states
 
@@ -648,7 +670,7 @@ class EDiT(ModelMixin, ConfigMixin):
             
             # For self-attention layers, use in_type for both query and key/value
             curr_cross_type = self.in_type if use_self_attn else self.cross_attention_type
-
+            curr_use_relative_position_bias = False if use_self_attn else use_relative_position_bias
             all_blocks += [
                 BasicTransformerBlock(
                     in_type=self.in_type,
@@ -664,7 +686,7 @@ class EDiT(ModelMixin, ConfigMixin):
                     norm_type=norm_type,
                     norm_eps=self.config.norm_eps,
                     final_dropout=final_dropout,
-                    use_relative_position_bias=use_relative_position_bias,
+                    use_relative_position_bias=curr_use_relative_position_bias,
                     max_relative_position=max_relative_position,
                     language_cross_attention_dim=self.config.language_cross_attention_dim,
                 )
