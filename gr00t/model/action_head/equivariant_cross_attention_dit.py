@@ -307,7 +307,6 @@ class EquivariantAttention(nn.Module):
         # Single softmax across all context tokens → joint attention over vision+language.
         # Equivariance is preserved: Q is equivariant→scalar, K/V are scalar, o_proj lifts back.
         if self.k_lang_proj is not None and self.v_lang_proj is not None and language_hidden_states is not None:
-            print("lang proj")
             Tk_vis = Tk
             Tk_lang = language_hidden_states.shape[1]
 
