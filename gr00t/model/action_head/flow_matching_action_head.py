@@ -309,6 +309,7 @@ class FlowmatchingActionHead(nn.Module):
         state_D = state_flat_features.shape[2]
 
         state_features = state_flat_features.view(batch_size, num_offsets, state_T, state_D)
+        state_features = state_features.view(batch_size, num_offsets * state_T, state_D)
 
 
         # Embed noised action trajectory.
@@ -339,31 +340,55 @@ class FlowmatchingActionHead(nn.Module):
             action_T,
             action_D,
         )
-
-        # concatenate suffixes
-        suffix_embs = action_features.reshape(
-            batch_size,
-            num_offsets * T,
-            D,
-        )
-
-        hidden_states = torch.cat(
-            (prefix_embs, suffix_embs),
-            dim=1,
-        )
+        action_features = action_features.view(batch_size, num_offsets * action_T, action_D)
 
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
-            pos_ids = torch.arange(action_flat_features.shape[1], dtype=torch.long, device=device)
+            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-            action_flat_features = action_flat_features + pos_embs
+            action_features = action_features + pos_embs
 
         # Join vision, language, state and action embedding along sequence dimension.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
         vl_attn_mask = backbone_output.backbone_attention_mask
+
+        # Build mask
+        prefix_pad_masks = torch.ones(
+            batch_size, future_tokens.shape[1],
+            dtype=torch.bool,
+            device=device,
+        )
+
+        # prefix = single attention region
+        prefix_att_masks = torch.zeros_like(prefix_pad_masks)
+
+        suffix_pad_masks = torch.ones(
+            batch_size, num_offsets * (state_T + action_T),
+            dtype=torch.bool,
+            device=device,
+        )
+
+        suffix_att_masks = torch.zeros_like(suffix_pad_masks)
+        suffix_att_masks[:, 0] = 1
+
+        offset_mask = torch.ones(
+            batch_size, num_offsets,
+            dtype=torch.bool,
+            device=device,
+        )
+
+        attention_mask, position_ids = build_shared_obs_attention_mask_and_position_ids(
+            prefix_pad_masks,
+            prefix_att_masks,
+            suffix_pad_masks,
+            suffix_att_masks,
+            num_offsets,
+            offset_mask,
+            sa_embs.dtype,
+        )
 
         model_output = self.model(
             hidden_states=sa_embs,
