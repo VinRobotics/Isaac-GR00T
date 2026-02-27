@@ -166,7 +166,6 @@ class EquivariantAttention(nn.Module):
         self,
         in_type: enn.FieldType,
         cross_attention_type: Optional[enn.FieldType] = None,
-        lang_cross_type: Optional[enn.FieldType] = None,
         *,
         heads=4,
         dim_head=16,
@@ -202,17 +201,6 @@ class EquivariantAttention(nn.Module):
         self.v_proj = enn.Linear(self.cross_type, self.scalar_type, bias=bias)
 
         self.o_proj = enn.Linear(self.scalar_type, in_type, bias=out_bias)
-
-        # Joint KV: optional language cross-attention (trivial repr → scalar)
-        # K_lang and V_lang are concatenated with K_vis and V_vis before softmax,
-        # so a single attention head jointly attends over vision + language context.
-        self.lang_cross_type = lang_cross_type
-        if lang_cross_type is not None:
-            self.k_lang_proj = enn.Linear(lang_cross_type, self.scalar_type, bias=bias)
-            self.v_lang_proj = enn.Linear(lang_cross_type, self.scalar_type, bias=bias)
-        else:
-            self.k_lang_proj = None
-            self.v_lang_proj = None
 
         self.dropout = nn.Dropout(dropout)
         self.scale = (dim_head) ** -0.5
@@ -256,20 +244,10 @@ class EquivariantAttention(nn.Module):
         
         return bias
     
-    def forward(
-        self,
-        hidden_states,
-        encoder_hidden_states=None,
-        attention_mask=None,
-        language_hidden_states=None,
-        language_attention_mask=None,
-    ):
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
         """
-        hidden_states          : (B, Tq, Cq*G)
-        encoder_hidden_states  : (B, Tk, Ckv*G)   vision context
-        language_hidden_states : (B, Tl, lang_dim) language context (trivial repr), optional
-        attention_mask         : (B, Tq, Tk)       additive mask for vision, optional
-        language_attention_mask: (B, Tl)           1=valid 0=pad, optional
+        hidden_states         : (B, Tq, Cq*G)
+        encoder_hidden_states : (B, Tk, Ckv*G)
         """
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
@@ -302,66 +280,21 @@ class EquivariantAttention(nn.Module):
         K = einops.rearrange(K, "(b t) d -> b t d", b=B)
         V = einops.rearrange(V, "(b t) d -> b t d", b=B)
 
-        # --- MM-DiT style joint KV: concatenate language K/V with vision K/V ---
-        # K = [K_vis, K_lang], V = [V_vis, V_lang] along the token dim.
-        # Single softmax across all context tokens → joint attention over vision+language.
-        # Equivariance is preserved: Q is equivariant→scalar, K/V are scalar, o_proj lifts back.
-        if self.k_lang_proj is not None and self.v_lang_proj is not None and language_hidden_states is not None:
-            Tk_vis = Tk
-            Tk_lang = language_hidden_states.shape[1]
-
-            k_lang_geo = enn.GeometricTensor(
-                einops.rearrange(language_hidden_states, "b t d -> (b t) d"),
-                self.lang_cross_type,
-            )
-            v_lang_geo = enn.GeometricTensor(
-                einops.rearrange(language_hidden_states, "b t d -> (b t) d"),
-                self.lang_cross_type,
-            )
-            K_lang = self.k_lang_proj(k_lang_geo).tensor  # (B*Tk_lang, scalar_dim)
-            V_lang = self.v_lang_proj(v_lang_geo).tensor
-
-            K_lang = einops.rearrange(K_lang, "(b t) d -> b t d", b=B)
-            V_lang = einops.rearrange(V_lang, "(b t) d -> b t d", b=B)
-
-            # Concatenate along token dimension: [vis | lang]
-            K = torch.cat([K, K_lang], dim=1)  # (B, Tk_vis + Tk_lang, scalar_dim)
-            V = torch.cat([V, V_lang], dim=1)
-
-            # Build combined additive mask (B, Tq, Tk_vis + Tk_lang)
-            # Language part: 0 for valid tokens, -1e9 for padding
-            lang_additive = torch.zeros(
-                B, Tq, Tk_lang, device=hidden_states.device, dtype=hidden_states.dtype
-            )
-            if language_attention_mask is not None:
-                pad = (1.0 - language_attention_mask.float()) * (-1e9)  # (B, Tk_lang)
-                lang_additive = pad.unsqueeze(1).expand(-1, Tq, -1)    # (B, Tq, Tk_lang)
-
-            if attention_mask is not None:
-                attention_mask = torch.cat([attention_mask, lang_additive], dim=-1)
-            else:
-                vis_zeros = torch.zeros(
-                    B, Tq, Tk_vis, device=hidden_states.device, dtype=hidden_states.dtype
-                )
-                attention_mask = torch.cat([vis_zeros, lang_additive], dim=-1)
-
         # Split into heads using einops
         # Q,K,V: (B, T, H, Dh)
         Q = einops.rearrange(Q, "b t (h d) -> b t h d", h=self.H)
         K = einops.rearrange(K, "b t (h d) -> b t h d", h=self.H)
         V = einops.rearrange(V, "b t (h d) -> b t h d", h=self.H)
 
-        Tk_total = K.shape[1]
-
         # Scaled dot-product attention (equivariant because Q,K are scalar reps)
-        # attn: (B, H, Tq, Tk_total)
+        # attn: (B, H, Tq, Tk)
         attn = torch.einsum("b t h d, b k h d -> b h t k", Q, K) * self.scale
-
+        
         # Add relative position bias (equivariant because it's translation-invariant)
         if self.use_relative_position_bias:
-            rel_pos_bias = self._get_relative_position_bias(Tq, Tk_total, attn.device)  # (H, Tq, Tk_total)
-            attn = attn + rel_pos_bias.unsqueeze(0)  # (B, H, Tq, Tk_total)
-
+            rel_pos_bias = self._get_relative_position_bias(Tq, Tk, attn.device)  # (H, Tq, Tk)
+            attn = attn + rel_pos_bias.unsqueeze(0)  # (B, H, Tq, Tk)
+        
         if attention_mask is not None:
             attn = attn + attention_mask[:, None, :, :]
 
@@ -460,7 +393,7 @@ class BasicTransformerBlock(nn.Module):
         cross_attention_type: enn.FieldType,
         inner_type: enn.FieldType,
         temb_type: Optional[enn.FieldType] = None,  # trivial type for timestep embedding
-
+        
         num_attention_heads: int = 8,
         attention_head_dim: int = 64,
         dropout=0.0,
@@ -472,7 +405,6 @@ class BasicTransformerBlock(nn.Module):
         attention_out_bias: bool = True,
         use_relative_position_bias: bool = False,
         max_relative_position: int = 32,
-        language_cross_attention_dim: Optional[int] = None,
     ):
         super().__init__()
 
@@ -487,17 +419,8 @@ class BasicTransformerBlock(nn.Module):
         # Store norm_type for forward pass
         self.norm_type = norm_type
         
-        # Build lang_trivial_type for joint KV cross-attention (trivial repr = invariant scalars)
-        if language_cross_attention_dim is not None:
-            lang_trivial_type = enn.FieldType(
-                in_type.gspace,
-                [in_type.gspace.trivial_repr] * language_cross_attention_dim,
-            )
-        else:
-            lang_trivial_type = None
-
-        # Define 2 blocks. Each block has its own normalization layer.
-        # 1. Cross-Attn (vision + language joint KV via MM-DiT style concatenation)
+        # Define 3 blocks. Each block has its own normalization layer.
+        # 1. Self-Attn
         if norm_type == "ada_norm":
             self.norm1 = EquivariantAdaLayerNorm(self.in_type, temb_type=self.temb_type)
         else:
@@ -506,7 +429,6 @@ class BasicTransformerBlock(nn.Module):
         self.attn1 = EquivariantAttention(
             in_type=self.in_type,
             cross_attention_type=self.cross_attention_type,
-            lang_cross_type=lang_trivial_type,
             heads=num_attention_heads,
             dim_head=attention_head_dim,
             dropout=dropout,
@@ -516,7 +438,7 @@ class BasicTransformerBlock(nn.Module):
             max_relative_position=max_relative_position,
         )
 
-        # 2. Feed-forward
+        # 3. Feed-forward
         self.norm3 = EquivariantLayerNorm(self.in_type, affine=False, eps=norm_eps)
         self.ff = EquivariantFeedForward(
             self.in_type,
@@ -536,8 +458,6 @@ class BasicTransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        language_hidden_states: Optional[torch.Tensor] = None,
-        language_attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -570,19 +490,16 @@ class BasicTransformerBlock(nn.Module):
         # Extract normalized tensor and reshape for attention: (B*T, C*G) -> (B, T, C*G)
         norm_hidden_states = einops.rearrange(norm_hidden_geo.tensor, "(b t) d -> b t d", b=B)
 
-        # Apply joint cross-attention: vision K/V and language K/V are concatenated inside
-        # attn1 (MM-DiT style), so a single softmax attends over both context streams.
+        # Apply attention (EquivariantAttention handles tensor input/output)
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             attention_mask=attention_mask,
-            language_hidden_states=language_hidden_states,
-            language_attention_mask=language_attention_mask,
         )
-
+        
         # Residual connection
         hidden_states = attn_output + hidden_states
-
+        
         # 2. Feed-forward with normalization
         # Flatten for ESCNN processing
         hidden_states_flat = einops.rearrange(hidden_states, "b t d -> (b t) d")
@@ -636,7 +553,6 @@ class EDiT(ModelMixin, ConfigMixin):
         cross_attention_dim: Optional[int] = None,
         use_relative_position_bias: bool = True,
         max_relative_position: int = 32,
-        language_cross_attention_dim: Optional[int] = None,
     ):
         super().__init__()
 
@@ -676,7 +592,6 @@ class EDiT(ModelMixin, ConfigMixin):
         print(f"  in_type size: {self.in_type.size} (regular repr - equivariant)")
         print(f"  cross_attention_type size: {self.cross_attention_type.size} (regular repr - equivariant)")
         print(f"  inner_type size: {self.ff_inner_type.size}")
-        print(f"  language_cross_attention_type size: {language_cross_attention_dim}")
 
         # Timestep encoder outputs TRIVIAL repr (time is scalar, not rotated)
 
@@ -714,7 +629,6 @@ class EDiT(ModelMixin, ConfigMixin):
                     final_dropout=final_dropout,
                     use_relative_position_bias=curr_use_relative_position_bias,
                     max_relative_position=max_relative_position,
-                    language_cross_attention_dim=self.config.language_cross_attention_dim,
                 )
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)
@@ -745,10 +659,8 @@ class EDiT(ModelMixin, ConfigMixin):
         self,
         hidden_states: torch.Tensor,  # Shape: (B, T, in_type.size)
         encoder_hidden_states: torch.Tensor,  # Shape: (B, S, cross_attention_type.size)
-        language_hidden_states: Optional[torch.Tensor] = None,  # Shape: (B, T_lang, language_cross_attention_dim)
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        language_attention_mask: Optional[torch.Tensor] = None,  # Shape: (B, T_lang), 1=valid 0=ignore
         return_all_hidden_states: bool = False,
     ):
         """
@@ -778,14 +690,12 @@ class EDiT(ModelMixin, ConfigMixin):
         # Process through equivariant transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1 and self.config.interleave_self_attention:
-                # Self-attention layer (language cross-attn still applied every block)
+                # Self-attention layer
                 hidden_states = block(
                     hidden_states,
                     attention_mask=None,
-                    encoder_hidden_states=None,  # Self-attention for vision/action
+                    encoder_hidden_states=None,  # Self-attention
                     encoder_attention_mask=None,
-                    language_hidden_states=language_hidden_states,
-                    language_attention_mask=language_attention_mask,
                     temb=temb,
                 )
             else:
@@ -795,8 +705,6 @@ class EDiT(ModelMixin, ConfigMixin):
                     attention_mask=None,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
-                    language_hidden_states=language_hidden_states,
-                    language_attention_mask=language_attention_mask,
                     temb=temb,
                 )
             all_hidden_states.append(hidden_states)
@@ -853,7 +761,7 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         use_relative_position_bias: bool = True,
-        max_relative_position: int = 512,
+        max_relative_position: int = 2048,
     ):
         super().__init__()
         self.attention_head_dim = attention_head_dim
