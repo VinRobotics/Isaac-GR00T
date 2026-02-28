@@ -138,6 +138,26 @@ class ArgsConfig:
     torque_aware: bool = False
     """Whether to use torque-aware training."""
 
+    # FAST effort tokenizer
+    use_fast_effort: bool = False
+    """Enable FAST effort tokenizer: conditions the DiT on effort-history tokens and adds an
+    autoregressive auxiliary loss that predicts future effort tokens."""
+
+    fast_tokenizer_path: str = "physical-intelligence/fast"
+    """HuggingFace path for the FAST tokenizer (UniversalActionProcessor)."""
+
+    fast_num_tokens: int = 80
+    """Fixed token-sequence length after pad/truncate (n_fast). ~67 tokens for T=16, D=7."""
+
+    fast_effort_loss_coeff: float = 0.1
+    """Weight of the AR effort CE loss relative to the main flow-matching loss."""
+
+    fast_ar_num_layers: int = 4
+    """Number of TransformerDecoder layers in the AR effort decoder."""
+
+    fast_ar_emb_dim: int = 512
+    """Hidden dimension of the AR effort decoder."""
+
 #####################################################################################
 # main training function
 #####################################################################################
@@ -225,6 +245,27 @@ def main(config: ArgsConfig):
         new_action_head_config.effort_dim = effort_dims
         new_action_head_config.torque_aware = True
         need_recreate = True
+
+    if config.use_fast_effort:
+        effort_dims = getattr(data_config_cls, 'effort_dims', None)
+        if effort_dims is None:
+            raise ValueError(
+                f"Data config {config.data_config} does not have effort_dims defined, "
+                "but use_fast_effort=True"
+            )
+        print(
+            f"Enabling FAST effort tokenizer: effort_dim={effort_dims}, "
+            f"n_fast={config.fast_num_tokens}, ar_layers={config.fast_ar_num_layers}, "
+            f"ar_emb_dim={config.fast_ar_emb_dim}, loss_coeff={config.fast_effort_loss_coeff}"
+        )
+        new_action_head_config.effort_dim = effort_dims
+        new_action_head_config.use_fast_effort = True
+        new_action_head_config.fast_tokenizer_path = config.fast_tokenizer_path
+        new_action_head_config.fast_num_tokens = config.fast_num_tokens
+        new_action_head_config.fast_effort_loss_coeff = config.fast_effort_loss_coeff
+        new_action_head_config.fast_ar_num_layers = config.fast_ar_num_layers
+        new_action_head_config.fast_ar_emb_dim = config.fast_ar_emb_dim
+        need_recreate = True
         
     # Update action_horizon to match data config
     # Need to recreate action head with correct config since it was initialized with old config
@@ -276,6 +317,15 @@ def main(config: ArgsConfig):
             effort_dims = getattr(data_config_cls, 'effort_dims', None)
             model.config.action_head_cfg["torque_aware"] = True
             model.config.action_head_cfg["effort_dim"] = effort_dims
+        if config.use_fast_effort:
+            effort_dims = getattr(data_config_cls, 'effort_dims', None)
+            model.config.action_head_cfg["use_fast_effort"] = True
+            model.config.action_head_cfg["effort_dim"] = effort_dims
+            model.config.action_head_cfg["fast_tokenizer_path"] = config.fast_tokenizer_path
+            model.config.action_head_cfg["fast_num_tokens"] = config.fast_num_tokens
+            model.config.action_head_cfg["fast_effort_loss_coeff"] = config.fast_effort_loss_coeff
+            model.config.action_head_cfg["fast_ar_num_layers"] = config.fast_ar_num_layers
+            model.config.action_head_cfg["fast_ar_emb_dim"] = config.fast_ar_emb_dim
 
         # Set trainable parameters for the new action head
         model.action_head.set_trainable_parameters(

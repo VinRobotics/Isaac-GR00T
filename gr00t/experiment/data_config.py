@@ -1424,8 +1424,10 @@ class AlohaRightArmEffortConfig(BaseDataConfig):
     observation_indices = [0]
     state_indices = [0]
     action_indices = list(range(16))
-    effort_indices = list(range(1, 17))
-    
+    # 32 indices: first 16 = effort history, last 16 = future effort
+    effort_indices = list(range(-15, 17))
+    effort_history_horizon = 16
+
     effort_dims=7
 
     def modality_config(self):
@@ -1504,6 +1506,7 @@ class AlohaRightArmEffortConfig(BaseDataConfig):
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
                 effort_horizon=len(self.action_indices),
+                effort_history_horizon=self.effort_history_horizon,
                 max_state_dim=64,
                 max_action_dim=32,
                 max_effort_dim=7,
@@ -1511,7 +1514,7 @@ class AlohaRightArmEffortConfig(BaseDataConfig):
         ]
 
         return ComposedModalityTransform(transforms=transforms)
-    
+
 
 class VRH3EffortConfig(BaseDataConfig):
     video_keys = ["video.cam_front"]
@@ -1537,8 +1540,10 @@ class VRH3EffortConfig(BaseDataConfig):
     observation_indices = [0]
     state_indices = [0]
     action_indices = list(range(16))
-    effort_indices = list(range(1, 17))
-    
+    # 32 indices: first 16 = effort history, last 16 = future effort
+    effort_indices = list(range(-15, 17))
+    effort_history_horizon = 16
+
     effort_dims=26
 
     def modality_config(self):
@@ -1617,6 +1622,7 @@ class VRH3EffortConfig(BaseDataConfig):
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
                 effort_horizon=len(self.action_indices),
+                effort_history_horizon=self.effort_history_horizon,
                 max_state_dim=64,
                 max_action_dim=32,
                 max_effort_dim=26,
@@ -1624,7 +1630,7 @@ class VRH3EffortConfig(BaseDataConfig):
         ]
 
         return ComposedModalityTransform(transforms=transforms)
-    
+
 ###########################################################################################
     
 

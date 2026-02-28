@@ -127,6 +127,13 @@ class GR00TTransform(InvertibleModalityTransform):
 
     max_length: int = 512
     embodiment_tag: EmbodimentTag | None = None
+    effort_history_horizon: int = Field(
+        default=0,
+        description="Number of past effort timesteps stored in the effort_history field. "
+                    "When > 0, data['effort'] must have (effort_history_horizon + effort_horizon) "
+                    "rows; the first effort_history_horizon rows become effort_history and the "
+                    "remaining effort_horizon rows become the future effort.",
+    )
 
     def set_metadata(self, dataset_metadata: DatasetMetadata):
         """Set the metadata for the transform."""
@@ -302,32 +309,55 @@ class GR00TTransform(InvertibleModalityTransform):
     
     def _prepare_effort(self, data: dict):
         """
-        Pad to max_action_dim, return masks.
+        Pad to max_effort_dim and return masks.
+
+        When effort_history_horizon > 0, data['effort'] must have
+        (effort_history_horizon + effort_horizon) rows:
+          - first effort_history_horizon rows  → effort_history / effort_history_mask
+          - remaining effort_horizon rows       → efforts / efforts_mask
+
+        Returns:
+            (efforts, efforts_mask, n_effort_tokens, effort_history, effort_history_mask)
+            effort_history / effort_history_mask are None when effort_history_horizon == 0.
         """
+        H = self.effort_history_horizon
+
+        def _pad(arr: np.ndarray):
+            n_dims = arr.shape[1]
+            assert (
+                n_dims <= self.max_effort_dim
+            ), f"effort dim {n_dims} exceeds max allowed {self.max_effort_dim}."
+            padded = np.pad(arr, ((0, 0), (0, self.max_effort_dim - n_dims)), "constant")
+            mask = np.zeros((arr.shape[0], self.max_effort_dim), dtype=bool)
+            mask[:, :n_dims] = True
+            return padded, mask
+
         if "effort" not in data:
             efforts = np.zeros((self.effort_horizon, self.max_effort_dim))
             efforts_mask = np.zeros((self.effort_horizon, self.max_effort_dim), dtype=bool)
-            n_effort_tokens = self.effort_horizon
-            return efforts, efforts_mask, n_effort_tokens
+            if H > 0:
+                effort_history = np.zeros((H, self.max_effort_dim))
+                effort_history_mask = np.zeros((H, self.max_effort_dim), dtype=bool)
+                return efforts, efforts_mask, self.effort_horizon, effort_history, effort_history_mask
+            return efforts, efforts_mask, self.effort_horizon, None, None
 
-        efforts = data["effort"]
-        assert efforts.shape[0] == self.effort_horizon, f"{efforts.shape=}, {self.effort_horizon=}"
+        full_effort = data["effort"]
 
-        n_effort_tokens = efforts.shape[0]  # T
-        n_effort_dims = efforts.shape[1]
-
-        assert (
-            n_effort_dims <= self.max_effort_dim
-        ), f"effort dim {n_effort_dims} exceeds max allowed {self.max_effort_dim}."
-
-        # Pad the channel dimension
-        efforts = np.pad(efforts, ((0, 0), (0, self.max_effort_dim - n_effort_dims)), "constant")
-
-        # Create mask: [T, max_effort_dim]
-        efforts_mask = np.zeros((n_effort_tokens, self.max_effort_dim), dtype=bool)
-        efforts_mask[:, :n_effort_dims] = True
-
-        return efforts, efforts_mask, n_effort_tokens
+        if H > 0:
+            expected_rows = H + self.effort_horizon
+            assert full_effort.shape[0] == expected_rows, (
+                f"Expected {expected_rows} effort rows (history={H} + future={self.effort_horizon}), "
+                f"got {full_effort.shape[0]}"
+            )
+            effort_history, effort_history_mask = _pad(full_effort[:H])
+            efforts, efforts_mask = _pad(full_effort[H:])
+            return efforts, efforts_mask, self.effort_horizon, effort_history, effort_history_mask
+        else:
+            assert full_effort.shape[0] == self.effort_horizon, (
+                f"{full_effort.shape=}, {self.effort_horizon=}"
+            )
+            efforts, efforts_mask = _pad(full_effort)
+            return efforts, efforts_mask, self.effort_horizon, None, None
 
     def apply_single(self, data: dict) -> dict:
         transformed_data = {}
@@ -353,9 +383,12 @@ class GR00TTransform(InvertibleModalityTransform):
             transformed_data["action"] = actions
             transformed_data["action_mask"] = actions_mask
         if self.max_effort_dim is not None:
-            efforts, efforts_mask, _ = self._prepare_effort(data)
+            efforts, efforts_mask, _, effort_history, effort_history_mask = self._prepare_effort(data)
             transformed_data["effort"] = efforts
             transformed_data["effort_mask"] = efforts_mask
+            if effort_history is not None:
+                transformed_data["effort_history"] = effort_history
+                transformed_data["effort_history_mask"] = effort_history_mask
 
         for k, v in vlm_outputs.items():
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."

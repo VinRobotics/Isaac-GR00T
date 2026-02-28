@@ -69,6 +69,25 @@ class DualBrainTrainer(transformers.Trainer):
         torch.serialization.add_safe_globals(
             [np.core.multiarray._reconstruct, np.ndarray, np.dtype, np.dtypes.UInt32DType]
         )
+        # Accumulators for auxiliary losses — averaged and flushed at each log() call.
+        self._aux_log_sum: dict = {}
+        self._aux_log_count: dict = {}
+
+    def _aux_accumulate(self, key: str, value: float):
+        self._aux_log_sum[key] = self._aux_log_sum.get(key, 0.0) + value
+        self._aux_log_count[key] = self._aux_log_count.get(key, 0) + 1
+
+    def log(self, logs: dict, start_time: float = None) -> None:
+        # Inject averaged auxiliary losses and reset accumulators.
+        for key, total in self._aux_log_sum.items():
+            count = self._aux_log_count.get(key, 1)
+            logs[key] = round(total / max(count, 1), 6)
+        self._aux_log_sum.clear()
+        self._aux_log_count.clear()
+        if start_time is not None:
+            super().log(logs, start_time)
+        else:
+            super().log(logs)
 
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
@@ -79,6 +98,9 @@ class DualBrainTrainer(transformers.Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(inputs)
         loss = outputs["loss"]
+        for key in ("action_loss", "effort_ar_loss"):
+            if key in outputs:
+                self._aux_accumulate(key, outputs[key].item())
         return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self):

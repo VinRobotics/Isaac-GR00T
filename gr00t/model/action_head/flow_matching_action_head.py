@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.distributions import Beta
-from transformers import PretrainedConfig
+from transformers import AutoProcessor, PretrainedConfig
 from transformers.feature_extraction_utils import BatchFeature
 
 from gr00t.model.action_head.action_encoder import (
@@ -188,12 +188,40 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=32, metadata={"help": "Number of target vision tokens."}
     )
     
-    # Torque aware
+    # Torque aware (original concatenation approach)
     torque_aware: bool = field(
         default=False, metadata={"help": "Whether to use torque-aware training."}
     )
     effort_dim: Optional[int] = field(
         default=None, metadata={"help": "Effort dimension."}
+    )
+
+    # FAST effort: history as conditioning tokens + AR decoder for future effort prediction
+    use_fast_effort: bool = field(
+        default=False,
+        metadata={"help": "Use FAST tokenizer for effort. "
+                           "History tokens condition the DiT; an AR decoder predicts future effort."},
+    )
+    fast_tokenizer_path: str = field(
+        default="physical-intelligence/fast",
+        metadata={"help": "HuggingFace model ID or local path for the FAST action tokenizer."},
+    )
+    fast_num_tokens: int = field(
+        default=80,
+        metadata={"help": "Fixed FAST token sequence length per sample (pad/truncate to this). "
+                           "For (T=16, D=7) ~67 tokens are produced; for (T=16, D=26) ~243."},
+    )
+    fast_effort_history_horizon: int = field(
+        default=16, metadata={"help": "Number of past effort timesteps used as FAST history."}
+    )
+    fast_effort_loss_coeff: float = field(
+        default=1.0, metadata={"help": "Weight of the AR effort cross-entropy loss."}
+    )
+    fast_ar_num_layers: int = field(
+        default=2, metadata={"help": "Number of Transformer Decoder layers in the AR effort head."}
+    )
+    fast_ar_emb_dim: int = field(
+        default=256, metadata={"help": "Hidden dimension of the AR effort decoder."}
     )
 
     def __init__(self, **kwargs):
@@ -241,6 +269,60 @@ class FlowmatchingActionHead(nn.Module):
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
+        # ── FAST effort modules ──────────────────────────────────────────────
+        self.use_fast_effort = config.use_fast_effort
+        if self.use_fast_effort:
+            assert config.effort_dim is not None, "effort_dim must be set when use_fast_effort=True"
+            self.fast_tokenizer = AutoProcessor.from_pretrained(
+                config.fast_tokenizer_path, trust_remote_code=True
+            )
+            self.fast_min_token: int = self.fast_tokenizer.min_token   # e.g. -354
+            # shifted token range: [0, emb_size-1]; PAD=emb_size; BOS=emb_size+1
+            self.fast_emb_size: int = self.fast_tokenizer.vocab_size - self.fast_min_token
+            self.fast_pad_token: int = self.fast_emb_size          # out-of-vocab → ignore_index
+            self.fast_bos_token: int = self.fast_emb_size + 1      # AR start token
+            self.n_fast: int = config.fast_num_tokens
+
+            ar_emb_dim = config.fast_ar_emb_dim
+            vocab_with_special = self.fast_emb_size + 2  # + PAD + BOS
+
+            # History tokens → sa_embs conditioning (input_embedding_dim space)
+            self.fast_hist_token_emb = nn.Embedding(
+                vocab_with_special, self.input_embedding_dim, padding_idx=self.fast_pad_token
+            )
+            nn.init.normal_(self.fast_hist_token_emb.weight, std=0.02)
+            self.fast_hist_pos_emb = nn.Embedding(self.n_fast, self.input_embedding_dim)
+            nn.init.normal_(self.fast_hist_pos_emb.weight, std=0.02)
+
+            # AR decoder modules (ar_emb_dim space, kept small for efficiency)
+            self.fast_ar_effort_emb = nn.Embedding(
+                vocab_with_special, ar_emb_dim, padding_idx=self.fast_pad_token
+            )
+            nn.init.normal_(self.fast_ar_effort_emb.weight, std=0.02)
+            self.fast_ar_pos_emb = nn.Embedding(self.n_fast, ar_emb_dim)
+            nn.init.normal_(self.fast_ar_pos_emb.weight, std=0.02)
+
+            # Project DiT future_tokens output → AR decoder memory dim
+            self.fast_context_proj = nn.Linear(self.hidden_size, ar_emb_dim)
+
+            # Causal Transformer Decoder
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=ar_emb_dim,
+                nhead=max(1, ar_emb_dim // 64),  # e.g. 4 heads for dim=256
+                dim_feedforward=4 * ar_emb_dim,
+                dropout=0.0,
+                batch_first=True,
+            )
+            self.fast_ar_decoder = nn.TransformerDecoder(
+                decoder_layer, num_layers=config.fast_ar_num_layers
+            )
+            # Classification head: ar_emb_dim → emb_size (predict shifted token ID)
+            self.fast_cls_head = nn.Linear(ar_emb_dim, self.fast_emb_size)
+            print(
+                f"FAST effort: n_fast={self.n_fast}, emb_size={self.fast_emb_size}, "
+                f"ar_emb_dim={ar_emb_dim}, ar_layers={config.fast_ar_num_layers}"
+            )
+
         self.vlln = (
             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
         )
@@ -271,6 +353,14 @@ class FlowmatchingActionHead(nn.Module):
             self.action_decoder.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
+            if self.use_fast_effort:
+                self.fast_hist_token_emb.requires_grad_(False)
+                self.fast_hist_pos_emb.requires_grad_(False)
+                self.fast_ar_effort_emb.requires_grad_(False)
+                self.fast_ar_pos_emb.requires_grad_(False)
+                self.fast_context_proj.requires_grad_(False)
+                self.fast_ar_decoder.requires_grad_(False)
+                self.fast_cls_head.requires_grad_(False)
         if not tune_diffusion_model:
             self.model.requires_grad_(False)
         print(f"Tune action head projector: {self.tune_projector}")
@@ -366,6 +456,28 @@ class FlowmatchingActionHead(nn.Module):
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
+    def _fast_tokenize(self, effort_tensor: torch.Tensor, n_fast: int) -> torch.Tensor:
+        """Tokenize an effort tensor using the FAST tokenizer, pad/truncate to n_fast.
+
+        Args:
+            effort_tensor: (B, T, D) float tensor on any device, values in [-1, 1]
+            n_fast: fixed output sequence length (pad with self.fast_pad_token)
+        Returns:
+            (B, n_fast) int64 tensor on CPU with shifted token IDs in [0, emb_size-1]
+            or fast_pad_token for padding positions.
+        """
+        effort_np = effort_tensor.detach().cpu().float().numpy()
+        tokens_list = self.fast_tokenizer(effort_np)   # list[list[int]], variable length
+        B = len(tokens_list)
+        result = torch.full((B, n_fast), self.fast_pad_token, dtype=torch.long)
+        for i, toks in enumerate(tokens_list):
+            shifted = [
+                min(t - self.fast_min_token, self.fast_emb_size - 1)
+                for t in toks[:n_fast]
+            ]
+            result[i, : len(shifted)] = torch.tensor(shifted, dtype=torch.long)
+        return result  # (B, n_fast) on CPU
+
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
@@ -402,7 +514,8 @@ class FlowmatchingActionHead(nn.Module):
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
         # Embed noised action trajectory.
-        if self.torque_aware:
+        # torque_aware concatenates effort with action; use_fast_effort handles effort separately.
+        if self.torque_aware and not self.use_fast_effort:
             actions = torch.concat([action_input.action, action_input.effort], dim=-1)
         else:
             actions = action_input.action
@@ -423,9 +536,26 @@ class FlowmatchingActionHead(nn.Module):
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
 
+        # Embed FAST effort history tokens for conditioning (prepended to sa_embs).
+        B = vl_embs.shape[0]
+        hist_embs: Optional[torch.Tensor] = None
+        if self.use_fast_effort:
+            hist_tokens = self._fast_tokenize(
+                action_input.effort_history[..., : self.effort_dim], self.n_fast
+            ).to(device)  # (B, n_fast) int64
+            hist_embs = (
+                self.fast_hist_token_emb(hist_tokens)        # (B, n_fast, emb_dim)
+                + self.fast_hist_pos_emb.weight.unsqueeze(0) # (1, n_fast, emb_dim)
+            )
+
         # Join vision, language, state and action embedding along sequence dimension.
-        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+        # Layout: [state(1) | hist(n_fast) | future_tokens(n_ft) | action(T)]  (fast_effort)
+        # Layout: [state(1) | future_tokens(n_ft) | action(T)]                  (standard)
+        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1)
+        if self.use_fast_effort and hist_embs is not None:
+            sa_embs = torch.cat((state_features, hist_embs, future_tokens, action_features), dim=1)
+        else:
+            sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
         vl_attn_mask = backbone_output.backbone_attention_mask
 
@@ -443,28 +573,78 @@ class FlowmatchingActionHead(nn.Module):
         # Slice out only the action portion of pred and target for action loss.
         action_mask = action_input.action_mask
 
-        pred_only_actions = pred_actions[..., :self.action_dim]
-        velocity_actions = velocity[..., :self.action_dim]
+        pred_only_actions = pred_actions[..., : self.action_dim]
+        velocity_actions = velocity[..., : self.action_dim]
         action_loss = F.mse_loss(pred_only_actions, velocity_actions, reduction="none") * action_mask
-        loss = (action_loss.sum() / action_mask.sum())
+        loss = action_loss.sum() / action_mask.sum()
 
-        if self.torque_aware:
+        if self.torque_aware and not self.use_fast_effort:
             # For efforts we must slice from the full pred_actions tensor (which still contains effort dims)
             effort_mask = action_input.effort_mask
-            pred_efforts = pred_actions[..., self.action_dim:]
-            velocity_efforts = velocity[..., self.action_dim:]
-            # Ensure masks and tensors broadcast correctly. effort_mask expected shape matches effort dims.
+            pred_efforts = pred_actions[..., self.action_dim :]
+            velocity_efforts = velocity[..., self.action_dim :]
             effort_loss = F.mse_loss(pred_efforts, velocity_efforts, reduction="none") * effort_mask
-            loss += 0.1 * (effort_loss.sum() / effort_mask.sum())
-        
+            loss = loss + 0.1 * (effort_loss.sum() / effort_mask.sum())
+
+        effort_ar_loss: Optional[torch.Tensor] = None
+        if self.use_fast_effort:
+            # ── AR effort decoder ────────────────────────────────────────────
+            # Context: DiT output at future_tokens positions
+            n_ft = self.config.num_target_vision_tokens
+            ft_start = 1 + self.n_fast   # after state(1) + hist(n_fast)
+            ft_end = ft_start + n_ft
+            context = self.fast_context_proj(
+                model_output[:, ft_start:ft_end, :]
+            )  # (B, n_ft, ar_emb_dim)
+
+            # Tokenise future effort → training targets (B, n_fast)
+            target_tokens = self._fast_tokenize(
+                action_input.effort[..., : self.effort_dim], self.n_fast
+            ).to(device)
+
+            # AR input (teacher forcing): [BOS, tok_0, ..., tok_{n-2}]
+            bos_ids = torch.full((B, 1), self.fast_bos_token, dtype=torch.long, device=device)
+            ar_input_ids = torch.cat([bos_ids, target_tokens[:, :-1]], dim=1)  # (B, n_fast)
+            ar_input_embs = (
+                self.fast_ar_effort_emb(ar_input_ids)            # (B, n_fast, ar_emb_dim)
+                + self.fast_ar_pos_emb.weight.unsqueeze(0)       # (1, n_fast, ar_emb_dim)
+            )
+
+            # Causal mask: each position can only attend to previous positions
+            causal_mask = nn.Transformer.generate_square_subsequent_mask(
+                self.n_fast, device=device
+            )  # (n_fast, n_fast)
+            ar_out = self.fast_ar_decoder(
+                tgt=ar_input_embs,
+                memory=context,
+                tgt_mask=causal_mask,
+                tgt_is_causal=True,
+            )  # (B, n_fast, ar_emb_dim)
+
+            effort_logits = self.fast_cls_head(ar_out)  # (B, n_fast, emb_size)
+            _ar_loss: torch.Tensor = F.cross_entropy(
+                effort_logits.reshape(B * self.n_fast, self.fast_emb_size),
+                target_tokens.reshape(B * self.n_fast),
+                ignore_index=self.fast_pad_token,
+            )
+            effort_ar_loss = _ar_loss
+            loss = loss + self.config.fast_effort_loss_coeff * _ar_loss
+
         output_dict = {
             "loss": loss,
             "action_loss": action_loss,
         }
+        if effort_ar_loss is not None:
+            output_dict["effort_ar_loss"] = effort_ar_loss
         return BatchFeature(data=output_dict)
 
     @torch.no_grad()
-    def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+    def get_action(
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        predict_effort: bool = True,
+    ) -> BatchFeature:
 
         backbone_output = self.process_backbone_output(backbone_output)
 
@@ -475,16 +655,26 @@ class FlowmatchingActionHead(nn.Module):
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
-        # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
-        
-        # When torque_aware, we predict both action and effort
-        if self.torque_aware:
+
+        # Pre-compute FAST effort history embeddings (fixed across all denoising steps).
+        hist_embs: Optional[torch.Tensor] = None
+        if self.use_fast_effort:
+            hist_tokens = self._fast_tokenize(
+                action_input.effort_history[..., : self.effort_dim], self.n_fast
+            ).to(device)
+            hist_embs = (
+                self.fast_hist_token_emb(hist_tokens)
+                + self.fast_hist_pos_emb.weight.unsqueeze(0)
+            )  # (B, n_fast, emb_dim)
+
+        # When torque_aware (legacy), noise covers both action and effort dims.
+        if self.torque_aware and not self.use_fast_effort:
             action_effort_dim = self.config.action_dim + self.config.effort_dim
         else:
             action_effort_dim = self.config.action_dim
-            
+
         actions = torch.randn(
             size=(batch_size, self.config.action_horizon, action_effort_dim),
             dtype=vl_embs.dtype,
@@ -493,47 +683,91 @@ class FlowmatchingActionHead(nn.Module):
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
+        model_output: Optional[torch.Tensor] = None  # set inside loop; valid after num_steps >= 1
 
         # Run denoising steps.
         for t in range(num_steps):
-            t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
+            t_cont = t / float(num_steps)
             t_discretized = int(t_cont * self.num_timestep_buckets)
 
-            # Embed noised action trajectory.
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
             action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Maybe add position embedding.
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-            sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+            future_tokens = self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1)
+            if self.use_fast_effort and hist_embs is not None:
+                sa_embs = torch.cat((state_features, hist_embs, future_tokens, action_features), dim=1)
+            else:
+                sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
-            # Run model forward.
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
                 timestep=timesteps_tensor,
             )
             pred = self.action_decoder(model_output, embodiment_id)
-
             pred_velocity = pred[:, -self.action_horizon :]
-
-            # Update actions using euler integration.
             actions = actions + dt * pred_velocity
-        
-        # If torque_aware, split the output into action and effort
+
+        # ── Post-denoising effort prediction via AR decoder ──────────────────
+        if self.use_fast_effort and predict_effort:
+            assert model_output is not None, "model_output is None — num_inference_timesteps must be >= 1"
+            n_ft = self.config.num_target_vision_tokens
+            ft_start = 1 + self.n_fast
+            ft_end = ft_start + n_ft
+            context = self.fast_context_proj(
+                model_output[:, ft_start:ft_end, :]
+            )  # (B, n_ft, ar_emb_dim)
+
+            # Greedy AR decoding: start with BOS, generate n_fast tokens
+            generated_ids = torch.full(
+                (batch_size, 1), self.fast_bos_token, dtype=torch.long, device=device
+            )
+            for _ in range(self.n_fast):
+                step_len = generated_ids.shape[1]
+                embs = (
+                    self.fast_ar_effort_emb(generated_ids)
+                    + self.fast_ar_pos_emb.weight[:step_len].unsqueeze(0)
+                )  # (B, step_len, ar_emb_dim)
+                causal_mask = nn.Transformer.generate_square_subsequent_mask(
+                    step_len, device=device
+                )
+                ar_out = self.fast_ar_decoder(
+                    tgt=embs,
+                    memory=context,
+                    tgt_mask=causal_mask,
+                    tgt_is_causal=True,
+                )  # (B, step_len, ar_emb_dim)
+                next_logit = self.fast_cls_head(ar_out[:, -1, :])   # (B, emb_size)
+                next_token = next_logit.argmax(dim=-1, keepdim=True) # (B, 1)
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+
+            pred_shifted = generated_ids[:, 1:]  # (B, n_fast) — drop BOS
+            # Unshift and decode via FAST tokenizer
+            pred_unshifted = (pred_shifted + self.fast_min_token).cpu().tolist()
+            effort_np = self.fast_tokenizer.decode(
+                pred_unshifted,
+                time_horizon=self.config.action_horizon,
+                action_dim=self.effort_dim,
+            )
+            import numpy as np
+            effort_pred = torch.tensor(
+                np.asarray(effort_np), dtype=vl_embs.dtype, device=device
+            )  # (B, action_horizon, effort_dim)
+            return BatchFeature(data={"action_pred": actions, "effort_pred": effort_pred})
+
+        # Legacy torque_aware: effort was denoised jointly with action
         if self.torque_aware:
-            action_pred = actions[:, :, :self.config.action_dim]
-            effort_pred = actions[:, :, self.config.action_dim:]
+            action_pred = actions[:, :, : self.config.action_dim]
+            effort_pred = actions[:, :, self.config.action_dim :]
             return BatchFeature(data={"action_pred": action_pred, "effort_pred": effort_pred})
-        else:
-            return BatchFeature(data={"action_pred": actions})
+
+        return BatchFeature(data={"action_pred": actions})
     
     @torch.enable_grad()
     def get_realtime_action(
