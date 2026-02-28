@@ -98,7 +98,7 @@ class DualBrainTrainer(transformers.Trainer):
         loss = outputs["loss"]
         for key in ("action_loss", "effort_ar_loss"):
             if key in outputs:
-                self._aux_accumulate(key, outputs[key].item())
+                self._aux_accumulate(key, outputs[key].detach().float().mean().item())
         return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self):
