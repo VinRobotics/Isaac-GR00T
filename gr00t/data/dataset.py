@@ -861,6 +861,37 @@ class LeRobotSingleDataset(Dataset):
             return self.get_language(trajectory_id, key, base_index)
         else:
             raise ValueError(f"Invalid modality: {modality}")
+        
+
+class VLASHLeRobotSingleDataset(LeRobotSingleDataset):
+    """
+    Base dataset class for LeRobot that supports VLASH.
+    """
+
+    def __init__(
+        self,
+        dataset_path: Path | str,
+        modality_configs: dict[str, ModalityConfig],
+        embodiment_tag: str | EmbodimentTag,
+        video_backend: str = "torchcodec",
+        video_backend_kwargs: dict | None = None,
+        transforms: ComposedModalityTransform | None = None,
+        max_delay_steps: int = 0,
+    ):
+        self.max_delay_steps = max_delay_steps
+        super().__init__(dataset_path, modality_configs, embodiment_tag, video_backend, video_backend_kwargs, transforms)
+
+        # Track last offset for state construction in __getitem__
+        self._last_offset: int = 0
+
+    def __getitem__(self, index):
+        """Get sample with state constructed from pre
+        
+        """
+        item = super().__getitem__(index)
+
+        return item
+
 
 
 class CachedLeRobotSingleDataset(LeRobotSingleDataset):

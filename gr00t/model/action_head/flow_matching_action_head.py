@@ -23,6 +23,7 @@ from transformers import PretrainedConfig
 from transformers.feature_extraction_utils import BatchFeature
 
 from gr00t.model.action_head.action_encoder import SinusoidalPositionalEncoding, swish
+from gr00t.model.action_head.utils import build_shared_obs_attention_mask_and_position_ids
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
 
@@ -343,18 +344,6 @@ class FlowmatchingActionHead(nn.Module):
         action_features = action_features.view(batch_size, num_offsets * action_T, action_D)
 
 
-        # Maybe add position embedding.
-        if self.config.add_pos_embed:
-            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-            action_features = action_features + pos_embs
-
-        # Join vision, language, state and action embedding along sequence dimension.
-        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
-
-        vl_attn_mask = backbone_output.backbone_attention_mask
-
         # Build mask
         prefix_pad_masks = torch.ones(
             batch_size, future_tokens.shape[1],
@@ -389,6 +378,18 @@ class FlowmatchingActionHead(nn.Module):
             offset_mask,
             sa_embs.dtype,
         )
+
+        # Maybe add position embedding.
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+            action_features = action_features + pos_embs
+
+        # Join vision, language, state and action embedding along sequence dimension.
+        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+
+        vl_attn_mask = backbone_output.backbone_attention_mask
 
         model_output = self.model(
             hidden_states=sa_embs,
