@@ -576,7 +576,8 @@ class FlowmatchingActionHead(nn.Module):
         pred_only_actions = pred_actions[..., : self.action_dim]
         velocity_actions = velocity[..., : self.action_dim]
         action_loss = F.mse_loss(pred_only_actions, velocity_actions, reduction="none") * action_mask
-        loss = action_loss.sum() / action_mask.sum()
+        action_loss_scalar = action_loss.sum() / action_mask.sum()
+        loss = action_loss_scalar
 
         if self.torque_aware and not self.use_fast_effort:
             # For efforts we must slice from the full pred_actions tensor (which still contains effort dims)
@@ -632,7 +633,7 @@ class FlowmatchingActionHead(nn.Module):
 
         output_dict = {
             "loss": loss,
-            "action_loss": action_loss,
+            "action_loss": action_loss_scalar,
         }
         if effort_ar_loss is not None:
             output_dict["effort_ar_loss"] = effort_ar_loss
