@@ -24,7 +24,7 @@ import torch
 import tyro
 from transformers import TrainingArguments
 
-from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset
+from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset, VLASHLeRobotSingleDataset
 from gr00t.data.schema import EmbodimentTag
 from gr00t.experiment.data_config import load_data_config
 from gr00t.experiment.runner import TrainRunner
@@ -137,6 +137,10 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+    # VLASH-specific parameters
+    use_vlash: bool = False
+    """Whether to use VLASH for training."""
+
 
 #####################################################################################
 # Helper functions
@@ -207,6 +211,12 @@ def main(config: ArgsConfig):
     # 1.2 data loader: we will use either single dataset or mixture dataset
     if len(config.dataset_path) == 1:
         train_dataset = LeRobotSingleDataset(
+            dataset_path=config.dataset_path[0],
+            modality_configs=modality_configs,
+            transforms=transforms,
+            embodiment_tag=embodiment_tag,  # This will override the dataset's embodiment tag to "new_embodiment"
+            video_backend=config.video_backend,
+        ) if not config.use_vlash else VLASHLeRobotSingleDataset(
             dataset_path=config.dataset_path[0],
             modality_configs=modality_configs,
             transforms=transforms,

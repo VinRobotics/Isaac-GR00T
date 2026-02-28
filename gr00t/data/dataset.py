@@ -29,6 +29,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
+import random
 
 import numpy as np
 import pandas as pd
@@ -702,6 +703,8 @@ class LeRobotSingleDataset(Dataset):
         # Get the corresponding video timestamps from the step indices
         video_timestamp = timestamp[step_indices]
 
+        print("\tVIDEO: ", step_indices)
+
         return get_frames_by_timestamps(
             video_path.as_posix(),
             video_timestamp,
@@ -780,6 +783,8 @@ class LeRobotSingleDataset(Dataset):
         # Get the state or action configuration
         state_or_action_cfg = getattr(self.metadata.modalities, modality)[key]
 
+        print("\tSTATE: ", step_indices)
+
         # Pad the data
         return self.retrieve_data_and_pad(
             array=data_array,
@@ -832,6 +837,7 @@ class LeRobotSingleDataset(Dataset):
             original_key = key
         for i in range(len(step_indices)):
             task_indices.append(self.curr_traj_data[original_key][step_indices[i]].item())
+        print("\tLANGUAGE: ", step_indices)
         return self.tasks.loc[task_indices]["task"].tolist()
 
     def get_data_by_modality(
@@ -890,8 +896,129 @@ class VLASHLeRobotSingleDataset(LeRobotSingleDataset):
         """
         item = super().__getitem__(index)
 
+        trajectory_id, base_index = self.all_steps[index]
+
+        offset = getattr(self, "_last_offset", 0)
+
+        print("STEP INDICES: ", offset)
+        if offset <= 0:
+            return item
+        
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        # Get the maximum length of the trajectory
+        max_length = self.trajectory_lengths[trajectory_index]
+
+        prev_index = max(0, min(max_length - 1, base_index + offset - 1))
+
+        assert "state" in self.modality_keys.keys(), f"No state modality found in modality keys for {self.modality_keys=}"
+        obs_state = item["state"]
+        prev_action = self.curr_traj_data[self.lerobot_modality_meta.action.original_key][prev_index].to_numpy()  # type: ignore
+
+        # Validate dimensions
+        if obs_state.dim() != 1 or prev_action.dim() != 1:
+            raise ValueError("For now only support 1D state/action.")
+
+        state_dim = obs_state.shape[0]
+        action_dim = prev_action.shape[0]
+
+        if state_dim == action_dim:
+            # Dimensions match: use previous action as state
+            new_state = prev_action
+        else:
+            raise ValueError(
+                f"Unsupported state_dim != action_dim combination "
+                "in VLASHDataset when applying async offset to observation.state. "
+            )
+
+        item["observation.state"] = new_state
+
+        print(item)
+
         return item
 
+    def get_state_or_action(
+        self,
+        trajectory_id: int,
+        modality: str,
+        key: str,
+        base_index: int,
+    ) -> np.ndarray:
+        """Get the state or action data for a trajectory by a base index.
+        
+        Override to support delayed state construction for VLASH.
+
+        Args:
+            dataset (BaseSingleDataset): The dataset to retrieve the data from.
+            trajectory_id (int): The ID of the trajectory.
+            modality (str): The modality of the data.
+            key (str): The key of the data.
+            base_index (int): The base index of the trajectory.
+
+        Returns:
+            np.ndarray: The data for the trajectory and step indices.
+        """
+        # Get the step indices
+        step_indices = self.delta_indices[key] + base_index
+        # Get the trajectory index
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        # Get the maximum length of the trajectory
+        max_length = self.trajectory_lengths[trajectory_index]
+        max_offset = min(self.max_delay_steps, max(0, max_length - 1 - (base_index + max_length)))
+        offset = random.randint(0, max_offset) if max_offset > 0 else 0
+
+        self._last_offset = offset  # Store the last offset for use in __getitem__
+        step_indices = step_indices + offset  # 
+
+        # this handles action.task_progress if specified
+        if key == "action.task_progress":
+            # Get frame_index array and apply proper bounds checking and padding
+            frame_index_array = self.curr_traj_data["frame_index"].to_numpy()
+            # Use retrieve_data_and_pad to handle out-of-bounds indices
+            frame_index = self.retrieve_data_and_pad(
+                array=frame_index_array,
+                step_indices=step_indices,
+                max_length=max_length,
+                padding_strategy="first_last",  # Use first/last for task progress
+            )
+            # get the task progress by using "frame index / trajectory length"
+            progress = min(frame_index + offset, max_length) / max_length
+            progress = progress.reshape(-1, 1)
+            return progress
+
+        assert key.startswith(modality + "."), f"{key} must start with {modality + '.'}, got {key}"
+        # Get the sub-key, e.g. state.joint_angles -> joint_angles
+        key = key.replace(modality + ".", "")
+        # Get the lerobot key
+        le_state_or_action_cfg = getattr(self.lerobot_modality_meta, modality)
+        le_key = le_state_or_action_cfg[key].original_key
+        if le_key is None:
+            le_key = key
+        # Get the data array, shape: (T, D)
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        assert le_key in self.curr_traj_data.columns, f"No {le_key} found in {trajectory_id=}"
+        data_array: np.ndarray = np.stack(self.curr_traj_data[le_key])  # type: ignore
+        if data_array.ndim == 1:
+            assert (
+                data_array.shape[0] == max_length
+            ), f"Expected 1D array with length {max_length}, got {data_array.shape} array"
+            data_array = data_array.reshape(-1, 1)
+        assert data_array.ndim == 2, f"Expected 2D array, got {data_array.shape} array"
+        le_indices = np.arange(
+            le_state_or_action_cfg[key].start,
+            le_state_or_action_cfg[key].end,
+        )
+        data_array = data_array[:, le_indices]
+        # Get the state or action configuration
+        state_or_action_cfg = getattr(self.metadata.modalities, modality)[key]
+
+        # Pad the data
+        return self.retrieve_data_and_pad(
+            array=data_array,
+            step_indices=step_indices,
+            max_length=max_length,
+            padding_strategy="first_last" if state_or_action_cfg.absolute else "zero",
+        )
 
 
 class CachedLeRobotSingleDataset(LeRobotSingleDataset):
