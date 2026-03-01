@@ -70,21 +70,29 @@ class DualBrainTrainer(transformers.Trainer):
             [np.core.multiarray._reconstruct, np.ndarray, np.dtype, np.dtypes.UInt32DType]
         )
 
-    def _wrap_model(self, model, training=True, dataloader=None):
-        """Override to call _set_static_graph() on the DDP wrapper.
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override to apply _set_static_graph() once before the first backward.
 
         The equivariant backbone runs the same LLM module N times per forward pass
-        (once per rotation group element). DDP's default behaviour fires a gradient-
-        ready hook once per parameter per backward pass; with N passes through the
-        same parameters the hook fires N times and DDP raises 'marked ready twice'.
+        (once per rotation group element). DDP fires a gradient-ready hook once per
+        parameter per backward traversal; with N traversals through the same parameters
+        the hook fires N times and raises 'marked ready twice'.
 
-        _set_static_graph() tells DDP that the computation graph is fixed across
-        iterations and allows parameters to be reduced more than once per step.
+        _set_static_graph() tells DDP the computation graph is fixed and parameters
+        may be marked ready more than once per step. Applied lazily here because
+        `model` in training_step is the actual DDP-wrapped model (Accelerate may
+        delay wrapping beyond _wrap_model).
         """
-        wrapped = super()._wrap_model(model, training=training, dataloader=dataloader)
-        if training and hasattr(wrapped, "_set_static_graph"):
-            wrapped._set_static_graph()
-        return wrapped
+        if not getattr(self, "_static_graph_set", False):
+            # Walk through Accelerate / DDP wrappers to find the DDP instance
+            candidate = model
+            while candidate is not None:
+                if hasattr(candidate, "_set_static_graph"):
+                    candidate._set_static_graph()
+                    break
+                candidate = getattr(candidate, "module", None)
+            self._static_graph_set = True
+        return super().training_step(model, inputs, num_items_in_batch)
 
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
