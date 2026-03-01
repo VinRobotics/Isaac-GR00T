@@ -70,6 +70,22 @@ class DualBrainTrainer(transformers.Trainer):
             [np.core.multiarray._reconstruct, np.ndarray, np.dtype, np.dtypes.UInt32DType]
         )
 
+    def _wrap_model(self, model, training=True, dataloader=None):
+        """Override to call _set_static_graph() on the DDP wrapper.
+
+        The equivariant backbone runs the same LLM module N times per forward pass
+        (once per rotation group element). DDP's default behaviour fires a gradient-
+        ready hook once per parameter per backward pass; with N passes through the
+        same parameters the hook fires N times and DDP raises 'marked ready twice'.
+
+        _set_static_graph() tells DDP that the computation graph is fixed across
+        iterations and allows parameters to be reduced more than once per step.
+        """
+        wrapped = super()._wrap_model(model, training=training, dataloader=dataloader)
+        if training and hasattr(wrapped, "_set_static_graph"):
+            wrapped._set_static_graph()
+        return wrapped
+
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
 
