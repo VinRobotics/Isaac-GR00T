@@ -364,7 +364,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         "dropout": 0.2,
         "final_dropout": True,
         "num_attention_heads": 32,
-        "num_layers": 12,
+        "num_layers": 4,
         "positional_embeddings": None
         }, metadata={"help": "VL self-attention configuration (n_group is injected from top-level)."}
     )

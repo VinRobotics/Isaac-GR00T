@@ -312,6 +312,15 @@ class EagleBackboneFATokens(nn.Module):
             if self.eagle_model.vision_model and not self.tune_visual:
                 self.eagle_model.vision_model.eval()
 
+    def _llm_forward(self, input_embeds: torch.Tensor, attention_mask: torch.Tensor):
+        """Single LLM forward pass, wrapped for gradient checkpointing."""
+        return self.eagle_model.language_model(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
     def prepare_input(self, batch: dict) -> BatchFeature:
         """Prepare input batch."""
         return BatchFeature(data=batch)
@@ -595,10 +604,19 @@ class EagleBackboneFATokens(nn.Module):
         text_mask = ~image_mask                                # [B, T_seq]
         T_text = int(text_mask[0].sum().item())
 
-        # ── Step 2: N_group LLM passes — each with raw (non-FA) vision ────────
-        all_post_llm_vision: list[torch.Tensor] = []  # each [B*num_imgs, T_vis, D_llm]
+        # ── Steps 2+3: N_group LLM passes with immediate FA (running sum) ───────
+        # Merges the two loops to avoid storing all N post-LLM tensors simultaneously.
+        # Each rotation's features are transformed and added to a running sum,
+        # then freed — peak extra memory is O(1) tensors instead of O(N).
+        # Gradient checkpointing on the LLM further reduces activation memory
+        # by recomputing activations during backward instead of storing them.
+        D_llm_out = None
+        feat_blocks_size = None
+        avg_post_llm = None
         language_features = None
         language_attention_mask = None
+
+        use_checkpointing = self.training and self.tune_visual
 
         for h in range(self.n_group):
             # Raw (non-FA) vision for rotation h: [B * num_imgs, T_vision, D_vis]
@@ -620,47 +638,46 @@ class EagleBackboneFATokens(nn.Module):
             input_embeds_flat[image_mask_flat] = vision_h_flat.to(input_embeds_flat.dtype)
             input_embeds = input_embeds_flat.reshape(B, T_seq, D_llm)
 
-            # LLM forward (frozen; no gradient flows through)
-            llm_outputs = self.eagle_model.language_model(
-                inputs_embeds=input_embeds,
-                attention_mask=original_attention_mask,
-                output_hidden_states=True,
-                return_dict=True,
-            )
+            # LLM forward — gradient checkpointing trades compute for activation memory
+            if use_checkpointing:
+                llm_outputs = torch.utils.checkpoint.checkpoint(
+                    self._llm_forward,
+                    input_embeds,
+                    original_attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                llm_outputs = self._llm_forward(input_embeds, original_attention_mask)
+
             hidden = llm_outputs.hidden_states[self.select_layer]  # [B, T_seq, D_llm]
 
             # Post-LLM vision at image positions: [B * num_imgs, T_vision, D_llm]
             post_llm_vis_h = hidden[image_mask].reshape(
                 B * self.num_images_per_sample, num_vision_tokens, -1
             )
-            all_post_llm_vision.append(post_llm_vis_h)
 
             # Language features from h=0 (original image → correct LLM distribution)
             if h == 0:
                 language_features = hidden[text_mask].reshape(B, T_text, -1)
                 language_attention_mask = original_attention_mask[text_mask].reshape(B, T_text)
+                D_llm_out = post_llm_vis_h.shape[-1]
+                assert D_llm_out % self.n_group == 0, (
+                    f"LLM hidden dim ({D_llm_out}) must be divisible by n_group ({self.n_group}) "
+                    "for the regular-repr feature permutation in FA."
+                )
+                feat_blocks_size = D_llm_out // self.n_group
 
-        # ── Step 3: FA formula on post-LLM vision ─────────────────────────────
-        # ρ(h⁻¹) = π(h⁻¹) [spatial] ⊗ ρ_reg(h⁻¹) [cyclic feature shift]
-        D_llm_out = all_post_llm_vision[0].shape[-1]
-        assert D_llm_out % self.n_group == 0, (
-            f"LLM hidden dim ({D_llm_out}) must be divisible by n_group ({self.n_group}) "
-            "for the regular-repr feature permutation in FA."
-        )
-        feat_blocks_size = D_llm_out // self.n_group
+            del hidden, llm_outputs
 
-        transformed_features = []
-        for h in range(self.n_group):
-            feat_h = all_post_llm_vision[h]  # [B * num_imgs, T_vis, D_llm]
-
+            # ── FA transformation: ρ(h⁻¹) = π(h⁻¹) [spatial] ⊗ ρ_reg(h⁻¹) [cyclic shift]
             if h == 0:
-                transformed_features.append(feat_h)
+                feat_transformed = post_llm_vis_h
             else:
                 h_inv = (self.n_group - h) % self.n_group
 
                 # Spatial permutation π(h⁻¹): realign tokens to canonical positions
                 spatial_perm = self.token_perm_indices[h_inv]
-                feat_permuted = feat_h[:, spatial_perm, :]
+                feat_permuted = post_llm_vis_h[:, spatial_perm, :]
 
                 # Feature permutation ρ_reg(h⁻¹): cyclic block shift by h_inv
                 feat_blk = feat_permuted.reshape(
@@ -671,11 +688,18 @@ class EagleBackboneFATokens(nn.Module):
                 feat_transformed = feat_shifted.reshape(
                     B * self.num_images_per_sample, num_vision_tokens, D_llm_out
                 )
-                transformed_features.append(feat_transformed)
 
-        # Average over group elements → equivariant post-LLM vision
-        # [B * num_imgs, T_vision, D_llm]
-        avg_post_llm = torch.mean(torch.stack(transformed_features, dim=1), dim=1)
+            del post_llm_vis_h
+
+            # Running sum: avg = (1/N) * Σ_h feat_transformed_h
+            if avg_post_llm is None:
+                avg_post_llm = feat_transformed * (1.0 / self.n_group)
+            else:
+                avg_post_llm = avg_post_llm + feat_transformed * (1.0 / self.n_group)
+
+            del feat_transformed
+
+        # avg_post_llm: [B * num_imgs, T_vision, D_llm]  (equivariant post-LLM vision)
 
         # ── Step 4: Project D_llm → project_to_dim ────────────────────────────
         avg_post_llm = self.eagle_linear(avg_post_llm)
