@@ -21,6 +21,9 @@ def get_lora_model(model, rank=32, lora_alpha=16, lora_dropout=0.1, action_head_
     for name, module in model.named_modules():
         if action_head_only and "action_head" not in name:
             continue
+            
+        if "backbone" not in name:
+            continue
 
         # Look for linear layers in attention mechanisms
         if isinstance(module, torch.nn.Linear):
