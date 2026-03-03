@@ -141,6 +141,9 @@ class ArgsConfig:
     use_vlash: bool = False
     """Whether to use VLASH for training."""
 
+    max_delay_steps: int = 0
+    """Maximum number of delay steps for VLASH dataset."""
+
 
 #####################################################################################
 # Helper functions
@@ -222,6 +225,7 @@ def main(config: ArgsConfig):
             transforms=transforms,
             embodiment_tag=embodiment_tag,  # This will override the dataset's embodiment tag to "new_embodiment"
             video_backend=config.video_backend,
+            max_delay_steps=config.max_delay_steps,
         )
     else:
         single_datasets = []

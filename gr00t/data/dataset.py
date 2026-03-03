@@ -703,8 +703,6 @@ class LeRobotSingleDataset(Dataset):
         # Get the corresponding video timestamps from the step indices
         video_timestamp = timestamp[step_indices]
 
-        print("\tVIDEO: ", step_indices)
-
         return get_frames_by_timestamps(
             video_path.as_posix(),
             video_timestamp,
@@ -783,8 +781,6 @@ class LeRobotSingleDataset(Dataset):
         # Get the state or action configuration
         state_or_action_cfg = getattr(self.metadata.modalities, modality)[key]
 
-        print("\tSTATE: ", step_indices)
-
         # Pad the data
         return self.retrieve_data_and_pad(
             array=data_array,
@@ -837,7 +833,6 @@ class LeRobotSingleDataset(Dataset):
             original_key = key
         for i in range(len(step_indices)):
             task_indices.append(self.curr_traj_data[original_key][step_indices[i]].item())
-        print("\tLANGUAGE: ", step_indices)
         return self.tasks.loc[task_indices]["task"].tolist()
 
     def get_data_by_modality(
@@ -900,7 +895,6 @@ class VLASHLeRobotSingleDataset(LeRobotSingleDataset):
 
         offset = getattr(self, "_last_offset", 0)
 
-        print("STEP INDICES: ", offset)
         if offset <= 0:
             return item
         
@@ -912,28 +906,12 @@ class VLASHLeRobotSingleDataset(LeRobotSingleDataset):
         prev_index = max(0, min(max_length - 1, base_index + offset - 1))
 
         assert "state" in self.modality_keys.keys(), f"No state modality found in modality keys for {self.modality_keys=}"
-        obs_state = item["state"]
-        prev_action = self.curr_traj_data[self.lerobot_modality_meta.action.original_key][prev_index].to_numpy()  # type: ignore
 
-        # Validate dimensions
-        if obs_state.dim() != 1 or prev_action.dim() != 1:
-            raise ValueError("For now only support 1D state/action.")
+        prev_action = self.curr_traj_data["action"][prev_index]  # type: ignore
 
-        state_dim = obs_state.shape[0]
         action_dim = prev_action.shape[0]
 
-        if state_dim == action_dim:
-            # Dimensions match: use previous action as state
-            new_state = prev_action
-        else:
-            raise ValueError(
-                f"Unsupported state_dim != action_dim combination "
-                "in VLASHDataset when applying async offset to observation.state. "
-            )
-
-        item["observation.state"] = new_state
-
-        print(item)
+        item["state"][:, : action_dim] = prev_action[None, :]
 
         return item
 
@@ -964,11 +942,11 @@ class VLASHLeRobotSingleDataset(LeRobotSingleDataset):
         trajectory_index = self.get_trajectory_index(trajectory_id)
         # Get the maximum length of the trajectory
         max_length = self.trajectory_lengths[trajectory_index]
-        max_offset = min(self.max_delay_steps, max(0, max_length - 1 - (base_index + max_length)))
+        max_offset = min(self.max_delay_steps, max(0, max_length - 1 - (step_indices[-1])))
         offset = random.randint(0, max_offset) if max_offset > 0 else 0
 
         self._last_offset = offset  # Store the last offset for use in __getitem__
-        step_indices = step_indices + offset  # 
+        step_indices = step_indices + offset  # Apply the offset
 
         # this handles action.task_progress if specified
         if key == "action.task_progress":
