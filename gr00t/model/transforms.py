@@ -311,10 +311,15 @@ class GR00TTransform(InvertibleModalityTransform):
         """
         Pad to max_effort_dim and return masks.
 
-        When effort_history_horizon > 0, data['effort'] must have
-        (effort_history_horizon + effort_horizon) rows:
-          - first effort_history_horizon rows  → effort_history / effort_history_mask
-          - remaining effort_horizon rows       → efforts / efforts_mask
+        Training (self.training=True):
+          data['effort'] must have (effort_history_horizon + effort_horizon) rows:
+            - first H rows  → effort_history / effort_history_mask
+            - remaining rows → efforts / efforts_mask (future, used for loss)
+
+        Inference (self.training=False):
+          data['effort'] has only current/recent readings (up to H rows).
+          Available rows are placed at the tail of effort_history; the rest is zero-padded.
+          Future effort is not needed and is returned as zeros.
 
         Returns:
             (efforts, efforts_mask, n_effort_tokens, effort_history, effort_history_mask)
@@ -332,32 +337,52 @@ class GR00TTransform(InvertibleModalityTransform):
             mask[:, :n_dims] = True
             return padded, mask
 
-        if "effort" not in data:
+        if self.training:
+            # ── Training path ────────────────────────────────────────────────
+            if "effort" not in data:
+                efforts = np.zeros((self.effort_horizon, self.max_effort_dim))
+                efforts_mask = np.zeros((self.effort_horizon, self.max_effort_dim), dtype=bool)
+                if H > 0:
+                    effort_history = np.zeros((H, self.max_effort_dim))
+                    effort_history_mask = np.zeros((H, self.max_effort_dim), dtype=bool)
+                    return efforts, efforts_mask, self.effort_horizon, effort_history, effort_history_mask
+                return efforts, efforts_mask, self.effort_horizon, None, None
+
+            full_effort = data["effort"]
+            if H > 0:
+                expected_rows = H + self.effort_horizon
+                assert full_effort.shape[0] == expected_rows, (
+                    f"Expected {expected_rows} effort rows (history={H} + future={self.effort_horizon}), "
+                    f"got {full_effort.shape[0]}"
+                )
+                effort_history, effort_history_mask = _pad(full_effort[:H])
+                efforts, efforts_mask = _pad(full_effort[H:])
+                return efforts, efforts_mask, self.effort_horizon, effort_history, effort_history_mask
+            else:
+                assert full_effort.shape[0] == self.effort_horizon, (
+                    f"{full_effort.shape=}, {self.effort_horizon=}"
+                )
+                efforts, efforts_mask = _pad(full_effort)
+                return efforts, efforts_mask, self.effort_horizon, None, None
+
+        else:
+            # ── Inference path ───────────────────────────────────────────────
+            # Future effort is unknown; only effort_history is needed for conditioning.
             efforts = np.zeros((self.effort_horizon, self.max_effort_dim))
             efforts_mask = np.zeros((self.effort_horizon, self.max_effort_dim), dtype=bool)
-            if H > 0:
-                effort_history = np.zeros((H, self.max_effort_dim))
-                effort_history_mask = np.zeros((H, self.max_effort_dim), dtype=bool)
-                return efforts, efforts_mask, self.effort_horizon, effort_history, effort_history_mask
-            return efforts, efforts_mask, self.effort_horizon, None, None
+            if H == 0:
+                return efforts, efforts_mask, self.effort_horizon, None, None
 
-        full_effort = data["effort"]
-
-        if H > 0:
-            expected_rows = H + self.effort_horizon
-            assert full_effort.shape[0] == expected_rows, (
-                f"Expected {expected_rows} effort rows (history={H} + future={self.effort_horizon}), "
-                f"got {full_effort.shape[0]}"
-            )
-            effort_history, effort_history_mask = _pad(full_effort[:H])
-            efforts, efforts_mask = _pad(full_effort[H:])
+            if "effort" not in data:
+                hist_arr = np.zeros((H, self.max_effort_dim))
+            else:
+                full_effort = data["effort"]
+                n_dims = full_effort.shape[1]
+                hist_arr = np.zeros((H, n_dims))
+                avail = min(full_effort.shape[0], H)
+                hist_arr[-avail:] = full_effort[:avail]
+            effort_history, effort_history_mask = _pad(hist_arr)
             return efforts, efforts_mask, self.effort_horizon, effort_history, effort_history_mask
-        else:
-            assert full_effort.shape[0] == self.effort_horizon, (
-                f"{full_effort.shape=}, {self.effort_horizon=}"
-            )
-            efforts, efforts_mask = _pad(full_effort)
-            return efforts, efforts_mask, self.effort_horizon, None, None
 
     def apply_single(self, data: dict) -> dict:
         transformed_data = {}
@@ -382,13 +407,21 @@ class GR00TTransform(InvertibleModalityTransform):
             actions, actions_mask, _ = self._prepare_action(data)
             transformed_data["action"] = actions
             transformed_data["action_mask"] = actions_mask
-        if self.max_effort_dim is not None:
-            efforts, efforts_mask, _, effort_history, effort_history_mask = self._prepare_effort(data)
-            transformed_data["effort"] = efforts
-            transformed_data["effort_mask"] = efforts_mask
-            if effort_history is not None:
-                transformed_data["effort_history"] = effort_history
-                transformed_data["effort_history_mask"] = effort_history_mask
+            # 4) Prepare effort (history + future target for loss)
+            if self.max_effort_dim is not None:
+                efforts, efforts_mask, _, effort_history, effort_history_mask = self._prepare_effort(data)
+                transformed_data["effort"] = efforts
+                transformed_data["effort_mask"] = efforts_mask
+                if effort_history is not None:
+                    transformed_data["effort_history"] = effort_history
+                    transformed_data["effort_history_mask"] = effort_history_mask
+        else:
+            # 4) Inference: only effort_history is needed for conditioning
+            if self.max_effort_dim is not None:
+                _, _, _, effort_history, effort_history_mask = self._prepare_effort(data)
+                if effort_history is not None:
+                    transformed_data["effort_history"] = effort_history
+                    transformed_data["effort_history_mask"] = effort_history_mask
 
         for k, v in vlm_outputs.items():
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."

@@ -16,6 +16,7 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -277,10 +278,13 @@ class FlowmatchingActionHead(nn.Module):
                 config.fast_tokenizer_path, trust_remote_code=True
             )
             self.fast_min_token: int = self.fast_tokenizer.min_token   # e.g. -354
-            # shifted token range: [0, emb_size-1]; PAD=emb_size; BOS=emb_size+1
+            # shifted token range: [0, emb_size-1]
+            # special tokens: PAD=emb_size (embedding pad, CE uses -100), BOS=emb_size+1
+            # EOS class in cls head output: emb_size (last logit index)
             self.fast_emb_size: int = self.fast_tokenizer.vocab_size - self.fast_min_token
-            self.fast_pad_token: int = self.fast_emb_size          # out-of-vocab → ignore_index
+            self.fast_pad_token: int = self.fast_emb_size          # embedding padding_idx
             self.fast_bos_token: int = self.fast_emb_size + 1      # AR start token
+            self.fast_eos_cls: int = self.fast_emb_size             # EOS class in cls head
             self.n_fast: int = config.fast_num_tokens
 
             ar_emb_dim = config.fast_ar_emb_dim
@@ -291,16 +295,14 @@ class FlowmatchingActionHead(nn.Module):
                 vocab_with_special, self.input_embedding_dim, padding_idx=self.fast_pad_token
             )
             nn.init.normal_(self.fast_hist_token_emb.weight, std=0.02)
-            self.fast_hist_pos_emb = nn.Embedding(self.n_fast, self.input_embedding_dim)
-            nn.init.normal_(self.fast_hist_pos_emb.weight, std=0.02)
+            self.fast_hist_pos_emb = SinusoidalPositionalEncoding(self.input_embedding_dim)
 
             # AR decoder modules (ar_emb_dim space, kept small for efficiency)
             self.fast_ar_effort_emb = nn.Embedding(
                 vocab_with_special, ar_emb_dim, padding_idx=self.fast_pad_token
             )
             nn.init.normal_(self.fast_ar_effort_emb.weight, std=0.02)
-            self.fast_ar_pos_emb = nn.Embedding(self.n_fast, ar_emb_dim)
-            nn.init.normal_(self.fast_ar_pos_emb.weight, std=0.02)
+            self.fast_ar_pos_emb = SinusoidalPositionalEncoding(ar_emb_dim)
 
             # Project DiT future_tokens output → AR decoder memory dim
             self.fast_context_proj = nn.Linear(self.hidden_size, ar_emb_dim)
@@ -316,8 +318,8 @@ class FlowmatchingActionHead(nn.Module):
             self.fast_ar_decoder = nn.TransformerDecoder(
                 decoder_layer, num_layers=config.fast_ar_num_layers
             )
-            # Classification head: ar_emb_dim → emb_size (predict shifted token ID)
-            self.fast_cls_head = nn.Linear(ar_emb_dim, self.fast_emb_size)
+            # Classification head: ar_emb_dim → emb_size+1 (real tokens + EOS)
+            self.fast_cls_head = nn.Linear(ar_emb_dim, self.fast_emb_size + 1)
             print(
                 f"FAST effort: n_fast={self.n_fast}, emb_size={self.fast_emb_size}, "
                 f"ar_emb_dim={ar_emb_dim}, ar_layers={config.fast_ar_num_layers}"
@@ -355,9 +357,7 @@ class FlowmatchingActionHead(nn.Module):
                 self.position_embedding.requires_grad_(False)
             if self.use_fast_effort:
                 self.fast_hist_token_emb.requires_grad_(False)
-                self.fast_hist_pos_emb.requires_grad_(False)
                 self.fast_ar_effort_emb.requires_grad_(False)
-                self.fast_ar_pos_emb.requires_grad_(False)
                 self.fast_context_proj.requires_grad_(False)
                 self.fast_ar_decoder.requires_grad_(False)
                 self.fast_cls_head.requires_grad_(False)
@@ -456,27 +456,35 @@ class FlowmatchingActionHead(nn.Module):
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
-    def _fast_tokenize(self, effort_tensor: torch.Tensor, n_fast: int) -> torch.Tensor:
-        """Tokenize an effort tensor using the FAST tokenizer, pad/truncate to n_fast.
+    def _fast_tokenize(
+        self, effort_tensor: torch.Tensor, n_fast: int, truncate: bool = True
+    ) -> torch.Tensor:
+        """Tokenize an effort tensor using the FAST tokenizer.
 
         Args:
             effort_tensor: (B, T, D) float tensor on any device, values in [-1, 1]
-            n_fast: fixed output sequence length (pad with self.fast_pad_token)
+            n_fast: sequence length when truncate=True (pad/clip to this)
+            truncate: if True, clip tokens to n_fast (used for history conditioning);
+                      if False, keep the full token sequence and pad to the max actual
+                      length in the batch (used for future effort targets).
         Returns:
-            (B, n_fast) int64 tensor on CPU with shifted token IDs in [0, emb_size-1]
-            or fast_pad_token for padding positions.
+            (B, n_fast) when truncate=True, or (B, max_actual_len) when truncate=False.
+            Padding positions are filled with self.fast_pad_token.
         """
         effort_np = effort_tensor.detach().cpu().float().numpy()
         tokens_list = self.fast_tokenizer(effort_np)   # list[list[int]], variable length
         B = len(tokens_list)
-        result = torch.full((B, n_fast), self.fast_pad_token, dtype=torch.long)
-        for i, toks in enumerate(tokens_list):
-            shifted = [
-                min(t - self.fast_min_token, self.fast_emb_size - 1)
-                for t in toks[:n_fast]
-            ]
+        if truncate:
+            seq_len = n_fast
+            toks_slices = [toks[:n_fast] for toks in tokens_list]
+        else:
+            seq_len = max(len(toks) for toks in tokens_list) if tokens_list else 0
+            toks_slices = tokens_list
+        result = torch.full((B, seq_len), self.fast_pad_token, dtype=torch.long)
+        for i, toks in enumerate(toks_slices):
+            shifted = [min(t - self.fast_min_token, self.fast_emb_size - 1) for t in toks]
             result[i, : len(shifted)] = torch.tensor(shifted, dtype=torch.long)
-        return result  # (B, n_fast) on CPU
+        return result  # (B, seq_len) on CPU
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
@@ -543,9 +551,12 @@ class FlowmatchingActionHead(nn.Module):
             hist_tokens = self._fast_tokenize(
                 action_input.effort_history[..., : self.effort_dim], self.n_fast
             ).to(device)  # (B, n_fast) int64
+            print(hist_tokens.shape, hist_tokens)
+            hist_len = hist_tokens.shape[1]
+            hist_pos = torch.arange(hist_len, device=device).unsqueeze(0)  # (1, hist_len)
             hist_embs = (
-                self.fast_hist_token_emb(hist_tokens)        # (B, n_fast, emb_dim)
-                + self.fast_hist_pos_emb.weight.unsqueeze(0) # (1, n_fast, emb_dim)
+                self.fast_hist_token_emb(hist_tokens)          # (B, hist_len, emb_dim)
+                + self.fast_hist_pos_emb(hist_pos)             # (1, hist_len, emb_dim)
             )
 
         # Join vision, language, state and action embedding along sequence dimension.
@@ -598,35 +609,43 @@ class FlowmatchingActionHead(nn.Module):
                 model_output[:, ft_start:ft_end, :]
             )  # (B, n_ft, ar_emb_dim)
 
-            # Tokenise future effort → training targets (B, n_fast)
+            # Tokenise future effort → training targets, full sequence (no truncation)
             target_tokens = self._fast_tokenize(
-                action_input.effort[..., : self.effort_dim], self.n_fast
+                action_input.effort[..., : self.effort_dim], self.n_fast, truncate=False
             ).to(device)
+            print(target_tokens.shape, target_tokens)
+            
+            # Append EOS class to each target sequence: (B, n_real) → (B, n_real+1)
+            eos_col = torch.full((B, 1), self.fast_eos_cls, dtype=torch.long, device=device)
+            target_with_eos = torch.cat([target_tokens, eos_col], dim=1)
+            target_len = target_with_eos.shape[1]
 
-            # AR input (teacher forcing): [BOS, tok_0, ..., tok_{n-2}]
+            # AR input (teacher forcing): [BOS, tok_0, ..., tok_{n_real-1}]
+            # EOS is the prediction target of the last step, not an input token.
             bos_ids = torch.full((B, 1), self.fast_bos_token, dtype=torch.long, device=device)
-            ar_input_ids = torch.cat([bos_ids, target_tokens[:, :-1]], dim=1)  # (B, n_fast)
+            ar_input_ids = torch.cat([bos_ids, target_tokens], dim=1)  # (B, target_len)
+            ar_pos = torch.arange(target_len, device=device).unsqueeze(0)
             ar_input_embs = (
-                self.fast_ar_effort_emb(ar_input_ids)            # (B, n_fast, ar_emb_dim)
-                + self.fast_ar_pos_emb.weight.unsqueeze(0)       # (1, n_fast, ar_emb_dim)
+                self.fast_ar_effort_emb(ar_input_ids)   # (B, target_len, ar_emb_dim)
+                + self.fast_ar_pos_emb(ar_pos)          # (1, target_len, ar_emb_dim)
             )
 
             # Causal mask: each position can only attend to previous positions
             causal_mask = nn.Transformer.generate_square_subsequent_mask(
-                self.n_fast, device=device
-            )  # (n_fast, n_fast)
+                target_len, device=device
+            )  # (target_len, target_len)
             ar_out = self.fast_ar_decoder(
                 tgt=ar_input_embs,
                 memory=context,
                 tgt_mask=causal_mask,
                 tgt_is_causal=True,
-            )  # (B, n_fast, ar_emb_dim)
+            )  # (B, target_len, ar_emb_dim)
 
-            effort_logits = self.fast_cls_head(ar_out)  # (B, n_fast, emb_size)
+            effort_logits = self.fast_cls_head(ar_out)  # (B, target_len, emb_size+1)
             _ar_loss: torch.Tensor = F.cross_entropy(
-                effort_logits.reshape(B * self.n_fast, self.fast_emb_size),
-                target_tokens.reshape(B * self.n_fast),
-                ignore_index=self.fast_pad_token,
+                effort_logits.reshape(B * target_len, self.fast_emb_size + 1),
+                target_with_eos.reshape(B * target_len),
+                ignore_index=-100,  # -100 for any padding (shouldn't occur for fixed T,D)
             )
             effort_ar_loss = _ar_loss
             loss = loss + self.config.fast_effort_loss_coeff * _ar_loss
@@ -665,10 +684,13 @@ class FlowmatchingActionHead(nn.Module):
             hist_tokens = self._fast_tokenize(
                 action_input.effort_history[..., : self.effort_dim], self.n_fast
             ).to(device)
+            print(hist_tokens.shape, hist_tokens)
+            hist_len = hist_tokens.shape[1]
+            hist_pos = torch.arange(hist_len, device=device).unsqueeze(0)
             hist_embs = (
                 self.fast_hist_token_emb(hist_tokens)
-                + self.fast_hist_pos_emb.weight.unsqueeze(0)
-            )  # (B, n_fast, emb_dim)
+                + self.fast_hist_pos_emb(hist_pos)
+            )  # (B, hist_len, emb_dim)
 
         # When torque_aware (legacy), noise covers both action and effort dims.
         if self.torque_aware and not self.use_fast_effort:
@@ -725,15 +747,18 @@ class FlowmatchingActionHead(nn.Module):
                 model_output[:, ft_start:ft_end, :]
             )  # (B, n_ft, ar_emb_dim)
 
-            # Greedy AR decoding: start with BOS, generate n_fast tokens
+            # Greedy AR decoding: start with BOS, stop when EOS is predicted
             generated_ids = torch.full(
                 (batch_size, 1), self.fast_bos_token, dtype=torch.long, device=device
             )
-            for _ in range(self.n_fast):
+            active = torch.ones(batch_size, dtype=torch.bool, device=device)
+            max_steps = self.n_fast + 1  # +1 to allow the EOS token itself
+            for _ in range(max_steps):
                 step_len = generated_ids.shape[1]
+                step_pos = torch.arange(step_len, device=device).unsqueeze(0)
                 embs = (
                     self.fast_ar_effort_emb(generated_ids)
-                    + self.fast_ar_pos_emb.weight[:step_len].unsqueeze(0)
+                    + self.fast_ar_pos_emb(step_pos)
                 )  # (B, step_len, ar_emb_dim)
                 causal_mask = nn.Transformer.generate_square_subsequent_mask(
                     step_len, device=device
@@ -744,19 +769,25 @@ class FlowmatchingActionHead(nn.Module):
                     tgt_mask=causal_mask,
                     tgt_is_causal=True,
                 )  # (B, step_len, ar_emb_dim)
-                next_logit = self.fast_cls_head(ar_out[:, -1, :])   # (B, emb_size)
-                next_token = next_logit.argmax(dim=-1, keepdim=True) # (B, 1)
+                next_logit = self.fast_cls_head(ar_out[:, -1, :])    # (B, emb_size+1)
+                next_token = next_logit.argmax(dim=-1, keepdim=True)  # (B, 1)
                 generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                # Stop once all samples in the batch have emitted EOS
+                active &= (next_token.squeeze(-1) != self.fast_eos_cls)
+                if not active.any():
+                    break
 
-            pred_shifted = generated_ids[:, 1:]  # (B, n_fast) — drop BOS
-            # Unshift and decode via FAST tokenizer
-            pred_unshifted = (pred_shifted + self.fast_min_token).cpu().tolist()
+            # Drop BOS; for each sample strip real tokens up to (not including) EOS
+            pred_ids = generated_ids[:, 1:].cpu().tolist()
+            pred_unshifted = []
+            for toks in pred_ids:
+                real = [t for t in toks if t != self.fast_eos_cls]
+                pred_unshifted.append([t + self.fast_min_token for t in real])
             effort_np = self.fast_tokenizer.decode(
                 pred_unshifted,
                 time_horizon=self.config.action_horizon,
                 action_dim=self.effort_dim,
             )
-            import numpy as np
             effort_pred = torch.tensor(
                 np.asarray(effort_np), dtype=vl_embs.dtype, device=device
             )  # (B, action_horizon, effort_dim)
