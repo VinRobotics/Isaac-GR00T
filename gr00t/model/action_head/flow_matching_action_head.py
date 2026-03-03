@@ -551,7 +551,7 @@ class FlowmatchingActionHead(nn.Module):
             hist_tokens = self._fast_tokenize(
                 action_input.effort_history[..., : self.effort_dim], self.n_fast
             ).to(device)  # (B, n_fast) int64
-            print(hist_tokens.shape, hist_tokens)
+
             hist_len = hist_tokens.shape[1]
             hist_pos = torch.arange(hist_len, device=device).unsqueeze(0)  # (1, hist_len)
             hist_embs = (
@@ -613,8 +613,7 @@ class FlowmatchingActionHead(nn.Module):
             target_tokens = self._fast_tokenize(
                 action_input.effort[..., : self.effort_dim], self.n_fast, truncate=False
             ).to(device)
-            print(target_tokens.shape, target_tokens)
-            
+
             # Append EOS class to each target sequence: (B, n_real) → (B, n_real+1)
             eos_col = torch.full((B, 1), self.fast_eos_cls, dtype=torch.long, device=device)
             target_with_eos = torch.cat([target_tokens, eos_col], dim=1)
@@ -684,7 +683,7 @@ class FlowmatchingActionHead(nn.Module):
             hist_tokens = self._fast_tokenize(
                 action_input.effort_history[..., : self.effort_dim], self.n_fast
             ).to(device)
-            print(hist_tokens.shape, hist_tokens)
+
             hist_len = hist_tokens.shape[1]
             hist_pos = torch.arange(hist_len, device=device).unsqueeze(0)
             hist_embs = (
