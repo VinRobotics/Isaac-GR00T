@@ -20,7 +20,7 @@ modality_config = data_config.modality_config()
 modality_transform = data_config.transform()
 
 pick_dataset = LeRobotSingleDataset(
-    "/mnt/data/sftp/data/locht1/20251204_VR_H3_pickpart_speedup1",
+    "/mnt/data/sftp/data/locht1/vr_data/20251204_VR_H3_pickpart_speedup1",
     embodiment_tag="new_embodiment",
     video_backend="torchvision_av",
     modality_configs=modality_config,
@@ -28,7 +28,7 @@ pick_dataset = LeRobotSingleDataset(
 )
 
 place_dataset = LeRobotSingleDataset(
-    "/mnt/data/sftp/data/locht1/20251206_VR_H3_placepart_speedup1",
+    "/mnt/data/sftp/data/locht1/vr_data/20251206_VR_H3_placepart_speedup1",
     embodiment_tag="new_embodiment",
     video_backend="torchvision_av",
     modality_configs=modality_config,
