@@ -1609,7 +1609,7 @@ class VRH3EffortConfig(BaseDataConfig):
             StateActionToTensor(apply_to=self.effort_keys),
             StateActionTransform(
                 apply_to=self.effort_keys,
-                normalization_modes={key: "min_max" for key in self.effort_keys},
+                normalization_modes={key: "q99" for key in self.effort_keys},
             ),
             # concat transforms
             ConcatTransform(
