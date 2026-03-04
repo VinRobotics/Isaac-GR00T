@@ -20,7 +20,7 @@ modality_config = data_config.modality_config()
 modality_transform = data_config.transform()
 
 pick_dataset = LeRobotSingleDataset(
-    "/mnt/data/sftp/data/locht1/vr_data/20251204_VR_H3_pickpart_speedup1",
+    "/home/locht1/Documents/locht1/code_convert/output/20251204_VR_H3_pickpart_speedup1",
     embodiment_tag="new_embodiment",
     video_backend="torchvision_av",
     modality_configs=modality_config,
@@ -28,7 +28,7 @@ pick_dataset = LeRobotSingleDataset(
 )
 
 place_dataset = LeRobotSingleDataset(
-    "/mnt/data/sftp/data/locht1/vr_data/20251206_VR_H3_placepart_speedup1",
+    "/home/locht1/Documents/locht1/code_convert/output/20251206_VR_H3_placepart_speedup1",
     embodiment_tag="new_embodiment",
     video_backend="torchvision_av",
     modality_configs=modality_config,
@@ -36,21 +36,19 @@ place_dataset = LeRobotSingleDataset(
 )
 
 # %%
-from tqdm import tqdm
-train_token_data = []
-for i in tqdm(range(len(pick_dataset))):
-    train_token_data.append(pick_dataset[i]["effort_history"])
-
-for i in tqdm(range(len(place_dataset))):
-    train_token_data.append(place_dataset[i]["effort_history"])
-
+# from tqdm import tqdm
+train_token_data = (
+    [d["effort_history"] for d in pick_dataset] +
+    [d["effort_history"] for d in place_dataset]
+)
 # %%
 torque_data = np.asarray(train_token_data)
 
+np.save("./fast_torque.npy", torque_data)
 
 # %%
 tokenizer = tokenizer.fit(torque_data)
-tokenizer.save_pretrained("/mnt/data/sftp/data/locht1/vr_checkpoints/fast_torque")
+tokenizer.save_pretrained("./fast_torque")
 tokenizer.push_to_hub("locht131/fast_torque_tokenizer")
 
 

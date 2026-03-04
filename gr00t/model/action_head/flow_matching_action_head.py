@@ -284,17 +284,8 @@ class FlowmatchingActionHead(nn.Module):
             assert config.effort_dim is not None, "effort_dim must be set when use_fast_effort=True"
             # Load the UniversalActionProcessor class from physical-intelligence/fast (cached),
             # then instantiate it with the retrained BPE weights + config from fast_tokenizer_path.
-            _base = AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
-            _pcfg_path = os.path.join(config.fast_tokenizer_path, "processor_config.json")
-            with open(_pcfg_path) as _f:
-                _pcfg = json.load(_f)
-            _bpe = PreTrainedTokenizerFast.from_pretrained(config.fast_tokenizer_path)
-            self.fast_tokenizer = type(_base)(
-                bpe_tokenizer=_bpe,
-                scale=_pcfg.get("scale", 10),
-                vocab_size=_pcfg.get("vocab_size", 1024),
-                min_token=_pcfg.get("min_token", 0),
-            )
+            self.fast_tokenizer = AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True).from_pretrained(config.fast_tokenizer_path)
+            print("load config path token", config.fast_tokenizer_path)
             self.fast_min_token: int = self.fast_tokenizer.min_token   # e.g. -40 for torque tokenizer
             # shifted token range: [|min_token|, vocab_size-1+|min_token|] ⊂ [0, emb_size-1]
             # special tokens: PAD=emb_size (embedding pad, CE uses -100), BOS=emb_size+1
