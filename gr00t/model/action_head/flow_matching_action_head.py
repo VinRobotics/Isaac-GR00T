@@ -16,12 +16,15 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
+import json
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.distributions import Beta
-from transformers import AutoProcessor, PretrainedConfig
+from transformers import AutoProcessor, PretrainedConfig, PreTrainedTokenizerFast
 from transformers.feature_extraction_utils import BatchFeature
 
 from gr00t.model.action_head.action_encoder import (
@@ -204,13 +207,18 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
                            "History tokens condition the DiT; an AR decoder predicts future effort."},
     )
     fast_tokenizer_path: str = field(
-        default="physical-intelligence/fast",
-        metadata={"help": "HuggingFace model ID or local path for the FAST action tokenizer."},
+        default="fast_torque",
+        metadata={"help": "Local path or HuggingFace model ID for the retrained FAST tokenizer "
+                           "(directory containing processor_config.json + tokenizer.json). "
+                           "The UniversalActionProcessor class is always loaded from "
+                           "physical-intelligence/fast; only the BPE weights and config are "
+                           "taken from this path."},
     )
     fast_num_tokens: int = field(
-        default=80,
+        default=320,
         metadata={"help": "Fixed FAST token sequence length per sample (pad/truncate to this). "
-                           "For (T=16, D=7) ~67 tokens are produced; for (T=16, D=26) ~243."},
+                           "For the torque tokenizer (T=16, D=26, vocab_size=1024, scale=10) "
+                           "the BPE sequence is ~275 tokens; 320 provides headroom."},
     )
     fast_effort_history_horizon: int = field(
         default=16, metadata={"help": "Number of past effort timesteps used as FAST history."}
@@ -274,11 +282,21 @@ class FlowmatchingActionHead(nn.Module):
         self.use_fast_effort = config.use_fast_effort
         if self.use_fast_effort:
             assert config.effort_dim is not None, "effort_dim must be set when use_fast_effort=True"
-            self.fast_tokenizer = AutoProcessor.from_pretrained(
-                config.fast_tokenizer_path, trust_remote_code=True
+            # Load the UniversalActionProcessor class from physical-intelligence/fast (cached),
+            # then instantiate it with the retrained BPE weights + config from fast_tokenizer_path.
+            _base = AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
+            _pcfg_path = os.path.join(config.fast_tokenizer_path, "processor_config.json")
+            with open(_pcfg_path) as _f:
+                _pcfg = json.load(_f)
+            _bpe = PreTrainedTokenizerFast.from_pretrained(config.fast_tokenizer_path)
+            self.fast_tokenizer = type(_base)(
+                bpe_tokenizer=_bpe,
+                scale=_pcfg.get("scale", 10),
+                vocab_size=_pcfg.get("vocab_size", 1024),
+                min_token=_pcfg.get("min_token", 0),
             )
-            self.fast_min_token: int = self.fast_tokenizer.min_token   # e.g. -354
-            # shifted token range: [0, emb_size-1]
+            self.fast_min_token: int = self.fast_tokenizer.min_token   # e.g. -40 for torque tokenizer
+            # shifted token range: [|min_token|, vocab_size-1+|min_token|] ⊂ [0, emb_size-1]
             # special tokens: PAD=emb_size (embedding pad, CE uses -100), BOS=emb_size+1
             # EOS class in cls head output: emb_size (last logit index)
             self.fast_emb_size: int = self.fast_tokenizer.vocab_size - self.fast_min_token

@@ -143,11 +143,15 @@ class ArgsConfig:
     """Enable FAST effort tokenizer: conditions the DiT on effort-history tokens and adds an
     autoregressive auxiliary loss that predicts future effort tokens."""
 
-    fast_tokenizer_path: str = "physical-intelligence/fast"
-    """HuggingFace path for the FAST tokenizer (UniversalActionProcessor)."""
+    fast_tokenizer_path: str = "locht131/fast_torque_tokenizer"
+    """Local path or HuggingFace hub ID for the retrained FAST tokenizer
+    (directory with processor_config.json + tokenizer.json).
+    The UniversalActionProcessor class is always loaded from physical-intelligence/fast;
+    only the BPE weights and config are taken from this path."""
 
-    fast_num_tokens: int = 80
-    """Fixed token-sequence length after pad/truncate (n_fast). ~67 tokens for T=16, D=7."""
+    fast_num_tokens: int = 320
+    """Fixed token-sequence length after pad/truncate (n_fast).
+    For the torque tokenizer (T=16, D=26, vocab_size=1024, scale=10) ~275 tokens; 320 provides headroom."""
 
     fast_effort_loss_coeff: float = 0.1
     """Weight of the AR effort CE loss relative to the main flow-matching loss."""
@@ -155,7 +159,7 @@ class ArgsConfig:
     fast_ar_num_layers: int = 4
     """Number of TransformerDecoder layers in the AR effort decoder."""
 
-    fast_ar_emb_dim: int = 512
+    fast_ar_emb_dim: int = 1536
     """Hidden dimension of the AR effort decoder."""
 
 #####################################################################################
