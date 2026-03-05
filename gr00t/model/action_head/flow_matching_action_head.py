@@ -610,13 +610,10 @@ class FlowmatchingActionHead(nn.Module):
         effort_ar_loss: Optional[torch.Tensor] = None
         if self.use_fast_effort:
             # ── AR effort decoder ────────────────────────────────────────────
-            # Context: DiT output at future_tokens positions
-            n_ft = self.config.num_target_vision_tokens
-            ft_start = 1 + self.n_fast   # after state(1) + hist(n_fast)
-            ft_end = ft_start + n_ft
+            # Context: DiT output at hist positions (effort-specific, not vision future tokens)
             context = self.fast_context_proj(
-                model_output[:, ft_start:ft_end, :]
-            )  # (B, n_ft, ar_emb_dim)
+                model_output[:, 1:1 + self.n_fast, :]
+            )  # (B, n_fast, ar_emb_dim)
 
             # Tokenise future effort → training targets, full sequence (no truncation)
             target_tokens = self._fast_tokenize(
@@ -671,7 +668,7 @@ class FlowmatchingActionHead(nn.Module):
         self,
         backbone_output: BatchFeature,
         action_input: BatchFeature,
-        predict_effort: bool = True,
+        predict_effort: bool = False,
     ) -> BatchFeature:
 
         backbone_output = self.process_backbone_output(backbone_output)
@@ -748,12 +745,9 @@ class FlowmatchingActionHead(nn.Module):
         # ── Post-denoising effort prediction via AR decoder ──────────────────
         if self.use_fast_effort and predict_effort:
             assert model_output is not None, "model_output is None — num_inference_timesteps must be >= 1"
-            n_ft = self.config.num_target_vision_tokens
-            ft_start = 1 + self.n_fast
-            ft_end = ft_start + n_ft
             context = self.fast_context_proj(
-                model_output[:, ft_start:ft_end, :]
-            )  # (B, n_ft, ar_emb_dim)
+                model_output[:, 1:1 + self.n_fast, :]
+            )  # (B, n_fast, ar_emb_dim)
 
             # Greedy AR decoding: start with BOS, stop when EOS is predicted
             generated_ids = torch.full(
@@ -807,8 +801,8 @@ class FlowmatchingActionHead(nn.Module):
             effort_pred = actions[:, :, self.config.action_dim :]
             return BatchFeature(data={"action_pred": action_pred, "effort_pred": effort_pred})
 
-        return BatchFeature(data={"action_pred": actions})
-    
+        return BatchFeature(data={"action_pred": actions, "effort_pred": torch.zeros((self.action_horizon, self.effort_dim), device=device)})
+
     @torch.enable_grad()
     def get_realtime_action(
         self,
