@@ -130,8 +130,8 @@ class EagleBackboneFATokens(nn.Module):
         config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
-        # Projection layer: D_llm (= mlp1 output dim = LLM hidden dim) → project_to_dim
-        # extract_feature already includes mlp1, so vision_dim == D_llm
+        # Projection layer for vision features
+        # Vision features from Eagle are typically 2048 dim after mlp1
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
         else:
@@ -311,15 +311,6 @@ class EagleBackboneFATokens(nn.Module):
                 self.eagle_model.language_model.eval()
             if self.eagle_model.vision_model and not self.tune_visual:
                 self.eagle_model.vision_model.eval()
-
-    def _llm_forward(self, input_embeds: torch.Tensor, attention_mask: torch.Tensor):
-        """Single LLM forward pass, wrapped for gradient checkpointing."""
-        return self.eagle_model.language_model(
-            inputs_embeds=input_embeds,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True,
-        )
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         """Prepare input batch."""
@@ -549,167 +540,109 @@ class EagleBackboneFATokens(nn.Module):
 
     def forward_eagle(self, vl_input: BatchFeature) -> tuple:
         """
-        Forward through Eagle model with post-LLM frame averaging.
-
-        Pipeline:
-          1. Extract ViT+mlp1 features for all N_group rotated images in one call.
-          2. For each rotation h (0..N-1):
-               - Inject raw (non-FA) vision_h into the frozen LLM.
-               - Run LLM once → get post-LLM hidden states.
-               - Extract vision positions: hidden[image_mask].
-          3. Apply FA formula to the N_group post-LLM vision feature sets:
-               FA(x) = (1/|G|) * Σ_h ρ(h⁻¹) · f(h·x)
-               = (1/|G|) * Σ_h [π(h⁻¹) ⊗ ρ_reg(h⁻¹)] applied to post-LLM vision_h
-          4. Project averaged features: D_llm → project_to_dim.
-          5. Language features from h=0 run (original image, correct LLM input distribution).
-
-        Key invariant: each LLM pass sees raw (single-rotation) mlp1 features,
-        matching the LLM's pre-training distribution. Equivariance is imposed
-        *after* the frozen LLM via the FA averaging step.
-
+        Forward through Eagle model with frame averaging on full vision tokens.
+        
+        Frame Averaging for COVARIANT equivariance:
+        
+        FA(x) = (1/|G|) * Σ_h ρ(h⁻¹) · f(h·x)
+        
+        Using ρ(h⁻¹) instead of ρ(h) gives the covariant property:
+        FA(g·x) = ρ(g) · FA(x)
+        
+        Where:
+        - h·x = image rotated by h
+        - f(h·x) = features from rotated image  
+        - ρ(h⁻¹) = inverse representation = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹)
+        
         Args:
             vl_input: Input batch with eagle_ prefixed keys
-
+            
         Returns:
-            (vision_features, language_features, language_attention_mask) tuple
-            - vision_features:   [B, num_imgs, T_vision, project_to_dim]  post-LLM, equivariant
-            - language_features: [B, T_text, D_llm]                       post-LLM, invariant
-            - language_attention_mask: [B, T_text]
+            (vision_features, language_features, attention_mask) tuple
         """
         eagle_prefix = "eagle_"
-
-        original_input_ids = vl_input.get(f"{eagle_prefix}input_ids")       # [B, T_seq]
-        original_attention_mask = vl_input.get(f"{eagle_prefix}attention_mask")  # [B, T_seq]
+        
+        # Get original batch size before rotation
+        original_input_ids = vl_input.get(f"{eagle_prefix}input_ids")
         B = original_input_ids.shape[0]
-
-        # ── Step 1: ViT+mlp1 features for all rotations in one batch ──────────
+        
+        # Rotate images by all group elements
         rotated_pixel_values = self.rotate_vl_batch(dict(vl_input))
-        # [B * num_imgs * N, T_vision, D_vis]  (extract_feature includes mlp1)
-        all_raw_vision, _ = self.eagle_model.extract_feature(rotated_pixel_values)
-
-        num_vision_tokens = all_raw_vision.shape[1]   # T_vision (e.g. 256)
-        vision_dim = all_raw_vision.shape[2]           # D_vis (= D_llm after mlp1)
-
-        # Reshape → [B * num_imgs, N, T_vision, D_vis]
-        vision_per_rotation = all_raw_vision.reshape(
+        
+        # Prepare eagle input
+        eagle_input = {
+            k.removeprefix(eagle_prefix): v
+            for k, v in vl_input.items()
+            if k.startswith(eagle_prefix)
+        }
+        
+        # Remove image_sizes if present
+        if "image_sizes" in eagle_input:
+            del eagle_input["image_sizes"]
+            
+        ## Extract vision features (full tokens, not pooled)
+        # vision_features: [B * num_imgs * N, T_vision, D_vision]
+        vision_features, _ = self.eagle_model.extract_feature(rotated_pixel_values)
+        
+        # Get dimensions
+        num_vision_tokens = vision_features.shape[1]   # T_vision (256)
+        vision_dim = vision_features.shape[2]          # D_vision (2048)
+        
+        # Reshape to [B * num_imgs, N, T_vision, D_vision]
+        vision_features_grouped = vision_features.reshape(
             B * self.num_images_per_sample, self.n_group, num_vision_tokens, vision_dim
         )
-
-        # Identify image token positions (same for all rotations)
-        image_token_idx = self.eagle_model.image_token_index
-        image_mask = (original_input_ids == image_token_idx)  # [B, T_seq]
-        image_mask_flat = image_mask.reshape(-1)               # [B * T_seq]
-
-        # Text-only positions (computed once, mask is rotation-independent)
-        text_mask = ~image_mask                                # [B, T_seq]
-        T_text = int(text_mask[0].sum().item())
-
-        # ── Steps 2+3: N_group LLM passes with immediate FA (running sum) ───────
-        # Merges the two loops to avoid storing all N post-LLM tensors simultaneously.
-        # Each rotation's features are transformed and added to a running sum,
-        # then freed — peak extra memory is O(1) tensors instead of O(N).
-        # Gradient checkpointing on the LLM further reduces activation memory
-        # by recomputing activations during backward instead of storing them.
-        D_llm_out = None
-        feat_blocks_size = None
-        avg_post_llm = None
-        language_features = None
-        language_attention_mask = None
-
-        use_checkpointing = self.training and self.tune_visual
-
+        
+        # Apply ρ(h⁻¹) = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹) to each f(h·x)
+        # Using ρ(h⁻¹) instead of ρ(h) gives covariant output: FA(g·x) = ρ(g)·FA(x)
+        # Then average over h
+        
+        transformed_features = []
         for h in range(self.n_group):
-            # Raw (non-FA) vision for rotation h: [B * num_imgs, T_vision, D_vis]
-            vision_h = vision_per_rotation[:, h, :, :]
-
-            # Build input embeddings: text embeddings + raw vision_h at image positions
-            input_embeds = self.eagle_model.language_model.get_input_embeddings()(
-                original_input_ids
-            )  # [B, T_seq, D_llm]
-            _, T_seq, D_llm = input_embeds.shape
-
-            input_embeds_flat = input_embeds.reshape(B * T_seq, D_llm).clone()
-            vision_h_flat = vision_h.reshape(-1, vision_dim)  # [B*num_imgs*T_vis, D_vis]
-            assert image_mask_flat.sum() == vision_h_flat.shape[0], (
-                f"Image token count mismatch: mask has {image_mask_flat.sum()} positions "
-                f"but vision features have {vision_h_flat.shape[0]} tokens. "
-                "Check num_images_per_sample and T_vision."
-            )
-            input_embeds_flat[image_mask_flat] = vision_h_flat.to(input_embeds_flat.dtype)
-            input_embeds = input_embeds_flat.reshape(B, T_seq, D_llm)
-
-            # LLM forward — gradient checkpointing trades compute for activation memory
-            if use_checkpointing:
-                llm_outputs = torch.utils.checkpoint.checkpoint(
-                    self._llm_forward,
-                    input_embeds,
-                    original_attention_mask,
-                    use_reentrant=False,
-                )
-            else:
-                llm_outputs = self._llm_forward(input_embeds, original_attention_mask)
-
-            hidden = llm_outputs.hidden_states[self.select_layer]  # [B, T_seq, D_llm]
-
-            # Post-LLM vision at image positions: [B * num_imgs, T_vision, D_llm]
-            post_llm_vis_h = hidden[image_mask].reshape(
-                B * self.num_images_per_sample, num_vision_tokens, -1
-            )
-
-            # Language features from h=0 (original image → correct LLM distribution)
+            # f(h·x): features from rotation h
+            feat_h = vision_features_grouped[:, h, :, :]  # [B * num_imgs, T, D]
+            
             if h == 0:
-                language_features = hidden[text_mask].reshape(B, T_text, -1)
-                language_attention_mask = original_attention_mask[text_mask].reshape(B, T_text)
-                D_llm_out = post_llm_vis_h.shape[-1]
-                assert D_llm_out % self.n_group == 0, (
-                    f"LLM hidden dim ({D_llm_out}) must be divisible by n_group ({self.n_group}) "
-                    "for the regular-repr feature permutation in FA."
-                )
-                feat_blocks_size = D_llm_out // self.n_group
-
-            del hidden, llm_outputs
-
-            # ── FA transformation: ρ(h⁻¹) = π(h⁻¹) [spatial] ⊗ ρ_reg(h⁻¹) [cyclic shift]
-            if h == 0:
-                feat_transformed = post_llm_vis_h
+                # Identity - no transformation needed (h⁻¹ = 0)
+                feat_transformed = feat_h
             else:
+                # Apply ρ(h⁻¹) = π(h⁻¹) ⊗ ρ_reg(h⁻¹)
                 h_inv = (self.n_group - h) % self.n_group
-
-                # Spatial permutation π(h⁻¹): realign tokens to canonical positions
+                
+                # Step 1: Spatial permutation π(h⁻¹)
                 spatial_perm = self.token_perm_indices[h_inv]
-                feat_permuted = post_llm_vis_h[:, spatial_perm, :]
-
-                # Feature permutation ρ_reg(h⁻¹): cyclic block shift by h_inv
-                feat_blk = feat_permuted.reshape(
-                    B * self.num_images_per_sample, num_vision_tokens,
-                    self.n_group, feat_blocks_size
+                feat_permuted = feat_h[:, spatial_perm, :]  # [B * num_imgs, T, D]
+                
+                # Step 2: Feature permutation ρ_reg(h⁻¹)
+                # Regular representation: cyclically shift blocks by h_inv
+                blocks = vision_dim // self.n_group
+                feat_blocks = feat_permuted.reshape(
+                    B * self.num_images_per_sample, num_vision_tokens, self.n_group, blocks
                 )
-                feat_shifted = torch.roll(feat_blk, shifts=h_inv, dims=2)
+                feat_shifted = torch.roll(feat_blocks, shifts=h_inv, dims=2)
                 feat_transformed = feat_shifted.reshape(
-                    B * self.num_images_per_sample, num_vision_tokens, D_llm_out
+                    B * self.num_images_per_sample, num_vision_tokens, vision_dim
                 )
-
-            del post_llm_vis_h
-
-            # Running sum: avg = (1/N) * Σ_h feat_transformed_h
-            if avg_post_llm is None:
-                avg_post_llm = feat_transformed * (1.0 / self.n_group)
-            else:
-                avg_post_llm = avg_post_llm + feat_transformed * (1.0 / self.n_group)
-
-            del feat_transformed
-
-        # avg_post_llm: [B * num_imgs, T_vision, D_llm]  (equivariant post-LLM vision)
-
-        # ── Step 4: Project D_llm → project_to_dim ────────────────────────────
-        avg_post_llm = self.eagle_linear(avg_post_llm)
-        # [B * num_imgs, T_vision, project_to_dim]
-
-        avg_post_llm = avg_post_llm.reshape(
-            B, self.num_images_per_sample, num_vision_tokens, self.project_to_dim
+            
+            transformed_features.append(feat_transformed)
+        
+        # Stack and average: [B * num_imgs, N, T, D] -> [B * num_imgs, T, D]
+        transformed_features = torch.stack(transformed_features, dim=1)
+        avg_vision_features = torch.mean(transformed_features, dim=1)
+        
+        # Reshape to [B, num_imgs, T_vision, D_vision]
+        avg_vision_features = avg_vision_features.reshape(
+            B, self.num_images_per_sample, num_vision_tokens, vision_dim
         )
-
-        return avg_post_llm, language_features, language_attention_mask
+        
+        
+        ## original
+        vl_features_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
+        vl_features = vl_features_output.hidden_states[self.select_layer]
+        vl_features = self.eagle_linear(vl_features)
+        
+        
+        return avg_vision_features, vl_features, eagle_input["attention_mask"]
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         """
@@ -726,24 +659,24 @@ class EagleBackboneFATokens(nn.Module):
         """
         self.set_frozen_modules_to_eval_mode()
 
-        vision_embs, language_embs, eagle_mask = self.forward_eagle(vl_input)
+        equi_vision_embs, vl_embs, eagle_mask = self.forward_eagle(vl_input)
 
         # DDP compatibility hack - ensure all trainable parameters participate in loss
         # This is needed because some parameters might not be used in certain forward paths
         if self.training and self.tune_visual:
             dummy_term = torch.tensor(
-                0.0, device=vision_embs.device, dtype=vision_embs.dtype, requires_grad=True
+                0.0, device=vl_embs.device, dtype=vl_embs.dtype, requires_grad=True
             )
             # Add all trainable parameters to the computation graph with zero contribution
             for param in self.parameters():
                 if param.requires_grad:
                     dummy_term = dummy_term + 0.0 * param.sum()
-            vision_embs = vision_embs + dummy_term
+            vl_embs = vl_embs + dummy_term
 
         return BatchFeature(
             data={
-                "backbone_vision_features": vision_embs,  # [B, num_imgs, T_vision, project_to_dim]
-                "backbone_language_features": language_embs,  # [B, T_text, D_llm]
+                "backbone_equi_vision_features": equi_vision_embs,  # [B, num_imgs, T_vision, D_vision]
+                "backbone_vision_language_features": vl_embs,  # [B, T_text, 2048]
                 "backbone_attention_mask": eagle_mask
             }
         )
