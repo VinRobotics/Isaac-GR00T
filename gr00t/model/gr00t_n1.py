@@ -31,7 +31,7 @@ from .action_head.flow_matching_action_head import (
 )
 from .backbone import EagleBackboneFATokens
 
-BACKBONE_FEATURE_KEY = "backbone_vision_features"
+BACKBONE_FEATURE_KEY = "backbone_vision_language_features"
 ACTION_KEY = "action_pred"
 LOSS_KEY = "loss"
 ERROR_MSG = "Error: unexpected input/output"
