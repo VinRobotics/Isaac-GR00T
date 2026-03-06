@@ -292,6 +292,7 @@ class FlowmatchingActionHead(nn.Module):
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
+        self.task_completion_only = False  # set True to skip diffusion forward pass
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
@@ -423,6 +424,13 @@ class FlowmatchingActionHead(nn.Module):
         
         vl_task_completion_logits = self.task_completion_detection(vl_task_completion_embs).squeeze()
         vl_task_completion_loss = self.task_completion_detection_loss(vl_task_completion_logits, task_completion)
+
+        # Skip expensive diffusion forward when only training task_completion_detection
+        if self.task_completion_only:
+            return BatchFeature(data={
+                "loss": vl_task_completion_loss,
+                "loss_vl_task_completion": vl_task_completion_loss.detach(),
+            })
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features

@@ -146,6 +146,9 @@ def main(config: ArgsConfig):
         tune_diffusion_model=False,
     )
 
+    # Skip diffusion forward pass to save compute — only task_completion loss is needed
+    model.action_head.task_completion_only = True
+
     # Freeze everything, then unfreeze only task_completion_detection
     for p in model.parameters():
         p.requires_grad = False
