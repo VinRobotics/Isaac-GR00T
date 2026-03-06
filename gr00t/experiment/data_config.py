@@ -1436,7 +1436,7 @@ class VRH3TwotHandTaskCompletionConfig(BaseDataConfig):
         e.g., ["observation.tasks.done"] reads directly from the 
         "observation.tasks.done" column in the parquet file.
     """
-    video_keys = ["video.cam_front"]
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
     state_keys = [
         "state.left_arm",
         "state.right_arm",
