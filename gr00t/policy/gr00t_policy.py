@@ -100,6 +100,14 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) == 1, "Only one language key is supported"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+        
+        self.temporal_agg = True
+        self.num_queries = 16
+        if self.temporal_agg:
+            self.k = 0.015
+            self.ensemble_weights = torch.exp(-self.k * torch.arange(self.num_queries)).cuda()
+            self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0).cuda()
+            self.reset()
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.
@@ -303,6 +311,41 @@ class Gr00tPolicy(BasePolicy):
                     f"Language batch item must be a string. Got {type(batch_item[0])}"
                 )
 
+    def process_output(self, actions):
+        """
+        Takes a (batch, num_queries, action_dim) sequence of actions, update the temporal ensemble for all
+        time steps, and pop/return the next batch of actions in the sequence.
+        """
+        # actions = actions * self.stats["action_std"] + self.stats["action_mean"]
+        if not self.temporal_agg:
+            return actions.squeeze()
+
+        if self.ensembled_actions is None:
+            self.ensembled_actions = actions.clone()
+            self.ensembled_actions_count = torch.ones(
+                (self.num_queries, 1), dtype=torch.long, device=self.ensembled_actions.device
+            )
+        else:
+            # self.ensembled_actions will have shape (batch_size, num_queries - 1, action_dim). Compute
+            # the online update for those entries.
+            self.ensembled_actions *= self.ensemble_weights_cumsum[self.ensembled_actions_count - 1]
+            self.ensembled_actions += actions[:, :-1] * self.ensemble_weights[self.ensembled_actions_count]
+            self.ensembled_actions /= self.ensemble_weights_cumsum[self.ensembled_actions_count]
+            self.ensembled_actions_count = torch.clamp(self.ensembled_actions_count + 1, max=self.num_queries)
+            # The last action, which has no prior online average, needs to get concatenated onto the end.
+            self.ensembled_actions = torch.cat([self.ensembled_actions, actions[:, -1:]], dim=1)
+            self.ensembled_actions_count = torch.cat(
+                [self.ensembled_actions_count, torch.ones_like(self.ensembled_actions_count[-1:])]
+            )
+        # "Consume" the first action.
+        action, self.ensembled_actions, self.ensembled_actions_count = (
+            self.ensembled_actions[:, :1, :],
+            self.ensembled_actions[:, 1:],
+            self.ensembled_actions_count[1:],
+        )
+        # print("PROCESS OUTPUT", action.shape)
+        return action
+
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -341,7 +384,11 @@ class Gr00tPolicy(BasePolicy):
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
             model_pred = self.model.get_action(**collated_inputs)
-        normalized_action = model_pred["action_pred"].float()
+        normalized_action = model_pred["action_pred"].float()[:, :self.num_queries]
+
+        # print(normalized_action.shape)
+        # TE inference - applied on normalized tensor before decoding
+        normalized_action = self.process_output(normalized_action)
 
         # Step 5: Decode actions from normalized space back to physical units
         batched_states = {}
@@ -398,9 +445,9 @@ class Gr00tPolicy(BasePolicy):
             )
 
             # Verify action horizon matches the expected temporal dimension from config
-            assert action_arr.shape[1] == len(self.modality_configs["action"].delta_indices), (
-                f"Action key '{action_key}'s horizon must be {len(self.modality_configs['action'].delta_indices)}. Got {action_arr.shape[1]}"
-            )
+            # assert action_arr.shape[1] == len(self.modality_configs["action"].delta_indices), (
+            #     f"Action key '{action_key}'s horizon must be {len(self.modality_configs['action'].delta_indices)}. Got {action_arr.shape[1]}"
+            # )
 
     def get_modality_config(self) -> dict[str, ModalityConfig]:
         return self.modality_configs
@@ -414,6 +461,9 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Dictionary containing the info after resetting the policy
         """
+        self.ensembled_actions = None
+        self.ensembled_actions_count = None
+        self.prev_action_chunk = None
         return {}
 
 
