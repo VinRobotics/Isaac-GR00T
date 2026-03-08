@@ -42,7 +42,7 @@ from gr00t.model.action_head.action_encoder import (
 
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
-from .equivariant_cross_attention_dit import EDiT
+from .equivariant_cross_attention_dit import EDiT, EquivariantAttentionPool
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -383,6 +383,9 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     backbone_language_embedding_dim: int = field(
         default=2048, metadata={"help": "Language feature dim from backbone LLM (D_llm)."}
     )
+    num_vis_queries: int = field(
+        default=8, metadata={"help": "Number of learned query tokens per camera for equivariant vision pooling."}
+    )
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
@@ -471,7 +474,17 @@ class FlowmatchingActionHead(nn.Module):
             self.group,
             [self.group.regular_repr] * (config.backbone_embedding_dim // self.n_group),
         )
-        self.equi_vis_proj = enn.Linear(self.equi_vis_in_type, self.model.cross_attention_type)
+        self.equi_vis_to_hidden = enn.Linear(self.equi_vis_in_type, self.model.in_type)
+
+        # Learnable equivariant pooling: T_vis spatial tokens → num_vis_queries tokens per camera
+        # Q and K both in regular repr (equivariant projections); V raw equivariant; no v_proj
+        _pool_dim_head = self.model.in_type.size // 4  # H*Dh = in_type.size → divisible by G ✓
+        self.equi_vis_pool = EquivariantAttentionPool(
+            in_type=self.model.in_type,
+            num_queries=config.num_vis_queries,
+            heads=4,
+            dim_head=_pool_dim_head,
+        )
 
         if config.add_pos_embed:
             self.position_embedding = nn.Embedding(config.max_seq_len, self.input_embedding_dim)
@@ -661,7 +674,7 @@ class FlowmatchingActionHead(nn.Module):
         filtered_state_dict = {}
         for key, value in state_dict.items():
             # Skip old-style state_encoder weights
-            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key or "vlln" in key or "vl_self_attention" in key or "language_proj" in key or "language_lift" in key:
+            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key or "vlln" in key or "vl_self_attention" in key or "language_proj" in key or "language_lift" in key or "equi_vis_proj" in key:
                 print(f"Skipping incompatible state_encoder weight: {key}")
                 continue
             filtered_state_dict[key] = value
@@ -700,15 +713,15 @@ class FlowmatchingActionHead(nn.Module):
 
         Equi vision stream (regular repr):
           backbone_vision_features [B, n_img, T_vis, backbone_embedding_dim]
-          → flatten → equi_vis_proj → [B, n_img*T_vis, cross_attention_type.size]
+          → flatten → equi_vis_to_hidden → [B, n_img*T_vis, in_type.size]
 
         VL stream (trivial repr, invariant):
           backbone_language_features [B, T_text, backbone_language_embedding_dim]
           → vlln → vl_self_attention → vl_proj → [B, T_text, vl_cross_attention_dim]
 
         Stores results in backbone_output.data:
-          - equi_vis_features: equivariant vision context for attn_equi_vis
-          - vl_features:       invariant VL context for attn_vl
+          - equi_vis_features: equivariant vision tokens [B, n_img*K, in_type.size], prepended to hidden_states
+          - vl_features:       invariant VL context for cross-attention
           - backbone_attention_mask: language attention mask
         """
         equi_vision_features = backbone_output.backbone_equi_vision_features   # [B, n_img, T_vis, D_vis]
@@ -718,11 +731,17 @@ class FlowmatchingActionHead(nn.Module):
         B, n_img, T_vis, D_vis = equi_vision_features.shape
 
         # ── Equi vision stream ───────────────────────────────────────────────
-        # Flatten: [B, n_img, T_vis, D_vis] → [B*n_img*T_vis, D_vis]
+        # Project: [B, n_img, T_vis, D_vis] → [B*n_img, T_vis, in_type.size]
         vis_flat = equi_vision_features.reshape(B * n_img * T_vis, D_vis)
         vis_geo = enn.GeometricTensor(vis_flat, self.equi_vis_in_type)
-        vis_proj = self.equi_vis_proj(vis_geo).tensor  # [B*n_img*T_vis, cross_attention_dim]
-        equi_vis_features = vis_proj.reshape(B, n_img * T_vis, -1)  # [B, n_img*T_vis, D_cross]
+        vis_proj = self.equi_vis_to_hidden(vis_geo).tensor  # [B*n_img*T_vis, in_type.size]
+        D_hidden = vis_proj.shape[-1]
+        vis_per_cam = vis_proj.reshape(B * n_img, T_vis, D_hidden)  # [B*n_img, T_vis, D_hidden]
+
+        # Pool T_vis spatial tokens → num_vis_queries tokens per camera (equivariant)
+        vis_pooled = self.equi_vis_pool(vis_per_cam)               # [B*n_img, K, D_hidden]
+        K = vis_pooled.shape[1]
+        equi_vis_features = vis_pooled.reshape(B, n_img * K, D_hidden)  # [B, n_img*K, D_hidden]
 
         # ── VL stream ────────────────────────────────────────────────────────
         lang = self.vlln(vision_language_features)           # [B, T_text, D_lang]
@@ -813,17 +832,20 @@ class FlowmatchingActionHead(nn.Module):
             t=actions_gt.shape[1]
         )
         
-        sa_embs = torch.cat((state_features, action_features), dim=1)
+        N_vis = equi_vis_embs.shape[1]
+        sa_embs = torch.cat((equi_vis_embs, state_features, action_features), dim=1)
 
         model_output = self.model(
             hidden_states=sa_embs,
-            encoder_hidden_states=equi_vis_embs,
+            encoder_hidden_states=vl_embs,
             encoder_attention_mask=encoder_mask,
             timestep=t_discretized,
-            return_all_hidden_states=False,
-            vl_hidden_states=vl_embs,
+            return_all_hidden_states=False
         )
-        
+
+        # Strip vis prefix tokens; keep only state+action outputs
+        model_output = model_output[:, N_vis:, :]
+
         action_decoder_embodiment_id = embodiment_id.repeat((model_output.shape[1]))
 
         model_output = einops.rearrange(
@@ -934,17 +956,20 @@ class FlowmatchingActionHead(nn.Module):
             # future_tokens = einops.rearrange(
             #     future_tokens.tensor, "(b t) d -> b t d", b = B, t = self.config.num_target_vision_tokens
             # )
-            sa_embs = torch.cat((state_features, action_features), dim=1)
+            N_vis = equi_vis_embs.shape[1]
+            sa_embs = torch.cat((equi_vis_embs, state_features, action_features), dim=1)
 
             # Run model forward.
             model_output = self.model(
                 hidden_states=sa_embs,
-                encoder_hidden_states=equi_vis_embs,
+                encoder_hidden_states=vl_embs,
                 encoder_attention_mask=encoder_mask,
                 timestep=timesteps_tensor,
-                vl_hidden_states=vl_embs,
             )
-            
+
+            # Strip vis prefix tokens; keep only state+action outputs
+            model_output = model_output[:, N_vis:, :]
+
             action_decoder_embodiment_id = embodiment_id.repeat((model_output.shape[1]))
 
             model_output = einops.rearrange(
@@ -1033,10 +1058,9 @@ class FlowmatchingActionHead(nn.Module):
                 # Run model forward.
                 model_output = self.model(
                     hidden_states=sa_embs,
-                    encoder_hidden_states=equi_vis_embeds,
+                    encoder_hidden_states=vl_embeds,
                     encoder_attention_mask=encoder_mask_rt,
                     timestep=timesteps_tensor,
-                    vl_hidden_states=vl_embeds,
                 )
                 pred = self.action_decoder(model_output, embodiment_id)
 

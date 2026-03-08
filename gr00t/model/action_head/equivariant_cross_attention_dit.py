@@ -189,18 +189,31 @@ class EquivariantAttention(nn.Module):
         self.Dh = dim_head
         self.scalar_dim = self.H * self.Dh
 
-        # Scalar FieldType for Q, K, V
-        self.scalar_type = enn.FieldType(
-            gspace,
-            [gspace.trivial_repr] * self.scalar_dim
+        # Use regular repr for Q/K/V when both in_type and cross_type are regular
+        # (dot product of same unitary repr is invariant: (ρ(g)q)ᵀ(ρ(g)k) = qᵀk)
+        cross_reprs = self.cross_type.representations
+        in_reprs = in_type.representations
+        self._equivariant_qkv = (
+            all(r == gspace.regular_repr for r in cross_reprs) and
+            all(r == gspace.regular_repr for r in in_reprs) and
+            (self.scalar_dim % self.G == 0)
         )
 
-        # ESCNN-equivariant projections
-        self.q_proj = enn.Linear(in_type, self.scalar_type, bias=bias)
-        self.k_proj = enn.Linear(self.cross_type, self.scalar_type, bias=bias)
-        self.v_proj = enn.Linear(self.cross_type, self.scalar_type, bias=bias)
-
-        self.o_proj = enn.Linear(self.scalar_type, in_type, bias=out_bias)
+        if self._equivariant_qkv:
+            # Regular FieldType for Q, K, V — fully equivariant projections
+            n_regular = self.scalar_dim // self.G
+            self.qkv_type = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
+            self.q_proj = enn.Linear(in_type, self.qkv_type, bias=bias)
+            self.k_proj = enn.Linear(self.cross_type, self.qkv_type, bias=bias)
+            self.v_proj = enn.Linear(self.cross_type, self.qkv_type, bias=bias)
+            self.o_proj = enn.Linear(self.qkv_type, in_type, bias=out_bias)
+        else:
+            # Scalar FieldType for Q, K, V (cross-attention with trivial VL features)
+            self.qkv_type = enn.FieldType(gspace, [gspace.trivial_repr] * self.scalar_dim)
+            self.q_proj = enn.Linear(in_type, self.qkv_type, bias=bias)
+            self.k_proj = enn.Linear(self.cross_type, self.qkv_type, bias=bias)
+            self.v_proj = enn.Linear(self.cross_type, self.qkv_type, bias=bias)
+            self.o_proj = enn.Linear(self.qkv_type, in_type, bias=out_bias)
 
         self.dropout = nn.Dropout(dropout)
         self.scale = (dim_head) ** -0.5
@@ -308,10 +321,95 @@ class EquivariantAttention(nn.Module):
         # merge heads
         out = einops.rearrange(out, "b h t d -> (b t) (h d)")
 
-        # Lift scalar back to group representation with ESCNN
-        out_geo = enn.GeometricTensor(out, self.scalar_type)
+        # Lift back to group representation with ESCNN (scalar or regular depending on mode)
+        out_geo = enn.GeometricTensor(out, self.qkv_type)
         out = self.o_proj(out_geo).tensor          # (B*Tq, Cq*G)
         out = einops.rearrange(out, "(b t) d -> b t d", b=B)
+
+        return out
+
+
+class EquivariantAttentionPool(nn.Module):
+    """
+    Pools N equivariant tokens → K tokens using learned query tokens in regular repr space.
+
+    Mirrors the equivariant self-attention design:
+      - query_tokens: K learned params in in_type (regular repr) space
+      - q_proj, k_proj: regular → regular (equivariant linear)
+      - V: raw equivariant features (no v_proj)
+      - Scores: Q_proj · K_proj — invariant because regular_repr is unitary:
+            (ρ(g)·q)ᵀ·(ρ(g)·k) = qᵀ·k
+        (holds when both Q and K transform together; here Q is projected from
+         fixed params and K from data — the equivariant projections ensure
+         K transforms equivariantly in the same repr space as Q)
+
+    Requires: H * dim_head % G == 0  (so qkv_type can use regular_repr blocks)
+    No residual connection — this is a pooling module (changes sequence length).
+    """
+
+    def __init__(
+        self,
+        in_type: enn.FieldType,
+        num_queries: int = 8,
+        heads: int = 4,
+        dim_head: int = 16,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.in_type = in_type
+        gspace = in_type.gspace
+        G = gspace.fibergroup.order()
+        self.H = heads
+        self.Dh = dim_head
+        self.scalar_dim = heads * dim_head
+        self.K = num_queries
+        self.in_dim = in_type.size
+
+        assert self.scalar_dim % G == 0, (
+            f"heads*dim_head={self.scalar_dim} must be divisible by G={G} for regular repr"
+        )
+
+        # Regular FieldType for Q and K projections
+        n_regular = self.scalar_dim // G
+        self.qkv_type = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
+
+        # Learned query tokens in in_type (regular repr) space
+        self.query_tokens = nn.Parameter(torch.empty(num_queries, in_type.size))
+        nn.init.trunc_normal_(self.query_tokens, std=0.02)
+
+        # Equivariant projections: regular → regular
+        self.q_proj = enn.Linear(in_type, self.qkv_type, bias=bias)
+        self.k_proj = enn.Linear(in_type, self.qkv_type, bias=bias)
+
+        self.scale = dim_head ** -0.5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x   : (B, N, in_dim) — equivariant input tokens
+        out : (B, K, in_dim) — pooled equivariant tokens
+        """
+        B, N, D = x.shape
+
+        # Project learned query tokens: (K, in_dim) → (B, K, H, Dh)
+        q_geo = enn.GeometricTensor(
+            self.query_tokens.unsqueeze(0).expand(B, -1, -1).reshape(B * self.K, -1),
+            self.in_type,
+        )
+        Q = self.q_proj(q_geo).tensor.reshape(B, self.K, self.H, self.Dh)
+
+        # Project keys from input: (B*N, in_dim) → (B, N, H, Dh)
+        k_geo = enn.GeometricTensor(x.reshape(B * N, D), self.in_type)
+        K_proj = self.k_proj(k_geo).tensor.reshape(B, N, self.H, self.Dh)
+
+        # Attention scores: (B, H, K, N)
+        attn = torch.einsum("b k h d, b n h d -> b h k n", Q, K_proj) * self.scale
+        attn = torch.softmax(attn, dim=-1)      # (B, H, K, N)
+
+        # Average over heads → pooling weights: (B, K, N)
+        attn = attn.mean(dim=1)
+
+        # Weighted sum of equivariant V (no projection) → (B, K, in_dim)
+        out = torch.einsum("b k n, b n d -> b k d", attn, x)
 
         return out
 
@@ -393,7 +491,7 @@ class BasicTransformerBlock(nn.Module):
         cross_attention_type: enn.FieldType,
         inner_type: enn.FieldType,
         temb_type: Optional[enn.FieldType] = None,  # trivial type for timestep embedding
-
+        
         num_attention_heads: int = 8,
         attention_head_dim: int = 64,
         dropout=0.0,
@@ -405,9 +503,6 @@ class BasicTransformerBlock(nn.Module):
         attention_out_bias: bool = True,
         use_relative_position_bias: bool = False,
         max_relative_position: int = 32,
-        # Two-stream cross-attention: secondary VL stream (trivial repr)
-        vl_cross_attention_type: Optional[enn.FieldType] = None,
-        num_vl_attention_heads: Optional[int] = None,
     ):
         super().__init__()
 
@@ -418,12 +513,12 @@ class BasicTransformerBlock(nn.Module):
         self.inner_type = inner_type
         # temb_type for trivial timestep embedding
         self.temb_type = temb_type
-
+        
         # Store norm_type for forward pass
         self.norm_type = norm_type
-
+        
         # Define 3 blocks. Each block has its own normalization layer.
-        # 1. Primary attention (self-attn or equi-vis cross-attn)
+        # 1. Self-Attn
         if norm_type == "ada_norm":
             self.norm1 = EquivariantAdaLayerNorm(self.in_type, temb_type=self.temb_type)
         else:
@@ -440,23 +535,6 @@ class BasicTransformerBlock(nn.Module):
             use_relative_position_bias=use_relative_position_bias,
             max_relative_position=max_relative_position,
         )
-
-        # 2. Optional secondary VL cross-attention (trivial repr, invariant language features)
-        if vl_cross_attention_type is not None:
-            self.norm_vl = EquivariantLayerNorm(self.in_type, affine=False, eps=norm_eps)
-            self.attn_vl = EquivariantAttention(
-                in_type=self.in_type,
-                cross_attention_type=vl_cross_attention_type,
-                heads=num_vl_attention_heads or (num_attention_heads // 2),
-                dim_head=attention_head_dim,
-                dropout=dropout,
-                bias=attention_bias,
-                out_bias=attention_out_bias,
-                use_relative_position_bias=False,  # no relative pos bias for language tokens
-            )
-        else:
-            self.norm_vl = None
-            self.attn_vl = None
 
         # 3. Feed-forward
         self.norm3 = EquivariantLayerNorm(self.in_type, affine=False, eps=norm_eps)
@@ -479,72 +557,70 @@ class BasicTransformerBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.Tensor] = None,
-        vl_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass through the equivariant transformer block.
-
+        
         Args:
             hidden_states: (B, T, C*G) tensor where C*G is in_type.size
-            encoder_hidden_states: (B, S, equi_vis_cross_type.size) equivariant vision context
+            encoder_hidden_states: (B, S, C*G) tensor for cross-attention
             attention_mask: Optional attention mask
             encoder_attention_mask: Optional encoder attention mask
             temb: Optional time embedding for adaptive norm
-            vl_hidden_states: (B, S, vl_cross_type.size) invariant VL context (trivial repr)
-
+            
         Returns:
             Output tensor of shape (B, T, C*G)
         """
         B, T, _ = hidden_states.shape
-
+        
         # Flatten for ESCNN processing: (B, T, C*G) -> (B*T, C*G)
         hidden_states_flat = einops.rearrange(hidden_states, "b t d -> (b t) d")
         hidden_geo = enn.GeometricTensor(hidden_states_flat, self.in_type)
 
-        # 1. Primary attention (self-attn or equi-vis cross-attn) with normalization
+        # 1. Self-Attention with normalization
         if self.norm_type == "ada_norm":
+            # AdaLayerNorm expects flattened input
             temb_flat = einops.repeat(temb, "b d -> (b t) d", t=T) if temb is not None else None
             norm_hidden_geo = self.norm1(hidden_geo, temb_flat)
         else:
             norm_hidden_geo = self.norm1(hidden_geo)
-
+        
+        # Extract normalized tensor and reshape for attention: (B*T, C*G) -> (B, T, C*G)
         norm_hidden_states = einops.rearrange(norm_hidden_geo.tensor, "(b t) d -> b t d", b=B)
 
+        # Apply attention (EquivariantAttention handles tensor input/output)
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             attention_mask=attention_mask,
         )
+        
+        # Residual connection
         hidden_states = attn_output + hidden_states
-
-        # 2. Secondary VL cross-attention (trivial repr, invariant language features)
-        if self.attn_vl is not None and self.norm_vl is not None and vl_hidden_states is not None:
-            hidden_states_flat = einops.rearrange(hidden_states, "b t d -> (b t) d")
-            hidden_geo = enn.GeometricTensor(hidden_states_flat, self.in_type)
-            norm_hidden_geo = self.norm_vl(hidden_geo)
-            norm_hidden_states = einops.rearrange(norm_hidden_geo.tensor, "(b t) d -> b t d", b=B)
-            vl_attn_output = self.attn_vl(
-                norm_hidden_states,
-                encoder_hidden_states=vl_hidden_states,
-            )
-            hidden_states = vl_attn_output + hidden_states
-
-        # 3. Feed-forward with normalization
+        
+        # 2. Feed-forward with normalization
+        # Flatten for ESCNN processing
         hidden_states_flat = einops.rearrange(hidden_states, "b t d -> (b t) d")
         hidden_geo = enn.GeometricTensor(hidden_states_flat, self.in_type)
-
+        
         norm_hidden_geo = self.norm3(hidden_geo)
+        
+        # Apply feedforward (EquivariantFeedForward handles GeometricTensor input/output)
         ff_output_geo = self.ff(norm_hidden_geo)
+        
+        # Extract tensor and reshape: (B*T, C*G) -> (B, T, C*G)
         ff_output = einops.rearrange(ff_output_geo.tensor, "(b t) d -> b t d", b=B)
-
+        
+        # Apply final dropout if needed
         if self.final_dropout is not None:
             ff_output_flat = einops.rearrange(ff_output, "b t d -> (b t) d")
             ff_output_geo = enn.GeometricTensor(ff_output_flat, self.in_type)
             ff_output_geo = self.final_dropout(ff_output_geo)
             ff_output = einops.rearrange(ff_output_geo.tensor, "(b t) d -> b t d", b=B)
-
+        
+        # Residual connection
         hidden_states = ff_output + hidden_states
-
+        
         return hidden_states
 
 
@@ -575,9 +651,6 @@ class EDiT(ModelMixin, ConfigMixin):
         cross_attention_dim: Optional[int] = None,
         use_relative_position_bias: bool = True,
         max_relative_position: int = 32,
-        # Two-stream: secondary trivial VL cross-attention
-        vl_cross_attention_dim: Optional[int] = None,
-        num_vl_attention_heads: Optional[int] = None,
     ):
         super().__init__()
 
@@ -596,17 +669,12 @@ class EDiT(ModelMixin, ConfigMixin):
             self.gspace, 
             [self.gspace.regular_repr] * int(self.inner_dim/self.n_group)
         )
-        # Primary cross-attention: equivariant vision tokens (regular repr)
+        # Cross-attention uses TRIVIAL representation for INVARIANT VL features
+        # This ensures the model is equivariant w.r.t. state/action regardless of VL content
         self.cross_attention_type = enn.FieldType(
             self.gspace,
-            [self.gspace.regular_repr] * int(self.config.cross_attention_dim / self.n_group)
-        )
-        # Secondary cross-attention: invariant VL features (trivial repr)
-        # vl_cross_attention_dim defaults to cross_attention_dim if not specified
-        _vl_dim = self.config.vl_cross_attention_dim or self.config.cross_attention_dim
-        self.vl_cross_attention_type = enn.FieldType(
-            self.gspace,
-            [self.gspace.trivial_repr] * _vl_dim
+            # [self.gspace.trivial_repr] * int(self.config.cross_attention_dim)
+            [self.gspace.trivial_repr] * int(self.config.cross_attention_dim / self.n_group)
         )
         self.ff_inner_type = enn.FieldType(
             self.gspace,
@@ -616,12 +684,11 @@ class EDiT(ModelMixin, ConfigMixin):
             self.gspace,
             [self.gspace.regular_repr] * int(self.config.output_dim/self.n_group)
         )
-
+        
         print(f"EDiT Equivariant Configuration:")
         print(f"  Group: C{n_group}")
         print(f"  in_type size: {self.in_type.size} (regular repr - equivariant)")
-        print(f"  cross_attention_type size: {self.cross_attention_type.size} (equi vision, regular repr)")
-        print(f"  vl_cross_attention_type size: {self.vl_cross_attention_type.size} (VL, trivial repr)")
+        print(f"  cross_attention_type size: {self.cross_attention_type.size} (regular repr - equivariant)")
         print(f"  inner_type size: {self.ff_inner_type.size}")
 
         # Timestep encoder outputs TRIVIAL repr (time is scalar, not rotated)
@@ -637,22 +704,19 @@ class EDiT(ModelMixin, ConfigMixin):
         
         # Build equivariant transformer blocks
         all_blocks = []
-        _num_vl_heads = self.config.num_vl_attention_heads or (self.config.num_attention_heads // 2)
         for idx in range(self.config.num_layers):
             use_self_attn = idx % 2 == 1 and interleave_self_attention
-
+            
             # For self-attention layers, use in_type for both query and key/value
             curr_cross_type = self.in_type if use_self_attn else self.cross_attention_type
-            curr_use_relative_position_bias = False if use_self_attn else use_relative_position_bias
-            # VL secondary cross-attn only for cross-attention blocks
-            curr_vl_cross_type = None if use_self_attn else self.vl_cross_attention_type
+
             all_blocks += [
                 BasicTransformerBlock(
                     in_type=self.in_type,
                     cross_attention_type=curr_cross_type,
                     inner_type=self.ff_inner_type,
                     temb_type=self.time_out_type,  # Pass trivial timestep type
-
+                    
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
                     dropout=self.config.dropout,
@@ -661,10 +725,8 @@ class EDiT(ModelMixin, ConfigMixin):
                     norm_type=norm_type,
                     norm_eps=self.config.norm_eps,
                     final_dropout=final_dropout,
-                    use_relative_position_bias=curr_use_relative_position_bias,
+                    use_relative_position_bias=use_relative_position_bias,
                     max_relative_position=max_relative_position,
-                    vl_cross_attention_type=curr_vl_cross_type,
-                    num_vl_attention_heads=_num_vl_heads,
                 )
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)
@@ -694,60 +756,54 @@ class EDiT(ModelMixin, ConfigMixin):
     def forward(
         self,
         hidden_states: torch.Tensor,  # Shape: (B, T, in_type.size)
-        encoder_hidden_states: torch.Tensor,  # Shape: (B, S, cross_attention_type.size) equi vision
+        encoder_hidden_states: torch.Tensor,  # Shape: (B, S, cross_attention_type.size)
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
-        vl_hidden_states: Optional[torch.Tensor] = None,  # (B, S, vl_cross_attention_type.size) trivial VL
     ):
         """
         Forward pass through the equivariant DiT model.
-
+        
         Args:
-            hidden_states: (B, T, in_type.size) - equivariant action/state features
-            encoder_hidden_states: (B, S, cross_attention_type.size) - equivariant vision context
+            hidden_states: (B, T, in_type.size) - equivariant input features
+            encoder_hidden_states: (B, S, cross_attention_type.size) - equivariant encoder features
             timestep: timestep for conditioning
             encoder_attention_mask: Optional attention mask
             return_all_hidden_states: Whether to return intermediate hidden states
-            vl_hidden_states: (B, S, vl_cross_attention_type.size) - invariant VL context (trivial repr)
-
+            
         Returns:
             Output tensor of shape (B, T, output_dim) or tuple with all hidden states
         """
         B, T, _ = hidden_states.shape
-
+        
         # Encode timesteps (non-equivariant conditioning)
         temb = self.timestep_encoder(timestep)  # (B, in_type.size)
 
         # Process through transformer blocks
         hidden_states = hidden_states.contiguous()
         encoder_hidden_states = encoder_hidden_states.contiguous()
-        if vl_hidden_states is not None:
-            vl_hidden_states = vl_hidden_states.contiguous()
 
         all_hidden_states = [hidden_states]
 
         # Process through equivariant transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1 and self.config.interleave_self_attention:
-                # Self-attention layer (no cross-attention context)
+                # Self-attention layer
                 hidden_states = block(
                     hidden_states,
                     attention_mask=None,
-                    encoder_hidden_states=None,
+                    encoder_hidden_states=None,  # Self-attention
                     encoder_attention_mask=None,
                     temb=temb,
-                    vl_hidden_states=None,
                 )
             else:
-                # Cross-attention layer: primary equi vision + secondary VL
+                # Cross-attention layer
                 hidden_states = block(
                     hidden_states,
                     attention_mask=None,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
                     temb=temb,
-                    vl_hidden_states=vl_hidden_states,
                 )
             all_hidden_states.append(hidden_states)
 
@@ -803,7 +859,7 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         use_relative_position_bias: bool = True,
-        max_relative_position: int = 2048,
+        max_relative_position: int = 512,
     ):
         super().__init__()
         self.attention_head_dim = attention_head_dim
