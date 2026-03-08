@@ -787,7 +787,7 @@ class FlowmatchingActionHead(nn.Module):
                 action_input[k] = expanded
 
         # Two-stream context from process_backbone_output.
-        equi_vis_embs = backbone_output.equi_vis_features       # [B, n_img*T_vis, D_cross]
+        equi_vis_embs = backbone_output.equi_vis_features       # [B, n_img*K, D_hidden]
         vl_embs = backbone_output.vl_features                   # [B, T_text, vl_cross_dim]
         encoder_mask = backbone_output.backbone_attention_mask  # [B, T_text], 1=valid 0=pad
         device = equi_vis_embs.device
@@ -844,9 +844,10 @@ class FlowmatchingActionHead(nn.Module):
         )
 
         # Strip vis prefix tokens; keep only state+action outputs
-        model_output = model_output[:, N_vis:, :]
+        model_output = model_output[:, N_vis:, :]  # [B, T+H, D]
+        N_sa = model_output.shape[1]               # T + H (no vis prefix)
 
-        action_decoder_embodiment_id = embodiment_id.repeat((model_output.shape[1]))
+        action_decoder_embodiment_id = embodiment_id.repeat(N_sa)
 
         model_output = einops.rearrange(
             model_output,
@@ -859,7 +860,7 @@ class FlowmatchingActionHead(nn.Module):
             pred.tensor,
             '(b t) c -> b t c',
             b=sa_embs.shape[0],
-            t=sa_embs.shape[1]
+            t=N_sa,
         )
 
         pred_actions = pred[:, -actions_gt.shape[1] :, :]
@@ -892,7 +893,7 @@ class FlowmatchingActionHead(nn.Module):
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Two-stream context from process_backbone_output.
-        equi_vis_embs = backbone_output.equi_vis_features       # [B, n_img*T_vis, D_cross]
+        equi_vis_embs = backbone_output.equi_vis_features       # [B, n_img*K, D_hidden]
         vl_embs = backbone_output.vl_features                   # [B, T_text, vl_cross_dim]
         encoder_mask = backbone_output.backbone_attention_mask  # [B, T_text]
 
@@ -968,9 +969,10 @@ class FlowmatchingActionHead(nn.Module):
             )
 
             # Strip vis prefix tokens; keep only state+action outputs
-            model_output = model_output[:, N_vis:, :]
+            model_output = model_output[:, N_vis:, :]  # [B, T+H, D]
+            N_sa = model_output.shape[1]               # T + H (no vis prefix)
 
-            action_decoder_embodiment_id = embodiment_id.repeat((model_output.shape[1]))
+            action_decoder_embodiment_id = embodiment_id.repeat(N_sa)
 
             model_output = einops.rearrange(
                 model_output,
@@ -983,7 +985,7 @@ class FlowmatchingActionHead(nn.Module):
                 pred.tensor,
                 '(b t) c -> b t c',
                 b=sa_embs.shape[0],
-                t=sa_embs.shape[1]
+                t=N_sa,
             )
 
             pred_velocity = pred[:, -self.action_horizon :]

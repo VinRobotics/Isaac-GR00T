@@ -116,12 +116,6 @@ class EagleBackboneFATokens(nn.Module):
         else:
             self.rotate_image_indices = rotate_image_indices
         
-        # Indices of images to duplicate (not rotate)
-        self.duplicate_image_indices = [
-            i for i in range(num_images_per_sample) 
-            if i not in self.rotate_image_indices
-        ]
-        
         # Ensure project_to_dim is divisible by n_group for regular representation
         assert self.project_to_dim % n_group == 0, \
             f"project_to_dim ({self.project_to_dim}) must be divisible by n_group ({n_group})"
@@ -356,60 +350,34 @@ class EagleBackboneFATokens(nn.Module):
         
         return rotated_imgs
 
-    def rotate_vl_batch(self, vl_input: dict) -> torch.Tensor:
+    def rotate_vl_batch(self, vl_input: dict) -> tuple:
         """
-        Rotate images and expand text inputs for N rotations.
-        
-        Args:
-            vl_input: dict with eagle_ prefixed keys
-            
+        Rotate only the equivariant images (rotate_image_indices) for FA.
+        Non-equivariant images are ignored entirely.
+
         Returns:
-            Rotated pixel values tensor
+            equi_pixels : [B * N * n_equi, C, H, W]
+            B           : original batch size
         """
-        # Extract eagle inputs
         eagle_prefix = "eagle_"
-        input_ids = vl_input.get(f"{eagle_prefix}input_ids")
-        pixel_values = vl_input.get(f"{eagle_prefix}pixel_values")
-        
-        if pixel_values is None:
-            return None
-            
-        total_imgs, C, H, W = pixel_values.shape
-        B = input_ids.shape[0]
-        
-        # Handle multiple images per sample
-        if self.num_images_per_sample > 1:
-            # Reshape to [B, num_images, C, H, W]
-            img_batch_reshaped = pixel_values.reshape(B, self.num_images_per_sample, C, H, W)
-            
-            processed_images = []
-            for img_idx in range(self.num_images_per_sample):
-                imgs_at_idx = img_batch_reshaped[:, img_idx, :, :, :]  # [B, C, H, W]
-                
-                if img_idx in self.rotate_image_indices:
-                    # Apply rotations: [B, C, H, W] -> [B*N, C, H, W]
-                    rotated = self._apply_rotations_to_images(imgs_at_idx)
-                    processed_images.append(rotated)
-                else:
-                    # Duplicate without rotation: [B, C, H, W] -> [B*N, C, H, W]
-                    expanded = imgs_at_idx.unsqueeze(1).expand(-1, self.n_group, -1, -1, -1)
-                    duplicated = expanded.reshape(B * self.n_group, C, H, W)
-                    processed_images.append(duplicated)
-            
-            # Reorganize: stack and reshape to [B*N*num_images, C, H, W]
-            # Each group of N consecutive samples should have the same rotation
-            processed_images_reshaped = [
-                img.reshape(B, self.n_group, C, H, W) for img in processed_images
-            ]
-            stacked = torch.stack(processed_images_reshaped, dim=0)  # [num_img, B, N, C, H, W]
-            stacked = stacked.permute(1, 0, 2, 3, 4, 5)  # [B, num_img, N, C, H, W]
-            rotated_pixel_values = stacked.reshape(
-                B * self.n_group * self.num_images_per_sample, C, H, W
-            )
-        else:
-            # Single image per sample
-            rotated_pixel_values = self._apply_rotations_to_images(pixel_values)
-        return rotated_pixel_values
+        pixel_values = vl_input[f"{eagle_prefix}pixel_values"]
+        B = vl_input[f"{eagle_prefix}input_ids"].shape[0]
+        _, C, H, W = pixel_values.shape
+
+        img_batch = pixel_values.reshape(B, self.num_images_per_sample, C, H, W)
+        n_equi = len(self.rotate_image_indices)
+
+        equi_imgs = [
+            self._apply_rotations_to_images(img_batch[:, idx]).reshape(B, self.n_group, C, H, W)
+            for idx in self.rotate_image_indices
+        ]
+        # [n_equi, B, N, C, H, W] → [B, N, n_equi, C, H, W] → [B*N*n_equi, C, H, W]
+        equi_pixels = (
+            torch.stack(equi_imgs, dim=0)
+            .permute(1, 2, 0, 3, 4, 5)
+            .reshape(B * self.n_group * n_equi, C, H, W)
+        )
+        return equi_pixels, B
 
     def _apply_frame_averaging(
         self, 
@@ -565,74 +533,54 @@ class EagleBackboneFATokens(nn.Module):
         # Get original batch size before rotation
         original_input_ids = vl_input.get(f"{eagle_prefix}input_ids")
         B = original_input_ids.shape[0]
-        
-        # Rotate images by all group elements
-        rotated_pixel_values = self.rotate_vl_batch(dict(vl_input))
-        
-        # Prepare eagle input
+
+        # Prepare base eagle input (for VL / LLM pass)
         eagle_input = {
             k.removeprefix(eagle_prefix): v
             for k, v in vl_input.items()
             if k.startswith(eagle_prefix)
         }
-        
-        # Remove image_sizes if present
         if "image_sizes" in eagle_input:
             del eagle_input["image_sizes"]
-            
-        ## Extract vision features (full tokens, not pooled)
-        # vision_features: [B * num_imgs * N, T_vision, D_vision]
-        vision_features, _ = self.eagle_model.extract_feature(rotated_pixel_values)
-        
-        # Get dimensions
-        num_vision_tokens = vision_features.shape[1]   # T_vision (256)
-        vision_dim = vision_features.shape[2]          # D_vision (2048)
-        
-        # Reshape to [B * num_imgs, N, T_vision, D_vision]
-        vision_features_grouped = vision_features.reshape(
-            B * self.num_images_per_sample, self.n_group, num_vision_tokens, vision_dim
+
+        # Rotate only equivariant cameras; non-equivariant images are skipped
+        equi_pixels, B = self.rotate_vl_batch(dict(vl_input))
+        n_equi = len(self.rotate_image_indices)
+
+        # Extract features: [B*N*n_equi, T, D]
+        equi_raw, _ = self.eagle_model.extract_feature(equi_pixels)
+        num_vision_tokens = equi_raw.shape[1]
+        vision_dim        = equi_raw.shape[2]
+
+        # Reshape to [B*n_equi, N, T, D]
+        equi_grouped = (
+            equi_raw
+            .reshape(B, self.n_group, n_equi, num_vision_tokens, vision_dim)
+            .permute(0, 2, 1, 3, 4)                          # [B, n_equi, N, T, D]
+            .reshape(B * n_equi, self.n_group, num_vision_tokens, vision_dim)
         )
-        
-        # Apply ρ(h⁻¹) = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹) to each f(h·x)
-        # Using ρ(h⁻¹) instead of ρ(h) gives covariant output: FA(g·x) = ρ(g)·FA(x)
-        # Then average over h
-        
+
+        # Apply FA: ρ(h⁻¹) = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹) then average
+        blocks = vision_dim // self.n_group
         transformed_features = []
         for h in range(self.n_group):
-            # f(h·x): features from rotation h
-            feat_h = vision_features_grouped[:, h, :, :]  # [B * num_imgs, T, D]
-            
+            feat_h = equi_grouped[:, h]                       # [B*n_equi, T, D]
             if h == 0:
-                # Identity - no transformation needed (h⁻¹ = 0)
-                feat_transformed = feat_h
+                transformed_features.append(feat_h)
             else:
-                # Apply ρ(h⁻¹) = π(h⁻¹) ⊗ ρ_reg(h⁻¹)
                 h_inv = (self.n_group - h) % self.n_group
-                
-                # Step 1: Spatial permutation π(h⁻¹)
-                spatial_perm = self.token_perm_indices[h_inv]
-                feat_permuted = feat_h[:, spatial_perm, :]  # [B * num_imgs, T, D]
-                
-                # Step 2: Feature permutation ρ_reg(h⁻¹)
-                # Regular representation: cyclically shift blocks by h_inv
-                blocks = vision_dim // self.n_group
-                feat_blocks = feat_permuted.reshape(
-                    B * self.num_images_per_sample, num_vision_tokens, self.n_group, blocks
-                )
-                feat_shifted = torch.roll(feat_blocks, shifts=h_inv, dims=2)
-                feat_transformed = feat_shifted.reshape(
-                    B * self.num_images_per_sample, num_vision_tokens, vision_dim
-                )
-            
-            transformed_features.append(feat_transformed)
-        
-        # Stack and average: [B * num_imgs, N, T, D] -> [B * num_imgs, T, D]
-        transformed_features = torch.stack(transformed_features, dim=1)
-        avg_vision_features = torch.mean(transformed_features, dim=1)
-        
-        # Reshape to [B, num_imgs, T_vision, D_vision]
-        avg_vision_features = avg_vision_features.reshape(
-            B, self.num_images_per_sample, num_vision_tokens, vision_dim
+                feat_h = feat_h[:, self.token_perm_indices[h_inv]]
+                feat_h = torch.roll(
+                    feat_h.reshape(B * n_equi, num_vision_tokens, self.n_group, blocks),
+                    shifts=h_inv, dims=2
+                ).reshape(B * n_equi, num_vision_tokens, vision_dim)
+                transformed_features.append(feat_h)
+
+        # [B*n_equi, T, D] → [B, n_equi, T, D]
+        avg_vision_features = (
+            torch.stack(transformed_features, dim=1)
+            .mean(dim=1)
+            .reshape(B, n_equi, num_vision_tokens, vision_dim)
         )
         
         
@@ -653,7 +601,7 @@ class EagleBackboneFATokens(nn.Module):
             
         Returns:
             BatchFeature with:
-                - backbone_vision_features: [B, num_imgs, T_vision, D] full vision token sequence
+                - backbone_vision_features: [B, n_equi, T_vision, D] equivariant cameras only
                 - backbone_language_features: [B, T_text, D_text] language features
                 - backbone_attention_mask: attention mask
         """

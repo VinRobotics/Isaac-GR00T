@@ -1549,8 +1549,8 @@ class VRH3TwotHand1CamEquiConfig(BaseDataConfig):
     
 class EquiLiberoConfig(BaseDataConfig):
     video_keys = ["video.image", "video.wrist_image"]
-    # Only rotate exterior image, wrist image is duplicated (not rotated)
-    rotate_video_keys = ["video.image"]
+    # video.image (index 0) = top/head camera → equivariant FA
+    # video.wrist_image (index 1) = wrist camera → VL only, skipped from equi_vision_embs
     state_keys = [
         "state.x",
         "state.y",
@@ -1603,6 +1603,24 @@ class EquiLiberoConfig(BaseDataConfig):
         }
         return modality_configs
 
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """
+        Backbone rotation config for equivariant frame averaging.
+
+        - num_images_per_sample=2: Eagle VL/LLM pass sees BOTH cameras (top + wrist).
+        - rotate_image_indices=[0]: Only the top/head camera (index 0) is rotated for FA.
+          The wrist camera (index 1) is skipped from equi_vision_embs entirely.
+
+        Result:
+          backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only (equivariant)
+          backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
+        """
+        return {
+            "num_images_per_sample": 2,
+            "rotate_image_indices": [0],
+        }
+
     def transform(self):
         transforms = [
             # video transforms
@@ -1626,6 +1644,7 @@ class EquiLiberoConfig(BaseDataConfig):
                     "state.y": "min_max",
                     "state.z": "min_max",
                     "state.gripper": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
                 },
             ),
             # action transforms
@@ -1637,6 +1656,7 @@ class EquiLiberoConfig(BaseDataConfig):
                     "action.y": "min_max",
                     "action.z": "min_max",
                     "action.gripper": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
                 },
             ),
             # concat transforms
@@ -1645,9 +1665,6 @@ class EquiLiberoConfig(BaseDataConfig):
                 state_concat_order=self.state_keys,
                 action_concat_order=self.action_keys,
             ),
-            # Use GR00TTransformFA for frame averaging
-            # rotate_image_indices=[0] means only the first image (exterior) is rotated
-            # The second image (wrist) will be duplicated N times
             GR00TTransform(
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),

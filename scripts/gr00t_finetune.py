@@ -252,10 +252,6 @@ def main(config: ArgsConfig):
                 model.backbone.rotate_image_indices = list(range(num_images_per_sample))
             else:
                 model.backbone.rotate_image_indices = rotate_image_indices
-            model.backbone.duplicate_image_indices = [
-                i for i in range(num_images_per_sample) 
-                if i not in model.backbone.rotate_image_indices
-            ]
             
             # Update the model config for saving
             model.config.backbone_cfg["num_images_per_sample"] = num_images_per_sample
