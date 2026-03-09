@@ -30,7 +30,7 @@ vrh3_two_hands_config = {
         ],
     ),
     "action": ModalityConfig(
-        delta_indices=list(range(0, 16)),
+        delta_indices=list(range(0, 50)),
         modality_keys=[
             "left_arm",
             "right_arm",
