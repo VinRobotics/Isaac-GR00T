@@ -221,11 +221,14 @@ def build_image_transformations_albumentations(
         max_size = shortest_image_edge
 
     # Training transforms (using ReplayCompose for consistent augmentation across views)
-    # Use SmallestMaxSize to preserve aspect ratios, with INTER_AREA for antialiasing
+    # LongestMaxSize + PadIfNeeded letterboxes to square so cameras with different
+    # aspect ratios all produce the same (max_size x max_size) tensor and can be stacked.
     train_transform_list = [
-        A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+        A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+        A.PadIfNeeded(min_height=max_size, min_width=max_size, border_mode=cv2.BORDER_CONSTANT, value=0, p=1.0),
         FractionalRandomCrop(crop_fraction=fraction_to_use),
-        A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+        A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+        A.PadIfNeeded(min_height=max_size, min_width=max_size, border_mode=cv2.BORDER_CONSTANT, value=0, p=1.0),
     ]
 
     if random_rotation_angle is not None and random_rotation_angle != 0:
@@ -247,12 +250,13 @@ def build_image_transformations_albumentations(
     train_transform = A.ReplayCompose(train_transform_list, p=1.0)
 
     # Evaluation transforms (deterministic)
-    # Use SmallestMaxSize to preserve aspect ratios, with INTER_AREA for antialiasing
     eval_transform = A.Compose(
         [
-            A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+            A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+            A.PadIfNeeded(min_height=max_size, min_width=max_size, border_mode=cv2.BORDER_CONSTANT, value=0, p=1.0),
             FractionalCenterCrop(crop_fraction=fraction_to_use),
-            A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+            A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+            A.PadIfNeeded(min_height=max_size, min_width=max_size, border_mode=cv2.BORDER_CONSTANT, value=0, p=1.0),
         ]
     )
 
