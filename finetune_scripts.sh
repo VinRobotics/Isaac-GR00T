@@ -1,5 +1,4 @@
 export NUM_GPUS=1
-export WANDB_API_KEY=435621b80bbb25dfdc8668babf17e242432c6c2b
 export WANDB_PROJECT=vrh3_sim_pick_place
 
 HF_HUB_OFFLINE=0
