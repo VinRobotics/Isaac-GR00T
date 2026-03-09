@@ -1424,8 +1424,9 @@ class AlohaRightArmEffortConfig(BaseDataConfig):
     observation_indices = [0]
     state_indices = [0]
     action_indices = list(range(16))
-    effort_indices = list(range(1, 17))
-    
+    effort_history_len = 16  # equals future effort len (len(action_indices))
+    effort_indices = list(range(-15, 1)) + list(range(1, 17))  # 16 history + 16 future
+
     effort_dims=7
 
     def modality_config(self):
@@ -1458,6 +1459,15 @@ class AlohaRightArmEffortConfig(BaseDataConfig):
         }
         return modality_configs
 
+    def inference_modality_config(self):
+        """Modality config for inference: effort uses only history indices (no future labels)."""
+        base = self.modality_config()
+        base["effort"] = ModalityConfig(
+            delta_indices=self.effort_indices[:self.effort_history_len],
+            modality_keys=self.effort_keys,
+        )
+        return base
+
     def transform(self):
         transforms = [
             # video transforms
@@ -1503,7 +1513,8 @@ class AlohaRightArmEffortConfig(BaseDataConfig):
             GR00TTransform(
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
-                effort_horizon=len(self.action_indices),
+                effort_horizon=len(self.effort_indices),  # history + future
+                effort_history_len=self.effort_history_len,
                 max_state_dim=64,
                 max_action_dim=32,
                 max_effort_dim=7,
@@ -1511,7 +1522,7 @@ class AlohaRightArmEffortConfig(BaseDataConfig):
         ]
 
         return ComposedModalityTransform(transforms=transforms)
-    
+
 
 class VRH3EffortConfig(BaseDataConfig):
     video_keys = ["video.cam_front"]
@@ -1537,8 +1548,9 @@ class VRH3EffortConfig(BaseDataConfig):
     observation_indices = [0]
     state_indices = [0]
     action_indices = list(range(16))
-    effort_indices = list(range(1, 17))
-    
+    effort_history_len = 16  # equals future effort len (len(action_indices))
+    effort_indices = list(range(-15, 1)) + list(range(1, 17))  # 16 history + 16 future
+
     effort_dims=26
 
     def modality_config(self):
@@ -1571,6 +1583,15 @@ class VRH3EffortConfig(BaseDataConfig):
         }
         return modality_configs
 
+    def inference_modality_config(self):
+        """Modality config for inference: effort uses only history indices (no future labels)."""
+        base = self.modality_config()
+        base["effort"] = ModalityConfig(
+            delta_indices=self.effort_indices[:self.effort_history_len],
+            modality_keys=self.effort_keys,
+        )
+        return base
+
     def transform(self):
         transforms = [
             # video transforms
@@ -1616,7 +1637,8 @@ class VRH3EffortConfig(BaseDataConfig):
             GR00TTransform(
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
-                effort_horizon=len(self.action_indices),
+                effort_horizon=len(self.effort_indices),  # history + future
+                effort_history_len=self.effort_history_len,
                 max_state_dim=64,
                 max_action_dim=32,
                 max_effort_dim=26,
@@ -1624,8 +1646,8 @@ class VRH3EffortConfig(BaseDataConfig):
         ]
 
         return ComposedModalityTransform(transforms=transforms)
-    
-    
+
+
 class VRH3_1EffortConfig(BaseDataConfig):
     video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
     state_keys = [
@@ -1665,8 +1687,9 @@ class VRH3_1EffortConfig(BaseDataConfig):
     observation_indices = [0]
     state_indices = [0]
     action_indices = list(range(16))
-    effort_indices = list(range(1, 17))
-    
+    effort_history_len = 16  # equals future effort len (len(action_indices))
+    effort_indices = list(range(-15, 1)) + list(range(1, 17))  # 16 history + 16 future
+
     effort_dims=26 + 1
 
     def modality_config(self):
@@ -1698,6 +1721,15 @@ class VRH3_1EffortConfig(BaseDataConfig):
             "language": language_modality,
         }
         return modality_configs
+
+    def inference_modality_config(self):
+        """Modality config for inference: effort uses only history indices (no future labels)."""
+        base = self.modality_config()
+        base["effort"] = ModalityConfig(
+            delta_indices=self.effort_indices[:self.effort_history_len],
+            modality_keys=self.effort_keys,
+        )
+        return base
 
     def transform(self):
         transforms = [
@@ -1747,7 +1779,8 @@ class VRH3_1EffortConfig(BaseDataConfig):
             GR00TTransform(
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
-                effort_horizon=len(self.action_indices),
+                effort_horizon=len(self.effort_indices),  # history + future
+                effort_history_len=self.effort_history_len,
                 max_state_dim=64,
                 max_action_dim=32,
                 max_effort_dim=27,
@@ -1755,7 +1788,7 @@ class VRH3_1EffortConfig(BaseDataConfig):
         ]
 
         return ComposedModalityTransform(transforms=transforms)
-    
+
 ###########################################################################################
     
 

@@ -222,6 +222,7 @@ def main(config: ArgsConfig):
         if effort_dims is None:
             raise ValueError(f"Data config {config.data_config} does not have effort_dims defined, but torque_aware=True")
         print(f"Enabling torque-aware training with effort_dim={effort_dims}")
+        new_action_head_config.effort_history_len = data_config_cls.effort_history_len
         new_action_head_config.effort_dim = effort_dims
         new_action_head_config.torque_aware = True
         need_recreate = True

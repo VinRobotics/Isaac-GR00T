@@ -124,6 +124,7 @@ class GR00TTransform(InvertibleModalityTransform):
     state_horizon: int
     action_horizon: int
     effort_horizon: int = None
+    effort_history_len: int = None  # if set, inference mode accepts only this many history frames
 
     max_length: int = 512
     embodiment_tag: EmbodimentTag | None = None
@@ -302,20 +303,37 @@ class GR00TTransform(InvertibleModalityTransform):
     
     def _prepare_effort(self, data: dict):
         """
-        Pad to max_action_dim, return masks.
+        Pad to max_effort_dim, return masks.
+
+        At inference (training=False), only history effort frames are available
+        (shape [effort_history_len, effort_dim]). These are accepted as-is and
+        padded with zeros up to effort_horizon so the tensor shape stays
+        consistent; the model only reads the first effort_history_len frames.
         """
         if "effort" not in data:
             efforts = np.zeros((self.effort_horizon, self.max_effort_dim))
             efforts_mask = np.zeros((self.effort_horizon, self.max_effort_dim), dtype=bool)
-            n_effort_tokens = self.effort_horizon
-            return efforts, efforts_mask, n_effort_tokens
+            return efforts, efforts_mask, self.effort_horizon
 
         efforts = data["effort"]
-        assert efforts.shape[0] == self.effort_horizon, f"{efforts.shape=}, {self.effort_horizon=}"
+        n_provided = efforts.shape[0]
 
-        n_effort_tokens = efforts.shape[0]  # T
+        if self.training:
+            assert n_provided == self.effort_horizon, (
+                f"Training expects {self.effort_horizon} effort frames "
+                f"(history + future), got {n_provided}. {efforts.shape=}"
+            )
+        else:
+            # Inference: only history frames are provided
+            expected_history = self.effort_history_len if self.effort_history_len is not None else self.effort_horizon
+            assert n_provided == expected_history, (
+                f"Inference expects {expected_history} effort history frames, got {n_provided}. {efforts.shape=}"
+            )
+            # Pad future portion with zeros so the tensor has shape [effort_horizon, ...]
+            if n_provided < self.effort_horizon:
+                efforts = np.pad(efforts, ((0, self.effort_horizon - n_provided), (0, 0)), "constant")
+
         n_effort_dims = efforts.shape[1]
-
         assert (
             n_effort_dims <= self.max_effort_dim
         ), f"effort dim {n_effort_dims} exceeds max allowed {self.max_effort_dim}."
@@ -323,11 +341,11 @@ class GR00TTransform(InvertibleModalityTransform):
         # Pad the channel dimension
         efforts = np.pad(efforts, ((0, 0), (0, self.max_effort_dim - n_effort_dims)), "constant")
 
-        # Create mask: [T, max_effort_dim]
-        efforts_mask = np.zeros((n_effort_tokens, self.max_effort_dim), dtype=bool)
-        efforts_mask[:, :n_effort_dims] = True
+        # Mask: True only for the history frames that were actually observed
+        efforts_mask = np.zeros((self.effort_horizon, self.max_effort_dim), dtype=bool)
+        efforts_mask[:n_provided, :n_effort_dims] = True
 
-        return efforts, efforts_mask, n_effort_tokens
+        return efforts, efforts_mask, self.effort_horizon
 
     def apply_single(self, data: dict) -> dict:
         transformed_data = {}

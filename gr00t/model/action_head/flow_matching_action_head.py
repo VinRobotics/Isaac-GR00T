@@ -195,6 +195,10 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     effort_dim: Optional[int] = field(
         default=None, metadata={"help": "Effort dimension."}
     )
+    effort_history_len: int = field(
+        default=0,
+        metadata={"help": "Number of past effort frames concatenated into a single history token (EXPERT_HIS_C_FUT). 0 means no history token (future-only mode)."},
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -218,6 +222,7 @@ class FlowmatchingActionHead(nn.Module):
         self.torque_aware = config.torque_aware
         self.action_dim = config.action_dim
         self.effort_dim = config.effort_dim
+        self.effort_history_len = config.effort_history_len
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
 
@@ -240,6 +245,13 @@ class FlowmatchingActionHead(nn.Module):
         )
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+
+        # EXPERT_HIS_C_FUT: project concatenated effort history into a single token
+        if self.torque_aware and self.effort_history_len > 0:
+            assert self.effort_dim is not None, "effort_dim must be set when effort_history_len > 0"
+            effort_dim_in = self.effort_dim * self.effort_history_len
+            self.effort_proj_in = nn.Linear(effort_dim_in, 2 * self.input_embedding_dim)
+            self.effort_proj_out = nn.Linear(2 * self.input_embedding_dim, self.input_embedding_dim)
 
         self.vlln = (
             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
@@ -402,7 +414,18 @@ class FlowmatchingActionHead(nn.Module):
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
         # Embed noised action trajectory.
-        if self.torque_aware:
+        # EXPERT_HIS_C_FUT: split effort into history (conditioning token) and future (diffusion target)
+        effort_hist_token = None
+        if self.torque_aware and self.effort_history_len > 0:
+            B = action_input.action.shape[0]
+            effort_history = action_input.effort[:, :self.effort_history_len, :]   # [B, H, effort_dim]
+            future_effort = action_input.effort[:, self.effort_history_len:, :]    # [B, horizon, effort_dim]
+            # Project flattened history → [B, 1, input_embedding_dim]
+            effort_hist_flat = effort_history.reshape(B, -1)                       # [B, H * effort_dim]
+            effort_hist_emb = swish(self.effort_proj_in(effort_hist_flat))         # [B, 2 * embed_dim]
+            effort_hist_token = self.effort_proj_out(effort_hist_emb).unsqueeze(1) # [B, 1, embed_dim]
+            actions = torch.concat([action_input.action, future_effort], dim=-1)
+        elif self.torque_aware:
             actions = torch.concat([action_input.action, action_input.effort], dim=-1)
         else:
             actions = action_input.action
@@ -424,8 +447,12 @@ class FlowmatchingActionHead(nn.Module):
             action_features = action_features + pos_embs
 
         # Join vision, language, state and action embedding along sequence dimension.
+        # EXPERT_HIS_C_FUT: prepend effort history token before state token.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-        sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+        if effort_hist_token is not None:
+            sa_embs = torch.cat((effort_hist_token, state_features, future_tokens, action_features), dim=1)
+        else:
+            sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
         vl_attn_mask = backbone_output.backbone_attention_mask
 
@@ -450,7 +477,10 @@ class FlowmatchingActionHead(nn.Module):
 
         if self.torque_aware:
             # For efforts we must slice from the full pred_actions tensor (which still contains effort dims)
+            # When history is used, effort_mask covers only the future portion (history_len onwards)
             effort_mask = action_input.effort_mask
+            if self.effort_history_len > 0:
+                effort_mask = effort_mask[:, self.effort_history_len:, :]
             pred_efforts = pred_actions[..., self.action_dim:]
             velocity_efforts = velocity[..., self.action_dim:]
             # Ensure masks and tensors broadcast correctly. effort_mask expected shape matches effort dims.
@@ -478,13 +508,21 @@ class FlowmatchingActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
-        
+
+        # EXPERT_HIS_C_FUT: build effort history token from the history portion of action_input.effort.
+        # At inference, action_input.effort contains only the history frames [B, effort_history_len, effort_dim].
+        effort_hist_token = None
+        if self.torque_aware and self.effort_history_len > 0:
+            effort_hist_flat = action_input.effort[:, :self.effort_history_len, :].reshape(batch_size, -1)
+            effort_hist_emb = swish(self.effort_proj_in(effort_hist_flat))
+            effort_hist_token = self.effort_proj_out(effort_hist_emb).unsqueeze(1)  # [B, 1, embed_dim]
+
         # When torque_aware, we predict both action and effort
         if self.torque_aware:
             action_effort_dim = self.config.action_dim + self.config.effort_dim
         else:
             action_effort_dim = self.config.action_dim
-            
+
         actions = torch.randn(
             size=(batch_size, self.config.action_horizon, action_effort_dim),
             dtype=vl_embs.dtype,
@@ -511,8 +549,12 @@ class FlowmatchingActionHead(nn.Module):
                 action_features = action_features + pos_embs
 
             # Join vision, language, state and action embedding along sequence dimension.
+            # EXPERT_HIS_C_FUT: prepend effort history token before state token.
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-            sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+            if effort_hist_token is not None:
+                sa_embs = torch.cat((effort_hist_token, state_features, future_tokens, action_features), dim=1)
+            else:
+                sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
             # Run model forward.
             model_output = self.model(
@@ -526,7 +568,7 @@ class FlowmatchingActionHead(nn.Module):
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
-        
+
         # If torque_aware, split the output into action and effort
         if self.torque_aware:
             action_pred = actions[:, :, :self.config.action_dim]
