@@ -122,6 +122,12 @@ class GR00TTransform(InvertibleModalityTransform):
     max_action_dim: int
     state_horizon: int
     action_horizon: int
+    
+    # Task completion prediction arguments
+    use_task_completion: bool = Field(
+        default=False,
+        description="Whether to include task completion in the transform output for training.",
+    )
 
     max_length: int = 512
     embodiment_tag: EmbodimentTag | None = None
@@ -298,6 +304,47 @@ class GR00TTransform(InvertibleModalityTransform):
 
         return actions, actions_mask, n_action_tokens
 
+    def _prepare_task_completion(self, data: dict):
+        """
+        Prepare task completion labels for training.
+        Task completion is a binary label (0 or 1) for each timestep in the action horizon.
+        Returns task_completion tensor.
+        
+        The data may contain the task completion key as:
+        - "task_completion" (already renamed)
+        - "observation.tasks.done" (original parquet column name)
+        - Any key containing "tasks.done" or "task_completion"
+        """
+        # Try to find the task completion key
+        task_completion_key = None
+        if "task_completion" in data:
+            task_completion_key = "task_completion"
+        else:
+            # Search for task completion key patterns
+            for key in data.keys():
+                if "tasks.done" in key or "task_completion" in key:
+                    task_completion_key = key
+                    break
+        
+        if task_completion_key is None:
+            # Return zeros with no mask if task completion data not available
+            task_completion = np.zeros((1), dtype=np.uint8)
+            return task_completion
+
+        task_completion = data[task_completion_key]
+        
+        # Convert tensor to numpy if needed
+        if hasattr(task_completion, 'numpy'):
+            task_completion = task_completion.numpy()
+        
+        # Take only the last value (for current step prediction)
+        # task_completion shape is [action_horizon, 1], we want just the last step
+        task_completion = task_completion[-1:]  # [1, 1]
+        
+        task_completion = task_completion.astype(np.uint8)
+
+        return task_completion
+
     def apply_single(self, data: dict) -> dict:
         transformed_data = {}
 
@@ -321,6 +368,11 @@ class GR00TTransform(InvertibleModalityTransform):
             actions, actions_mask, _ = self._prepare_action(data)
             transformed_data["action"] = actions
             transformed_data["action_mask"] = actions_mask
+            
+            # 4) Prepare task completion if enabled
+            if self.use_task_completion:
+                task_completion = self._prepare_task_completion(data)
+                transformed_data["task_completion"] = task_completion
 
         for k, v in vlm_outputs.items():
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."

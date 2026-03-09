@@ -261,7 +261,7 @@ class Gr00tPolicy(BasePolicy):
                 obs_copy[k] = np.array(v)
 
         normalized_input = self.apply_transforms(obs_copy)
-        normalized_action = self._get_action_from_normalized_input(normalized_input) if self.smooth_option not in ["rtc", "training-time-rtc"] else self._get_realtime_action_from_normalized_input(
+        normalized_action, task_completion = self._get_action_from_normalized_input(normalized_input) if self.smooth_option not in ["rtc", "training-time-rtc"] else self._get_realtime_action_from_normalized_input(
             normalized_input,
             self.prev_action_chunk,
             inference_delay,
@@ -291,17 +291,19 @@ class Gr00tPolicy(BasePolicy):
                 unnormalized_action[k] = unnormalized_action[k].squeeze(1)  # remove the 1 dimension
         elif not is_batch:
             unnormalized_action = squeeze_dict_values(unnormalized_action)
+            
+        unnormalized_action["task_completion"] = task_completion.detach().cpu().numpy()
         return unnormalized_action
 
     def _get_action_from_normalized_input(self, normalized_input: Dict[str, Any]) -> torch.Tensor:
         # Set up autocast context if needed
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
             model_pred = self.model.get_action(normalized_input)
-
         normalized_action = model_pred["action_pred"].float()
+        task_completion = model_pred["task_completion"].float()
         if self.smooth_option == "te":
             normalized_action = self.process_output(normalized_action)
-        return normalized_action
+        return normalized_action, task_completion
     
     def _get_realtime_action_from_normalized_input(self, normalized_input: Dict[str, Any],
                                                    prev_action_chunk: torch.Tensor | None,

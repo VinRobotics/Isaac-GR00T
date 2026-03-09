@@ -130,6 +130,10 @@ class ArgsConfig:
     dit_dtype: Literal["fp16", "fp8"] = "fp8"
     """DiT model dtype (fp16, fp8). Only used when use_tensorrt is True."""
 
+    task_completion_detection_path: str = None
+    """Path to a task_completion_detection.pt file saved by finetune_task_completion.py.
+    If provided, the model's task_completion_detection weights are replaced with these."""
+
 
 #####################################################################################
 
@@ -201,6 +205,12 @@ def main(args: ArgsConfig):
             denoising_steps=args.denoising_steps,
             smooth_option=args.smooth_option
         )
+
+        if args.task_completion_detection_path is not None:
+            import torch as _torch
+            tcd_state = _torch.load(args.task_completion_detection_path, map_location="cpu")
+            policy.model.action_head.task_completion_detection.load_state_dict(tcd_state)
+            print(f"Loaded task_completion_detection weights from: {args.task_completion_detection_path}")
 
         if args.guidance_option == "acg":
             policy.get_action = types.MethodType(Gr00tPolicy_ACG.get_action, policy)

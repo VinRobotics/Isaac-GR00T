@@ -286,7 +286,7 @@ def main(config: ArgsConfig):
     action_horizon_mismatch = data_action_horizon != model.action_head.config.action_horizon
     action_dim_mismatch = data_max_action_dim != model.action_head.config.action_dim
 
-    if action_horizon_mismatch or action_dim_mismatch:
+    if action_horizon_mismatch or action_dim_mismatch or 1:
         # Store old values for logging
         old_action_horizon = model.action_head.config.action_horizon
         old_action_dim = model.action_head.config.action_dim

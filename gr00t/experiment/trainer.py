@@ -79,6 +79,19 @@ class DualBrainTrainer(transformers.Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(inputs)
         loss = outputs["loss"]
+        
+        # Log additional losses to TensorBoard
+        if self.state.global_step % self.args.logging_steps == 0:
+            logs = {}
+            for key, value in outputs.items():
+                if key.startswith("loss") and key != "loss":
+                    if hasattr(value, "item"):
+                        logs[key] = value.item()
+                    else:
+                        logs[key] = value
+            if logs:
+                self.log(logs)
+        
         return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self):
