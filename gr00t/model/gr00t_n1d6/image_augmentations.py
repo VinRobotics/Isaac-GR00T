@@ -223,9 +223,14 @@ def build_image_transformations_albumentations(
     # Training transforms (using ReplayCompose for consistent augmentation across views)
     # Resize all cameras to the target size so different aspect ratios (e.g. head 600x960,
     # left/right 480x640) produce the same tensor and can be stacked.
-    target_h, target_w = image_target_size[0], image_target_size[1]
+    # Falls back to SmallestMaxSize when image_target_size is not provided.
+    if image_target_size is not None and len(image_target_size) >= 2:
+        target_h, target_w = image_target_size[0], image_target_size[1]
+        first_resize = A.Resize(height=target_h, width=target_w, interpolation=cv2.INTER_AREA)
+    else:
+        first_resize = A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA)
     train_transform_list = [
-        A.Resize(height=target_h, width=target_w, interpolation=cv2.INTER_AREA),
+        first_resize,
         FractionalRandomCrop(crop_fraction=fraction_to_use),
         A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
     ]
@@ -251,7 +256,7 @@ def build_image_transformations_albumentations(
     # Evaluation transforms (deterministic)
     eval_transform = A.Compose(
         [
-            A.Resize(height=target_h, width=target_w, interpolation=cv2.INTER_AREA),
+            first_resize,
             FractionalCenterCrop(crop_fraction=fraction_to_use),
             A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
         ]
