@@ -649,7 +649,7 @@ class EDiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
-        use_relative_position_bias: bool = True,
+        use_relative_position_bias: bool = False,
         max_relative_position: int = 32,
     ):
         super().__init__()
@@ -858,7 +858,7 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
         final_dropout: bool = True,
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
-        use_relative_position_bias: bool = True,
+        use_relative_position_bias: bool = False,
         max_relative_position: int = 512,
     ):
         super().__init__()
