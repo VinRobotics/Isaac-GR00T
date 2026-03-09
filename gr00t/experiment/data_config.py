@@ -1639,7 +1639,7 @@ class VRH3_1EffortConfig(BaseDataConfig):
 
         "state.left_hand",
         "state.right_hand",
-        "gripper_open"
+        "state.gripper_open"
     ]
     action_keys = [
         "action.left_arm",
@@ -1659,7 +1659,7 @@ class VRH3_1EffortConfig(BaseDataConfig):
 
         "effort.left_hand",
         "effort.right_hand",
-        "gripper_open"
+        "effort.gripper_open"
     ]
     language_keys = ["annotation.human.task_description"]
     observation_indices = [0]
