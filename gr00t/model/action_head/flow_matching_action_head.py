@@ -58,6 +58,87 @@ def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch
     return w
 
 
+class TaskCompletionDetector(nn.Module):
+    """
+    Predicts task completion from a variable-length sequence of VL embeddings.
+
+    A learnable CLS token (the "query") cross-attends over the full token
+    sequence via nn.MultiheadAttention, then the attended CLS representation
+    is fed through a classifier MLP.
+
+    This naturally handles any sequence length and lets the model learn which
+    tokens are informative for task completion (e.g. gripper-view tokens).
+    """
+
+    def __init__(self, seq_dim: int, hidden_dim: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        # Ensure seq_dim is divisible by num_heads
+        while seq_dim % num_heads != 0 and num_heads > 1:
+            num_heads //= 2
+
+        self.norm_in = nn.LayerNorm(seq_dim)
+
+        # Learnable CLS token — dedicated "task-completion query"
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, seq_dim))
+        nn.init.normal_(self.cls_token, std=0.02)
+
+        # Cross-attention: CLS attends over all sequence tokens
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=seq_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_attn = nn.LayerNorm(seq_dim)
+
+        # Classifier MLP with dropout
+        self.classifier = nn.Sequential(
+            nn.Linear(seq_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Small-scale init to prevent NaN in bfloat16.
+        Default PyTorch kaiming init produces large attention logits which
+        overflow bfloat16 softmax. We scale all Linear weights down to
+        std=0.02 (same as GPT-2 / ViT convention) and zero biases.
+        The final classifier bias is also zeroed so the model starts at
+        ~0.5 predicted probability, avoiding saturated sigmoids at init.
+        """
+        # Cross-attention projection weights
+        for name, p in self.cross_attn.named_parameters():
+            if "weight" in name:
+                nn.init.normal_(p, mean=0.0, std=0.02)
+            elif "bias" in name:
+                nn.init.zeros_(p)
+        # Classifier MLP
+        for module in self.classifier.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, seq_dim) — variable-length VL token sequence
+        Returns:
+            logits: (B, 1)
+        """
+        x = self.norm_in(x)
+        cls = self.cls_token.expand(x.shape[0], -1, -1)  # (B, 1, seq_dim)
+        # CLS queries the full sequence; attn handles any T
+        attended, _ = self.cross_attn(query=cls, key=x, value=x)  # (B, 1, seq_dim)
+        attended = self.norm_attn(attended.squeeze(1))              # (B, seq_dim)
+        return self.classifier(attended)
+
+
 class CategorySpecificLinear(nn.Module):
     def __init__(self, num_categories, input_dim, hidden_dim):
         super().__init__()
@@ -245,16 +326,9 @@ class FlowmatchingActionHead(nn.Module):
         )
         
         # done detection
-        self.task_completion_detection = nn.Sequential(
-            
-                nn.Linear(
-                    config.hidden_size*2, config.hidden_size
-                ),
-                nn.GELU(),
-                nn.Linear(
-                    config.hidden_size, 1
-                ),
-            
+        self.task_completion_detection = TaskCompletionDetector(
+            seq_dim=config.backbone_embedding_dim,
+            hidden_dim=config.hidden_size,
         )
         self.task_completion_detection_loss = nn.BCEWithLogitsLoss()
         
@@ -293,6 +367,7 @@ class FlowmatchingActionHead(nn.Module):
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
         self.task_completion_only = False  # set True to skip diffusion forward pass
+        self.task_completion_loss_weight = 1.0  # scale factor for task completion loss
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
@@ -420,15 +495,14 @@ class FlowmatchingActionHead(nn.Module):
         # get task completion
         task_completion = action_input.task_completion.squeeze().float()
         vl_task_completion_embs = backbone_output.backbone_features.detach()
-        vl_task_completion_embs = vl_task_completion_embs.mean(dim=1)
-        
         vl_task_completion_logits = self.task_completion_detection(vl_task_completion_embs).squeeze()
         vl_task_completion_loss = self.task_completion_detection_loss(vl_task_completion_logits, task_completion)
 
         # Skip expensive diffusion forward when only training task_completion_detection
         if self.task_completion_only:
+            weighted_loss = self.task_completion_loss_weight * vl_task_completion_loss
             return BatchFeature(data={
-                "loss": vl_task_completion_loss,
+                "loss": weighted_loss,
                 "loss_vl_task_completion": vl_task_completion_loss.detach(),
             })
 
@@ -544,8 +618,6 @@ class FlowmatchingActionHead(nn.Module):
 
         backbone_output = self.process_backbone_output(backbone_output)
         vl_task_completion_embs = backbone_output.backbone_features.detach()
-        vl_task_completion_embs = vl_task_completion_embs.mean(dim=1)
-        
         vl_task_completion_logits = self.task_completion_detection(vl_task_completion_embs).squeeze()
         vl_task_completion_pred = F.sigmoid(vl_task_completion_logits)
         # Get vision and language embeddings.
