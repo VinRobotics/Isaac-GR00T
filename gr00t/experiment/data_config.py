@@ -1702,9 +1702,12 @@ class VRH3_1EffortConfig(BaseDataConfig):
     def transform(self):
         transforms = [
             # video transforms
-            VideoToTensor(apply_to=self.video_keys),
-            VideoCrop(apply_to=self.video_keys, scale=0.95),
-            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
             VideoColorJitter(
                 apply_to=self.video_keys,
                 brightness=0.3,
