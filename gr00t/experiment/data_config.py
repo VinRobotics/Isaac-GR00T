@@ -1649,16 +1649,16 @@ class VRH3_1EffortConfig(BaseDataConfig):
         "action.gripper_open"
     ]
     effort_keys = [
-        "state.left_shoulder",
-        "state.left_elbow",
-        "state.left_wrist",
+        "effort.left_shoulder",
+        "effort.left_elbow",
+        "effort.left_wrist",
         
-        "state.right_shoulder",
-        "state.right_elbow",
-        "state.right_wrist",
+        "effort.right_shoulder",
+        "effort.right_elbow",
+        "effort.right_wrist",
 
-        "state.left_hand",
-        "state.right_hand",
+        "effort.left_hand",
+        "effort.right_hand",
         "gripper_open"
     ]
     language_keys = ["annotation.human.task_description"]
