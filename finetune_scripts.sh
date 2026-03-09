@@ -1,16 +1,21 @@
 export NUM_GPUS=1
-CUDA_VISIBLE_DEVICES=0 python \
+export WANDB_API_KEY=435621b80bbb25dfdc8668babf17e242432c6c2b
+export WANDB_PROJECT=vrh3_sim_pick_place
+
+HF_HUB_OFFLINE=0
+
+CUDA_VISIBLE_DEVICES=2 python \
     gr00t/experiment/launch_finetune.py \
     --base-model-path nvidia/GR00T-N1.6-3B \
-    --dataset-path ./home/locht1/Documents/locht1/code_convert/output/20260227_VR_H31_bodyshop_place_part2_speedup1 /home/locht1/Documents/locht1/code_convert/output/20260227_VR_H31_bodyshop_place_part2_recovery_speedup1 \
+    --dataset-path mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_trym_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_recovery_trym_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_ood_trym_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260302_VR_H31_bodyshop_place_part2_linhld23_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260306_VR_H31_bodyshop_place_part2_correction_stereo_exclude_torque_speedup1 \
     --embodiment-tag NEW_EMBODIMENT \
-    --modality-config-path /home/locht1/Documents/locht1/Isaac-GR00T/data_config/vrh3_two_hands.py \
+    --modality-config-path /home/locht1/gr00t/data_config/vrh3_two_hands.py \
     --num-gpus $NUM_GPUS \
-    --output-dir ~/vr_checkpoints/gr00t_n16_vrh3_two_hands \
+    --output-dir /mnt/data/sftp/data/vla/vr_checkpoints/gr00t_n16_vrh3_two_hands_chunk50_0903 \
     --save-total-limit 5 \
-    --save-steps 5000 \
+    --save-steps 10000 \
     --max-steps 50000 \
     --use-wandb \
-    --global-batch-size 32 \
+    --global-batch-size 64 \
     --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
     --dataloader-num-workers 6
