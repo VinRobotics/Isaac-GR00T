@@ -315,7 +315,8 @@ class Gr00tN1d6ActionHead(nn.Module):
         effort_mask = effort_mask[:, :actions.shape[1], :self.effort_dim]
         pred_efforts = pred_actions[..., self.action_dim:self.action_dim + self.effort_dim]
         velocity_efforts = velocity[..., self.action_dim:self.action_dim + self.effort_dim]
-        effort_loss = F.mse_loss(pred_efforts, velocity_efforts, reduction="none") * effort_mask
+        # Compute in float32 to avoid bf16 overflow when squaring large initial values.
+        effort_loss = F.mse_loss(pred_efforts.float(), velocity_efforts.float(), reduction="none") * effort_mask.float()
         effort_loss = effort_loss.sum() / (effort_mask.sum() + 1e-6)
         loss = loss + 0.1 * effort_loss
         _check("effort_loss", effort_loss)
@@ -495,20 +496,35 @@ class Gr00tN1d6ActionHead(nn.Module):
             # --- action_encoder.W1.W  [E, action_dim+effort_dim, H] ---
             w = _get("action_encoder.W1.W")
             if w is not None:
-                orig = w.shape[1]  # original action_dim (e.g. 29)
-                self.action_encoder.W1.W.data[:, :orig, :] = w.to(self.action_encoder.W1.W.device)
+                orig = w.shape[1]  # original action_dim (e.g. 128)
+                num_emb, new_action_dim, hidden_size = self.action_encoder.W1.W.shape
+                # Pretrained action slice + 0.02*randn effort slice (matches N1.5 approach).
+                new_W = torch.randn(num_emb, new_action_dim, hidden_size, dtype=w.dtype) * 0.02
+                new_W[:, :orig, :] = w
+                self.action_encoder.W1.W.data.copy_(new_W.to(self.action_encoder.W1.W.device))
+                print(f"  Expanded action_encoder.W1.W: {list(w.shape)} -> {list(new_W.shape)}")
 
             # --- action_decoder.layer2.W  [E, H, action_dim+effort_dim] ---
             w = _get("action_decoder.layer2.W")
             if w is not None:
                 orig = w.shape[2]
-                self.action_decoder.layer2.W.data[:, :, :orig] = w.to(self.action_decoder.layer2.W.device)
+                num_emb, hidden_size, new_action_dim = self.action_decoder.layer2.W.shape
+                # Pretrained action slice + 0.02*randn effort slice.
+                new_W = torch.randn(num_emb, hidden_size, new_action_dim, dtype=w.dtype) * 0.02
+                new_W[:, :, :orig] = w
+                self.action_decoder.layer2.W.data.copy_(new_W.to(self.action_decoder.layer2.W.device))
+                print(f"  Expanded action_decoder.layer2.W: {list(w.shape)} -> {list(new_W.shape)}")
 
             # --- action_decoder.layer2.b  [E, action_dim+effort_dim] ---
             b = _get("action_decoder.layer2.b")
             if b is not None:
                 orig = b.shape[1]
-                self.action_decoder.layer2.b.data[:, :orig] = b.to(self.action_decoder.layer2.b.device)
+                num_emb, new_action_dim = self.action_decoder.layer2.b.shape
+                # Pretrained action bias + zeros for effort slice.
+                new_b = torch.zeros(num_emb, new_action_dim, dtype=b.dtype)
+                new_b[:, :orig] = b
+                self.action_decoder.layer2.b.data.copy_(new_b.to(self.action_decoder.layer2.b.device))
+                print(f"  Expanded action_decoder.layer2.b: {list(b.shape)} -> {list(new_b.shape)}")
 
     @property
     def device(self):
