@@ -24,8 +24,11 @@ def extract_step_data(
         step_data[modality] = {}
         # Sample timesteps according to delta indices configuration
         indices_to_load = [step_index + delta_index for delta_index in config.delta_indices]
+        # Always clamp negative indices to 0 (backward-looking history before episode start
+        # should repeat the first frame, not wrap to episode end via pandas negative indexing).
+        indices_to_load = [max(0, idx) for idx in indices_to_load]
         if allow_padding:
-            indices_to_load = [max(0, min(idx, len(episode_data) - 1)) for idx in indices_to_load]
+            indices_to_load = [min(idx, len(episode_data) - 1) for idx in indices_to_load]
         for key in config.modality_keys:
             if f"{modality}.{key}" in episode_data.columns:
                 modality_data = episode_data[f"{modality}.{key}"].iloc[indices_to_load]
@@ -208,9 +211,14 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.shard_lengths = shard_lengths
 
     def get_effective_episode_length(self, episode_index: int) -> int:
-        """Get the effective episode length accounting for action horizon."""
+        """Get the effective episode length accounting for the maximum forward delta across all modalities."""
         original_length = self.episode_loader.get_episode_length(episode_index)
-        return max(0, original_length - self.action_horizon + 1)
+        max_forward_delta = max(
+            max(cfg.delta_indices)
+            for cfg in self.modality_configs.values()
+            if cfg.delta_indices
+        )
+        return max(0, original_length - max_forward_delta)
 
     def __len__(self):
         """Return the number of shards in the dataset."""
