@@ -193,7 +193,6 @@ class Gr00tN1d6ActionHead(nn.Module):
         # Embed effort.
         B = action_input.action.shape[0]
         # Slice last dim to self.effort_dim to guard against max_effort_dim padding mismatch.
-        print(f"Effort original shape: {action_input.effort.shape}")
         effort_history = action_input.effort[:, :self.effort_history_len, :self.effort_dim]
         effort_future = action_input.effort[:, self.effort_history_len:, :self.effort_dim]
 
@@ -279,8 +278,10 @@ class Gr00tN1d6ActionHead(nn.Module):
         effort_mask = action_input.effort_mask
         if self.effort_history_len > 0:
             effort_mask = effort_mask[:, self.effort_history_len:, :]
-        pred_efforts = pred_actions[..., self.action_dim:]
-        velocity_efforts = velocity[..., self.action_dim:]
+        # Trim horizon and feature dim to match the effort slice used in the trajectory.
+        effort_mask = effort_mask[:, :actions.shape[1], :self.effort_dim]
+        pred_efforts = pred_actions[..., self.action_dim:self.action_dim + self.effort_dim]
+        velocity_efforts = velocity[..., self.action_dim:self.action_dim + self.effort_dim]
         effort_loss = F.mse_loss(pred_efforts, velocity_efforts, reduction="none") * effort_mask
         effort_loss = effort_loss.sum() / (effort_mask.sum() + 1e-6)
         loss = loss + 0.1 * effort_loss
