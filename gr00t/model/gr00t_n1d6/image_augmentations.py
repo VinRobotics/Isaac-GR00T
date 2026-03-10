@@ -221,18 +221,14 @@ def build_image_transformations_albumentations(
         max_size = shortest_image_edge
 
     # Training transforms (using ReplayCompose for consistent augmentation across views)
-    # Resize all cameras to the target size so different aspect ratios (e.g. head 600x960,
-    # left/right 480x640) produce the same tensor and can be stacked.
-    # Falls back to SmallestMaxSize when image_target_size is not provided.
-    if image_target_size is not None and len(image_target_size) >= 2:
-        target_h, target_w = image_target_size[0], image_target_size[1]
-        first_resize = A.Resize(height=target_h, width=target_w, interpolation=cv2.INTER_AREA)
-    else:
-        first_resize = A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA)
+    # LongestMaxSize + PadIfNeeded letterboxes to square so cameras with different
+    # aspect ratios all produce the same (max_size x max_size) tensor and can be stacked.
     train_transform_list = [
-        first_resize,
+        A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+        A.PadIfNeeded(min_height=max_size, min_width=max_size, border_mode=cv2.BORDER_CONSTANT, value=0, p=1.0),
         FractionalRandomCrop(crop_fraction=fraction_to_use),
-        A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+        A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+        A.PadIfNeeded(min_height=max_size, min_width=max_size, border_mode=cv2.BORDER_CONSTANT, value=0, p=1.0),
     ]
 
     if random_rotation_angle is not None and random_rotation_angle != 0:
@@ -256,9 +252,11 @@ def build_image_transformations_albumentations(
     # Evaluation transforms (deterministic)
     eval_transform = A.Compose(
         [
-            first_resize,
+            A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+            A.PadIfNeeded(min_height=max_size, min_width=max_size, border_mode=cv2.BORDER_CONSTANT, value=0, p=1.0),
             FractionalCenterCrop(crop_fraction=fraction_to_use),
-            A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+            A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+            A.PadIfNeeded(min_height=max_size, min_width=max_size, border_mode=cv2.BORDER_CONSTANT, value=0, p=1.0),
         ]
     )
 

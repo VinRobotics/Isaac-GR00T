@@ -514,10 +514,6 @@ class Gr00tN1d6Processor(BaseProcessor):
                 "random_rotation_angle",
                 "color_jitter_params",
                 "use_relative_action",
-                "image_target_size",
-                "image_crop_size",
-                "shortest_image_edge",
-                "crop_fraction",
             ]
             for key in override_keys:
                 if key in kwargs:
