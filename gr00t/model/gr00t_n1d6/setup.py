@@ -145,20 +145,16 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                     )
                 logging.info("mask_token not in checkpoint - initialized")
 
-            # Re-initialize effort_proj_in / effort_proj_out if they were missing from the
-            # checkpoint (new layers).  This guards against any NaN/Inf that could arise from
-            # checkpoint loading artefacts and ensures a clean zero-output start.
+            # Always re-initialize effort_proj_in / effort_proj_out — these are new layers
+            # never present in a base pretrained checkpoint.  Unconditional init avoids
+            # NaN/Inf gradients regardless of whether missing_keys detection works.
             if effort_dim > 0:
-                effort_proj_missing = any(
-                    "effort_proj" in k for k in loading_info.get("missing_keys", [])
-                )
-                if effort_proj_missing:
-                    with torch.no_grad():
-                        nn.init.kaiming_uniform_(model.action_head.effort_proj_in.weight, a=0.01)
-                        nn.init.zeros_(model.action_head.effort_proj_in.bias)
-                        nn.init.zeros_(model.action_head.effort_proj_out.weight)
-                        nn.init.zeros_(model.action_head.effort_proj_out.bias)
-                    logging.info("effort_proj_in/out not in checkpoint — re-initialized")
+                with torch.no_grad():
+                    nn.init.kaiming_uniform_(model.action_head.effort_proj_in.weight, a=0.01)
+                    nn.init.zeros_(model.action_head.effort_proj_in.bias)
+                    nn.init.zeros_(model.action_head.effort_proj_out.weight)
+                    nn.init.zeros_(model.action_head.effort_proj_out.bias)
+                logging.info("effort_proj_in/out re-initialized for clean start")
 
             # Extend action_encoder / action_decoder weights for the effort dimension.
             # from_pretrained skips mismatched tensors; we copy the pretrained action slice here.
