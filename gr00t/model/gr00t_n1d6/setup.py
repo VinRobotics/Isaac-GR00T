@@ -51,6 +51,7 @@ def _load_checkpoint_state_dict(checkpoint_path: str, transformers_loading_kwarg
 
     # --- HuggingFace Hub path ---
     from transformers.utils import cached_file as _cached_file
+    # Try single-file formats first.
     for filename in ("model.safetensors", "pytorch_model.bin"):
         try:
             resolved = _cached_file(checkpoint_path, filename, **transformers_loading_kwargs)
@@ -61,6 +62,18 @@ def _load_checkpoint_state_dict(checkpoint_path: str, transformers_loading_kwarg
                     return result
         except Exception:
             continue
+    # Sharded safetensors: locate the index file to get the cache directory.
+    try:
+        index_resolved = _cached_file(
+            checkpoint_path, "model.safetensors.index.json", **transformers_loading_kwargs
+        )
+        if index_resolved is not None:
+            local_dir = _Path(index_resolved).parent
+            result = _load_local(local_dir)
+            if result is not None:
+                return result
+    except Exception:
+        pass
     raise FileNotFoundError(f"No model weights found at {checkpoint_path}")
 
 
