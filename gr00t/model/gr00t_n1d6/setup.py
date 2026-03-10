@@ -156,6 +156,23 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                     nn.init.zeros_(model.action_head.effort_proj_out.bias)
                 logging.info("effort_proj_in/out re-initialized for clean start")
 
+                # --- Diagnostic: verify no NaN/Inf in new layers ---
+                def _check_layer(name, layer):
+                    w = layer.weight.float()
+                    b = layer.bias.float()
+                    has_nan = torch.isnan(w).any() or torch.isnan(b).any()
+                    has_inf = torch.isinf(w).any() or torch.isinf(b).any()
+                    logging.info(
+                        "[init-check] %s: weight=[min=%.4f, max=%.4f], bias=[min=%.4f, max=%.4f], "
+                        "has_nan=%s, has_inf=%s",
+                        name, w.min(), w.max(), b.min(), b.max(), has_nan.item(), has_inf.item(),
+                    )
+                    if has_nan or has_inf:
+                        logging.warning("WARNING: NaN/Inf detected in %s after init!", name)
+
+                _check_layer("effort_proj_in", model.action_head.effort_proj_in)
+                _check_layer("effort_proj_out", model.action_head.effort_proj_out)
+
             # Extend action_encoder / action_decoder weights for the effort dimension.
             # from_pretrained skips mismatched tensors; we copy the pretrained action slice here.
             if effort_dim > 0:
@@ -166,6 +183,10 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                     "action_head.action_decoder.layer2.b",
                 }
                 needs_extension = any(k[0] in effort_keys for k in mismatched)
+                logging.info(
+                    "[init-check] mismatched_keys=%s, needs_extension=%s",
+                    [k[0] for k in mismatched], needs_extension,
+                )
                 if needs_extension:
                     pretrained_sd = _load_checkpoint_state_dict(
                         self.config.training.start_from_checkpoint,
@@ -174,6 +195,13 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                     model.action_head.extend_weights_for_effort(pretrained_sd)
                     logging.info(
                         "Extended action_encoder / action_decoder weights for effort_dim=%d", effort_dim
+                    )
+                else:
+                    logging.warning(
+                        "[init-check] needs_extension=False — action_encoder/decoder were either "
+                        "loaded from checkpoint (same size) or skipped without extending. "
+                        "Verify action_encoder.W1.W shape: %s",
+                        list(model.action_head.action_encoder.W1.W.shape),
                     )
 
         else:
