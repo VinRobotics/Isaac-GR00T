@@ -1651,37 +1651,22 @@ class VRH3EffortConfig(BaseDataConfig):
 class VRH3_1EffortConfig(BaseDataConfig):
     video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
     state_keys = [
-        "state.left_shoulder",
-        "state.left_elbow",
-        "state.left_wrist",
-        
-        "state.right_shoulder",
-        "state.right_elbow",
-        "state.right_wrist",
-
+        "state.left_arm",
+        "state.right_arm",
         "state.left_hand",
         "state.right_hand",
-        "state.gripper_open"
     ]
     action_keys = [
         "action.left_arm",
         "action.right_arm",
         "action.left_hand",
-        "action.right_hand",
-        "action.gripper_open"
+        "action.right_hand"
     ]
     effort_keys = [
-        "effort.left_shoulder",
-        "effort.left_elbow",
-        "effort.left_wrist",
-        
-        "effort.right_shoulder",
-        "effort.right_elbow",
-        "effort.right_wrist",
-
+        "effort.left_arm",
+        "effort.right_arm",
         "effort.left_hand",
-        "effort.right_hand",
-        "effort.gripper_open"
+        "effort.right_hand"
     ]
     language_keys = ["annotation.human.task_description"]
     observation_indices = [0]
@@ -1690,7 +1675,7 @@ class VRH3_1EffortConfig(BaseDataConfig):
     effort_history_len = 16  # equals future effort len (len(action_indices))
     effort_indices = list(range(-15, 1)) + list(range(1, 17))  # 16 history + 16 future
 
-    effort_dims=26 + 1
+    effort_dims=26
 
     def modality_config(self):
         video_modality = ModalityConfig(
@@ -1783,7 +1768,7 @@ class VRH3_1EffortConfig(BaseDataConfig):
                 effort_history_len=self.effort_history_len,
                 max_state_dim=64,
                 max_action_dim=32,
-                max_effort_dim=27,
+                max_effort_dim=26,
             ),
         ]
 
