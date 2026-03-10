@@ -226,7 +226,7 @@ def build_image_transformations_albumentations(
     train_transform_list = [
         A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
         FractionalRandomCrop(crop_fraction=fraction_to_use),
-        A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+        A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
         A.PadIfNeeded(
             min_height=max_size,
             min_width=max_size,
@@ -260,7 +260,7 @@ def build_image_transformations_albumentations(
         [
             A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
             FractionalCenterCrop(crop_fraction=fraction_to_use),
-            A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+            A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
             A.PadIfNeeded(
                 min_height=max_size,
                 min_width=max_size,
