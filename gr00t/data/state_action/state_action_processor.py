@@ -106,7 +106,20 @@ class StateActionProcessor:
             if key not in self.statistics or override:
                 self.statistics[key] = deepcopy(statistics[key])
             else:
-                print(f"Embodiment tag {key} already in statistics, skipping updating")
+                # Merge at modality level: add new modalities (e.g. "effort") that are not
+                # yet present in the existing statistics, while keeping existing ones intact.
+                new_modalities = []
+                for modality, modality_stats in statistics[key].items():
+                    if modality not in self.statistics[key]:
+                        self.statistics[key][modality] = deepcopy(modality_stats)
+                        new_modalities.append(modality)
+                if new_modalities:
+                    print(
+                        f"Embodiment tag {key} already in statistics; "
+                        f"merged new modalities: {new_modalities}"
+                    )
+                else:
+                    print(f"Embodiment tag {key} already in statistics, skipping updating")
         self._compute_normalization_parameters()
 
     def _compute_normalization_parameters(self) -> None:
@@ -252,7 +265,12 @@ class StateActionProcessor:
             return normalized_values
 
         if "effort" not in self.norm_params.get(embodiment_tag, {}):
-            return normalized_values
+            raise KeyError(
+                f"Effort normalization statistics not found for embodiment '{embodiment_tag}'. "
+                f"Make sure 'observation.effort' is in the dataset's meta/info.json as a float feature "
+                f"and regenerate stats by deleting meta/stats.json and re-running: "
+                f"python gr00t/data/stats.py <dataset_path> <embodiment_tag>"
+            )
 
         for joint_group in effort_modality_config.modality_keys:
             if joint_group not in effort:

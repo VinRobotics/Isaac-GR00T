@@ -358,7 +358,9 @@ class Gr00tN1d6Processor(BaseProcessor):
             dim=-1,
         )
 
-        # Normalize and pack effort if configured.
+        # Normalize and pack effort if configured (stored temporarily, added after final dict init).
+        normalized_efforts_tensor = None
+        effort_mask = None
         if "effort" in self.modality_configs.get(embodiment_tag.value, {}):
             effort_data = content.efforts
             normalized_efforts = self.state_action_processor.apply_effort(
@@ -379,8 +381,7 @@ class Gr00tN1d6Processor(BaseProcessor):
             )  # [total_steps, max_effort_dim]
             effort_mask = torch.ones_like(normalized_efforts)
             effort_mask[:, effort_dim:] = 0
-            transformed_inputs["effort"] = normalized_efforts.to(torch.get_default_dtype())
-            transformed_inputs["effort_mask"] = effort_mask
+            normalized_efforts_tensor = normalized_efforts.to(torch.get_default_dtype())
 
         # Crop and resize images.
         if self.training:
@@ -411,6 +412,9 @@ class Gr00tN1d6Processor(BaseProcessor):
         transformed_inputs.update(vlm_inputs)
         if action_mask is not None:
             transformed_inputs["action_mask"] = action_mask
+        if normalized_efforts_tensor is not None:
+            transformed_inputs["effort"] = normalized_efforts_tensor
+            transformed_inputs["effort_mask"] = effort_mask
         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
         return transformed_inputs
 
