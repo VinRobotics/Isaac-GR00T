@@ -191,38 +191,18 @@ class Gr00tN1d6ActionHead(nn.Module):
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
 
-        # NaN/Inf step-check helper (prints once per offending tensor, training only).
-        _nan_reported = set()
-        def _check(tag, t):
-            if self.training and tag not in _nan_reported:
-                t_f = t.float()
-                if torch.isnan(t_f).any() or torch.isinf(t_f).any():
-                    print(
-                        f"[nan-check] {tag}: shape={list(t.shape)} "
-                        f"nan={torch.isnan(t_f).sum().item()} "
-                        f"inf={torch.isinf(t_f).sum().item()} "
-                        f"min={t_f.min().item():.4f} max={t_f.max().item():.4f}"
-                    )
-                    _nan_reported.add(tag)
-
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
-        _check("state_input", action_input.state)
-        _check("state_features", state_features)
 
         # Embed effort.
         B = action_input.action.shape[0]
         # Slice last dim to self.effort_dim to guard against max_effort_dim padding mismatch.
         effort_history = action_input.effort[:, :self.effort_history_len, :self.effort_dim]
         effort_future = action_input.effort[:, self.effort_history_len:, :self.effort_dim]
-        _check("effort_history", effort_history)
-        _check("effort_future", effort_future)
 
         effort_hist_flat = effort_history.reshape(B, -1)
         effort_hist_emb = swish(self.effort_proj_in(effort_hist_flat))
         effort_hist_token = self.effort_proj_out(effort_hist_emb).unsqueeze(1)
-        _check("effort_hist_emb", effort_hist_emb)
-        _check("effort_hist_token", effort_hist_token)
 
         # Dropout state features.
         if self.state_dropout_prob > 0:
@@ -243,7 +223,6 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         # Embed noised action trajectory.
         actions = action_input.action
-        _check("actions_input", actions)
         # Trim effort_future horizon to match action horizon (both should be equal by design).
         effort_future = effort_future[:, :actions.shape[1], :]
         actions = torch.concat([actions, effort_future], dim=-1)
@@ -253,24 +232,19 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         noisy_trajectory = (1 - t) * noise + t * actions
         velocity = actions - noise
-        _check("noisy_trajectory", noisy_trajectory)
-        _check("velocity", velocity)
 
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
         action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
-        _check("action_features", action_features)
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
-        _check("action_features_pos", action_features)
 
         # Join vision, language, state and action embedding along sequence dimension.
         sa_embs = torch.cat((effort_hist_token, state_features, action_features), dim=1)
-        _check("sa_embs", sa_embs)
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         if self.config.use_alternate_vl_dit:
@@ -293,11 +267,9 @@ class Gr00tN1d6ActionHead(nn.Module):
                 timestep=t_discretized,
                 return_all_hidden_states=True,
             )
-        _check("model_output", model_output)
 
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
-        _check("pred_actions", pred_actions)
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
@@ -306,7 +278,6 @@ class Gr00tN1d6ActionHead(nn.Module):
         velocity_actions = velocity[..., :self.action_dim]
         action_loss = F.mse_loss(pred_only_actions, velocity_actions, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
-        _check("action_loss", action_loss)
 
         effort_mask = action_input.effort_mask
         if self.effort_history_len > 0:
@@ -319,8 +290,6 @@ class Gr00tN1d6ActionHead(nn.Module):
         effort_loss = F.mse_loss(pred_efforts.float(), velocity_efforts.float(), reduction="none") * effort_mask.float()
         effort_loss = effort_loss.sum() / (effort_mask.sum() + 1e-6)
         loss = loss + 0.1 * effort_loss
-        _check("effort_loss", effort_loss)
-        _check("total_loss", loss)
 
         return {
             "loss": loss,
