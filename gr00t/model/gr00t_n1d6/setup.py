@@ -173,36 +173,23 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 _check_layer("effort_proj_in", model.action_head.effort_proj_in)
                 _check_layer("effort_proj_out", model.action_head.effort_proj_out)
 
-            # Extend action_encoder / action_decoder weights for the effort dimension.
-            # from_pretrained skips mismatched tensors; we copy the pretrained action slice here.
+            # Always extend action_encoder / action_decoder weights for the effort dimension.
+            # from_pretrained's mismatched_keys detection is unreliable (depends on checkpoint
+            # config defaults), so we unconditionally load pretrained weights into the action
+            # slice — mirroring the old N1.5 expand_action_weights_for_torque_aware approach.
             if effort_dim > 0:
-                mismatched = loading_info.get("mismatched_keys", [])
-                effort_keys = {
-                    "action_head.action_encoder.W1.W",
-                    "action_head.action_decoder.layer2.W",
-                    "action_head.action_decoder.layer2.b",
-                }
-                needs_extension = any(k[0] in effort_keys for k in mismatched)
                 logging.info(
-                    "[init-check] mismatched_keys=%s, needs_extension=%s",
-                    [k[0] for k in mismatched], needs_extension,
+                    "[init-check] mismatched_keys=%s",
+                    [k[0] for k in loading_info.get("mismatched_keys", [])],
                 )
-                if needs_extension:
-                    pretrained_sd = _load_checkpoint_state_dict(
-                        self.config.training.start_from_checkpoint,
-                        self.transformers_loading_kwargs,
-                    )
-                    model.action_head.extend_weights_for_effort(pretrained_sd)
-                    logging.info(
-                        "Extended action_encoder / action_decoder weights for effort_dim=%d", effort_dim
-                    )
-                else:
-                    logging.warning(
-                        "[init-check] needs_extension=False — action_encoder/decoder were either "
-                        "loaded from checkpoint (same size) or skipped without extending. "
-                        "Verify action_encoder.W1.W shape: %s",
-                        list(model.action_head.action_encoder.W1.W.shape),
-                    )
+                pretrained_sd = _load_checkpoint_state_dict(
+                    self.config.training.start_from_checkpoint,
+                    self.transformers_loading_kwargs,
+                )
+                model.action_head.extend_weights_for_effort(pretrained_sd)
+                logging.info(
+                    "Extended action_encoder / action_decoder weights for effort_dim=%d", effort_dim
+                )
 
         else:
             model = self.model_class(
