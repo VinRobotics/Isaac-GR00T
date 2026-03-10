@@ -251,6 +251,9 @@ class StateActionProcessor:
         if effort_modality_config is None:
             return normalized_values
 
+        if "effort" not in self.norm_params.get(embodiment_tag, {}):
+            return normalized_values
+
         for joint_group in effort_modality_config.modality_keys:
             if joint_group not in effort:
                 raise KeyError(
