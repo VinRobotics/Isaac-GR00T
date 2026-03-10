@@ -68,7 +68,7 @@ if __name__ == "__main__":
     config.model.model_name = "nvidia/Eagle-Block2A-2B-v2"
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
-    config.model.use_albumentations_transforms = True  # fixed: LongestMaxSize+PadIfNeeded letterboxes to square for cameras with different aspect ratios
+    config.model.use_albumentations_transforms = False  # fixed: LongestMaxSize+PadIfNeeded letterboxes to square for cameras with different aspect ratios
 
     config.training.start_from_checkpoint = ft_config.base_model_path
     config.training.optim = "adamw_torch"
