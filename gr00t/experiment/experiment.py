@@ -72,7 +72,7 @@ def warn_configs(config: Config):
     if (
         hasattr(config.model, "image_crop_size")
         and hasattr(config.model, "image_target_size")
-        and (config.model.image_crop_size is not None or config.model.image_target_size is not None)
+        and (config.model.image_crop_size is not None and config.model.image_target_size is not None)
     ):
         assert (
             config.model.image_crop_size is not None and config.model.image_target_size is not None

@@ -71,8 +71,8 @@ if __name__ == "__main__":
     config.model.use_albumentations_transforms = True
     # Resize all cameras to this target so mixed-resolution cameras (e.g. head 600x960,
     # left/right 480x640) produce identical tensors that can be stacked.
+    # shortest_image_edge (256) still controls final output size to match pretrained model.
     config.model.image_target_size = [480, 640]
-    config.model.shortest_image_edge = None  # use image_target_size[0] (480) as max_size
 
     config.training.start_from_checkpoint = ft_config.base_model_path
     config.training.optim = "adamw_torch"
