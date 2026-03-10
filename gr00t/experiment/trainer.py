@@ -303,6 +303,22 @@ class Gr00tTrainer(Trainer):
         self.loss = loss
 
         # --------------------------------------------------------------
+        # Log effort_loss and action_loss to WandB if present in outputs.
+        # --------------------------------------------------------------
+        if (
+            self.state.global_step % self.args.logging_steps == 0
+            and model.training
+            and self.args.local_rank in (-1, 0)
+        ):
+            extra = {}
+            for key in ("action_loss", "effort_loss"):
+                val = outputs.get(key) if isinstance(outputs, dict) else getattr(outputs, key, None)
+                if val is not None:
+                    extra[key] = val.detach().float().mean().item()
+            if extra:
+                self.log(extra)
+
+        # --------------------------------------------------------------
         # Accuracy calculation
         # --------------------------------------------------------------
         if (
