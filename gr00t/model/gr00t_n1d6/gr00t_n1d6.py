@@ -34,6 +34,10 @@ class Gr00tN1d6ActionHead(nn.Module):
         self.effort_dim_in = self.effort_dim * self.effort_history_len
         self.effort_proj_in = nn.Linear(self.effort_dim_in, 2 * self.input_embedding_dim)
         self.effort_proj_out = nn.Linear(2 * self.input_embedding_dim, self.input_embedding_dim)
+        # Zero-init the output projection so the effort token starts as a zero vector,
+        # adding no noise to the pretrained backbone at the start of fine-tuning.
+        nn.init.zeros_(self.effort_proj_out.weight)
+        nn.init.zeros_(self.effort_proj_out.bias)
 
         # Initialize components directly from config
         if config.use_alternate_vl_dit:

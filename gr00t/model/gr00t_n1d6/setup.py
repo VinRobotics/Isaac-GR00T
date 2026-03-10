@@ -11,6 +11,7 @@ from gr00t.model.gr00t_n1d6.gr00t_n1d6 import Gr00tN1d6
 from gr00t.model.gr00t_n1d6.processing_gr00t_n1d6 import Gr00tN1d6Processor
 from gr00t.model.registry import register_model
 import numpy as np
+from torch import nn
 from termcolor import colored
 import torch
 from transformers import AutoModel, AutoProcessor
@@ -143,6 +144,21 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                         0.02 * torch.randn_like(model.action_head.mask_token)
                     )
                 logging.info("mask_token not in checkpoint - initialized")
+
+            # Re-initialize effort_proj_in / effort_proj_out if they were missing from the
+            # checkpoint (new layers).  This guards against any NaN/Inf that could arise from
+            # checkpoint loading artefacts and ensures a clean zero-output start.
+            if effort_dim > 0:
+                effort_proj_missing = any(
+                    "effort_proj" in k for k in loading_info.get("missing_keys", [])
+                )
+                if effort_proj_missing:
+                    with torch.no_grad():
+                        nn.init.kaiming_uniform_(model.action_head.effort_proj_in.weight, a=0.01)
+                        nn.init.zeros_(model.action_head.effort_proj_in.bias)
+                        nn.init.zeros_(model.action_head.effort_proj_out.weight)
+                        nn.init.zeros_(model.action_head.effort_proj_out.bias)
+                    logging.info("effort_proj_in/out not in checkpoint — re-initialized")
 
             # Extend action_encoder / action_decoder weights for the effort dimension.
             # from_pretrained skips mismatched tensors; we copy the pretrained action slice here.
