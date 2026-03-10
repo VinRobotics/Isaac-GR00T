@@ -751,47 +751,47 @@ class FlowmatchingActionHead(nn.Module):
           - vl_features:       invariant VL context for cross-attention
           - backbone_attention_mask: language attention mask
         """
-        equi_vision_features = backbone_output.backbone_equi_vision_features   # [B, n_img, T_vis, D_vis]
+        # equi_vision_features = backbone_output.backbone_equi_vision_features   # [B, n_img, T_vis, D_vis]
         vision_language_features = backbone_output.backbone_vision_language_features  # [B, T_text, D_lang]
         language_mask = backbone_output.backbone_attention_mask         # [B, T_text]
 
-        B, n_img, T_vis, D_vis = equi_vision_features.shape
+        # B, n_img, T_vis, D_vis = equi_vision_features.shape
 
         # ── Equi vision stream ───────────────────────────────────────────────
         # Project: [B, n_img, T_vis, D_vis] → [B*n_img, T_vis, in_type.size]
-        vis_flat = equi_vision_features.reshape(B * n_img * T_vis, D_vis)
-        vis_geo = enn.GeometricTensor(vis_flat, self.equi_vis_in_type)
-        vis_proj = self.equi_vis_to_hidden(vis_geo).tensor  # [B*n_img*T_vis, in_type.size]
-        D_hidden = vis_proj.shape[-1]
-        vis_per_cam = vis_proj.reshape(B * n_img, T_vis, D_hidden)  # [B*n_img, T_vis, D_hidden]
+        # vis_flat = equi_vision_features.reshape(B * n_img * T_vis, D_vis)
+        # vis_geo = enn.GeometricTensor(vis_flat, self.equi_vis_in_type)
+        # vis_proj = self.equi_vis_to_hidden(vis_geo).tensor  # [B*n_img*T_vis, in_type.size]
+        # D_hidden = vis_proj.shape[-1]
+        # vis_per_cam = vis_proj.reshape(B * n_img, T_vis, D_hidden)  # [B*n_img, T_vis, D_hidden]
 
         # Add equivariant 2D positional embeddings before pooling.
         # (x, y) coords in [-1, 1] transform as irrep(1) under CN → equivariant spatial cues.
-        T_vis = vis_per_cam.shape[1]
-        h = w = int(T_vis ** 0.5)
-        idx = torch.arange(T_vis, device=vis_per_cam.device, dtype=vis_per_cam.dtype)
-        row, col = idx // w, idx % w
-        pos_2d = torch.stack([
-            2 * col / (w - 1) - 1,           # x: left=-1, right=+1
-            -(2 * row / (h - 1) - 1),         # y: top=+1, bottom=-1
-        ], dim=-1)                             # [T_vis, 2]
-        pos_emb = self.equi_vis_pos_proj(
-            enn.GeometricTensor(pos_2d, self.equi_vis_pos_type)
-        ).tensor                               # [T_vis, D_hidden]
-        vis_per_cam = vis_per_cam + pos_emb.unsqueeze(0)  # [B*n_img, T_vis, D_hidden]
+        # T_vis = vis_per_cam.shape[1]
+        # h = w = int(T_vis ** 0.5)
+        # idx = torch.arange(T_vis, device=vis_per_cam.device, dtype=vis_per_cam.dtype)
+        # row, col = idx // w, idx % w
+        # pos_2d = torch.stack([
+        #     2 * col / (w - 1) - 1,           # x: left=-1, right=+1
+        #     -(2 * row / (h - 1) - 1),         # y: top=+1, bottom=-1
+        # ], dim=-1)                             # [T_vis, 2]
+        # pos_emb = self.equi_vis_pos_proj(
+        #     enn.GeometricTensor(pos_2d, self.equi_vis_pos_type)
+        # ).tensor                               # [T_vis, D_hidden]
+        # vis_per_cam = vis_per_cam + pos_emb.unsqueeze(0)  # [B*n_img, T_vis, D_hidden]
 
         # Pool T_vis spatial tokens → num_vis_queries tokens per camera (equivariant)
-        vis_pooled = self.equi_vis_pool(vis_per_cam)               # [B*n_img, K, D_hidden]
-        K = vis_pooled.shape[1]
-        equi_vis_features = vis_pooled.reshape(B, n_img * K, D_hidden)  # [B, n_img*K, D_hidden]
+        # vis_pooled = self.equi_vis_pool(vis_per_cam)               # [B*n_img, K, D_hidden]
+        # K = vis_pooled.shape[1]
+        # equi_vis_features = vis_pooled.reshape(B, n_img * K, D_hidden)  # [B, n_img*K, D_hidden]
 
         # ── VL stream ────────────────────────────────────────────────────────
         lang = self.vlln(vision_language_features)           # [B, T_text, D_lang]
         lang = self.vl_self_attention(lang)            # [B, T_text, vl_sa_inner_dim]
-        vl_features = self.vl_proj(lang)               # [B, T_text, vl_cross_dim]
+        # vl_features = self.vl_proj(lang)               # [B, T_text, vl_cross_dim]
 
-        backbone_output.data["equi_vis_features"] = equi_vis_features
-        backbone_output.data["vl_features"] = vl_features
+        # backbone_output.data["equi_vis_features"] = equi_vis_features
+        backbone_output.data["vl_features"] = lang
         backbone_output.data["backbone_attention_mask"] = language_mask
         return backbone_output
 
@@ -829,7 +829,7 @@ class FlowmatchingActionHead(nn.Module):
                 action_input[k] = expanded
 
         # Two-stream context from process_backbone_output.
-        equi_vis_embs = backbone_output.get("equi_vis_features")  # [B, n_img*K, D_hidden] or None
+        # equi_vis_embs = backbone_output.get("equi_vis_features")  # [B, n_img*K, D_hidden] or None
         vl_embs = backbone_output.vl_features                     # [B, T_text, vl_cross_dim]
         encoder_mask = backbone_output.backbone_attention_mask    # [B, T_text], 1=valid 0=pad
         device = vl_embs.device
@@ -878,12 +878,12 @@ class FlowmatchingActionHead(nn.Module):
             state_features = self._add_temporal_pos_embed(state_features)
             action_features = self._add_temporal_pos_embed(action_features)
 
-        if equi_vis_embs is not None:
-            N_vis = equi_vis_embs.shape[1]
-            sa_embs = torch.cat((equi_vis_embs, state_features, action_features), dim=1)
-        else:
-            N_vis = 0
-            sa_embs = torch.cat((state_features, action_features), dim=1)
+        # if equi_vis_embs is not None:
+        #     N_vis = equi_vis_embs.shape[1]
+        #     sa_embs = torch.cat((equi_vis_embs, state_features, action_features), dim=1)
+        # else:
+        N_vis = 0
+        sa_embs = torch.cat((state_features, action_features), dim=1)
 
         model_output = self.model(
             hidden_states=sa_embs,
@@ -943,7 +943,7 @@ class FlowmatchingActionHead(nn.Module):
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Two-stream context from process_backbone_output.
-        equi_vis_embs = backbone_output.get("equi_vis_features")  # [B, n_img*K, D_hidden] or None
+        # equi_vis_embs = backbone_output.get("equi_vis_features")  # [B, n_img*K, D_hidden] or None
         vl_embs = backbone_output.vl_features                     # [B, T_text, vl_cross_dim]
         encoder_mask = backbone_output.backbone_attention_mask    # [B, T_text]
 
@@ -1007,12 +1007,12 @@ class FlowmatchingActionHead(nn.Module):
             # future_tokens = einops.rearrange(
             #     future_tokens.tensor, "(b t) d -> b t d", b = B, t = self.config.num_target_vision_tokens
             # )
-            if equi_vis_embs is not None:
-                N_vis = equi_vis_embs.shape[1]
-                sa_embs = torch.cat((equi_vis_embs, state_features, action_features), dim=1)
-            else:
-                N_vis = 0
-                sa_embs = torch.cat((state_features, action_features), dim=1)
+            # if equi_vis_embs is not None:
+            #     N_vis = equi_vis_embs.shape[1]
+            #     sa_embs = torch.cat((equi_vis_embs, state_features, action_features), dim=1)
+            # else:
+            N_vis = 0
+            sa_embs = torch.cat((state_features, action_features), dim=1)
 
             # Run model forward.
             model_output = self.model(

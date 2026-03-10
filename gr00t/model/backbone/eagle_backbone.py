@@ -129,5 +129,5 @@ class EagleBackbone(nn.Module):
             eagle_embeds = eagle_embeds + dummy_term
 
         return BatchFeature(
-            data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
+            data={"backbone_vision_language_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
         )  # [B, T2, hidden_size]
