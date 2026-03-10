@@ -216,7 +216,7 @@ class ShardedMixtureDataset(IterableDataset):
         stats_by_emb = {}
         for emb, stats in all_stats_by_emb.items():
             stats_by_emb[emb] = {}
-            for modality in ["state", "action", "relative_action"]:
+            for modality in ["state", "action", "effort", "relative_action"]:
                 if modality in stats[0]:
                     modality_stats = [s[modality] for s in stats]
                     stats_by_emb[emb][modality] = merge_statistics(

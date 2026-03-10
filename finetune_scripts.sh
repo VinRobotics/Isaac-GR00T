@@ -6,7 +6,7 @@ HF_HUB_OFFLINE=0
 python \
     gr00t/experiment/launch_finetune.py \
     --base-model-path nvidia/GR00T-N1.6-3B \
-    --dataset-path /mnt/data/sftp/data/locht1/vr_data/20260309_VR_H31_bodyshop_place_part2_baoht9_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260309_VR_H31_bodyshop_place_part2_lindld23_stereo_speedup1 \
+    --dataset-path /mnt/data/sftp/data/locht1/vr_data/20260309_VR_H31_bodyshop_place_part2_baoht9_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260309_VR_H31_bodyshop_place_part2_linhld23_stereo_speedup1 \
     --embodiment-tag NEW_EMBODIMENT \
     --modality-config-path /home/locht1/gr00t/data_config/vrh3_two_hands_effort.py \
     --effort-dim 26 \

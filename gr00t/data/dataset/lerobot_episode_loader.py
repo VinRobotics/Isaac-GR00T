@@ -397,6 +397,37 @@ class LeRobotEpisodeLoader:
         for modality in mapping.keys():  # state, action, effort
             if modality not in self.modality_configs:
                 continue
+            if modality not in self.modality_meta:
+                # Fallback: if modality.json has no entry for this modality (e.g. "effort"),
+                # try to infer joint-group boundaries from stats.json directly.
+                stats_key = mapping[modality]
+                if stats_key not in self.stats:
+                    print(
+                        f"Warning: Modality '{modality}' not found in modality.json or stats.json, "
+                        f"skipping statistics extraction."
+                    )
+                    continue
+                raw_stats = self.stats[stats_key]
+                # Determine per-group slice boundaries from modality_configs.
+                # Assume groups are stacked contiguously in the order given by modality_keys.
+                # We need the total dimension to partition evenly OR read from info features.
+                total_dim = len(raw_stats["min"])
+                group_keys = self.modality_configs[modality].modality_keys
+                # Try to get per-group dims from info features
+                feature_entry = self.feature_config.get(stats_key, {})
+                group_dims = None
+                if "shapes" in feature_entry and isinstance(feature_entry["shapes"], dict):
+                    group_dims = [feature_entry["shapes"].get(k) for k in group_keys]
+                if group_dims is None or any(d is None for d in group_dims):
+                    # Fall back to equal split
+                    per_group = total_dim // len(group_keys)
+                    group_dims = [per_group] * len(group_keys)
+                idx = 0
+                for joint_key, dim in zip(group_keys, group_dims):
+                    for stat_type in raw_stats.keys():
+                        dataset_statistics[modality][joint_key][stat_type] = raw_stats[stat_type][idx: idx + dim]
+                    idx += dim
+                continue
             for joint_key in self.modality_configs[modality].modality_keys:
                 # Determine which statistics key to use
                 if self.modality_meta[modality][joint_key].get("original_key", None) is not None:
