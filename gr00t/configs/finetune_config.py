@@ -116,3 +116,17 @@ class FinetuneConfig:
 
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""
+
+    # --- Effort Modality ---
+    effort_dim: int = 0
+    """
+    Max effort feature dimension (padded). Set to the total raw effort dim from your dataset
+    (sum of all effort joint group dims, without sin/cos expansion). Set to 0 if not using effort.
+    Example: if 8 groups x 3 dims each = 24, set to 24.
+    """
+
+    effort_history_len: int = 0
+    """
+    Number of effort steps used as history context token (steps with delta_index <= 0).
+    Example: for delta_indices=range(-15, 51), set to 16 (indices -15..0 inclusive).
+    """

@@ -55,6 +55,8 @@ class Gr00tN1d6Config(PretrainedConfig):
     max_state_dim: int = 29  # Default from state_shape
     max_action_dim: int = 29  # Default from action_shape
     action_horizon: int = 16
+    effort_dim: int = 29  # Max effort dimension (padded), 0 to disable effort
+    effort_history_len: int = 1  # Number of past effort steps used as context token
     hidden_size: int = 1024
     input_embedding_dim: int = 1536
 

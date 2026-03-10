@@ -16,6 +16,53 @@ import torch
 from transformers import AutoModel, AutoProcessor
 
 
+def _load_checkpoint_state_dict(checkpoint_path: str, transformers_loading_kwargs: dict = {}) -> dict:
+    """
+    Load a flat state dict from a local or HuggingFace Hub checkpoint.
+    Handles safetensors (single + sharded) and pytorch_model.bin.
+    """
+    from pathlib import Path as _Path
+    from safetensors.torch import load_file
+
+    path = _Path(checkpoint_path)
+
+    def _load_local(directory: _Path) -> dict | None:
+        sf = directory / "model.safetensors"
+        if sf.exists():
+            return load_file(str(sf), device="cpu")
+        shards = sorted(directory.glob("model-*-of-*.safetensors"))
+        if shards:
+            sd = {}
+            for shard in shards:
+                sd.update(load_file(str(shard), device="cpu"))
+            return sd
+        pt = directory / "pytorch_model.bin"
+        if pt.exists():
+            return torch.load(str(pt), map_location="cpu")
+        return None
+
+    # --- local directory ---
+    if path.is_dir():
+        result = _load_local(path)
+        if result is not None:
+            return result
+        raise FileNotFoundError(f"No model weights found at {checkpoint_path}")
+
+    # --- HuggingFace Hub path ---
+    from transformers.utils import cached_file as _cached_file
+    for filename in ("model.safetensors", "pytorch_model.bin"):
+        try:
+            resolved = _cached_file(checkpoint_path, filename, **transformers_loading_kwargs)
+            if resolved is not None:
+                local_dir = _Path(resolved).parent
+                result = _load_local(local_dir)
+                if result is not None:
+                    return result
+        except Exception:
+            continue
+    raise FileNotFoundError(f"No model weights found at {checkpoint_path}")
+
+
 # Convert tensors to lists for JSON serialization
 def convert_tensors_to_lists(obj):
     """Recursively convert tensors to lists in nested dictionaries/lists."""
@@ -66,6 +113,8 @@ class Gr00tN1d6Pipeline(ModelPipeline):
         # Build transformers loading kwargs from training config
 
         if self.config.training.start_from_checkpoint is not None:
+            effort_dim = getattr(self.config.model, "effort_dim", 0)
+            effort_history_len = getattr(self.config.model, "effort_history_len", 0)
             model, loading_info = AutoModel.from_pretrained(
                 self.config.training.start_from_checkpoint,
                 tune_llm=self.config.model.tune_llm,
@@ -76,7 +125,10 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
+                effort_dim=effort_dim,
+                effort_history_len=effort_history_len,
                 output_loading_info=True,
+                ignore_mismatched_sizes=True,
                 **self.transformers_loading_kwargs,
             )
 
@@ -91,6 +143,26 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                         0.02 * torch.randn_like(model.action_head.mask_token)
                     )
                 logging.info("mask_token not in checkpoint - initialized")
+
+            # Extend action_encoder / action_decoder weights for the effort dimension.
+            # from_pretrained skips mismatched tensors; we copy the pretrained action slice here.
+            if effort_dim > 0:
+                mismatched = loading_info.get("mismatched_keys", [])
+                effort_keys = {
+                    "action_head.action_encoder.W1.W",
+                    "action_head.action_decoder.layer2.W",
+                    "action_head.action_decoder.layer2.b",
+                }
+                needs_extension = any(k[0] in effort_keys for k in mismatched)
+                if needs_extension:
+                    pretrained_sd = _load_checkpoint_state_dict(
+                        self.config.training.start_from_checkpoint,
+                        self.transformers_loading_kwargs,
+                    )
+                    model.action_head.extend_weights_for_effort(pretrained_sd)
+                    logging.info(
+                        "Extended action_encoder / action_decoder weights for effort_dim=%d", effort_dim
+                    )
 
         else:
             model = self.model_class(
@@ -135,6 +207,7 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 formalize_language=self.model_config.formalize_language,
                 apply_sincos_state_encoding=self.model_config.apply_sincos_state_encoding,
                 max_action_horizon=self.model_config.action_horizon,
+                max_effort_dim=getattr(self.model_config, "effort_dim", 0),
                 use_albumentations=self.model_config.use_albumentations_transforms,
                 shortest_image_edge=self.model_config.shortest_image_edge,
                 crop_fraction=self.model_config.crop_fraction,

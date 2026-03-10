@@ -125,6 +125,7 @@ class Gr00tN1d6Processor(BaseProcessor):
         model_type: Literal["eagle"] = "eagle",
         max_state_dim: int = 29,
         max_action_dim: int = 29,
+        max_effort_dim: int = 29,
         apply_sincos_state_encoding: bool = False,
         max_action_horizon: int = 40,
         use_albumentations: bool = False,
@@ -157,6 +158,7 @@ class Gr00tN1d6Processor(BaseProcessor):
 
         self.max_state_dim = max_state_dim
         self.max_action_dim = max_action_dim
+        self.max_effort_dim = max_effort_dim
         self.max_action_horizon = max_action_horizon
 
         # Save image processing settings
@@ -356,6 +358,30 @@ class Gr00tN1d6Processor(BaseProcessor):
             dim=-1,
         )
 
+        # Normalize and pack effort if configured.
+        if "effort" in self.modality_configs.get(embodiment_tag.value, {}):
+            effort_data = content.efforts
+            normalized_efforts = self.state_action_processor.apply_effort(
+                effort_data, embodiment_tag.value
+            )
+            effort_keys = self.modality_configs[embodiment_tag.value]["effort"].modality_keys
+            normalized_efforts = torch.cat(
+                [torch.from_numpy(normalized_efforts[key]) for key in effort_keys], dim=-1
+            )  # [total_steps, raw_effort_dim]
+            effort_dim = normalized_efforts.shape[1]
+            # Pad feature dimension to max_effort_dim.
+            normalized_efforts = torch.cat(
+                [
+                    normalized_efforts,
+                    torch.zeros(normalized_efforts.shape[0], self.max_effort_dim - effort_dim),
+                ],
+                dim=-1,
+            )  # [total_steps, max_effort_dim]
+            effort_mask = torch.ones_like(normalized_efforts)
+            effort_mask[:, effort_dim:] = 0
+            transformed_inputs["effort"] = normalized_efforts.to(torch.get_default_dtype())
+            transformed_inputs["effort_mask"] = effort_mask
+
         # Crop and resize images.
         if self.training:
             image_transform = self.train_image_transform
@@ -457,6 +483,7 @@ class Gr00tN1d6Processor(BaseProcessor):
                 # State action dimensions
                 "max_state_dim": self.max_state_dim,
                 "max_action_dim": self.max_action_dim,
+                "max_effort_dim": self.max_effort_dim,
                 "max_action_horizon": self.max_action_horizon,
                 # StateActionProcessor settings
                 "use_percentiles": self.use_percentiles,

@@ -39,10 +39,11 @@ LEROBOT_MODALITY_FILENAME = "modality.json"
 LEROBOT_STATS_FILE_NAME = "stats.json"
 LEROBOT_RELATIVE_STATS_FILE_NAME = "relative_stats.json"
 
-ALLOWED_MODALITIES = ["video", "state", "action", "language"]
+ALLOWED_MODALITIES = ["video", "state", "action", "language", "effort"]
 DEFAULT_COLUMN_NAMES = {
     "state": "observation.state",
     "action": "action",
+    "effort": "observation.effort",
 }
 
 LANG_KEYS = ["task", "sub_task"]
@@ -320,8 +321,8 @@ class LeRobotEpisodeLoader:
                     lambda x: self.tasks_map[x]
                 )
 
-        # Extract joint groups for state and action modalities
-        for modality_type in ["state", "action"]:
+        # Extract joint groups for state, action, and effort modalities
+        for modality_type in ["state", "action", "effort"]:
             if modality_type not in self.modality_configs:
                 continue
             joint_groups_df = self._extract_joint_groups(
@@ -390,10 +391,12 @@ class LeRobotEpisodeLoader:
         Returns:
             Nested dictionary: {modality: {joint_group: {stat_type: values}}}
         """
-        mapping = {"state": "observation.state", "action": "action"}
+        mapping = {"state": "observation.state", "action": "action", "effort": "observation.effort"}
         dataset_statistics = _rec_defaultdict()
 
-        for modality in mapping.keys():  # state, action
+        for modality in mapping.keys():  # state, action, effort
+            if modality not in self.modality_configs:
+                continue
             for joint_key in self.modality_configs[modality].modality_keys:
                 # Determine which statistics key to use
                 if self.modality_meta[modality][joint_key].get("original_key", None) is not None:

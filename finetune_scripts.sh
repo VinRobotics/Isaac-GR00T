@@ -3,14 +3,16 @@ export WANDB_PROJECT=vrh3_sim_pick_place
 
 HF_HUB_OFFLINE=0
 
-CUDA_VISIBLE_DEVICES=2 python \
+python \
     gr00t/experiment/launch_finetune.py \
     --base-model-path nvidia/GR00T-N1.6-3B \
-    --dataset-path mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_trym_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_recovery_trym_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_ood_trym_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260302_VR_H31_bodyshop_place_part2_linhld23_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260306_VR_H31_bodyshop_place_part2_correction_stereo_exclude_torque_speedup1 \
+    --dataset-path /mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_trym_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_recovery_trym_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_ood_trym_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260302_VR_H31_bodyshop_place_part2_linhld23_stereo_speedup1 /mnt/data/sftp/data/locht1/vr_data/20260306_VR_H31_bodyshop_place_part2_correction_stereo_exclude_torque_speedup1 \
     --embodiment-tag NEW_EMBODIMENT \
-    --modality-config-path /home/locht1/gr00t/data_config/vrh3_two_hands.py \
+    --modality-config-path /home/locht1/gr00t/data_config/vrh3_two_hands_effort.py \
+    --effort-dim 26 \
+    --effort-history-len 16 \
     --num-gpus $NUM_GPUS \
-    --output-dir /mnt/data/sftp/data/vla/vr_checkpoints/gr00t_n16_vrh3_two_hands_chunk50_0903 \
+    --output-dir /mnt/data/sftp/data/locht1/vr_checkpoints/gr00t_n16_ta_vrh3_two_hands_chunk50_0903 \
     --save-total-limit 5 \
     --save-steps 10000 \
     --max-steps 50000 \

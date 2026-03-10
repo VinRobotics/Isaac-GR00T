@@ -114,7 +114,7 @@ class StateActionProcessor:
         for embodiment_tag in self.statistics:
             self.norm_params[embodiment_tag] = {}
 
-            for modality in ["state", "action"]:
+            for modality in ["state", "action", "effort"]:
                 if modality not in self.statistics[embodiment_tag]:
                     continue
 
@@ -228,6 +228,39 @@ class StateActionProcessor:
                     normalized = np.clip(normalized, -1.0, 1.0)
 
                 normalized_values[joint_group] = normalized
+
+        return normalized_values
+
+    def apply_effort(
+        self,
+        effort: dict[str, np.ndarray],
+        embodiment_tag: str,
+    ) -> dict[str, np.ndarray]:
+        """
+        Apply effort processing (normalization), identical to state normalization.
+
+        Args:
+            effort: Dict mapping joint_group -> raw effort values, shape (..., D)
+            embodiment_tag: Embodiment identifier
+
+        Returns:
+            Dict mapping joint_group -> normalized effort values
+        """
+        normalized_values = {}
+        effort_modality_config = self.modality_configs[embodiment_tag].get("effort")
+        if effort_modality_config is None:
+            return normalized_values
+
+        for joint_group in effort_modality_config.modality_keys:
+            if joint_group not in effort:
+                raise KeyError(
+                    f"Joint group '{joint_group}' not found in effort dict for embodiment '{embodiment_tag}'"
+                )
+            params = self.norm_params[embodiment_tag]["effort"][joint_group]
+            normalized = normalize_values_minmax(effort[joint_group], params)
+            if self.clip_outliers:
+                normalized = np.clip(normalized, -1.0, 1.0)
+            normalized_values[joint_group] = normalized
 
         return normalized_values
 

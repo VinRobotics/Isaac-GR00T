@@ -61,6 +61,9 @@ if __name__ == "__main__":
     config.model.state_dropout_prob = ft_config.state_dropout_prob
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
+    if ft_config.effort_dim > 0:
+        config.model.effort_dim = ft_config.effort_dim
+        config.model.effort_history_len = ft_config.effort_history_len
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False

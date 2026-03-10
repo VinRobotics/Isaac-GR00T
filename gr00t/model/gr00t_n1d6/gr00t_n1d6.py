@@ -6,6 +6,7 @@ from gr00t.model.modules.eagle_backbone import EagleBackbone
 from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
+    swish
 )
 import torch
 from torch import nn
@@ -26,6 +27,13 @@ class Gr00tN1d6ActionHead(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
+        
+        # effort
+        self.effort_history_len = self.config.effort_history_len
+        self.effort_dim = self.config.effort_dim
+        self.effort_dim_in = self.effort_dim * self.effort_history_len
+        self.effort_proj_in = nn.Linear(self.effort_dim_in, 2 * self.input_embedding_dim)
+        self.effort_proj_out = nn.Linear(2 * self.input_embedding_dim, self.input_embedding_dim)
 
         # Initialize components directly from config
         if config.use_alternate_vl_dit:
@@ -51,7 +59,7 @@ class Gr00tN1d6ActionHead(nn.Module):
             output_dim=self.input_embedding_dim,
         )
         self.action_encoder = MultiEmbodimentActionEncoder(
-            action_dim=self.action_dim,
+            action_dim=self.action_dim + self.effort_dim,
             hidden_size=self.input_embedding_dim,
             num_embodiments=config.max_num_embodiments,
         )
@@ -59,7 +67,7 @@ class Gr00tN1d6ActionHead(nn.Module):
             num_categories=config.max_num_embodiments,
             input_dim=self.hidden_size,
             hidden_dim=self.hidden_size,
-            output_dim=self.action_dim,
+            output_dim=self.action_dim + self.effort_dim,
         )
 
         self.vlln = (
@@ -99,6 +107,8 @@ class Gr00tN1d6ActionHead(nn.Module):
             self.state_encoder.requires_grad_(False)
             self.action_encoder.requires_grad_(False)
             self.action_decoder.requires_grad_(False)
+            self.effort_proj_in.requires_grad_(False)
+            self.effort_proj_out.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
             if self.state_dropout_prob > 0:
@@ -129,6 +139,8 @@ class Gr00tN1d6ActionHead(nn.Module):
                 self.state_encoder.eval()
                 self.action_encoder.eval()
                 self.action_decoder.eval()
+                self.effort_proj_in.eval()
+                self.effort_proj_out.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
             if not self.tune_diffusion_model:
@@ -177,6 +189,15 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
+        
+        # Embed effort.
+        B = action_input.action.shape[0]
+        effort_history = action_input.effort[:, :self.effort_history_len, :]
+        effort_future = action_input.effort[:, self.effort_history_len:, :]
+        
+        effort_hist_flat = effort_history.reshape(B, -1)
+        effort_hist_emb = swish(self.effort_proj_in(effort_hist_flat))
+        effort_hist_token = self.effort_proj_out(effort_hist_emb).unsqueeze(1)
 
         # Dropout state features.
         if self.state_dropout_prob > 0:
@@ -197,6 +218,7 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         # Embed noised action trajectory.
         actions = action_input.action
+        actions = torch.concat([actions, effort_future], dim=-1)
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
@@ -215,7 +237,7 @@ class Gr00tN1d6ActionHead(nn.Module):
             action_features = action_features + pos_embs
 
         # Join vision, language, state and action embedding along sequence dimension.
-        sa_embs = torch.cat((state_features, action_features), dim=1)
+        sa_embs = torch.cat((effort_hist_token, state_features, action_features), dim=1)
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         if self.config.use_alternate_vl_dit:
@@ -244,11 +266,24 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
-        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+        
+        pred_only_actions = pred_actions[..., :self.action_dim]
+        velocity_actions = velocity[..., :self.action_dim]
+        action_loss = F.mse_loss(pred_only_actions, velocity_actions, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        
+        effort_mask = action_input.effort_mask
+        if self.effort_history_len > 0:
+            effort_mask = effort_mask[:, self.effort_history_len:, :]
+        pred_efforts = pred_actions[..., self.action_dim:]
+        velocity_efforts = velocity[..., self.action_dim:]
+        effort_loss = F.mse_loss(pred_efforts, velocity_efforts, reduction="none") * effort_mask
+        effort_loss = effort_loss.sum() / (effort_mask.sum() + 1e-6)
+        loss = loss + 0.1 * effort_loss
 
         return {
             "loss": loss,
+            "effort_loss": effort_loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
@@ -283,13 +318,25 @@ class Gr00tN1d6ActionHead(nn.Module):
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
-        return BatchFeature(data={"backbone_features": vl_embeds, "state_features": state_features})
+        # Embed effort history into a single context token.
+        B = vl_embeds.shape[0]
+        effort_history = action_input.effort[:, :self.effort_history_len, :]  # [B, H, effort_dim]
+        effort_hist_flat = effort_history.reshape(B, -1)  # [B, H*effort_dim]
+        effort_hist_emb = swish(self.effort_proj_in(effort_hist_flat))
+        effort_hist_token = self.effort_proj_out(effort_hist_emb).unsqueeze(1)  # [B, 1, input_embedding_dim]
+
+        return BatchFeature(data={
+            "backbone_features": vl_embeds,
+            "state_features": state_features,
+            "effort_hist_token": effort_hist_token,
+        })
 
     @torch.no_grad()
     def get_action_with_features(
         self,
         backbone_features: torch.Tensor,
         state_features: torch.Tensor,
+        effort_hist_token: torch.Tensor,
         embodiment_id: torch.Tensor,
         backbone_output: BatchFeature,
     ) -> BatchFeature:
@@ -298,17 +345,18 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         Args:
             backbone_features: [B, seq_len, backbone_embedding_dim]
-            state_features: [B, state_horizon, input_embedding_dim]
+            state_features: [B, 1, input_embedding_dim]
+            effort_hist_token: [B, 1, input_embedding_dim]
             embodiment_id: [B] (embodiment IDs)
             backbone_output: Output from the backbone model
         """
         vl_embeds = backbone_features
 
-        # Set initial actions as the sampled noise.
+        # Initialise noise for the joint [action, effort_future] trajectory.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.action_dim),
+        trajectory = torch.randn(
+            size=(batch_size, self.config.action_horizon, self.action_dim + self.effort_dim),
             dtype=vl_embeds.dtype,
             device=device,
         )
@@ -317,24 +365,21 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
-            t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
+            t_cont = t / float(self.num_inference_timesteps)
             t_discretized = int(t_cont * self.num_timestep_buckets)
 
-            # Embed noised action trajectory.
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Add position embedding.
+            action_features = self.action_encoder(trajectory, timesteps_tensor, embodiment_id)
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            sa_embs = torch.cat((state_features, action_features), dim=1)
+            # effort_hist_token prepended so sequence matches training layout.
+            sa_embs = torch.cat((effort_hist_token, state_features, action_features), dim=1)
 
-            # Run model forward.
             if self.config.use_alternate_vl_dit:
                 model_output = self.model(
                     hidden_states=sa_embs,
@@ -350,14 +395,14 @@ class Gr00tN1d6ActionHead(nn.Module):
                     timestep=timesteps_tensor,
                 )
             pred = self.action_decoder(model_output, embodiment_id)
+            pred_velocity = pred[:, -self.action_horizon:]
+            trajectory = trajectory + dt * pred_velocity
 
-            pred_velocity = pred[:, -self.action_horizon :]
-
-            # Update actions using euler integration.
-            actions = actions + dt * pred_velocity
+        # Return only the action slice; effort future is discarded at inference.
+        action_pred = trajectory[..., :self.action_dim]
         return BatchFeature(
             data={
-                "action_pred": actions,
+                "action_pred": action_pred,
                 "backbone_features": vl_embeds,
                 "state_features": state_features,
             }
@@ -384,9 +429,46 @@ class Gr00tN1d6ActionHead(nn.Module):
         return self.get_action_with_features(
             backbone_features=features.backbone_features,
             state_features=features.state_features,
+            effort_hist_token=features.effort_hist_token,
             embodiment_id=action_input.embodiment_id,
             backbone_output=backbone_output,
         )
+
+    def extend_weights_for_effort(self, pretrained_sd: dict, key_prefix: str = "action_head.") -> None:
+        """
+        Copy pretrained action_encoder / action_decoder weights into the action slice of the
+        extended tensors, leaving the effort slice with the small-random values from __init__.
+
+        Call this after AutoModel.from_pretrained(..., ignore_mismatched_sizes=True) when
+        effort_dim > 0 and the pretrained checkpoint was trained without effort.
+
+        Args:
+            pretrained_sd: flat state dict loaded from the pretrained checkpoint (CPU tensors).
+            key_prefix: prefix prepended to action-head keys in the full model state dict
+                        (default "action_head." when called from Gr00tN1d6).
+        """
+        def _get(key):
+            full_key = f"{key_prefix}{key}"
+            return pretrained_sd.get(full_key)
+
+        with torch.no_grad():
+            # --- action_encoder.W1.W  [E, action_dim+effort_dim, H] ---
+            w = _get("action_encoder.W1.W")
+            if w is not None:
+                orig = w.shape[1]  # original action_dim (e.g. 29)
+                self.action_encoder.W1.W.data[:, :orig, :] = w.to(self.action_encoder.W1.W.device)
+
+            # --- action_decoder.layer2.W  [E, H, action_dim+effort_dim] ---
+            w = _get("action_decoder.layer2.W")
+            if w is not None:
+                orig = w.shape[2]
+                self.action_decoder.layer2.W.data[:, :, :orig] = w.to(self.action_decoder.layer2.W.device)
+
+            # --- action_decoder.layer2.b  [E, action_dim+effort_dim] ---
+            b = _get("action_decoder.layer2.b")
+            if b is not None:
+                orig = b.shape[1]
+                self.action_decoder.layer2.b.data[:, :orig] = b.to(self.action_decoder.layer2.b.device)
 
     @property
     def device(self):
