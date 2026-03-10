@@ -192,9 +192,11 @@ class Gr00tN1d6ActionHead(nn.Module):
         
         # Embed effort.
         B = action_input.action.shape[0]
-        effort_history = action_input.effort[:, :self.effort_history_len, :]
-        effort_future = action_input.effort[:, self.effort_history_len:, :]
-        
+        # Slice last dim to self.effort_dim to guard against max_effort_dim padding mismatch.
+        print(f"Effort original shape: {action_input.effort.shape}")
+        effort_history = action_input.effort[:, :self.effort_history_len, :self.effort_dim]
+        effort_future = action_input.effort[:, self.effort_history_len:, :self.effort_dim]
+
         effort_hist_flat = effort_history.reshape(B, -1)
         effort_hist_emb = swish(self.effort_proj_in(effort_hist_flat))
         effort_hist_token = self.effort_proj_out(effort_hist_emb).unsqueeze(1)
@@ -218,6 +220,8 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         # Embed noised action trajectory.
         actions = action_input.action
+        # Trim effort_future horizon to match action horizon (both should be equal by design).
+        effort_future = effort_future[:, :actions.shape[1], :]
         actions = torch.concat([actions, effort_future], dim=-1)
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
@@ -320,7 +324,7 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         # Embed effort history into a single context token.
         B = vl_embeds.shape[0]
-        effort_history = action_input.effort[:, :self.effort_history_len, :]  # [B, H, effort_dim]
+        effort_history = action_input.effort[:, :self.effort_history_len, :self.effort_dim]  # [B, H, effort_dim]
         effort_hist_flat = effort_history.reshape(B, -1)  # [B, H*effort_dim]
         effort_hist_emb = swish(self.effort_proj_in(effort_hist_flat))
         effort_hist_token = self.effort_proj_out(effort_hist_emb).unsqueeze(1)  # [B, 1, input_embedding_dim]
