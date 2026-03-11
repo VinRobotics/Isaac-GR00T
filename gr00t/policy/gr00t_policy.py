@@ -100,6 +100,21 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) == 1, "Only one language key is supported"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+
+        # Override effort modality config to inference mode (history only, no future labels).
+        # Training config includes future effort indices; at inference we only receive history.
+        self.effort_history_len = getattr(
+            getattr(self.model, "action_head", None), "effort_history_len", 0
+        )
+        if "effort" in self.modality_configs and self.effort_history_len > 0:
+            orig_effort_cfg = self.modality_configs["effort"]
+            history_indices = [d for d in orig_effort_cfg.delta_indices if d <= 0][
+                : self.effort_history_len
+            ]
+            self.modality_configs["effort"] = ModalityConfig(
+                delta_indices=history_indices,
+                modality_keys=orig_effort_cfg.modality_keys,
+            )
         
         self.temporal_agg = True
         self.num_queries = 16
@@ -129,6 +144,8 @@ class Gr00tPolicy(BasePolicy):
                 "state": {k: v[i] for k, v in value["state"].items()},
                 "language": {k: v[i] for k, v in value["language"].items()},
             }
+            if "effort" in value:
+                unbatched_value["effort"] = {k: v[i] for k, v in value["effort"].items()}
             unbatched_obs.append(unbatched_value)
         return unbatched_obs
 
@@ -145,6 +162,7 @@ class Gr00tPolicy(BasePolicy):
             images=observation["video"],
             states=observation["state"],
             actions={},  # No ground truth actions during inference
+            efforts=observation.get("effort", {}),  # history effort frames; empty if not provided
             text=observation["language"][self.language_key][0],
             embodiment=self.embodiment_tag,
         )
@@ -265,6 +283,30 @@ class Gr00tPolicy(BasePolicy):
             assert batched_state.shape[1] == len(self.modality_configs["state"].delta_indices), (
                 f"State key '{state_key}'s horizon must be {len(self.modality_configs['state'].delta_indices)}. Got {batched_state.shape[1]}"
             )
+
+        # ===== EFFORT VALIDATION (optional) =====
+        if "effort" in self.modality_configs and "effort" in observation:
+            assert isinstance(observation["effort"], dict), (
+                f"Observation 'effort' must be a dictionary. Got {type(observation['effort'])}"
+            )
+            for effort_key in self.modality_configs["effort"].modality_keys:
+                assert effort_key in observation["effort"], (
+                    f"Effort key '{effort_key}' must be in observation['effort']"
+                )
+                batched_effort = observation["effort"][effort_key]
+                assert isinstance(batched_effort, np.ndarray), (
+                    f"Effort key '{effort_key}' must be a numpy array. Got {type(batched_effort)}"
+                )
+                assert batched_effort.dtype == np.float32, (
+                    f"Effort key '{effort_key}' must be np.float32. Got {batched_effort.dtype}"
+                )
+                assert batched_effort.ndim == 3, (
+                    f"Effort key '{effort_key}' must have shape (B, T, D), got {batched_effort.shape}"
+                )
+                assert batched_effort.shape[1] == len(self.modality_configs["effort"].delta_indices), (
+                    f"Effort key '{effort_key}' horizon must be "
+                    f"{len(self.modality_configs['effort'].delta_indices)}, got {batched_effort.shape[1]}"
+                )
 
         # ===== LANGUAGE VALIDATION =====
         # Validate each language stream defined in the modality config
