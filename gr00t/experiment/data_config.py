@@ -1603,8 +1603,10 @@ class VRH3FullBodyConfig(BaseDataConfig):
         "state.right_arm",
         "state.left_hand",
         "state.right_hand",
-        "state.left_leg",
-        "state.right_leg",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
     ]
     action_keys = [
         "action.left_arm",
@@ -1645,9 +1647,12 @@ class VRH3FullBodyConfig(BaseDataConfig):
     def transform(self):
         transforms = [
             # video transforms
-            VideoToTensor(apply_to=self.video_keys),
-            VideoCrop(apply_to=self.video_keys, scale=0.95),
-            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
             VideoColorJitter(
                 apply_to=self.video_keys,
                 brightness=0.3,
@@ -1710,7 +1715,7 @@ DATA_CONFIG_MAP = {
     "vrh2_two_hand_2_cam": VRH2TwotHand2CamConfig(),
     "vrh2_two_hand_2_cam_vel_eff": VRH2TwotHand2CamVelEffConfig(),
     "vrh3_two_hand": VRH3TwotHandConfig(),
-    "vrh3_full_body": VRH3FullBodyConfig(),
+    "vrh31_effort": VRH3FullBodyConfig(),
     "aloha_right_arm_only": AlohaRightArmConfig(),
     "aloha_right_arm_30_only": AlohaRightArm30Config()
 }
