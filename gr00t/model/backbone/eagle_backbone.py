@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ast import List
 import os
 
 import torch
@@ -38,6 +39,10 @@ class EagleBackbone(nn.Module):
         load_bf16: bool = False,
         eagle_path: str | None = None,
         project_to_dim: int = 1536,
+        n_group: int = 8,  # Number of rotations (C4 = 4, C8 = 8)
+        num_images_per_sample: int = 1,
+        rotate_image_indices: List[int] | None = None,  # Which images to rotate (None = all)
+        output_type: str = 'reg',  # 'reg' for regular representation
     ):
         """
         Args:
@@ -46,7 +51,16 @@ class EagleBackbone(nn.Module):
         """
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
-
+        self.n_group = n_group
+        self.num_images_per_sample = num_images_per_sample
+        self.output_type = output_type
+        self.project_to_dim = project_to_dim if project_to_dim else 2048
+        
+        if rotate_image_indices is None:
+            self.rotate_image_indices = list(range(num_images_per_sample))
+        else:
+            self.rotate_image_indices = rotate_image_indices
+            
         config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
