@@ -155,7 +155,10 @@ def main(args: ArgsConfig):
         # construct your own modality config and transform
         # see gr00t/utils/data.py for more details
         data_config = load_data_config(args.data_config)
-        modality_config = data_config.modality_config()
+        if hasattr(data_config, "inference_modality_config"):
+            modality_config = data_config.inference_modality_config()
+        else:
+            modality_config = data_config.modality_config()
         modality_transform = data_config.transform()
 
         policy = Gr00tPolicy(
