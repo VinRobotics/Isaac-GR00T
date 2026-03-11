@@ -334,14 +334,12 @@ class EquivariantAttentionPool(nn.Module):
     Pools N equivariant tokens → K tokens using learned query tokens in regular repr space.
 
     Mirrors the equivariant self-attention design:
-      - query_tokens: K learned params in in_type (regular repr) space
-      - q_proj, k_proj: regular → regular (equivariant linear)
+      - query_tokens: K learned params in trivial (scalar/invariant) repr — no group structure
+      - q_proj: trivial → regular (lifting); k_proj: regular → regular
       - V: raw equivariant features (no v_proj)
-      - Scores: Q_proj · K_proj — invariant because regular_repr is unitary:
-            (ρ(g)·q)ᵀ·(ρ(g)·k) = qᵀ·k
-        (holds when both Q and K transform together; here Q is projected from
-         fixed params and K from data — the equivariant projections ensure
-         K transforms equivariantly in the same repr space as Q)
+      - Scores: Q_proj · K_proj — Q is invariant (doesn't rotate), K transforms
+        equivariantly, so attention weights change correctly with group action and
+        the pooled output inherits equivariance from V
 
     Requires: H * dim_head % G == 0  (so qkv_type can use regular_repr blocks)
     No residual connection — this is a pooling module (changes sequence length).
@@ -373,12 +371,15 @@ class EquivariantAttentionPool(nn.Module):
         n_regular = self.scalar_dim // G
         self.qkv_type = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
 
-        # Learned query tokens in in_type (regular repr) space
-        self.query_tokens = nn.Parameter(torch.empty(num_queries, in_type.size))
+        # Trivial FieldType for learned query tokens (orientation-free scalars)
+        self.q_trivial_type = enn.FieldType(gspace, [gspace.trivial_repr] * self.scalar_dim)
+
+        # Learned query tokens: K × scalar_dim free scalars (no group structure)
+        self.query_tokens = nn.Parameter(torch.empty(num_queries, self.scalar_dim))
         nn.init.trunc_normal_(self.query_tokens, std=0.02)
 
-        # Equivariant projections: regular → regular
-        self.q_proj = enn.Linear(in_type, self.qkv_type, bias=bias)
+        # q_proj lifts trivial → regular; k_proj maps regular → regular
+        self.q_proj = enn.Linear(self.q_trivial_type, self.qkv_type, bias=bias)
         self.k_proj = enn.Linear(in_type, self.qkv_type, bias=bias)
 
         self.scale = dim_head ** -0.5
@@ -390,10 +391,10 @@ class EquivariantAttentionPool(nn.Module):
         """
         B, N, D = x.shape
 
-        # Project learned query tokens: (K, in_dim) → (B, K, H, Dh)
+        # Project learned query tokens: (K, scalar_dim) → (B, K, H, Dh)
         q_geo = enn.GeometricTensor(
             self.query_tokens.unsqueeze(0).expand(B, -1, -1).reshape(B * self.K, -1),
-            self.in_type,
+            self.q_trivial_type,
         )
         Q = self.q_proj(q_geo).tensor.reshape(B, self.K, self.H, self.Dh)
 
