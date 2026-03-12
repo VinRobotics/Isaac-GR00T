@@ -29,9 +29,9 @@ from transformers.feature_extraction_utils import BatchFeature
 
 from .action_head.flow_matching_action_head import (
     FlowmatchingActionHead,
-    FlowmatchingActionHeadConfig,
-    TaskCompletionDetector,
+    FlowmatchingActionHeadConfig
 )
+from .action_head.task_completion import TaskCompletionDetector
 from .backbone import EagleBackbone
 
 BACKBONE_FEATURE_KEY = "backbone_features"
@@ -97,6 +97,23 @@ class GR00T_N1_5(PreTrainedModel):
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """
+        Skip any task_completion_detection keys from the checkpoint so the
+        module always starts from the NaN-safe _init_weights() values.
+        This handles both old checkpoints (action_head.task_completion_detection.*)
+        and new ones (task_completion_detection.*) that may contain weights
+        with large magnitudes that overflow bfloat16.
+        """
+        filtered = {
+            k: v for k, v in state_dict.items()
+            if "task_completion_detection" not in k
+        }
+        skipped = len(state_dict) - len(filtered)
+        if skipped:
+            print(f"Skipping {skipped} task_completion_detection keys (will use fresh _init_weights())")
+        return super().load_state_dict(filtered, strict=False, assign=assign)
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -290,6 +307,12 @@ class GR00T_N1_5(PreTrainedModel):
         pretrained_model = super().from_pretrained(
             local_model_path, local_model_path=local_model_path, **kwargs
         )
+
+        # The base checkpoint has no task_completion_detection keys, so HuggingFace
+        # leaves those params uninitialized (meta tensors → NaN when accessed).
+        # Explicitly re-run _init_weights() to guarantee safe std=0.02 values.
+        pretrained_model.task_completion_detection._init_weights()
+        print("Re-initialized task_completion_detection weights (not in base checkpoint)")
 
         pretrained_model.backbone.set_trainable_parameters(
             tune_visual=tune_visual, tune_llm=tune_llm

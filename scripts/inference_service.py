@@ -209,7 +209,7 @@ def main(args: ArgsConfig):
         if args.task_completion_detection_path is not None:
             import torch as _torch
             tcd_state = _torch.load(args.task_completion_detection_path, map_location="cpu")
-            policy.model.action_head.task_completion_detection.load_state_dict(tcd_state)
+            policy.model.task_completion_detection.load_state_dict(tcd_state)
             print(f"Loaded task_completion_detection weights from: {args.task_completion_detection_path}")
 
         if args.guidance_option == "acg":
