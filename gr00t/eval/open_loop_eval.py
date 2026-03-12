@@ -123,6 +123,11 @@ def parse_observation_gr00t(
                 new_obs[modality][key] = [[arr]]
             else:
                 new_obs[modality][key] = arr[None, :]
+    if "effort" in modality_configs:
+        new_obs["effort"] = {}
+        for key in modality_configs["effort"].modality_keys:
+            arr = obs[f"effort.{key}"]
+            new_obs["effort"][key] = arr[None, :]
     return new_obs
 
 
@@ -167,6 +172,8 @@ def evaluate_single_trajectory(
             obs[f"state.{k}"] = v  # (T, D)
         for k, v in data_point.images.items():
             obs[f"video.{k}"] = np.array(v)  # (T, H, W, C)
+        for k, v in data_point.efforts.items():
+            obs[f"effort.{k}"] = v  # (T, D)
         for language_key in loader.modality_configs["language"].modality_keys:
             obs[language_key] = data_point.text
         parsed_obs = parse_observation_gr00t(obs, loader.modality_configs)
@@ -235,7 +242,7 @@ class ArgsConfig:
     port: int = 5555
     """Port to connect to."""
 
-    steps: int = 200
+    steps: int = 500
     """Maximum number of steps to evaluate (will be capped by trajectory length)."""
 
     traj_ids: list[int] = field(default_factory=lambda: [0])
@@ -305,7 +312,7 @@ def main(args: ArgsConfig):
     dataset = LeRobotEpisodeLoader(
         dataset_path=args.dataset_path,
         modality_configs=modality,
-        video_backend="torchcodec",
+        video_backend="ffmpeg",
         video_backend_kwargs=None,
     )
 
