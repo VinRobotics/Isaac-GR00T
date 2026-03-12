@@ -308,12 +308,6 @@ class FlowmatchingActionHead(nn.Module):
             output_dim=self.action_dim,
         )
         
-        # done detection
-        self.task_completion_detection = TaskCompletionDetector(
-            seq_dim=config.backbone_embedding_dim,
-            hidden_dim=config.hidden_size,
-        )
-        self.task_completion_detection_loss = nn.BCEWithLogitsLoss()
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
@@ -333,8 +327,6 @@ class FlowmatchingActionHead(nn.Module):
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
-        self.task_completion_only = False  # set True to skip diffusion forward pass
-        self.task_completion_loss_weight = 1.0  # scale factor for task completion loss
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
@@ -376,28 +368,6 @@ class FlowmatchingActionHead(nn.Module):
             if not self.tune_diffusion_model:
                 self.model.eval()
                 
-    def load_state_dict(self, state_dict, strict=True, assign=False):
-        """
-        Custom load_state_dict that handles the transition from old state_encoder (simple linear)
-        to new state_encoder (ESCNN equivariant).
-        
-        Old checkpoint has: action_head.state_encoder.layer1.W, action_head.state_encoder.layer1.b
-        New model has: action_head.state_encoder.layer1.layers.*.* (ESCNN linear layers)
-        
-        This method filters out incompatible state_encoder keys to prevent weight mismatches.
-        """
-        # Filter out old state_encoder weights that don't match the new ESCNN architecture
-        filtered_state_dict = {}
-        for key, value in state_dict.items():
-            # Skip old-style state_encoder weights
-            if "task_completion_detection" in key:
-                print(f"Skipping incompatible state_encoder weight: {key}")
-                continue
-            filtered_state_dict[key] = value
-        # print(filtered_state_dict)
-        # Call parent's load_state_dict with filtered state
-        return super().load_state_dict(filtered_state_dict, strict=False, assign=assign)
-
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         return (self.config.noise_s - sample) / self.config.noise_s
@@ -415,19 +385,6 @@ class FlowmatchingActionHead(nn.Module):
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
-        # get task completion
-        task_completion = action_input.task_completion.squeeze().float()
-        vl_task_completion_embs = backbone_output.backbone_features.detach()
-        vl_task_completion_logits = self.task_completion_detection(vl_task_completion_embs).squeeze()
-        vl_task_completion_loss = self.task_completion_detection_loss(vl_task_completion_logits, task_completion)
-
-        # Skip expensive diffusion forward when only training task_completion_detection
-        if self.task_completion_only:
-            weighted_loss = self.task_completion_loss_weight * vl_task_completion_loss
-            return BatchFeature(data={
-                "loss": weighted_loss,
-                "loss_vl_task_completion": vl_task_completion_loss.detach(),
-            })
         backbone_output = self.process_backbone_output(backbone_output)
 
         if self.config.expand_batch is not None:
@@ -506,10 +463,6 @@ class FlowmatchingActionHead(nn.Module):
 
     @torch.no_grad()
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
-
-        vl_task_completion_embs = backbone_output.backbone_features.detach()
-        vl_task_completion_logits = self.task_completion_detection(vl_task_completion_embs).squeeze()
-        vl_task_completion_pred = F.sigmoid(vl_task_completion_logits)
         backbone_output = self.process_backbone_output(backbone_output)
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
@@ -562,7 +515,7 @@ class FlowmatchingActionHead(nn.Module):
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
-        return BatchFeature(data={"action_pred": actions, "task_completion": vl_task_completion_pred})
+        return BatchFeature(data={"action_pred": actions})
     
     @torch.enable_grad()
     def get_realtime_action(

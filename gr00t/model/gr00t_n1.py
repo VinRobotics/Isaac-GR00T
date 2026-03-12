@@ -19,15 +19,18 @@ import copy
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import tree
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
+from torch import nn
 from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel
 from transformers.feature_extraction_utils import BatchFeature
 
 from .action_head.flow_matching_action_head import (
     FlowmatchingActionHead,
     FlowmatchingActionHeadConfig,
+    TaskCompletionDetector,
 )
 from .backbone import EagleBackbone
 
@@ -82,6 +85,14 @@ class GR00T_N1_5(PreTrainedModel):
         self.backbone = EagleBackbone(**config.backbone_cfg)
         action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
         self.action_head = FlowmatchingActionHead(action_head_cfg)
+
+        self.task_completion_detection = TaskCompletionDetector(
+            seq_dim=action_head_cfg.backbone_embedding_dim,
+            hidden_dim=action_head_cfg.hidden_size,
+        )
+        self.task_completion_detection_loss = nn.BCEWithLogitsLoss()
+        self.task_completion_only = False  # set True to skip diffusion forward pass
+        self.task_completion_loss_weight = 1.0  # scale factor for task completion loss
 
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
@@ -165,6 +176,19 @@ class GR00T_N1_5(PreTrainedModel):
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
+
+        if "task_completion" in action_inputs:
+            task_completion = action_inputs.task_completion.squeeze().float()
+            vl_embs = backbone_outputs.backbone_features.detach()
+            tc_logits = self.task_completion_detection(vl_embs).squeeze()
+            tc_loss = self.task_completion_detection_loss(tc_logits, task_completion)
+
+            if self.task_completion_only:
+                return BatchFeature(data={
+                    "loss": self.task_completion_loss_weight * tc_loss,
+                    "loss_vl_task_completion": tc_loss.detach(),
+                })
+
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=True)
         return action_head_outputs
@@ -176,7 +200,10 @@ class GR00T_N1_5(PreTrainedModel):
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
         backbone_outputs = self.backbone(backbone_inputs)
+        tc_logits = self.task_completion_detection(backbone_outputs.backbone_features.detach()).squeeze()
+        tc_pred = F.sigmoid(tc_logits)
         action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
+        action_head_outputs["task_completion"] = tc_pred
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
     
@@ -194,6 +221,8 @@ class GR00T_N1_5(PreTrainedModel):
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
         backbone_outputs = self.backbone(backbone_inputs)
+        tc_logits = self.task_completion_detection(backbone_outputs.backbone_features.detach()).squeeze()
+        tc_pred = F.sigmoid(tc_logits)
         if prev_action_chunk is None:
             action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
 
@@ -210,9 +239,10 @@ class GR00T_N1_5(PreTrainedModel):
                 actual_action_dim=actual_action_dim
             )
             # print("action_head_outputs: ", action_head_outputs)
+        action_head_outputs["task_completion"] = tc_pred
         _real_action_head_outputs = copy.deepcopy(action_head_outputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
-        
+
         return action_head_outputs, _real_action_head_outputs
 
     def prepare_input(self, inputs) -> Tuple[BatchFeature, BatchFeature]:

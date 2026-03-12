@@ -154,34 +154,20 @@ def main(config: ArgsConfig):
         tune_diffusion_model=False,
     )
 
-    # The custom load_state_dict skips task_completion_detection keys, so the
-    # TaskCompletionDetector is left with whatever PyTorch default init produced
-    # before _init_weights() runs. Recreate a fresh action head and copy all
-    # compatible weights via strict=False — this guarantees task_completion_detection
-    # gets the NaN-safe _init_weights() values from the new module's __init__.
-    import copy
-    from gr00t.model.action_head.flow_matching_action_head import FlowmatchingActionHead
-
-    new_action_head_config = copy.deepcopy(model.action_head.config)
-    new_action_head = FlowmatchingActionHead(new_action_head_config)
-    new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
-    model.action_head = new_action_head
-    print("Recreated action head and copied compatible weights (task_completion_detection re-initialized safely)")
-
     # Skip diffusion forward pass to save compute — only task_completion loss is needed
-    model.action_head.task_completion_only = True
-    model.action_head.task_completion_loss_weight = config.task_completion_loss_weight
+    model.task_completion_only = True
+    model.task_completion_loss_weight = config.task_completion_loss_weight
 
     # Replace loss with class-weighted version to handle failure/success imbalance
     if config.success_pos_weight != 1.0:
         pos_weight = torch.tensor([config.success_pos_weight])
-        model.action_head.task_completion_detection_loss = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        model.task_completion_detection_loss = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         print(f"Using pos_weight={config.success_pos_weight} for success labels")
 
     # Freeze everything, then unfreeze only task_completion_detection
     for p in model.parameters():
         p.requires_grad = False
-    for p in model.action_head.task_completion_detection.parameters():
+    for p in model.task_completion_detection.parameters():
         p.requires_grad = True
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -236,7 +222,7 @@ def main(config: ArgsConfig):
     # Save only task_completion_detection weights
     output_path = Path(config.output_dir) / "task_completion_detection.pt"
     torch.save(
-        model.action_head.task_completion_detection.state_dict(),
+        model.task_completion_detection.state_dict(),
         output_path,
     )
     print(f"\nSaved task_completion_detection weights to: {output_path}")
