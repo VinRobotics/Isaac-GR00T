@@ -22,8 +22,14 @@ vrh3_two_hands_config = {
         ],
     ),
     "effort": ModalityConfig(
-        delta_indices=list(range(-15, 51)),
+        delta_indices=list(range(-15, 1)) + [i * 2 for i in range(1, 51)],
         modality_keys=[
+            "left_arm",
+            "right_arm",
+            "left_hand",
+            "right_hand",
+        ],
+        sin_cos_embedding_keys=[
             "left_arm",
             "right_arm",
             "left_hand",
@@ -31,7 +37,7 @@ vrh3_two_hands_config = {
         ],
     ),
     "action": ModalityConfig(
-        delta_indices=list(range(0, 50)),
+        delta_indices=[i * 2 for i in range(0, 50)],
         modality_keys=[
             "left_arm",
             "right_arm",
