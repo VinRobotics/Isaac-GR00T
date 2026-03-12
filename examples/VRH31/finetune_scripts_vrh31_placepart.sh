@@ -3,7 +3,7 @@ export WANDB_PROJECT=vrh3_sim_pick_place
 export CUDA_VISIBLE_DEVICES=0,1
 HF_HUB_OFFLINE=0
 
-python \
+torchrun --nproc_per_node=2 \
     gr00t/experiment/launch_finetune.py \
     --base-model-path nvidia/GR00T-N1.6-3B \
     --dataset-path \
