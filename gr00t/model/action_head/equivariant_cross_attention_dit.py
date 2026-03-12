@@ -331,17 +331,14 @@ class EquivariantAttention(nn.Module):
 
 class EquivariantAttentionPool(nn.Module):
     """
-    Pools N equivariant tokens → K tokens using learned query tokens in regular repr space.
+    Fully equivariant attention pool: N equivariant tokens → K equivariant tokens.
 
-    Mirrors the equivariant self-attention design:
-      - query_tokens: K learned params in trivial (scalar/invariant) repr — no group structure
-      - q_proj: trivial → regular (lifting); k_proj: regular → regular
-      - V: raw equivariant features (no v_proj)
-      - Scores: Q_proj · K_proj — Q is invariant (doesn't rotate), K transforms
-        equivariantly, so attention weights change correctly with group action and
-        the pooled output inherits equivariance from V
+    Equivariance proof:
+      - K scores: GroupPooling(x) is INVARIANT — output unchanged when x → ρ(g)·x
+      - Q: learned orientation-free scalar params (no group action applied)
+      - attn = softmax(Q · K) is TRULY INVARIANT under group action ✓
+      - out[k] = Σ_n attn[k,n] * x[n] → ρ(g)·out[k] when x[n] → ρ(g)·x[n] ✓
 
-    Requires: H * dim_head % G == 0  (so qkv_type can use regular_repr blocks)
     No residual connection — this is a pooling module (changes sequence length).
     """
 
@@ -355,32 +352,24 @@ class EquivariantAttentionPool(nn.Module):
     ):
         super().__init__()
         self.in_type = in_type
-        gspace = in_type.gspace
-        G = gspace.fibergroup.order()
         self.H = heads
         self.Dh = dim_head
         self.scalar_dim = heads * dim_head
         self.K = num_queries
         self.in_dim = in_type.size
 
-        assert self.scalar_dim % G == 0, (
-            f"heads*dim_head={self.scalar_dim} must be divisible by G={G} for regular repr"
-        )
+        # GroupPooling: regular repr → trivial repr (max over G elements per block)
+        # INVARIANT: GroupPool(ρ(g)·x) = GroupPool(x) for all g
+        self.k_gpool = enn.GroupPooling(in_type)
+        k_inv_dim = self.k_gpool.out_type.size  # = in_type.size // G
 
-        # Regular FieldType for Q and K projections
-        n_regular = self.scalar_dim // G
-        self.qkv_type = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
+        # Project invariant K features to attention dimension
+        # nn.Linear is valid here: invariant scalars can be freely mixed
+        self.k_linear = nn.Linear(k_inv_dim, self.scalar_dim, bias=bias)
 
-        # Trivial FieldType for learned query tokens (orientation-free scalars)
-        self.q_trivial_type = enn.FieldType(gspace, [gspace.trivial_repr] * self.scalar_dim)
-
-        # Learned query tokens: K × scalar_dim free scalars (no group structure)
+        # Learned query tokens: K × scalar_dim orientation-free scalars
         self.query_tokens = nn.Parameter(torch.empty(num_queries, self.scalar_dim))
         nn.init.trunc_normal_(self.query_tokens, std=0.02)
-
-        # q_proj lifts trivial → regular; k_proj maps regular → regular
-        self.q_proj = enn.Linear(self.q_trivial_type, self.qkv_type, bias=bias)
-        self.k_proj = enn.Linear(in_type, self.qkv_type, bias=bias)
 
         self.scale = dim_head ** -0.5
 
@@ -391,25 +380,26 @@ class EquivariantAttentionPool(nn.Module):
         """
         B, N, D = x.shape
 
-        # Project learned query tokens: (K, scalar_dim) → (B, K, H, Dh)
-        q_geo = enn.GeometricTensor(
-            self.query_tokens.unsqueeze(0).expand(B, -1, -1).reshape(B * self.K, -1),
-            self.q_trivial_type,
-        )
-        Q = self.q_proj(q_geo).tensor.reshape(B, self.K, self.H, self.Dh)
+        # Compute INVARIANT K features via GroupPooling
+        # GroupPool(ρ(g)·x) = GroupPool(x) — invariant under group action
+        x_geo = enn.GeometricTensor(x.reshape(B * N, D), self.in_type)
+        k_inv = self.k_gpool(x_geo).tensor      # (B*N, k_inv_dim) — INVARIANT
+        k_inv = self.k_linear(k_inv)             # (B*N, scalar_dim)
+        K = k_inv.reshape(B, N, self.H, self.Dh)
 
-        # Project keys from input: (B*N, in_dim) → (B, N, H, Dh)
-        k_geo = enn.GeometricTensor(x.reshape(B * N, D), self.in_type)
-        K_proj = self.k_proj(k_geo).tensor.reshape(B, N, self.H, self.Dh)
+        # Learned query tokens (scalar, no group structure)
+        Q = self.query_tokens.unsqueeze(0).expand(B, -1, -1)  # (B, K, scalar_dim)
+        Q = Q.reshape(B, self.K, self.H, self.Dh)
 
-        # Attention scores: (B, H, K, N)
-        attn = torch.einsum("b k h d, b n h d -> b h k n", Q, K_proj) * self.scale
+        # Attention scores: (B, H, K, N) — TRULY INVARIANT (Q scalar, K invariant)
+        attn = torch.einsum("b k h d, b n h d -> b h k n", Q, K) * self.scale
         attn = torch.softmax(attn, dim=-1)      # (B, H, K, N)
 
         # Average over heads → pooling weights: (B, K, N)
         attn = attn.mean(dim=1)
 
-        # Weighted sum of equivariant V (no projection) → (B, K, in_dim)
+        # Weighted sum of equivariant V = x (no projection) → equivariant output
+        # attn is invariant → out[k] = Σ_n attn[k,n]*x[n] transforms as ρ(g)·out[k] ✓
         out = torch.einsum("b k n, b n d -> b k d", attn, x)
 
         return out
@@ -838,7 +828,7 @@ class EDiT(ModelMixin, ConfigMixin):
             return output
 
 
-class SelfAttentionTransformer(ModelMixin, ConfigMixin):
+class EquiSelfAttentionTransformer(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = True
 
     @register_to_config

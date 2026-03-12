@@ -42,7 +42,7 @@ from gr00t.model.action_head.action_encoder import (
 
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
-from .equivariant_cross_attention_dit import EDiT, EquivariantAttentionPool
+from .equivariant_cross_attention_dit import EDiT, EquivariantAttentionPool, EquiSelfAttentionTransformer
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -483,8 +483,20 @@ class FlowmatchingActionHead(nn.Module):
         self.equi_vis_pos_type = enn.FieldType(self.group, [self.group.irrep(1)])
         self.equi_vis_pos_proj = enn.Linear(self.equi_vis_pos_type, self.model.in_type)
 
+        # 2-layer equivariant self-attention over vis tokens before pooling
+        self.equi_vis_self_attn = EquiSelfAttentionTransformer(
+            n_group=self.model.config.n_group,
+            num_attention_heads=self.model.config.num_attention_heads,
+            attention_head_dim=self.model.config.attention_head_dim,
+            output_dim=self.model.inner_dim,
+            num_layers=2,
+            dropout=self.model.config.dropout,
+            attention_bias=self.model.config.attention_bias,
+            activation_fn=self.model.config.activation_fn,
+            final_dropout=False,
+        )
+
         # Learnable equivariant pooling: T_vis spatial tokens → num_vis_queries tokens per camera
-        # Q and K both in regular repr (equivariant projections); V raw equivariant; no v_proj
         _pool_dim_head = self.model.in_type.size // 4  # H*Dh = in_type.size → divisible by G ✓
         self.equi_vis_pool = EquivariantAttentionPool(
             in_type=self.model.in_type,
@@ -779,6 +791,9 @@ class FlowmatchingActionHead(nn.Module):
             enn.GeometricTensor(pos_2d, self.equi_vis_pos_type)
         ).tensor                               # [T_vis, D_hidden]
         vis_per_cam = vis_per_cam + pos_emb.unsqueeze(0)  # [B*n_img, T_vis, D_hidden]
+
+        # 2-layer equivariant self-attention over vis tokens (before pooling)
+        vis_per_cam = self.equi_vis_self_attn(vis_per_cam)
 
         # Pool T_vis spatial tokens → num_vis_queries tokens per camera (equivariant)
         vis_pooled = self.equi_vis_pool(vis_per_cam)               # [B*n_img, K, D_hidden]
