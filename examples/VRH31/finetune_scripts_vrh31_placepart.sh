@@ -7,12 +7,14 @@ python \
     gr00t/experiment/launch_finetune.py \
     --base-model-path nvidia/GR00T-N1.6-3B \
     --dataset-path \
-    /mnt/data/sftp/data/locht1/vr_data/20260309_VR_H31_bodyshop_place_part2_baoht9_stereo_speedup1 \
-    /mnt/data/sftp/data/locht1/vr_data/20260309_VR_H31_bodyshop_place_part2_linhld23_stereo_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_trym_stereo_speedup1 \
     /mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_recovery_trym_stereo_speedup1 \
     /mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_ood_trym_stereo_speedup1 \
-    /mnt/data/sftp/data/locht1/vr_data/20260227_VR_H31_bodyshop_place_part2_trym_stereo_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/20260306_VR_H31_bodyshop_place_part2_correction_stereo_speedup1 \
     /mnt/data/sftp/data/locht1/vr_data/20260302_VR_H31_bodyshop_place_part2_linhld23_stereo_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/20260309_VR_H31_bodyshop_place_part2_baoht9_stereo_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/20260309_VR_H31_bodyshop_place_part2_linhld23_stereo_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/20260310_VR_H31_bodyshop_place_part2_stereo_speedup1 \
     --embodiment-tag NEW_EMBODIMENT \
     --modality-config-path /home/locht1/gr00t/data_config/vrh3_two_hands_effort.py \
     --effort-dim 26 \
@@ -21,7 +23,7 @@ python \
     --output-dir /mnt/data/sftp/data/locht1/vr_checkpoints/gr00t_n16_ta_vrh31_two_hands_chunk50_1103 \
     --save-total-limit 5 \
     --save-steps 10000 \
-    --max-steps 70000 \
+    --max-steps 90000 \
     --use-wandb \
     --global-batch-size 64 \
     --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
