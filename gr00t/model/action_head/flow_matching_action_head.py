@@ -415,7 +415,19 @@ class FlowmatchingActionHead(nn.Module):
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
+        # get task completion
+        task_completion = action_input.task_completion.squeeze().float()
+        vl_task_completion_embs = backbone_output.backbone_features.detach()
+        vl_task_completion_logits = self.task_completion_detection(vl_task_completion_embs).squeeze()
+        vl_task_completion_loss = self.task_completion_detection_loss(vl_task_completion_logits, task_completion)
 
+        # Skip expensive diffusion forward when only training task_completion_detection
+        if self.task_completion_only:
+            weighted_loss = self.task_completion_loss_weight * vl_task_completion_loss
+            return BatchFeature(data={
+                "loss": weighted_loss,
+                "loss_vl_task_completion": vl_task_completion_loss.detach(),
+            })
         backbone_output = self.process_backbone_output(backbone_output)
 
         if self.config.expand_batch is not None:
@@ -436,19 +448,7 @@ class FlowmatchingActionHead(nn.Module):
                 factors = tuple(factors)
                 expanded = v.repeat(*factors)
                 action_input[k] = expanded
-        # get task completion
-        task_completion = action_input.task_completion.squeeze().float()
-        vl_task_completion_embs = backbone_output.backbone_features.detach()
-        vl_task_completion_logits = self.task_completion_detection(vl_task_completion_embs).squeeze()
-        vl_task_completion_loss = self.task_completion_detection_loss(vl_task_completion_logits, task_completion)
 
-        # Skip expensive diffusion forward when only training task_completion_detection
-        if self.task_completion_only:
-            weighted_loss = self.task_completion_loss_weight * vl_task_completion_loss
-            return BatchFeature(data={
-                "loss": weighted_loss,
-                "loss_vl_task_completion": vl_task_completion_loss.detach(),
-            })
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
@@ -507,10 +507,10 @@ class FlowmatchingActionHead(nn.Module):
     @torch.no_grad()
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
 
-        backbone_output = self.process_backbone_output(backbone_output)
         vl_task_completion_embs = backbone_output.backbone_features.detach()
         vl_task_completion_logits = self.task_completion_detection(vl_task_completion_embs).squeeze()
         vl_task_completion_pred = F.sigmoid(vl_task_completion_logits)
+        backbone_output = self.process_backbone_output(backbone_output)
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
         embodiment_id = action_input.embodiment_id
