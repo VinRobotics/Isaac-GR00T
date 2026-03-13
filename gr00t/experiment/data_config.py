@@ -1129,6 +1129,116 @@ class LiberoConfig(BaseDataConfig):
 
 ###########################################################################################
 
+class EquiLiberoConfig(BaseDataConfig):
+    video_keys = ["video.image", "video.wrist_image"]
+    state_keys = [
+        "state.x",
+        "state.y",
+        "state.z",
+        "state.rx",
+        "state.ry",
+        "state.rz",
+        "state.rw",
+        "state.gripper",
+    ]
+    action_keys = [
+        "action.x",
+        "action.y",
+        "action.z",
+        "action.rx",
+        "action.ry",
+        "action.rz",
+        "action.rw",
+        "action.gripper",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.x": "min_max",
+                    "state.y": "min_max",
+                    "state.z": "min_max",
+                    "state.gripper": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
+                },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.x": "min_max",
+                    "action.y": "min_max",
+                    "action.z": "min_max",
+                    "action.gripper": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
+                },
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+                num_hand=self.num_hand,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+
+###########################################################################################
+
 class VRH2TwotHand2CamConfig(BaseDataConfig):
     video_keys = ["video.cam_front", "video.cam_waist"]
     state_keys = [
@@ -1712,6 +1822,7 @@ DATA_CONFIG_MAP = {
     "agi_two_hand": AGITwotHandConfig(),
     "agi_two_hand_3_cam": AGITwotHand3CamConfig(),
     "libero": LiberoConfig(),
+    "equi_libero": EquiLiberoConfig(),
     "vrh2_two_hand_2_cam": VRH2TwotHand2CamConfig(),
     "vrh2_two_hand_2_cam_vel_eff": VRH2TwotHand2CamVelEffConfig(),
     "vrh3_two_hand": VRH3TwotHandConfig(),
