@@ -464,10 +464,6 @@ class FlowmatchingActionHead(nn.Module):
             if config.use_vlln
             else nn.Identity()
         )
-        # Project VL features (after SA) to trivial VL cross-attention dim
-        _vl_cross_dim = diffusion_cfg.get("vl_cross_attention_dim") or diffusion_cfg.get("cross_attention_dim", 2048)
-        _vl_sa_inner_dim = config.vl_self_attention_cfg["num_attention_heads"] * config.vl_self_attention_cfg["attention_head_dim"]
-        self.vl_proj = nn.Linear(_vl_sa_inner_dim, _vl_cross_dim)
 
         # Equi vision stream (equivariant): backbone vision features → equi_vis_proj
         # backbone_vision_features has dim = backbone_embedding_dim (= project_to_dim, regular repr)
@@ -483,25 +479,13 @@ class FlowmatchingActionHead(nn.Module):
         self.equi_vis_pos_type = enn.FieldType(self.group, [self.group.irrep(1)])
         self.equi_vis_pos_proj = enn.Linear(self.equi_vis_pos_type, self.model.in_type)
 
-        # 2-layer equivariant self-attention over vis tokens before pooling
-        self.equi_vis_self_attn = EquiSelfAttentionTransformer(
-            n_group=self.model.config.n_group,
-            num_attention_heads=self.model.config.num_attention_heads,
-            attention_head_dim=self.model.config.attention_head_dim,
-            output_dim=self.model.inner_dim,
-            num_layers=2,
-            dropout=self.model.config.dropout,
-            attention_bias=self.model.config.attention_bias,
-            activation_fn=self.model.config.activation_fn,
-            final_dropout=False,
-        )
-
         # Learnable equivariant pooling: T_vis spatial tokens → num_vis_queries tokens per camera
-        _pool_dim_head = self.model.in_type.size // 4  # H*Dh = in_type.size → divisible by G ✓
+        heads = 8
+        _pool_dim_head = self.model.in_type.size // heads  # H*Dh = in_type.size → divisible by G ✓
         self.equi_vis_pool = EquivariantAttentionPool(
             in_type=self.model.in_type,
             num_queries=config.num_vis_queries,
-            heads=4,
+            heads=heads,
             dim_head=_pool_dim_head,
         )
 
@@ -792,18 +776,14 @@ class FlowmatchingActionHead(nn.Module):
         ).tensor                               # [T_vis, D_hidden]
         vis_per_cam = vis_per_cam + pos_emb.unsqueeze(0)  # [B*n_img, T_vis, D_hidden]
 
-        # 2-layer equivariant self-attention over vis tokens (before pooling)
-        vis_per_cam = self.equi_vis_self_attn(vis_per_cam)
-
         # Pool T_vis spatial tokens → num_vis_queries tokens per camera (equivariant)
         vis_pooled = self.equi_vis_pool(vis_per_cam)               # [B*n_img, K, D_hidden]
         K = vis_pooled.shape[1]
         equi_vis_features = vis_pooled.reshape(B, n_img * K, D_hidden)  # [B, n_img*K, D_hidden]
 
         # ── VL stream ────────────────────────────────────────────────────────
-        lang = self.vlln(vision_language_features)           # [B, T_text, D_lang]
-        lang = self.vl_self_attention(lang)            # [B, T_text, vl_sa_inner_dim]
-        vl_features = self.vl_proj(lang)               # [B, T_text, vl_cross_dim]
+        vl_features = self.vlln(vision_language_features)           # [B, T_text, D_lang]
+        vl_features = self.vl_self_attention(vl_features)            # [B, T_text, vl_sa_inner_dim]
 
         backbone_output.data["equi_vis_features"] = equi_vis_features
         backbone_output.data["vl_features"] = vl_features
@@ -1011,17 +991,6 @@ class FlowmatchingActionHead(nn.Module):
             if self.config.add_pos_embed:
                 action_features = self._add_temporal_pos_embed(action_features)
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            # future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-                    
-            # future_tokens = einops.rearrange(
-            #     future_tokens, "b t d -> (b t) d"
-            # )
-            # future_tokens = enn.GeometricTensor(future_tokens, self.future_tokens_in_type)
-            # future_tokens = self.future_tokens_equi_proj(future_tokens)
-            # future_tokens = einops.rearrange(
-            #     future_tokens.tensor, "(b t) d -> b t d", b = B, t = self.config.num_target_vision_tokens
-            # )
             if equi_vis_embs is not None:
                 N_vis = equi_vis_embs.shape[1]
                 sa_embs = torch.cat((equi_vis_embs, state_features, action_features), dim=1)

@@ -331,17 +331,20 @@ class EquivariantAttention(nn.Module):
 
 class EquivariantAttentionPool(nn.Module):
     """
-    Fully equivariant attention pool: N equivariant tokens → K equivariant tokens.
-
+    Improved equivariant pool: 256 → K tokens.
+    
+    Two invariant scoring mechanisms combined:
+      1. Magnitude score:  ||x||² per regular block — invariant, captures activation strength
+      2. Content score:    GroupPool(x) — invariant, captures max-activation direction
+    
+    Each query learns to weight between magnitude and content scoring
+    via a learned invariant gate — giving queries the ability to specialize.
+    
     Equivariance proof:
-      - K scores: GroupPooling(x) is INVARIANT — output unchanged when x → ρ(g)·x
-      - Q: learned orientation-free scalar params (no group action applied)
-      - attn = softmax(Q · K) is TRULY INVARIANT under group action ✓
-      - out[k] = Σ_n attn[k,n] * x[n] → ρ(g)·out[k] when x[n] → ρ(g)·x[n] ✓
-
-    No residual connection — this is a pooling module (changes sequence length).
+      All scores are invariant (magnitude and GroupPool are both G-invariant)
+      attn = f(invariant scores) → invariant
+      out  = attn @ x → equivariant ✅
     """
-
     def __init__(
         self,
         in_type: enn.FieldType,
@@ -351,59 +354,102 @@ class EquivariantAttentionPool(nn.Module):
         bias: bool = True,
     ):
         super().__init__()
-        self.in_type = in_type
-        self.H = heads
-        self.Dh = dim_head
+        self.in_type   = in_type
+        self.H         = heads
+        self.Dh        = dim_head
         self.scalar_dim = heads * dim_head
-        self.K = num_queries
-        self.in_dim = in_type.size
+        self.K         = num_queries
+        self.in_dim    = in_type.size
+        G              = in_type.gspace.fibergroup.order()
+        self.G         = G
+        self.scale     = dim_head ** -0.5
 
-        # GroupPooling: regular repr → trivial repr (max over G elements per block)
-        # INVARIANT: GroupPool(ρ(g)·x) = GroupPool(x) for all g
-        self.k_gpool = enn.GroupPooling(in_type)
-        k_inv_dim = self.k_gpool.out_type.size  # = in_type.size // G
+        # ── Score path 1: GroupPooling (max over G elements) ──────────────
+        # GroupPool(ρ(g)·x) = GroupPool(x) — strictly invariant
+        self.k_gpool   = enn.GroupPooling(in_type)
+        k_inv_dim      = self.k_gpool.out_type.size   # in_dim // G
+        self.k_content = nn.Linear(k_inv_dim, self.scalar_dim, bias=bias)
 
-        # Project invariant K features to attention dimension
-        # nn.Linear is valid here: invariant scalars can be freely mixed
-        self.k_linear = nn.Linear(k_inv_dim, self.scalar_dim, bias=bias)
+        # ── Score path 2: Block norm (||x_block||² per regular repr block) ─
+        # ||ρ(g)·x||² = ||x||² — strictly invariant (unitary repr)
+        n_blocks       = in_type.size // G            # number of regular repr blocks
+        self.k_norm    = nn.Linear(n_blocks, self.scalar_dim, bias=bias)
 
-        # Learned query tokens: K × scalar_dim orientation-free scalars
+        # ── Per-query gate: how much to use content vs norm score ──────────
+        # gate is a scalar per (query, head, dim) → invariant
+        # Each query learns its own scoring strategy
         self.query_tokens = nn.Parameter(torch.empty(num_queries, self.scalar_dim))
+        self.query_gate   = nn.Parameter(torch.zeros(num_queries, 1))  # init=0 → equal mix
         nn.init.trunc_normal_(self.query_tokens, std=0.02)
 
-        self.scale = dim_head ** -0.5
+        # ── Optional: learned temperature per query ─────────────────────────
+        self.log_temp = nn.Parameter(torch.zeros(num_queries, 1, 1))  # (K, 1, 1)
+
+    def _block_norms(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-block L2 norm of x.
+        x:      (B*N, D) where D = n_blocks * G
+        return: (B*N, n_blocks) — invariant feature per block ✅
+        
+        ||ρ(g)·x_block||² = ||x_block||²  because regular repr is unitary
+        """
+        BN, D = x.shape
+        n_blocks = D // self.G
+        # Reshape to (B*N, n_blocks, G) — each block is one regular repr
+        x_blocks = x.reshape(BN, n_blocks, self.G)
+        # L2 norm over the G elements of each block → invariant scalar per block
+        return torch.norm(x_blocks, dim=-1)   # (B*N, n_blocks) invariant ✅
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x   : (B, N, in_dim) — equivariant input tokens
-        out : (B, K, in_dim) — pooled equivariant tokens
+        x   : (B, N, D) — equivariant tokens in regular repr
+        out : (B, K, D) — K pooled equivariant tokens
         """
         B, N, D = x.shape
 
-        # Compute INVARIANT K features via GroupPooling
-        # GroupPool(ρ(g)·x) = GroupPool(x) — invariant under group action
-        x_geo = enn.GeometricTensor(x.reshape(B * N, D), self.in_type)
-        k_inv = self.k_gpool(x_geo).tensor      # (B*N, k_inv_dim) — INVARIANT
-        k_inv = self.k_linear(k_inv)             # (B*N, scalar_dim)
-        K = k_inv.reshape(B, N, self.H, self.Dh)
+        x_flat = x.reshape(B * N, D)
+        x_geo  = enn.GeometricTensor(x_flat, self.in_type)
 
-        # Learned query tokens (scalar, no group structure)
-        Q = self.query_tokens.unsqueeze(0).expand(B, -1, -1)  # (B, K, scalar_dim)
-        Q = Q.reshape(B, self.K, self.H, self.Dh)
+        # ── Score path 1: content via GroupPooling ─────────────────────────
+        k_content = self.k_gpool(x_geo).tensor          # (B*N, D//G) invariant ✅
+        k_content = self.k_content(k_content)            # (B*N, scalar_dim)
+        k_content = k_content.reshape(B, N, self.H, self.Dh)
 
-        # Attention scores: (B, H, K, N) — TRULY INVARIANT (Q scalar, K invariant)
-        attn = torch.einsum("b k h d, b n h d -> b h k n", Q, K) * self.scale
-        attn = torch.softmax(attn, dim=-1)      # (B, H, K, N)
+        # ── Score path 2: magnitude via block norms ────────────────────────
+        k_norm = self._block_norms(x_flat)               # (B*N, n_blocks) invariant ✅
+        k_norm = self.k_norm(k_norm)                     # (B*N, scalar_dim)
+        k_norm = k_norm.reshape(B, N, self.H, self.Dh)
 
-        # Average over heads → pooling weights: (B, K, N)
-        attn = attn.mean(dim=1)
+        # ── Combine scores with per-query learned gate ─────────────────────
+        # gate ∈ [0,1]: 0 → pure norm score, 1 → pure content score
+        gate = torch.sigmoid(self.query_gate)            # (K, 1) invariant scalar ✅
+        # gate shape broadcast: (K, 1) → (B, K, H, Dh) via einsum
+        # K_combined[k] = gate[k]*k_content + (1-gate[k])*k_norm — invariant ✅
+        K_combined = (
+            gate.unsqueeze(-1).unsqueeze(-1) * k_content.unsqueeze(1) +
+            (1 - gate).unsqueeze(-1).unsqueeze(-1) * k_norm.unsqueeze(1)
+        )   # (B, K, N, H, Dh)
 
-        # Weighted sum of equivariant V = x (no projection) → equivariant output
-        # attn is invariant → out[k] = Σ_n attn[k,n]*x[n] transforms as ρ(g)·out[k] ✓
-        out = torch.einsum("b k n, b n d -> b k d", attn, x)
+        # ── Attention scores ───────────────────────────────────────────────
+        Q = self.query_tokens.reshape(self.K, self.H, self.Dh)
+        Q = Q.unsqueeze(0).expand(B, -1, -1, -1)        # (B, K, H, Dh)
 
+        # score[b,k,h,n] = Q[b,k,h] · K_combined[b,k,n,h] * scale
+        attn = torch.einsum(
+            "b k h d, b k n h d -> b k h n", Q, K_combined
+        ) * self.scale                                   # (B, K, H, N) invariant ✅
+
+        # Per-query learned temperature — sharpens or softens specialization
+        temp = torch.exp(self.log_temp)                  # (K, 1, 1) positive scalar
+        attn = attn * temp.unsqueeze(0)                  # (B, K, H, N)
+
+        attn = torch.softmax(attn, dim=-1)               # (B, K, H, N) invariant ✅
+        attn = attn.mean(dim=2)                          # (B, K, N) avg over heads
+
+        # ── Weighted sum of equivariant V = x ─────────────────────────────
+        # invariant_weight × equivariant_x = equivariant ✅
+        out = torch.einsum("b k n, b n d -> b k d", attn, x)   # (B, K, D) equivariant ✅
         return out
-
 
 class EquivariantFeedForward(nn.Module):
     r"""
