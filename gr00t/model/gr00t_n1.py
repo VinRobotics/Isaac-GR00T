@@ -29,9 +29,9 @@ from .action_head.flow_matching_action_head import (
     FlowmatchingActionHead,
     FlowmatchingActionHeadConfig,
 )
-from .backbone import EagleBackbone
+from .backbone import EagleBackboneFATokens
 
-BACKBONE_FEATURE_KEY = "backbone_features"
+BACKBONE_FEATURE_KEY = "backbone_vision_language_features"
 ACTION_KEY = "action_pred"
 LOSS_KEY = "loss"
 ERROR_MSG = "Error: unexpected input/output"
@@ -79,7 +79,7 @@ class GR00T_N1_5(PreTrainedModel):
         super().__init__(config)
         self.local_model_path = local_model_path
 
-        self.backbone = EagleBackbone(**config.backbone_cfg)
+        self.backbone = EagleBackboneFATokens(**config.backbone_cfg)
         action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
         self.action_head = FlowmatchingActionHead(action_head_cfg)
 
@@ -136,7 +136,8 @@ class GR00T_N1_5(PreTrainedModel):
             error_msg = ERROR_MSG
             error_msg += f"\n{isinstance(backbone_outputs, BatchFeature)=}"
             error_msg += f"\n{BACKBONE_FEATURE_KEY in backbone_outputs=}"
-            error_msg += f"\n{backbone_outputs[BACKBONE_FEATURE_KEY].shape=}"
+            if BACKBONE_FEATURE_KEY in backbone_outputs:
+                error_msg += f"\n{backbone_outputs[BACKBONE_FEATURE_KEY].shape=}"
             raise ValueError(error_msg)
 
         fail_action_head = (not isinstance(action_head_outputs, BatchFeature)) or not (
@@ -238,8 +239,10 @@ class GR00T_N1_5(PreTrainedModel):
         tune_llm = kwargs.pop("tune_llm", False)
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
+        load_backbone_only = kwargs.pop("load_backbone_only", False)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
+        print(f"Load backbone only: {load_backbone_only}")
         print(f"Tune backbone vision tower: {tune_visual}")
         print(f"Tune backbone LLM: {tune_llm}")
         print(f"Tune action head projector: {tune_projector}")
@@ -257,9 +260,44 @@ class GR00T_N1_5(PreTrainedModel):
             )
             local_model_path = pretrained_model_name_or_path
 
-        pretrained_model = super().from_pretrained(
-            local_model_path, local_model_path=local_model_path, **kwargs
-        )
+        if load_backbone_only:
+            # Instantiate model from config (new action head weights), then load only backbone from checkpoint
+            import json
+            import os
+            from safetensors.torch import load_file as load_safetensors
+
+            config = AutoConfig.from_pretrained(local_model_path)
+            pretrained_model = cls(config, local_model_path=local_model_path)
+
+            safetensors_index_path = os.path.join(local_model_path, "model.safetensors.index.json")
+            safetensors_path = os.path.join(local_model_path, "model.safetensors")
+            pytorch_bin_path = os.path.join(local_model_path, "pytorch_model.bin")
+
+            if os.path.exists(safetensors_index_path):
+                with open(safetensors_index_path, "r") as f:
+                    index = json.load(f)
+                state_dict = {}
+                for shard_file in set(index["weight_map"].values()):
+                    state_dict.update(load_safetensors(os.path.join(local_model_path, shard_file)))
+            elif os.path.exists(safetensors_path):
+                state_dict = load_safetensors(safetensors_path)
+            elif os.path.exists(pytorch_bin_path):
+                import torch as _torch
+                state_dict = _torch.load(pytorch_bin_path, map_location="cpu")
+            else:
+                raise FileNotFoundError(f"No model weights found in {local_model_path}")
+
+            backbone_state_dict = {
+                k.replace("backbone.", ""): v
+                for k, v in state_dict.items()
+                if k.startswith("backbone.")
+            }
+            pretrained_model.backbone.load_state_dict(backbone_state_dict, strict=False)
+            print(f"Loaded {len(backbone_state_dict)} backbone parameters from checkpoint")
+        else:
+            pretrained_model = super().from_pretrained(
+                local_model_path, local_model_path=local_model_path, **kwargs
+            )
 
         pretrained_model.backbone.set_trainable_parameters(
             tune_visual=tune_visual, tune_llm=tune_llm

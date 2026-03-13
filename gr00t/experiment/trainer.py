@@ -130,7 +130,7 @@ class DualBrainTrainer(transformers.Trainer):
             state_dict = self.model.state_dict()
 
         if self.args.should_save:
-            return self.model.save_pretrained(output_dir, state_dict=state_dict)
+            return self.model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=False)
 
     def train(
         self,

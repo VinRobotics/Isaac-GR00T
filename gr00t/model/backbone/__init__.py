@@ -14,3 +14,4 @@
 # limitations under the License.
 
 from .eagle_backbone import EagleBackbone  # noqa: F401
+from .eagle_backbone_fa_tokens import EagleBackboneFATokens  # noqa: F401

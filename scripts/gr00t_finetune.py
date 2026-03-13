@@ -258,6 +258,9 @@ def main(config: ArgsConfig):
     assert hasattr(last_transform, "max_action_dim"), "GR00TTransform must have max_action_dim"
     data_max_action_dim = last_transform.max_action_dim
 
+    rotation_config = data_config_cls.get_rotation_config() if hasattr(data_config_cls, "get_rotation_config") else None
+    print(rotation_config)
+    print(rotation_config.get("num_images_per_sample", 1), rotation_config.get("rotate_image_indices", None))
     # Load model
     model = GR00T_N1_5.from_pretrained(
         pretrained_model_name_or_path=config.base_model_path,
@@ -265,8 +268,37 @@ def main(config: ArgsConfig):
         tune_visual=config.tune_visual,  # backbone's vision tower
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
+        load_backbone_only=True,  # load backbone only, not the action head
+        
     )
-
+    
+    # Update backbone with rotation config if available (for frame averaging)
+    if rotation_config is not None:
+        num_images_per_sample = rotation_config.get("num_images_per_sample", 1)
+        rotate_image_indices = rotation_config.get("rotate_image_indices", None)
+        
+        # Check if backbone needs to be updated with rotation config
+        backbone_needs_update = (
+            model.backbone.num_images_per_sample != num_images_per_sample or
+            model.backbone.rotate_image_indices != rotate_image_indices
+        )
+        
+        if backbone_needs_update:
+            print(f"Updating backbone with rotation config: "
+                  f"num_images_per_sample={num_images_per_sample}, "
+                  f"rotate_image_indices={rotate_image_indices}")
+            
+            # Update backbone config
+            model.backbone.num_images_per_sample = num_images_per_sample
+            if rotate_image_indices is None:
+                model.backbone.rotate_image_indices = list(range(num_images_per_sample))
+            else:
+                model.backbone.rotate_image_indices = rotate_image_indices
+            
+            # Update the model config for saving
+            model.config.backbone_cfg["num_images_per_sample"] = num_images_per_sample
+            model.config.backbone_cfg["rotate_image_indices"] = rotate_image_indices
+    
     if config.use_action_conditioning:
         # Import the FlowmatchingActionHeadActionCondition class
         from gr00t.model.action_head.flow_matching_action_head_action_condition import (
@@ -459,11 +491,14 @@ if __name__ == "__main__":
 
             # Use subprocess.run instead of os.system
             raw_args_list = sys.argv[1:]
+            import random
+            rdzv_port = random.randint(29400, 29600)
             cmd = [
                 "torchrun",
-                "--standalone",
                 f"--nproc_per_node={config.num_gpus}",
-                "--nnodes=1",  # default to 1 node for now
+                "--nnodes=1",
+                "--rdzv_backend=c10d",
+                f"--rdzv_endpoint=127.0.0.1:{rdzv_port}",
                 str(script_path),
                 *raw_args_list,
             ]
@@ -471,4 +506,7 @@ if __name__ == "__main__":
             print("Running torchrun command: ", cmd)
             env = os.environ.copy()
             env["IS_TORCHRUN"] = "1"
+            env["MASTER_ADDR"] = "127.0.0.1"
+            env["NCCL_SOCKET_IFNAME"] = "lo"
+            env["GLOO_SOCKET_IFNAME"] = "lo"
             sys.exit(subprocess.run(cmd, env=env).returncode)

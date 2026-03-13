@@ -60,6 +60,32 @@ class BaseDataConfig(ABC):
             "action": action_modality,
             "language": language_modality,
         }
+        
+    
+    def get_rotation_config(self) -> dict:
+        """
+        Returns configuration for image rotation in the backbone.
+        
+        Returns:
+            dict with:
+                - num_images_per_sample: number of video keys (images per sample)
+                - rotate_image_indices: list of indices for images that should be rotated
+        """
+        num_images = len(self.video_keys)
+        if self.rotate_video_keys is None:
+            # Rotate all images
+            rotate_indices = list(range(num_images))
+        else:
+            # Only rotate specified video keys
+            rotate_indices = [
+                i for i, key in enumerate(self.video_keys) 
+                if key in self.rotate_video_keys
+            ]
+        
+        return {
+            "num_images_per_sample": num_images,
+            "rotate_image_indices": rotate_indices,
+        }
 
     @abstractmethod
     def transform(self) -> ModalityTransform:
@@ -1127,6 +1153,127 @@ class LiberoConfig(BaseDataConfig):
 
         return ComposedModalityTransform(transforms=transforms)
 
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """FA backbone rotation config for Libero: 2 cameras, rotate top camera (index 0) only."""
+        return {
+            "num_images_per_sample": 2,
+            "rotate_image_indices": [0],
+        }
+
+###########################################################################################
+
+class EquiLiberoConfig(BaseDataConfig):
+    """Libero config with separate x/y/z/quat state-action keys for equivariant training."""
+    video_keys = ["video.image", "video.wrist_image"]
+    state_keys = [
+        "state.x",
+        "state.y",
+        "state.z",
+        "state.rx",
+        "state.ry",
+        "state.rz",
+        "state.rw",
+        "state.gripper",
+    ]
+    action_keys = [
+        "action.x",
+        "action.y",
+        "action.z",
+        "action.rx",
+        "action.ry",
+        "action.rz",
+        "action.rw",
+        "action.gripper",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """FA backbone rotation config: 2 cameras, rotate top/head camera (index 0) only.
+
+        backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only
+        backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
+        """
+        return {
+            "num_images_per_sample": 2,
+            "rotate_image_indices": [0],
+        }
+
+    def transform(self):
+        transforms = [
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.x": "min_max",
+                    "state.y": "min_max",
+                    "state.z": "min_max",
+                    "state.gripper": "min_max",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.x": "min_max",
+                    "action.y": "min_max",
+                    "action.z": "min_max",
+                    "action.gripper": "min_max",
+                },
+            ),
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
 ###########################################################################################
 
 class VRH2TwotHand2CamConfig(BaseDataConfig):
@@ -1695,6 +1842,111 @@ class VRH3FullBodyConfig(BaseDataConfig):
 
 ###########################################################################################
 
+class VRH3_1camConfig(BaseDataConfig):
+    video_keys = ["video.cam_front"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand"
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+    
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """FA backbone rotation config: 2 cameras, rotate top/head camera (index 0) only.
+
+        backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only
+        backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
+        """
+        return {
+            "num_images_per_sample": 1,
+            "rotate_image_indices": [0],
+        }
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+
 DATA_CONFIG_MAP = {
     "fourier_gr1_arms_waist": FourierGr1ArmsWaistDataConfig(),
     "fourier_gr1_arms_only": FourierGr1ArmsOnlyDataConfig(),
@@ -1712,10 +1964,12 @@ DATA_CONFIG_MAP = {
     "agi_two_hand": AGITwotHandConfig(),
     "agi_two_hand_3_cam": AGITwotHand3CamConfig(),
     "libero": LiberoConfig(),
+    "equi_libero": EquiLiberoConfig(),
     "vrh2_two_hand_2_cam": VRH2TwotHand2CamConfig(),
     "vrh2_two_hand_2_cam_vel_eff": VRH2TwotHand2CamVelEffConfig(),
     "vrh3_two_hand": VRH3TwotHandConfig(),
     "vrh31_effort": VRH3FullBodyConfig(),
+    "vrh3_1_cam": VRH3_1camConfig(),
     "aloha_right_arm_only": AlohaRightArmConfig(),
     "aloha_right_arm_30_only": AlohaRightArm30Config()
 }
