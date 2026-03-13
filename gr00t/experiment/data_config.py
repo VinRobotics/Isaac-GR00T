@@ -1229,8 +1229,7 @@ class EquiLiberoConfig(BaseDataConfig):
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
                 max_state_dim=64,
-                max_action_dim=32,
-                num_hand=self.num_hand,
+                max_action_dim=32
             ),
         ]
 
