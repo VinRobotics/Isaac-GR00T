@@ -457,23 +457,26 @@ class TaskConditionedEquiPool(nn.Module):
     Equivariant attention pool: N tokens → K tokens, where pool query directions
     are dynamically generated from VL (vision-language) features.
 
-    Strictly equivariant in regular repr:
-      - Keys:   block L2 norms of equi_vis  →  invariant  (||ρ(g)·x_block|| = ||x_block||, unitary)
-      - Queries: linear(mean(vl_features))  →  invariant  (any fn of trivial/invariant input)
-      - Scores: Q · K                       →  invariant  ✅
-      - Attn:   softmax(scores)             →  invariant  ✅
-      - Output: Σ attn · x                  →  equivariant (invariant × equivariant = equivariant) ✅
+    Strictly equivariant in regular repr — all invariance enforced via ESCNN:
+      - Keys:   enn.GroupPooling(in_type) → trivial FieldType  (ESCNN-verified invariant)
+                enn.Linear(gpool_type, score_type)             (trivial → trivial, ESCNN)
+      - Queries: nn.Linear(vl_dim, K*scalar_dim)               (trivial input → trivial output)
+      - Scores: Q · K                                          → invariant ✅
+      - Attn:   softmax(scores)                                → invariant ✅
+      - Output: Σ attn · x                                     → equivariant ✅
 
-    Why this matters vs. V1 (fixed queries):
-      V1 fixes K query vectors that do not rotate with the input, so attention scores
-      change when x → ρ(g)·x, breaking strict equivariance.
-      Here, queries are generated from VL (invariant), keys are block norms (invariant),
-      so scores are G-invariant for any input rotation.
+    Key design choices:
+      Keys use enn.GroupPooling (ESCNN-native, type-safe) instead of manual block norms.
+      GroupPooling: max over the G elements of each regular repr block → trivial FieldType.
+      ESCNN verifies ρ_out(g) ∘ W = W ∘ ρ_in(g) at construction time.
+
+      Queries use nn.Linear (not enn.Linear) because VL features are plain tensors
+      (not GeometricTensors) — wrapping them in ESCNN would add overhead with no benefit.
 
     Why this matters vs. V3 (fixed invariant queries):
       V3 uses fixed learned scalars as queries — blind to the current task.
-      Here, queries are conditioned on VL: the pool learns *which* spatial directions
-      matter for the current instruction + scene, not a fixed geometric prior.
+      Here, queries are conditioned on VL: the pool learns *which* regions to focus on
+      for the current instruction + scene, not a fixed geometric prior.
     """
 
     def __init__(
@@ -492,42 +495,36 @@ class TaskConditionedEquiPool(nn.Module):
         self.scalar_dim = heads * dim_head
         self.K          = num_queries
         self.in_dim     = in_type.size
-        G               = in_type.gspace.fibergroup.order()
-        self.G          = G
+        gspace          = in_type.gspace
         self.scale      = dim_head ** -0.5
-        n_blocks        = in_type.size // G   # number of regular repr blocks per token
 
-        # ── Invariant key: block L2 norms → scoring space ─────────────────
-        # block_norms(x): (B*N, n_blocks) — invariant because ||ρ(g)·x_b|| = ||x_b|| (unitary)
-        # Standard nn.Linear is valid here: invariant input → invariant output ✅
-        self.k_proj = nn.Linear(n_blocks, self.scalar_dim, bias=bias)
+        # ── Invariant key path — fully ESCNN ──────────────────────────────
+        # GroupPooling: regular repr → trivial repr (max over G elements per block).
+        # ESCNN enforces GroupPool(ρ(g)·x) = GroupPool(x) at construction. ✅
+        self.k_gpool = enn.GroupPooling(in_type)
+        # k_gpool.out_type: FieldType with trivial_repr * n_blocks (size = in_dim // G)
 
-        # ── Invariant query: VL global context → K query vectors ──────────
-        # vl_features is trivial (invariant) → linear(vl) is invariant ✅
-        # Each of the K queries gets its own slice of the VL projection.
+        # Project invariant pooled features to scoring space.
+        # trivial → trivial: no group constraint, enn.Linear reduces to nn.Linear
+        # but stays in ESCNN's type system for consistency.
+        self.k_score_type = enn.FieldType(
+            gspace, [gspace.trivial_repr] * self.scalar_dim
+        )
+        self.k_proj = enn.Linear(self.k_gpool.out_type, self.k_score_type, bias=bias)
+
+        # ── Invariant query path — nn.Linear (VL is plain tensor, not GeometricTensor) ─
+        # VL features are trivial/invariant: any linear map of trivial input is trivial.
+        # nn.Linear is correct and avoids unnecessary GeometricTensor wrapping.
         self.vl_to_queries = nn.Linear(vl_dim, num_queries * self.scalar_dim, bias=bias)
         nn.init.trunc_normal_(self.vl_to_queries.weight, std=0.02)
         nn.init.zeros_(self.vl_to_queries.bias)
 
-        # ── Learned base queries: task-agnostic prior (like V1 scalar queries) ─
-        # Init to zero → starts as pure VL-conditioned; learns a fixed offset.
+        # ── Learned base queries: task-agnostic prior ─────────────────────
+        # Init to zero → starts as pure VL-conditioned; learns a fixed offset over training.
         self.query_base = nn.Parameter(torch.zeros(num_queries, self.scalar_dim))
 
         # ── Per-query learned temperature ──────────────────────────────────
         self.log_temp = nn.Parameter(torch.zeros(num_queries, 1, 1))  # (K, 1, 1)
-
-    # ------------------------------------------------------------------
-    def _block_norms(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Per-block L2 norm — strictly G-invariant for regular repr.
-
-        x      : (B*N, D)  where D = n_blocks * G
-        returns: (B*N, n_blocks)  invariant ✅
-
-        Proof: regular repr is unitary, so ||ρ(g)·x_block|| = ||x_block||.
-        """
-        n_blocks = self.in_dim // self.G
-        return torch.norm(x.reshape(-1, n_blocks, self.G), dim=-1)  # (B*N, n_blocks)
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor, vl_features: torch.Tensor) -> torch.Tensor:
@@ -538,31 +535,26 @@ class TaskConditionedEquiPool(nn.Module):
         """
         B, N, D = x.shape
 
-        # ── Invariant keys from block norms ────────────────────────────────
-        k_inv = self._block_norms(x.reshape(B * N, D))   # (B*N, n_blocks) invariant ✅
-        k_inv = self.k_proj(k_inv)                        # (B*N, H*Dh)
-        k_inv = k_inv.reshape(B, N, self.H, self.Dh)     # (B, N, H, Dh)
+        # ── Invariant keys via ESCNN GroupPooling ──────────────────────────
+        x_geo = enn.GeometricTensor(x.reshape(B * N, D), self.in_type)
+        k_inv = self.k_gpool(x_geo)           # GeometricTensor, trivial type, (B*N, n_blocks)
+        k_inv = self.k_proj(k_inv).tensor     # (B*N, scalar_dim) invariant — ESCNN verified ✅
+        k_inv = k_inv.reshape(B, N, self.H, self.Dh)                     # (B, N, H, Dh)
 
         # ── Invariant queries from VL global context ───────────────────────
-        # Mean over token dim: (B, T, D_vl) → (B, D_vl) — global scene+task summary
         vl_global = vl_features.mean(dim=1)               # (B, D_vl) invariant ✅
-        q_vl = self.vl_to_queries(vl_global)              # (B, K * H*Dh) invariant ✅
-        # Add learned task-agnostic base: starts as pure VL, learns fixed offset
-        q_inv = self.query_base + q_vl.reshape(B, self.K, self.scalar_dim)  # (B, K, H*Dh)
-        q_inv = q_inv.reshape(B, self.K, self.H, self.Dh)                   # (B, K, H, Dh)
+        q_vl = self.vl_to_queries(vl_global)              # (B, K*scalar_dim) invariant ✅
+        q_inv = self.query_base + q_vl.reshape(B, self.K, self.scalar_dim)
+        q_inv = q_inv.reshape(B, self.K, self.H, self.Dh)                # (B, K, H, Dh)
 
         # ── Invariant attention scores ─────────────────────────────────────
-        # Both Q and K are invariant → dot product is invariant ✅
         attn = torch.einsum(
             "b k h d, b n h d -> b k h n", q_inv, k_inv
         ) * self.scale                                     # (B, K, H, N) invariant ✅
 
-        # Per-query learned temperature
         temp = torch.exp(self.log_temp)                    # (K, 1, 1)
-        attn = attn * temp.unsqueeze(0)                    # (B, K, H, N)
-
-        attn = torch.softmax(attn, dim=-1)                 # (B, K, H, N) invariant ✅
-        attn = attn.mean(dim=2)                            # (B, K, N) avg over heads
+        attn = (attn * temp.unsqueeze(0)).softmax(dim=-1)  # (B, K, H, N) invariant ✅
+        attn = attn.mean(dim=2)                            # (B, K, N)
 
         # ── Equivariant output ─────────────────────────────────────────────
         # invariant_weight × equivariant_x = equivariant ✅
