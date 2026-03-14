@@ -15,7 +15,7 @@ class Gr00tPolicy_CFG(Gr00tPolicy):
 
     def get_action(
         self, observations: Dict[str, Any],
-        scale: float = 1.3,
+        scale: float = 4.0,
         **kwargs,
     ) -> Dict[str, Any]:
         """

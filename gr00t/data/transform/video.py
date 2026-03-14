@@ -13,18 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, ClassVar, Literal
+from typing import Any, Callable, ClassVar, Dict, Literal
 
 import albumentations as A
 import cv2
 import numpy as np
+import random
 import torch
 import torchvision.transforms.v2 as T
+import torchvision.transforms.functional as F
 from einops import rearrange
 from pydantic import Field, PrivateAttr, field_validator
 
 from gr00t.data.schema import DatasetMetadata
 from gr00t.data.transform.base import ModalityTransform
+
+
+class TopLeftCrop(T.Transform):
+    def __init__(self, height: int, width: int):
+        super().__init__()
+        self.height = height
+        self.width = width
+
+    def transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
+        return F.crop(inpt, top=0, left=0, height=self.height, width=self.width)
 
 
 class VideoTransform(ModalityTransform):
@@ -300,6 +312,136 @@ class VideoCrop(VideoTransform):
             assert (
                 height == self.height and width == self.width
             ), f"Video {key} has invalid shape {height, width}, expected {self.height, self.width}"
+
+
+class VideoCropCenter(VideoTransform):
+    height: int | None = Field(default=None, description="The height of the input image")
+    width: int | None = Field(default=None, description="The width of the input image")
+    scale: float = Field(
+        ...,
+        description="The scale of the crop. The crop size is (width * scale, height * scale)",
+    )
+
+    def get_transform(self, mode: Literal["train", "eval"] = "train") -> Callable:
+        """Get the transform for the given mode.
+
+        Args:
+            mode (Literal["train", "eval"]): The mode to get the transform for.
+
+        Returns:
+            Callable: If mode is "train", return a random crop transform. If mode is "eval", return a center crop transform.
+        """
+        # 1. Check the input resolution
+        assert (
+            len(set(self.original_resolutions.values())) == 1
+        ), f"All video keys must have the same resolution, got: {self.original_resolutions}"
+        if self.height is None:
+            assert self.width is None, "Height and width must be either both provided or both None"
+            self.width, self.height = self.original_resolutions[self.apply_to[0]]
+        else:
+            assert (
+                self.width is not None
+            ), "Height and width must be either both provided or both None"
+        # 2. Create the transform
+        size = (int(self.height * self.scale), int(self.width * self.scale))
+        if self.backend == "torchvision":
+            if mode == "train":
+                return T.Compose([
+                    T.CenterCrop((self.height, self.width)),
+                    T.RandomCrop(size)
+                ])
+            elif mode == "eval":
+                return T.CenterCrop(size)
+            else:
+                raise ValueError(f"Crop mode {mode} not supported")
+        # elif self.backend == "albumentations":
+        #     if mode == "train":
+        #         return A.RandomCrop(height=size[0], width=size[1], p=1)
+        #     elif mode == "eval":
+        #         return A.CenterCrop(height=size[0], width=size[1], p=1)
+        #     else:
+        #         raise ValueError(f"Crop mode {mode} not supported")
+        else:
+            raise ValueError(f"Backend {self.backend} not supported")
+
+    def check_input(self, data: dict[str, Any]):
+        super().check_input(data)
+        # Check the input resolution
+        for key in self.apply_to:
+            if self.backend == "torchvision":
+                height, width = data[key].shape[-2:]
+            elif self.backend == "albumentations":
+                height, width = data[key].shape[-3:-1]
+            else:
+                raise ValueError(f"Backend {self.backend} not supported")
+            # assert (
+            #     height == self.height and width == self.width
+            # ), f"Video {key} has invalid shape {height, width}, expected {self.height, self.width}"
+
+
+class VideoCropTopLeft(VideoTransform):
+    height: int | None = Field(default=None, description="The height of the input image")
+    width: int | None = Field(default=None, description="The width of the input image")
+    scale: float = Field(
+        ...,
+        description="The scale of the crop. The crop size is (width * scale, height * scale)",
+    )
+
+    def get_transform(self, mode: Literal["train", "eval"] = "train") -> Callable:
+        """Get the transform for the given mode.
+
+        Args:
+            mode (Literal["train", "eval"]): The mode to get the transform for.
+
+        Returns:
+            Callable: If mode is "train", return a random crop transform. If mode is "eval", return a center crop transform.
+        """
+        # 1. Check the input resolution
+        assert (
+            len(set(self.original_resolutions.values())) == 1
+        ), f"All video keys must have the same resolution, got: {self.original_resolutions}"
+        if self.height is None:
+            assert self.width is None, "Height and width must be either both provided or both None"
+            self.width, self.height = self.original_resolutions[self.apply_to[0]]
+        else:
+            assert (
+                self.width is not None
+            ), "Height and width must be either both provided or both None"
+        # 2. Create the transform
+        size = (int(self.height * self.scale), int(self.width * self.scale))
+        if self.backend == "torchvision":
+            if mode == "train":
+                return T.Compose([
+                    TopLeftCrop(self.height, self.width),
+                    T.RandomCrop(size)
+                ])
+            elif mode == "eval":
+                return TopLeftCrop(size[0], size[1])
+            else:
+                raise ValueError(f"Crop mode {mode} not supported")
+        # elif self.backend == "albumentations":
+        #     if mode == "train":
+        #         return A.RandomCrop(height=size[0], width=size[1], p=1)
+        #     elif mode == "eval":
+        #         return A.CenterCrop(height=size[0], width=size[1], p=1)
+        #     else:
+        #         raise ValueError(f"Crop mode {mode} not supported")
+        else:
+            raise ValueError(f"Backend {self.backend} not supported")
+
+    def check_input(self, data: dict[str, Any]):
+        super().check_input(data)
+        # Check the input resolution
+        for key in self.apply_to:
+            if self.backend == "torchvision":
+                height, width = data[key].shape[-2:]
+            elif self.backend == "albumentations":
+                height, width = data[key].shape[-3:-1]
+            else:
+                raise ValueError(f"Backend {self.backend} not supported")
+            # assert (
+            #     height == self.height and width == self.width
+            # ), f"Video {key} has invalid shape {height, width}, expected {self.height, self.width}"
 
 
 class VideoResize(VideoTransform):
@@ -582,3 +724,101 @@ class VideoToNumpy(VideoTransform):
             numpy array of shape [T, H, W, C] in uint8 format
         """
         return (frames.permute(0, 2, 3, 1) * 255).to(torch.uint8).cpu().numpy()
+
+
+class VideoRandomlyRandomAffine(VideoTransform):
+    degrees: float | tuple[float, float] = Field(..., description="")
+    p: float = Field(..., description="")
+    translate: tuple[float, float] | None = Field(default=None, description="")
+    scale: tuple[float, float] | None = Field(default=None, description="")
+    shear: float | list[float] | None = Field(default=None, description="")
+    height: int | None = Field(default=None, description="")
+    width: int | None = Field(default=None, description="")
+    
+    def get_transform(self, mode: Literal["train", "eval"] = "train") -> Callable | None:
+        if mode == "eval":
+            return None
+
+        assert (
+            len(set(self.original_resolutions.values())) == 1
+        ), f"All video keys must have the same resolution, got: {self.original_resolutions}"
+        if self.height is None:
+            assert self.width is None, "Height and width must be either both provided or both None"
+            self.width, self.height = self.original_resolutions[self.apply_to[0]]
+        else:
+            assert (
+                self.width is not None
+            ), "Height and width must be either both provided or both None"
+        
+        if self.backend == "torchvision":
+            center_x = random.uniform(0, self.width)
+            center_y = random.uniform(0, self.height)
+            return T.RandomApply([
+                T.RandomAffine(
+                    degrees=self.degrees,
+                    translate=self.translate,
+                    scale=self.scale,
+                    shear=self.shear,
+                    center=(center_x, center_y),
+                )
+            ], p=self.p)
+        else:
+            raise ValueError(f"Backend {self.backend} not supported")
+
+
+class VideoRandomPerspective(VideoTransform):
+    distortion_scale: float = Field(..., description="")
+    p: float = Field(..., description="")
+    interpolation: str = Field(default="linear", description="")
+
+    def get_transform(self, mode: Literal["train", "eval"] = "train") -> Callable | None:
+        if mode == "eval":
+            return None
+        
+        interpolation = self._get_interpolation(self.interpolation, self.backend)
+        if interpolation is None:
+            raise ValueError(
+                f"Interpolation mode {self.interpolation} not supported for torchvision"
+            )
+
+        if self.backend == "torchvision":
+            return T.RandomPerspective(
+                distortion_scale=self.distortion_scale,
+                p=self.p,
+                interpolation=interpolation,
+            )
+        else:
+            raise ValueError(f"Backend {self.backend} not supported")
+
+
+class VideoRandomEqualize(VideoTransform):
+    p: float = Field(..., discription="")
+
+    def get_transform(self, mode: Literal["train", "eval"] = "train") -> Callable | None:
+        if mode == "eval":
+            return None
+
+        if self.backend == "torchvision":
+            return T.RandomEqualize(p=self.p)
+        else:
+            raise ValueError(f"Backend {self.backend} not supported")
+
+
+class VideoRandomlyGaussianNoise(VideoTransform):
+    mean: float = Field(..., discription="")
+    sigma: float = Field(..., discription="")
+    p: float = Field(..., discription="")
+
+    def get_transform(self, mode: Literal["train", "eval"] = "train") -> Callable | None:
+        if mode == "eval":
+            return None
+        
+        if self.backend == "torchvision":
+            return T.RandomApply([
+                T.GaussianNoise(
+                    mean=self.mean,
+                    sigma=self.sigma,
+                )
+            ], p=self.p)
+        else:
+            raise ValueError(f"Backend {self.backend} not supported")

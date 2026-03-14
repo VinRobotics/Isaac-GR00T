@@ -560,6 +560,32 @@ class StateActionPerturbation(ModalityTransform):
         return data
 
 
+class StateActionPerturbationVRH31(ModalityTransform):
+    perturbation_prob: float = Field(..., description="")
+    min_noises: dict[str, list[float]] = Field(..., description="")
+    max_noises: dict[str, list[float]] = Field(..., description="")
+    min_state_limits: dict[str, list[float]] = Field(..., description="")
+    max_state_limits: dict[str, list[float]] = Field(..., description="")
+    
+    def apply(self, data: dict[str, Any]) -> dict[str, Any]:
+        if not self.training:
+            return data
+        if self.perturbation_prob > 1e-9 and random.random() < self.perturbation_prob:
+            for key in self.apply_to:
+                state = data[key]
+                assert isinstance(state, torch.Tensor)
+                min_noise = torch.tensor(self.min_noises[key], device=state.device)
+                max_noise = torch.tensor(self.max_noises[key], device=state.device)
+                noise = min_noise + (max_noise - min_noise) * torch.rand_like(state, device=state.device)
+                state += noise
+                # Clip to the original range
+                min_state_limit = torch.tensor(self.min_state_limits[key], device=state.device)
+                max_state_limit = torch.tensor(self.max_state_limits[key], device=state.device)
+                state = torch.clamp(state, min_state_limit, max_state_limit)
+                data[key] = state
+        return data
+
+
 class StateActionDropout(ModalityTransform):
     """
     Class for state or action dropout.
