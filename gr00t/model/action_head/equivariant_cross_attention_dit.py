@@ -332,14 +332,14 @@ class EquivariantAttention(nn.Module):
 class EquivariantAttentionPool(nn.Module):
     """
     Improved equivariant pool: 256 → K tokens.
-    
+
     Two invariant scoring mechanisms combined:
       1. Magnitude score:  ||x||² per regular block — invariant, captures activation strength
       2. Content score:    GroupPool(x) — invariant, captures max-activation direction
-    
+
     Each query learns to weight between magnitude and content scoring
     via a learned invariant gate — giving queries the ability to specialize.
-    
+
     Equivariance proof:
       All scores are invariant (magnitude and GroupPool are both G-invariant)
       attn = f(invariant scores) → invariant
@@ -390,7 +390,7 @@ class EquivariantAttentionPool(nn.Module):
         Compute per-block L2 norm of x.
         x:      (B*N, D) where D = n_blocks * G
         return: (B*N, n_blocks) — invariant feature per block ✅
-        
+
         ||ρ(g)·x_block||² = ||x_block||²  because regular repr is unitary
         """
         BN, D = x.shape
@@ -449,6 +449,124 @@ class EquivariantAttentionPool(nn.Module):
         # ── Weighted sum of equivariant V = x ─────────────────────────────
         # invariant_weight × equivariant_x = equivariant ✅
         out = torch.einsum("b k n, b n d -> b k d", attn, x)   # (B, K, D) equivariant ✅
+        return out
+
+
+class TaskConditionedEquiPool(nn.Module):
+    """
+    Equivariant attention pool: N tokens → K tokens, where pool query directions
+    are dynamically generated from VL (vision-language) features.
+
+    Strictly equivariant in regular repr:
+      - Keys:   block L2 norms of equi_vis  →  invariant  (||ρ(g)·x_block|| = ||x_block||, unitary)
+      - Queries: linear(mean(vl_features))  →  invariant  (any fn of trivial/invariant input)
+      - Scores: Q · K                       →  invariant  ✅
+      - Attn:   softmax(scores)             →  invariant  ✅
+      - Output: Σ attn · x                  →  equivariant (invariant × equivariant = equivariant) ✅
+
+    Why this matters vs. V1 (fixed queries):
+      V1 fixes K query vectors that do not rotate with the input, so attention scores
+      change when x → ρ(g)·x, breaking strict equivariance.
+      Here, queries are generated from VL (invariant), keys are block norms (invariant),
+      so scores are G-invariant for any input rotation.
+
+    Why this matters vs. V3 (fixed invariant queries):
+      V3 uses fixed learned scalars as queries — blind to the current task.
+      Here, queries are conditioned on VL: the pool learns *which* spatial directions
+      matter for the current instruction + scene, not a fixed geometric prior.
+    """
+
+    def __init__(
+        self,
+        in_type: enn.FieldType,
+        vl_dim: int,
+        num_queries: int = 8,
+        heads: int = 4,
+        dim_head: int = 16,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.in_type    = in_type
+        self.H          = heads
+        self.Dh         = dim_head
+        self.scalar_dim = heads * dim_head
+        self.K          = num_queries
+        self.in_dim     = in_type.size
+        G               = in_type.gspace.fibergroup.order()
+        self.G          = G
+        self.scale      = dim_head ** -0.5
+        n_blocks        = in_type.size // G   # number of regular repr blocks per token
+
+        # ── Invariant key: block L2 norms → scoring space ─────────────────
+        # block_norms(x): (B*N, n_blocks) — invariant because ||ρ(g)·x_b|| = ||x_b|| (unitary)
+        # Standard nn.Linear is valid here: invariant input → invariant output ✅
+        self.k_proj = nn.Linear(n_blocks, self.scalar_dim, bias=bias)
+
+        # ── Invariant query: VL global context → K query vectors ──────────
+        # vl_features is trivial (invariant) → linear(vl) is invariant ✅
+        # Each of the K queries gets its own slice of the VL projection.
+        self.vl_to_queries = nn.Linear(vl_dim, num_queries * self.scalar_dim, bias=bias)
+        nn.init.trunc_normal_(self.vl_to_queries.weight, std=0.02)
+        nn.init.zeros_(self.vl_to_queries.bias)
+
+        # ── Learned base queries: task-agnostic prior (like V1 scalar queries) ─
+        # Init to zero → starts as pure VL-conditioned; learns a fixed offset.
+        self.query_base = nn.Parameter(torch.zeros(num_queries, self.scalar_dim))
+
+        # ── Per-query learned temperature ──────────────────────────────────
+        self.log_temp = nn.Parameter(torch.zeros(num_queries, 1, 1))  # (K, 1, 1)
+
+    # ------------------------------------------------------------------
+    def _block_norms(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Per-block L2 norm — strictly G-invariant for regular repr.
+
+        x      : (B*N, D)  where D = n_blocks * G
+        returns: (B*N, n_blocks)  invariant ✅
+
+        Proof: regular repr is unitary, so ||ρ(g)·x_block|| = ||x_block||.
+        """
+        n_blocks = self.in_dim // self.G
+        return torch.norm(x.reshape(-1, n_blocks, self.G), dim=-1)  # (B*N, n_blocks)
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor, vl_features: torch.Tensor) -> torch.Tensor:
+        """
+        x           : (B, N, D)     equivariant tokens in regular repr
+        vl_features : (B, T, D_vl)  trivial/invariant VL tokens
+        returns     : (B, K, D)     K pooled equivariant tokens
+        """
+        B, N, D = x.shape
+
+        # ── Invariant keys from block norms ────────────────────────────────
+        k_inv = self._block_norms(x.reshape(B * N, D))   # (B*N, n_blocks) invariant ✅
+        k_inv = self.k_proj(k_inv)                        # (B*N, H*Dh)
+        k_inv = k_inv.reshape(B, N, self.H, self.Dh)     # (B, N, H, Dh)
+
+        # ── Invariant queries from VL global context ───────────────────────
+        # Mean over token dim: (B, T, D_vl) → (B, D_vl) — global scene+task summary
+        vl_global = vl_features.mean(dim=1)               # (B, D_vl) invariant ✅
+        q_vl = self.vl_to_queries(vl_global)              # (B, K * H*Dh) invariant ✅
+        # Add learned task-agnostic base: starts as pure VL, learns fixed offset
+        q_inv = self.query_base + q_vl.reshape(B, self.K, self.scalar_dim)  # (B, K, H*Dh)
+        q_inv = q_inv.reshape(B, self.K, self.H, self.Dh)                   # (B, K, H, Dh)
+
+        # ── Invariant attention scores ─────────────────────────────────────
+        # Both Q and K are invariant → dot product is invariant ✅
+        attn = torch.einsum(
+            "b k h d, b n h d -> b k h n", q_inv, k_inv
+        ) * self.scale                                     # (B, K, H, N) invariant ✅
+
+        # Per-query learned temperature
+        temp = torch.exp(self.log_temp)                    # (K, 1, 1)
+        attn = attn * temp.unsqueeze(0)                    # (B, K, H, N)
+
+        attn = torch.softmax(attn, dim=-1)                 # (B, K, H, N) invariant ✅
+        attn = attn.mean(dim=2)                            # (B, K, N) avg over heads
+
+        # ── Equivariant output ─────────────────────────────────────────────
+        # invariant_weight × equivariant_x = equivariant ✅
+        out = torch.einsum("b k n, b n d -> b k d", attn, x)  # (B, K, D) equivariant ✅
         return out
 
 class EquivariantFeedForward(nn.Module):
