@@ -561,6 +561,249 @@ class TaskConditionedEquiPool(nn.Module):
         out = torch.einsum("b k n, b n d -> b k d", attn, x)  # (B, K, D) equivariant ✅
         return out
 
+
+def _orbit_symmetric_init(num_queries: int, in_dim: int, G: int, std: float = 0.02) -> torch.Tensor:
+    """
+    Initialize query tokens with orbit-symmetric (trivially invariant) values.
+
+    Each regular repr block of G elements starts with all G values equal.
+    This is the invariant fixed point of ρ(g) (cyclic shift), giving queries
+    a geometrically meaningful starting point before training breaks symmetry.
+
+    trunc_normal init:    block = [0.3, -0.7, 0.1, ...]  ← arbitrary, no group structure
+    orbit-symmetric init: block = [0.3,  0.3, 0.3, ...]  ← uniform across G elements
+
+    Training is unconstrained — values can develop directional preferences freely.
+    """
+    n_blocks = in_dim // G
+    base = nn.init.trunc_normal_(torch.empty(num_queries, n_blocks), std=std)
+    return base.unsqueeze(-1).expand(-1, -1, G).reshape(num_queries, in_dim).contiguous()
+
+
+class TaskBiasedEquiPool(nn.Module):
+    """
+    V1 architecture (regular repr Q/K, expressive directional attention)
+    + orbit-symmetric query init (proper regular repr starting point)
+    + VL-conditioned invariant additive bias (task-aware scoring).
+
+    Combines V1's directional expressiveness with task-conditioning:
+      - Base attention: Q_regular · K_regular   (directional, like V1)
+      - VL bias:        Q_vl_inv · GroupPool(K) (invariant, task-conditioned)
+      - Combined:       attn = softmax(base + α · bias)
+      - α = tanh(bias_scale), init=0 → starts identical to V1, learns to use VL
+
+    Orbit-symmetric init for query_tokens:
+      V1 used trunc_normal_(K, in_dim) with no group structure.
+      Here each regular repr block starts uniform (orbit-symmetric),
+      a valid regular repr element that training can break symmetry from.
+
+    Equivariance:
+      base scores: change with rotation (same as V1, "broken" but expressive)
+      VL bias:     invariant (GroupPool keys × trivial VL queries) ✅
+      output:      Σ attn · x → equivariant ✅
+    """
+
+    def __init__(
+        self,
+        in_type: enn.FieldType,
+        vl_dim: int,
+        num_queries: int = 8,
+        heads: int = 4,
+        dim_head: int = 16,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.in_type    = in_type
+        self.H          = heads
+        self.Dh         = dim_head
+        self.scalar_dim = heads * dim_head
+        self.K          = num_queries
+        self.in_dim     = in_type.size
+        gspace          = in_type.gspace
+        G               = gspace.fibergroup.order()
+        self.G          = G
+        self.scale      = dim_head ** -0.5
+
+        assert self.scalar_dim % G == 0, \
+            f"heads*dim_head={self.scalar_dim} must be divisible by G={G}"
+
+        # ── V1 base path: regular repr Q/K projections ────────────────────
+        n_regular       = self.scalar_dim // G
+        self.qkv_type   = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
+        self.q_proj     = enn.Linear(in_type, self.qkv_type, bias=bias)
+        self.k_proj     = enn.Linear(in_type, self.qkv_type, bias=bias)
+
+        # Orbit-symmetric init: each regular repr block starts uniform.
+        # Valid regular repr element → training freely develops directional preferences.
+        self.query_tokens = nn.Parameter(
+            _orbit_symmetric_init(num_queries, in_type.size, G, std=0.02)
+        )
+
+        # ── VL bias path: invariant task-conditioned additive scores ───────
+        # Keys: GroupPooling (ESCNN-native, verified invariant)
+        self.k_gpool      = enn.GroupPooling(in_type)       # regular → trivial
+        k_inv_dim         = self.k_gpool.out_type.size      # in_dim // G
+
+        # VL → K invariant bias queries (one scalar vector per query slot)
+        # Zero-init: bias contributes nothing at step 0 → clean V1 start
+        self.vl_to_bias   = nn.Linear(vl_dim, num_queries * k_inv_dim, bias=True)
+        nn.init.zeros_(self.vl_to_bias.weight)
+        nn.init.zeros_(self.vl_to_bias.bias)
+
+        # Learned scale: tanh(bias_scale) ∈ (-1,1), init=0 → starts as pure V1
+        self.bias_scale   = nn.Parameter(torch.zeros(1))
+
+        # Per-query temperature
+        self.log_temp     = nn.Parameter(torch.zeros(num_queries, 1, 1))
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor, vl_features: torch.Tensor) -> torch.Tensor:
+        """
+        x           : (B, N, D)     equivariant tokens in regular repr
+        vl_features : (B, T, D_vl)  trivial/invariant VL tokens
+        returns     : (B, K, D)     K pooled equivariant tokens
+        """
+        B, N, D = x.shape
+
+        # ── Wrap input as GeometricTensor once; reuse for both paths ───────
+        x_geo = enn.GeometricTensor(x.reshape(B * N, D), self.in_type)
+
+        # ── V1 base: regular repr Q · K (directional) ─────────────────────
+        q_geo = enn.GeometricTensor(
+            self.query_tokens.unsqueeze(0).expand(B, -1, -1).reshape(B * self.K, -1),
+            self.in_type,
+        )
+        Q     = self.q_proj(q_geo).tensor.reshape(B, self.K, self.H, self.Dh)
+        K_reg = self.k_proj(x_geo).tensor.reshape(B, N, self.H, self.Dh)
+        attn  = torch.einsum("bkhd,bnhd->bkhn", Q, K_reg) * self.scale  # (B,K,H,N)
+
+        # ── VL bias: invariant GroupPool · VL query ───────────────────────
+        k_inv    = self.k_gpool(x_geo).tensor.reshape(B, N, -1)            # (B,N,k_inv_dim) ✅
+        vl_q     = self.vl_to_bias(vl_features.mean(dim=1))               # (B, K*k_inv_dim)
+        vl_q     = vl_q.reshape(B, self.K, -1)                            # (B, K, k_inv_dim)
+        bias     = torch.einsum("bkd,bnd->bkn", vl_q, k_inv) * self.scale # (B,K,N) ✅
+        bias     = bias.unsqueeze(2)                                        # (B,K,1,N) → broadcast over H
+
+        # ── Combine: directional base + task-conditioned invariant bias ────
+        α     = torch.tanh(self.bias_scale)                  # scalar ∈ (-1,1), init=0 = V1
+        temp  = torch.exp(self.log_temp)                     # (K,1,1)
+        attn  = ((attn + α * bias) * temp.unsqueeze(0)).softmax(dim=-1)  # (B,K,H,N)
+        attn  = attn.mean(dim=2)                             # (B,K,N)
+
+        # ── Equivariant output ─────────────────────────────────────────────
+        out = torch.einsum("bkn,bnd->bkd", attn, x)         # (B,K,D) equivariant ✅
+        return out
+
+
+class OrbitQueryEquiPool(nn.Module):
+    """
+    Equivariant attention pool with orbit-structured queries.
+
+    K = n_base * G queries, organised into n_base orbits of size G.
+    Query [b*G + g] = cyclic_shift(query_base[b], g) within each regular repr block.
+
+    Equivariance proof:
+      When x → ρ(g)·x:
+        k_proj(x)   → ρ_qkv(g) · k_proj(x)         (equivariant linear)
+        Q[b, g']    → Q[b, (g'+g) % G]              (orbit shift: scores permute)
+        score(b,g',n) after rotation = score(b, g'-g, n) before rotation
+        → attn weights permute within each orbit
+        → out[b*G+g](ρ(g)·x) = ρ(g) · out[b*G+0](x)  ✅
+
+    vs V1: same direction-sensitive regular repr scoring, but output is equivariant.
+    vs V3/V4: NOT invariant scoring — directionality that makes V1 work is preserved.
+
+    Requires: num_queries % G == 0  (n_base = num_queries // G)
+    """
+
+    def __init__(
+        self,
+        in_type: enn.FieldType,
+        num_queries: int = 24,
+        heads: int = 4,
+        dim_head: int = 16,
+        bias: bool = True,
+    ):
+        super().__init__()
+        gspace = in_type.gspace
+        G      = gspace.fibergroup.order()
+        assert num_queries % G == 0, \
+            f"num_queries={num_queries} must be divisible by G={G} for orbit structure"
+
+        self.in_type    = in_type
+        self.H          = heads
+        self.Dh         = dim_head
+        self.scalar_dim = heads * dim_head
+        self.K          = num_queries
+        self.G          = G
+        self.n_base     = num_queries // G
+        self.in_dim     = in_type.size
+        self.scale      = dim_head ** -0.5
+
+        assert self.scalar_dim % G == 0, \
+            f"heads*dim_head={self.scalar_dim} must be divisible by G={G}"
+        n_regular      = self.scalar_dim // G
+        self.qkv_type  = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
+        self.q_proj    = enn.Linear(in_type, self.qkv_type, bias=bias)
+        self.k_proj    = enn.Linear(in_type, self.qkv_type, bias=bias)
+
+        # n_base free generator vectors — each spawns G queries via cyclic shift.
+        # Orbit-symmetric init: all G elements per block start equal (invariant fixed point).
+        # Training freely breaks this symmetry → queries develop directional preferences.
+        n_blocks = in_type.size // G
+        self.query_base = nn.Parameter(
+            nn.init.trunc_normal_(torch.empty(self.n_base, n_blocks), std=0.02)
+            .unsqueeze(-1).expand(-1, -1, G)          # (n_base, n_blocks, G) — uniform
+            .reshape(self.n_base, in_type.size).contiguous()
+        )
+
+        self.log_temp = nn.Parameter(torch.zeros(num_queries, 1, 1))  # per-query temperature
+
+    # ------------------------------------------------------------------
+    def _orbit_queries(self) -> torch.Tensor:
+        """
+        Build K = n_base * G query vectors from n_base generators.
+
+        For each base b and shift g:
+          query[b*G + g, block, :] = cyclic_shift(query_base[b, block, :], g)
+
+        Returns: (K, in_dim)
+        """
+        n_blocks = self.in_dim // self.G
+        q = self.query_base.reshape(self.n_base, n_blocks, self.G)  # (n_base, n_blocks, G)
+        orbits = torch.stack(
+            [torch.roll(q, g, dims=-1) for g in range(self.G)], dim=1
+        )  # (n_base, G, n_blocks, G)
+        return orbits.reshape(self.K, self.in_dim)                   # (K, in_dim)
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x   : (B, N, D)  equivariant tokens in regular repr
+        out : (B, K, D)  K pooled equivariant tokens, K = n_base * G
+        """
+        B, N, D = x.shape
+
+        query_tokens = self._orbit_queries()   # (K, in_dim) — built from n_base generators
+
+        x_geo = enn.GeometricTensor(x.reshape(B * N, D), self.in_type)
+        q_geo = enn.GeometricTensor(
+            query_tokens.unsqueeze(0).expand(B, -1, -1).reshape(B * self.K, -1),
+            self.in_type,
+        )
+
+        Q     = self.q_proj(q_geo).tensor.reshape(B, self.K, self.H, self.Dh)
+        K_reg = self.k_proj(x_geo).tensor.reshape(B, N,      self.H, self.Dh)
+
+        # Direction-sensitive scores — equivariant via orbit structure ✅
+        temp = torch.exp(self.log_temp)                              # (K, 1, 1)
+        attn = (torch.einsum("bkhd,bnhd->bkhn", Q, K_reg) * self.scale * temp.unsqueeze(0))
+        attn = attn.softmax(dim=-1).mean(dim=2)                      # (B, K, N)
+
+        out  = torch.einsum("bkn,bnd->bkd", attn, x)                # (B, K, D) equivariant ✅
+        return out
+
+
 class EquivariantFeedForward(nn.Module):
     r"""
     An equivariant feed-forward layer using ESCNN.

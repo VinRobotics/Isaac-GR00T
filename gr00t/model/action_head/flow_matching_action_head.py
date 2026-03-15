@@ -42,7 +42,7 @@ from gr00t.model.action_head.action_encoder import (
 
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
-from .equivariant_cross_attention_dit import EDiT, TaskConditionedEquiPool
+from .equivariant_cross_attention_dit import EDiT, TaskConditionedEquiPool, TaskBiasedEquiPool, OrbitQueryEquiPool
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -385,7 +385,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=2048, metadata={"help": "Language feature dim from backbone LLM (D_llm)."}
     )
     num_vis_queries: int = field(
-        default=8, metadata={"help": "Number of learned query tokens per camera for equivariant vision pooling."}
+        default=24, metadata={"help": "Number of learned query tokens per camera for equivariant vision pooling. Must be divisible by n_group for OrbitQueryEquiPool (n_base = num_vis_queries // n_group)."}
     )
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -479,15 +479,15 @@ class FlowmatchingActionHead(nn.Module):
         self.equi_vis_pos_type = enn.FieldType(self.group, [self.group.irrep(1)])
         self.equi_vis_pos_proj = enn.Linear(self.equi_vis_pos_type, self.model.in_type)
 
-        # Learnable equivariant pooling: T_vis spatial tokens → num_vis_queries tokens per camera.
-        # TaskConditionedEquiPool uses VL features to generate invariant pool queries,
-        # making the K pooled tokens task-aware (conditioned on current instruction + scene).
+        # Equivariant pooling: T_vis spatial tokens → num_vis_queries tokens per camera.
+        # OrbitQueryEquiPool: K = n_base * G queries organised in G-orbits.
+        #   query[b*G + g] = cyclic_shift(query_base[b], g)
+        #   → direction-sensitive scoring (like V1) + true equivariant output ✅
+        #   n_base = num_vis_queries // n_group  (3 concepts × 8 orientations = 24 queries)
         heads = 8
         _pool_dim_head = self.model.in_type.size // heads  # H*Dh = in_type.size → divisible by G ✓
-        _vl_dim = config.backbone_language_embedding_dim   # dim of vl_features after vlln+vl_sa
-        self.equi_vis_pool = TaskConditionedEquiPool(
+        self.equi_vis_pool = OrbitQueryEquiPool(
             in_type=self.model.in_type,
-            vl_dim=_vl_dim,
             num_queries=config.num_vis_queries,
             heads=heads,
             dim_head=_pool_dim_head,
@@ -780,18 +780,15 @@ class FlowmatchingActionHead(nn.Module):
         ).tensor                               # [T_vis, D_hidden]
         vis_per_cam = vis_per_cam + pos_emb.unsqueeze(0)  # [B*n_img, T_vis, D_hidden]
 
-        # ── VL stream (computed first — needed to condition equi_vis pooling) ──
-        vl_features = self.vlln(vision_language_features)           # [B, T_text, D_lang]
-        vl_features = self.vl_self_attention(vl_features)           # [B, T_text, vl_sa_inner_dim]
-
         # Pool T_vis spatial tokens → num_vis_queries tokens per camera (equivariant).
-        # VL features provide invariant task+scene context to condition the K pool queries.
-        # vl_features must be expanded to match B*n_img for per-camera pooling.
-        vl_for_pool = vl_features.unsqueeze(1).expand(-1, n_img, -1, -1)  # [B, n_img, T, D_vl]
-        vl_for_pool = vl_for_pool.reshape(B * n_img, vl_features.shape[1], vl_features.shape[2])
-        vis_pooled = self.equi_vis_pool(vis_per_cam, vl_for_pool)   # [B*n_img, K, D_hidden]
+        # OrbitQueryEquiPool needs only equi_vis — no VL conditioning.
+        vis_pooled = self.equi_vis_pool(vis_per_cam)                 # [B*n_img, K, D_hidden]
         K = vis_pooled.shape[1]
         equi_vis_features = vis_pooled.reshape(B, n_img * K, D_hidden)  # [B, n_img*K, D_hidden]
+
+        # ── VL stream ────────────────────────────────────────────────────────
+        vl_features = self.vlln(vision_language_features)           # [B, T_text, D_lang]
+        vl_features = self.vl_self_attention(vl_features)           # [B, T_text, vl_sa_inner_dim]
 
         backbone_output.data["equi_vis_features"] = equi_vis_features
         backbone_output.data["vl_features"] = vl_features
