@@ -751,9 +751,10 @@ class OrbitQueryEquiPool(nn.Module):
         # Orbit-symmetric init: all G elements per block start equal (invariant fixed point).
         # Training freely breaks this symmetry → queries develop directional preferences.
         n_blocks = in_type.size // G
+        _qb = torch.empty(self.n_base, n_blocks)
+        nn.init.trunc_normal_(_qb, std=0.02)
         self.query_base = nn.Parameter(
-            nn.init.trunc_normal_(torch.empty(self.n_base, n_blocks), std=0.02)
-            .unsqueeze(-1).expand(-1, -1, G)          # (n_base, n_blocks, G) — uniform
+            _qb.unsqueeze(-1).expand(-1, -1, G)       # (n_base, n_blocks, G) — uniform
             .reshape(self.n_base, in_type.size).contiguous()
         )
 
