@@ -42,7 +42,7 @@ from gr00t.model.action_head.action_encoder import (
 
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
-from .equivariant_cross_attention_dit import EDiT, TaskConditionedEquiPool, TaskBiasedEquiPool, OrbitQueryEquiPool, EquivariantAttentionPool
+from .equivariant_cross_attention_dit import EDiT, EquivariantAttentionPool
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
