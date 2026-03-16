@@ -385,7 +385,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=2048, metadata={"help": "Language feature dim from backbone LLM (D_llm)."}
     )
     num_vis_queries: int = field(
-        default=8, metadata={"help": "Number of pooled query tokens per camera for equivariant vision pooling."}
+        default=16, metadata={"help": "Number of pooled query tokens per camera for equivariant vision pooling."}
     )
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
