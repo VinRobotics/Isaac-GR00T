@@ -42,7 +42,7 @@ from gr00t.model.action_head.action_encoder import (
 
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
-from .equivariant_cross_attention_dit import EDiT, TaskConditionedEquiPool, TaskBiasedEquiPool, OrbitQueryEquiPool
+from .equivariant_cross_attention_dit import EDiT, TaskConditionedEquiPool, TaskBiasedEquiPool, OrbitQueryEquiPool, EquivariantAttentionPool
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -385,7 +385,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=2048, metadata={"help": "Language feature dim from backbone LLM (D_llm)."}
     )
     num_vis_queries: int = field(
-        default=24, metadata={"help": "Number of learned query tokens per camera for equivariant vision pooling. Must be divisible by n_group for OrbitQueryEquiPool (n_base = num_vis_queries // n_group)."}
+        default=8, metadata={"help": "Number of pooled query tokens per camera for equivariant vision pooling."}
     )
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -480,17 +480,12 @@ class FlowmatchingActionHead(nn.Module):
         self.equi_vis_pos_proj = enn.Linear(self.equi_vis_pos_type, self.model.in_type)
 
         # Equivariant pooling: T_vis spatial tokens → num_vis_queries tokens per camera.
-        # OrbitQueryEquiPool: K = n_base * G queries organised in G-orbits.
-        #   query[b*G + g] = cyclic_shift(query_base[b], g)
-        #   → direction-sensitive scoring (like V1) + true equivariant output ✅
-        #   n_base = num_vis_queries // n_group  (3 concepts × 8 orientations = 24 queries)
-        heads = 8
-        _pool_dim_head = self.model.in_type.size // heads  # H*Dh = in_type.size → divisible by G ✓
-        self.equi_vis_pool = OrbitQueryEquiPool(
+        # EquivariantAttentionPool: trivial-repr keys (invariant) + equivariant out_proj.
+        #   k_proj: regular → trivial (learned Reynolds generalisation) → invariant keys ✅
+        #   scores: trivial Q · trivial K → invariant → equivariant output ✅
+        self.equi_vis_pool = EquivariantAttentionPool(
             in_type=self.model.in_type,
             num_queries=config.num_vis_queries,
-            heads=heads,
-            dim_head=_pool_dim_head,
         )
 
         if config.add_pos_embed:
