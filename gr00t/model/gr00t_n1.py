@@ -220,7 +220,7 @@ class GR00T_N1_5(PreTrainedModel):
         tc_logits = self.task_completion_detection(backbone_outputs.backbone_features.detach()).squeeze()
         tc_pred = F.sigmoid(tc_logits)
         action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
-        action_head_outputs["task_completion"] = tc_pred
+        action_head_outputs["action.task_completion"] = tc_pred
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
     
@@ -256,7 +256,7 @@ class GR00T_N1_5(PreTrainedModel):
                 actual_action_dim=actual_action_dim
             )
             # print("action_head_outputs: ", action_head_outputs)
-        action_head_outputs["task_completion"] = tc_pred
+        action_head_outputs["action.task_completion"] = tc_pred
         _real_action_head_outputs = copy.deepcopy(action_head_outputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
 
