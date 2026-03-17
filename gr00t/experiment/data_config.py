@@ -1909,7 +1909,7 @@ DATA_CONFIG_MAP = {
     "vrh2_two_hand_2_cam_vel_eff": VRH2TwotHand2CamVelEffConfig(),
     "vrh3_two_hand": VRH3TwotHandConfig(),
     "vrh31_effort": VRH3FullBodyConfig(),
-    "vrh31_left_arm_effort": VRH3LeftHandConfig(),
+    "vrh31_left_hand_effort": VRH3LeftHandConfig(),
     "aloha_right_arm_only": AlohaRightArmConfig(),
     "aloha_right_arm_30_only": AlohaRightArm30Config()
 }
