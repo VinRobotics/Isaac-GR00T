@@ -10,36 +10,20 @@ vrh3_two_hands_config = {
         delta_indices=[0],
         modality_keys=[
             "left_arm",
-            "right_arm",
             "left_hand",
-            "right_hand",
         ],
         sin_cos_embedding_keys=[
             "left_arm",
-            "right_arm",
             "left_hand",
-            "right_hand",
         ],
     ),
     "action": ModalityConfig(
-        delta_indices=list(range(0, 50)),
+        delta_indices=list(range(0, 32, 2)),
         modality_keys=[
             "left_arm",
-            "right_arm",
             "left_hand",
-            "right_hand",
         ],
         action_configs=[
-            ActionConfig(
-                rep=ActionRepresentation.ABSOLUTE,
-                type=ActionType.NON_EEF,
-                format=ActionFormat.DEFAULT,
-            ),
-            ActionConfig(
-                rep=ActionRepresentation.ABSOLUTE,
-                type=ActionType.NON_EEF,
-                format=ActionFormat.DEFAULT,
-            ),
             ActionConfig(
                 rep=ActionRepresentation.ABSOLUTE,
                 type=ActionType.NON_EEF,
