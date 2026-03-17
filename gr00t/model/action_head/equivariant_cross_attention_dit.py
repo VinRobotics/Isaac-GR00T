@@ -336,20 +336,22 @@ class EquivariantAttentionPool(nn.Module):
 
     Design:
       - query_tokens : K plain nn.Parameter vectors in ℝᴰ  (trivial repr)
-      - k_proj       : equivariant linear  regular_repr → trivial_repr
+      - k_proj       : equivariant linear  in_type → trivial_repr
                        keys are group-invariant scalars
       - score        : q · k  — trivial · trivial → scalar, invariant ✓
-      - values       : raw input tokens (no projection), regular_repr
-      - out_proj     : equivariant linear  regular_repr → regular_repr
-                       one per head, then summed equivariantly
+      - v_proj       : equivariant linear  in_type → in_type
+                       learns which equivariant content to expose as values
+      - out_proj     : equivariant linear  H*in_type → in_type
+                       recombines heads equivariantly
 
     Equivariance proof:
         score_i(g·f) = q · W_K(ρ(g)·fᵢ)
                      = q · ρ_triv(g) · W_K(fᵢ)   [W_K equivariant]
                      = q · W_K(fᵢ)                [ρ_triv(g) = I]
                      = score_i(f)                  ✓ invariant
-        out(g·f) = Σᵢ score_i(g·f) · ρ(g)·fᵢ
-                 = ρ(g) · Σᵢ score_i(f) · fᵢ
+        out(g·f) = Σᵢ score_i(g·f) · W_V(ρ(g)·fᵢ)
+                 = Σᵢ score_i(f) · ρ(g)·W_V(fᵢ)  [W_V equivariant]
+                 = ρ(g) · Σᵢ score_i(f) · W_V(fᵢ)
                  = ρ(g) · out(f)                   ✓ equivariant
     """
 
@@ -357,7 +359,7 @@ class EquivariantAttentionPool(nn.Module):
         self,
         in_type: enn.FieldType,
         num_queries: int = 8,
-        heads: int = 8,
+        heads: int = 32,
         dim_head: int = 64,
         bias: bool = True,
     ):
@@ -384,10 +386,14 @@ class EquivariantAttentionPool(nn.Module):
         )
         nn.init.trunc_normal_(self.query_tokens, std=0.02)
 
-        # ── Key projection: regular_repr → trivial_repr (equivariant) ───────
-        # This is the Reynolds-generalisation: learns which invariant
-        # combination of group channels to use as keys.
+        # ── Key projection: in_type → trivial_repr (equivariant) ───────────
+        # Reynolds-generalisation: learns which invariant combination to use.
         self.k_proj = enn.Linear(in_type, self.key_type, bias=bias)
+
+        # ── Value projection: in_type → in_type (equivariant) ───────────────
+        # Learns which equivariant content to expose as values.
+        # Equivariance preserved: W_V(ρ(g)·x) = ρ(g)·W_V(x) ✓
+        self.v_proj = enn.Linear(in_type, in_type, bias=bias)
 
         # ── Output projection: H pooled heads → in_type (equivariant) ───────
         # Each head independently produces a D-dim regular_repr vector.
@@ -421,9 +427,12 @@ class EquivariantAttentionPool(nn.Module):
         attn = torch.einsum("k h d, b n h d -> b h k n", Q, keys) * self.scale
         attn = attn.softmax(dim=-1)               # (B, H, K, N)
 
-        # ── Weighted sum of values (raw tokens, regular_repr) ────────────────
+        # ── Values: project equivariantly before weighted sum ────────────────
+        v_geo = enn.GeometricTensor(x.reshape(B * N, D), self.in_type)
+        values = self.v_proj(v_geo).tensor.reshape(B, N, D)  # (B, N, D)
+
         # Each head independently: (B, H, K, in_dim)
-        vals = torch.einsum("b h k n, b n d -> b h k d", attn, x)
+        vals = torch.einsum("b h k n, b n d -> b h k d", attn, values)
 
         # ── Recombine heads equivariantly ────────────────────────────────────
         # Reshape to (B*K, H*in_dim) and pass through equivariant out_proj
@@ -944,7 +953,7 @@ class EquiSelfAttentionTransformer(ModelMixin, ConfigMixin):
         all_hidden_states = [hidden_states]
 
         # Process through transformer blocks
-        for idx, block in enumerate(self.transformer_blocks):
+        for block in self.transformer_blocks:
             hidden_states = block(hidden_states)
             all_hidden_states.append(hidden_states)
 
