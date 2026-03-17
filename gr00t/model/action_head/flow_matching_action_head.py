@@ -388,9 +388,18 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=16, metadata={"help": "Number of pooled query tokens per camera for equivariant vision pooling."}
     )
     def __init__(self, **kwargs):
+        import dataclasses
         super().__init__(**kwargs)
         for key, value in kwargs.items():
             setattr(self, key, value)
+        # Ensure all dataclass fields with defaults become instance attributes
+        # so PretrainedConfig.to_dict() (which uses self.__dict__) saves them.
+        for f in dataclasses.fields(self):
+            if f.name not in self.__dict__:
+                if f.default is not dataclasses.MISSING:
+                    setattr(self, f.name, f.default)
+                elif f.default_factory is not dataclasses.MISSING:
+                    setattr(self, f.name, f.default_factory())
 
 
 class FlowmatchingActionHead(nn.Module):

@@ -155,6 +155,9 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+    num_vis_queries: int = 16
+    """Number of pooled query tokens per camera for equivariant vision pooling."""
+
 #####################################################################################
 # main training function
 #####################################################################################
@@ -261,13 +264,15 @@ def main(config: ArgsConfig):
     # Need to recreate action head with correct config since it was initialized with old config
     action_horizon_changed = data_action_horizon != model.action_head.config.action_horizon
     num_hand_changed = data_num_hand != model.action_head.config.num_hand
-    rot_type_changed = data_rot_type != model.action_head.config.num_hand
-    
-    if action_horizon_changed or num_hand_changed or rot_type_changed:
+    rot_type_changed = data_rot_type != model.action_head.config.rot_type
+    num_vis_queries_changed = config.num_vis_queries != model.action_head.config.num_vis_queries
+
+    if action_horizon_changed or num_hand_changed or rot_type_changed or num_vis_queries_changed:
         print(
             f"Recreating action head with action_horizon {data_action_horizon} (was {model.action_head.config.action_horizon}), "
             f"num_hand {data_num_hand} (was {model.action_head.config.num_hand}), "
             f"rot_type {data_rot_type} (was {model.action_head.config.rot_type}), "
+            f"num_vis_queries {config.num_vis_queries} (was {model.action_head.config.num_vis_queries}), "
         )
         
 
@@ -276,6 +281,7 @@ def main(config: ArgsConfig):
         new_action_head_config.action_horizon = data_action_horizon
         new_action_head_config.num_hand = data_num_hand
         new_action_head_config.rot_type = data_rot_type
+        new_action_head_config.num_vis_queries = config.num_vis_queries
 
         # Import the FlowmatchingActionHead class
         from gr00t.model.action_head.flow_matching_action_head import (
@@ -297,6 +303,7 @@ def main(config: ArgsConfig):
         model.config.action_head_cfg["num_hand"] = new_action_head_config.num_hand
         model.config.action_head_cfg["rot_type"] = new_action_head_config.rot_type
         model.config.action_head_cfg["action_horizon"] = data_action_horizon
+        model.config.action_head_cfg["num_vis_queries"] = config.num_vis_queries
 
         # Set trainable parameters for the new action head
         model.action_head.set_trainable_parameters(
