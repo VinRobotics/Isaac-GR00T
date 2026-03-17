@@ -1648,32 +1648,26 @@ class VRH3EffortConfig(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 
 
-class VRH3_1EffortConfig(BaseDataConfig):
+class VRH3_1EffortLeftHandConfig(BaseDataConfig):
     video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
     state_keys = [
         "state.left_arm",
-        "state.right_arm",
         "state.left_hand",
-        "state.right_hand",
     ]
     action_keys = [
         "action.left_arm",
-        "action.right_arm",
         "action.left_hand",
-        "action.right_hand"
     ]
     effort_keys = [
         "effort.left_arm",
-        "effort.right_arm",
         "effort.left_hand",
-        "effort.right_hand"
     ]
     language_keys = ["annotation.human.task_description"]
     observation_indices = [0]
     state_indices = [0]
-    action_indices = list(range(16))
+    action_indices = list(range(0, 32, 2))
     effort_history_len = 16  # equals future effort len (len(action_indices))
-    effort_indices = list(range(-15, 1)) + list(range(1, 17))  # 16 history + 16 future
+    effort_indices = list(range(-15, 1)) + list(range(2, 34, 2))  # 16 history + 16 future
 
     effort_dims=26
 
@@ -1796,5 +1790,5 @@ DATA_CONFIG_MAP = {
     "aloha_right_arm_only": AlohaRightArmConfig(),
     "aloha_right_arm_only_effort": AlohaRightArmEffortConfig(),
     "vrh3_effort": VRH3EffortConfig(),
-    "vrh31_effort": VRH3_1EffortConfig()
+    "vrh31_left_hand_effort": VRH3_1EffortLeftHandConfig()
 }
