@@ -6,15 +6,15 @@ HF_HUB_OFFLINE=0
 torchrun --nproc_per_node=2 gr00t/experiment/launch_finetune.py \
     --base-model-path nvidia/GR00T-N1.6-3B \
     --dataset-path \
-    /mnt/data/sftp/data/locht/vr_data/VR_H31_bodyshop_place_part2_base_poseA_stereo_rvt_trym_speedup1 \
-    /mnt/data/sftp/data/locht/vr_data/VR_H31_bodyshop_place_part2_pose0_linhld23_stereo_rvt_trym_speedup1 \
-    /mnt/data/sftp/data/locht/vr_data/VR_H31_bodyshop_place_part2_pose3_stereo_rvt_trym_speedup1 \
-    /mnt/data/sftp/data/locht/vr_data/VR_H31_bodyshop_place_part2_pose1_stereo_rvt_trym_speedup1 \
-    /mnt/data/sftp/data/locht/vr_data/VR_H31_bodyshop_place_part2_pose2_stereo_rvt_trym_speedup1 \
-    /mnt/data/sftp/data/locht/vr_data/VR_H31_bodyshop_place_part2_pose4_stereo_rvt_trym_speedup1 \
-    /mnt/data/sftp/data/locht/vr_data/VR_H31_bodyshop_place_part2_pose5_stereo_rvt_trym_speedup1 \
-    /mnt/data/sftp/data/locht/vr_data/VR_H31_bodyshop_place_part2_pose6_stereo_rvt_trym_speedup1 \
-    /mnt/data/sftp/data/locht/vr_data/VR_H31_bodyshop_place_part2_pose7a_stereo_rvt_trym_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/VR_H31_bodyshop_place_part2_base_poseA_stereo_rvt_trym_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/VR_H31_bodyshop_place_part2_pose0_linhld23_stereo_rvt_trym_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/VR_H31_bodyshop_place_part2_pose3_stereo_rvt_trym_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/VR_H31_bodyshop_place_part2_pose1_stereo_rvt_trym_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/VR_H31_bodyshop_place_part2_pose2_stereo_rvt_trym_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/VR_H31_bodyshop_place_part2_pose4_stereo_rvt_trym_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/VR_H31_bodyshop_place_part2_pose5_stereo_rvt_trym_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/VR_H31_bodyshop_place_part2_pose6_stereo_rvt_trym_speedup1 \
+    /mnt/data/sftp/data/locht1/vr_data/VR_H31_bodyshop_place_part2_pose7a_stereo_rvt_trym_speedup1 \
     --embodiment-tag NEW_EMBODIMENT \
     --modality-config-path /home/locht1/gr00t/data_config/vrh3_two_hands.py \
     --num-gpus $NUM_GPUS \
