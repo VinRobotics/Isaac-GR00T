@@ -427,6 +427,7 @@ class Gr00tPolicy(BasePolicy):
         with torch.inference_mode():
             model_pred = self.model.get_action(**collated_inputs)
         normalized_action = model_pred["action_pred"].float()[:, :self.num_queries]
+        normalized_effort = model_pred["effort_pred"].float()[:, :self.num_queries]
 
         # print(normalized_action.shape)
         # TE inference - applied on normalized tensor before decoding
@@ -439,11 +440,18 @@ class Gr00tPolicy(BasePolicy):
         unnormalized_action = self.processor.decode_action(
             normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
         )
+        unnormalized_effort = self.processor.decode_effort(
+            normalized_effort.cpu().numpy(), self.embodiment_tag
+        )
 
         # Cast all actions to float32 for consistency
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
+        casted_effort = {
+            "effort_" +key: value.astype(np.float32) for key, value in unnormalized_effort.items()
+        }
+        casted_action.update(casted_effort)
         return casted_action, {}
 
     def check_action(self, action: dict[str, Any]) -> None:

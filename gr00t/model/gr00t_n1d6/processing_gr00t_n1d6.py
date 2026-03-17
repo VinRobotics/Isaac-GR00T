@@ -252,6 +252,24 @@ class Gr00tN1d6Processor(BaseProcessor):
             out_dict, embodiment_tag.value, state=state
         )
 
+    def decode_effort(
+        self,
+        effort: np.ndarray,
+        embodiment_tag: EmbodimentTag,
+    ):
+        """Undo effort normalization. Returns per-joint-group unnormalized effort."""
+        out_dict = {}
+        start_idx = 0
+        joint_groups = self.modality_configs[embodiment_tag.value]["effort"].modality_keys
+        for key in joint_groups:
+            joint_dim = self.state_action_processor.norm_params[embodiment_tag.value]["effort"][
+                key
+            ]["dim"].item()
+            out_dict[key] = effort[..., start_idx : start_idx + joint_dim]
+            start_idx += joint_dim
+
+        return self.state_action_processor.unapply_effort(out_dict, embodiment_tag.value)
+
     def _apply_vlm_processing(self, images: np.ndarray, language: str) -> BatchFeature:
         """
         Args:

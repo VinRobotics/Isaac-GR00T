@@ -408,11 +408,13 @@ class Gr00tN1d6ActionHead(nn.Module):
             pred_velocity = pred[:, -self.action_horizon:]
             trajectory = trajectory + dt * pred_velocity
 
-        # Return only the action slice; effort future is discarded at inference.
+        # Return action slice and effort prediction.
         action_pred = trajectory[..., :self.action_dim]
+        effort_pred = trajectory[..., self.action_dim:]
         return BatchFeature(
             data={
                 "action_pred": action_pred,
+                "effort_pred": effort_pred,
                 "backbone_features": vl_embeds,
                 "state_features": state_features,
             }

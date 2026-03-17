@@ -540,6 +540,42 @@ class StateActionProcessor:
 
         return unnormalized_values
 
+    def unapply_effort(
+        self,
+        effort: dict[str, np.ndarray],
+        embodiment_tag: str,
+    ) -> dict[str, np.ndarray]:
+        """
+        Reverse effort normalization (min/max unnormalize).
+
+        Args:
+            effort: Dict mapping joint_group -> normalized effort values
+                Shape per group: (T, D) or (B, T, D)
+            embodiment_tag: Embodiment identifier
+
+        Returns:
+            Dict mapping joint_group -> raw effort values
+        """
+        effort_modality_config = self.modality_configs[embodiment_tag].get("effort")
+        if effort_modality_config is None:
+            return {}
+
+        if "effort" not in self.norm_params.get(embodiment_tag, {}):
+            raise KeyError(
+                f"Effort normalization statistics not found for embodiment '{embodiment_tag}'."
+            )
+
+        unnormalized_values = {}
+        for joint_group in effort_modality_config.modality_keys:
+            if joint_group not in effort:
+                raise KeyError(
+                    f"Joint group '{joint_group}' not found in effort dict for embodiment '{embodiment_tag}'"
+                )
+            params = self.norm_params[embodiment_tag]["effort"][joint_group]
+            unnormalized_values[joint_group] = unnormalize_values_minmax(effort[joint_group], params)
+
+        return unnormalized_values
+
     def apply(
         self,
         state: dict[str, np.ndarray],
