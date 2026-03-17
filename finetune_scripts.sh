@@ -18,11 +18,11 @@ torchrun --nproc_per_node=2 gr00t/experiment/launch_finetune.py \
     --embodiment-tag NEW_EMBODIMENT \
     --modality-config-path /home/locht1/gr00t/data_config/vrh3_two_hands.py \
     --num-gpus $NUM_GPUS \
-    --output-dir /mnt/data/sftp/data/locht1/vr_checkpoints/gr00t_n16_vrh31_two_hands_chunk50_3random_pose_1703 \
+    --output-dir /mnt/data/sftp/data/locht1/vr_checkpoints/gr00t_n16_vrh31_left_hand_chunk50_3random_pose_1703 \
     --save-total-limit 5 \
     --save-steps 10000 \
-    --max-steps 50000 \
+    --max-steps 150000 \
     --use-wandb \
-    --global-batch-size 64 \
+    --global-batch-size 32 \
     --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
     --dataloader-num-workers 4
