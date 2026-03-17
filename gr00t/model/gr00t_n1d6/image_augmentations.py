@@ -222,17 +222,10 @@ def build_image_transformations_albumentations(
 
     # Training transforms (using ReplayCompose for consistent augmentation across views)
     # Use SmallestMaxSize to preserve aspect ratios, with INTER_AREA for antialiasing
-    # PadIfNeeded pads to square so images with different aspect ratios stack correctly
     train_transform_list = [
         A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
         FractionalRandomCrop(crop_fraction=fraction_to_use),
-        A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
-        A.PadIfNeeded(
-            min_height=max_size,
-            min_width=max_size,
-            border_mode=cv2.BORDER_CONSTANT,
-            value=0,
-        ),
+        A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
     ]
 
     if random_rotation_angle is not None and random_rotation_angle != 0:
@@ -255,18 +248,11 @@ def build_image_transformations_albumentations(
 
     # Evaluation transforms (deterministic)
     # Use SmallestMaxSize to preserve aspect ratios, with INTER_AREA for antialiasing
-    # PadIfNeeded pads to square so images with different aspect ratios stack correctly
     eval_transform = A.Compose(
         [
             A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
             FractionalCenterCrop(crop_fraction=fraction_to_use),
-            A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
-            A.PadIfNeeded(
-                min_height=max_size,
-                min_width=max_size,
-                border_mode=cv2.BORDER_CONSTANT,
-                value=0,
-            ),
+            A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
         ]
     )
 
