@@ -385,7 +385,14 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=2048, metadata={"help": "Language feature dim from backbone LLM (D_llm)."}
     )
     num_vis_queries: int = field(
-        default=16, metadata={"help": "Number of pooled query tokens per camera for equivariant vision pooling."}
+        default=8, metadata={"help": "Number of pooled query tokens per camera for equivariant vision pooling."}
+    )
+    equi_vis_pool_cfg: dict = field(
+        default_factory=lambda: {
+            "heads": 32,
+            "dim_head": 64,
+        },
+        metadata={"help": "EquivariantAttentionPool config. heads*dim_head should equal inner_dim/n_group."}
     )
     def __init__(self, **kwargs):
         import dataclasses
@@ -495,6 +502,7 @@ class FlowmatchingActionHead(nn.Module):
         self.equi_vis_pool = EquivariantAttentionPool(
             in_type=self.model.in_type,
             num_queries=config.num_vis_queries,
+            **config.equi_vis_pool_cfg,
         )
 
         if config.add_pos_embed:
