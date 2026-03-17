@@ -1817,15 +1817,15 @@ class VRH3LeftHandConfig(BaseDataConfig):
     language_keys = ["annotation.human.task_description"]
     observation_indices = [0]
     state_indices = [0]
-    action_indices = list(range(16))
+    action_indices = list(range(0, 32, 2))
 
-    def modality_config(self):
+    def modality_config(self) -> dict[str, ModalityConfig]:
         video_modality = ModalityConfig(
             delta_indices=self.observation_indices,
             modality_keys=self.video_keys,
         )
         state_modality = ModalityConfig(
-            delta_indices=self.observation_indices,
+            delta_indices=self.state_indices,
             modality_keys=self.state_keys,
         )
         action_modality = ModalityConfig(
@@ -1836,15 +1836,14 @@ class VRH3LeftHandConfig(BaseDataConfig):
             delta_indices=self.observation_indices,
             modality_keys=self.language_keys,
         )
-        modality_configs = {
+        return {
             "video": video_modality,
             "state": state_modality,
             "action": action_modality,
             "language": language_modality,
         }
-        return modality_configs
 
-    def transform(self):
+    def transform(self) -> ModalityTransform:
         transforms = [
             # video transforms
             VideoToTensor(apply_to=self.video_keys),
@@ -1863,10 +1862,6 @@ class VRH3LeftHandConfig(BaseDataConfig):
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={key: "min_max" for key in self.state_keys},
-                # target_rotations={
-                #     "state.end_effector_rotation_relative": "rotation_6d",
-                #     "state.base_rotation": "rotation_6d",
-                # },
             ),
             # action transforms
             StateActionToTensor(apply_to=self.action_keys),
@@ -1880,14 +1875,14 @@ class VRH3LeftHandConfig(BaseDataConfig):
                 state_concat_order=self.state_keys,
                 action_concat_order=self.action_keys,
             ),
+            # model-specific transform
             GR00TTransform(
-                state_horizon=len(self.observation_indices),
+                state_horizon=len(self.state_indices),
                 action_horizon=len(self.action_indices),
                 max_state_dim=64,
                 max_action_dim=32,
             ),
         ]
-
         return ComposedModalityTransform(transforms=transforms)
 
 ###########################################################################################
