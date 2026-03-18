@@ -330,23 +330,29 @@ class EquivariantAttention(nn.Module):
 
 class EquivariantAttentionPool(nn.Module):
     """
-    Pools N equivariant tokens → K tokens using MHA-style value splitting.
+    Case A: trivial-repr keys.
 
-    Enforces H * dim_head = D = in_type.size so out_proj is always D → D
-    regardless of the number of heads.
+    Pools N equivariant tokens → K tokens.
 
     Design:
       - query_tokens : K plain nn.Parameter vectors in ℝᴰ  (trivial repr)
-      - k_proj       : equivariant linear  in_type → trivial_repr (D scalars)
+      - k_proj       : equivariant linear  in_type → trivial_repr
                        keys are group-invariant scalars
       - score        : q · k  — trivial · trivial → scalar, invariant ✓
       - v_proj       : equivariant linear  in_type → in_type
-                       values split per head: (B, N, H, Dh) where H*Dh = D
-      - out_proj     : equivariant linear  in_type → in_type  (D → D, constant cost)
+                       learns which equivariant content to expose as values
+      - out_proj     : equivariant linear  H*in_type → in_type
+                       recombines heads equivariantly
 
     Equivariance proof:
-        score_i(g·f) = q · W_K(ρ(g)·fᵢ) = q · W_K(fᵢ)   [trivial keys] ✓ invariant
-        out(g·f) = ρ(g) · out(f)                           ✓ equivariant
+        score_i(g·f) = q · W_K(ρ(g)·fᵢ)
+                     = q · ρ_triv(g) · W_K(fᵢ)   [W_K equivariant]
+                     = q · W_K(fᵢ)                [ρ_triv(g) = I]
+                     = score_i(f)                  ✓ invariant
+        out(g·f) = Σᵢ score_i(g·f) · W_V(ρ(g)·fᵢ)
+                 = Σᵢ score_i(f) · ρ(g)·W_V(fᵢ)  [W_V equivariant]
+                 = ρ(g) · Σᵢ score_i(f) · W_V(fᵢ)
+                 = ρ(g) · out(f)                   ✓ equivariant
     """
 
     def __init__(
@@ -354,75 +360,87 @@ class EquivariantAttentionPool(nn.Module):
         in_type: enn.FieldType,
         num_queries: int = 8,
         heads: int = 8,
+        dim_head: int = 64,
         bias: bool = True,
     ):
         super().__init__()
         self.in_type = in_type
         gspace = in_type.gspace
         self.H = heads
+        self.Dh = dim_head
         self.K = num_queries
         self.D = in_type.size
 
-        assert self.D % self.H == 0, (
-            f"in_type.size ({self.D}) must be divisible by heads ({self.H})"
-        )
-        self.Dh = self.D // self.H  # dim per head, H * Dh = D
-
-        # ── Key type: D trivial channels (H heads × Dh each) ────────────────
+        # ── Key type: trivial_repr (invariant scalars) ──────────────────────
+        # Each head gets dim_head trivial channels as its key space.
+        # trivial_repr has size 1, so we need H*dim_head copies.
         self.key_type = enn.FieldType(
             gspace,
-            [gspace.trivial_repr] * self.D,
+            [gspace.trivial_repr] * (heads * dim_head),
         )
 
-        # ── Query tokens: (K, D) trivial, fixed ─────────────────────────────
-        self.query_tokens = nn.Parameter(torch.empty(num_queries, self.D))
+        # ── Query tokens: plain parameters in trivial key space ─────────────
+        # Shape (K, H*dim_head) — no group action needed, keys are invariant.
+        self.query_tokens = nn.Parameter(
+            torch.empty(num_queries, heads * dim_head)
+        )
         nn.init.trunc_normal_(self.query_tokens, std=0.02)
 
-        # ── Key projection: in_type → key_type (equivariant) ────────────────
+        # ── Key projection: in_type → trivial_repr (equivariant) ───────────
+        # Reynolds-generalisation: learns which invariant combination to use.
         self.k_proj = enn.Linear(in_type, self.key_type, bias=bias)
 
         # ── Value projection: in_type → in_type (equivariant) ───────────────
-        # Values are split per head in forward: (B, N, H, Dh)
+        # Learns which equivariant content to expose as values.
+        # Equivariance preserved: W_V(ρ(g)·x) = ρ(g)·W_V(x) ✓
         self.v_proj = enn.Linear(in_type, in_type, bias=bias)
 
-        # ── Output projection: in_type → in_type (D → D, constant cost) ─────
-        # H*Dh = D so merged heads always have size D = in_type.size
-        self.out_proj = enn.Linear(in_type, in_type, bias=bias)
+        # ── Output projection: H pooled heads → in_type (equivariant) ───────
+        # Each head independently produces a D-dim regular_repr vector.
+        # concat_type = H copies of in_type's representations (total size H*D).
+        # out_proj recombines heads equivariantly: H*D → D.
+        self.concat_type = enn.FieldType(
+            gspace,
+            list(in_type.representations) * heads,   # H × (reps of in_type)
+        )
+        self.out_proj = enn.Linear(self.concat_type, in_type, bias=bias)
 
-        self.scale = self.Dh ** -0.5
+        self.scale = dim_head ** -0.5
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x   : (B, N, D)  equivariant input tokens
-        out : (B, K, D)  pooled equivariant tokens
+        x   : (B, N, in_dim)  equivariant input tokens
+        out : (B, K, in_dim)  pooled equivariant tokens
         """
         B, N, D = x.shape
 
-        # ── Keys: (B, N, H, Dh)  invariant ──────────────────────────────────
+        # ── Keys: (B, N, H*Dh)  invariant ───────────────────────────────────
         k_geo = enn.GeometricTensor(x.reshape(B * N, D), self.in_type)
-        keys = self.k_proj(k_geo).tensor                   # (B*N, D)
-        keys = keys.reshape(B, N, self.H, self.Dh)         # (B, N, H, Dh)
+        keys = self.k_proj(k_geo).tensor          # (B*N, H*Dh)
+        keys = keys.reshape(B, N, self.H, self.Dh)  # (B, N, H, Dh)
 
         # ── Queries: (K, H, Dh)  trivial, fixed ─────────────────────────────
-        Q = self.query_tokens.reshape(self.K, self.H, self.Dh)
+        Q = self.query_tokens.reshape(self.K, self.H, self.Dh)  # (K, H, Dh)
 
         # ── Attention scores: (B, H, K, N) ──────────────────────────────────
+        # trivial · trivial → scalar, invariant ✓
         attn = torch.einsum("k h d, b n h d -> b h k n", Q, keys) * self.scale
-        attn = attn.softmax(dim=-1)
+        attn = attn.softmax(dim=-1)               # (B, H, K, N)
 
-        # ── Values: split per head (B, N, H, Dh) ────────────────────────────
+        # ── Values: project equivariantly before weighted sum ────────────────
         v_geo = enn.GeometricTensor(x.reshape(B * N, D), self.in_type)
-        values = self.v_proj(v_geo).tensor.reshape(B, N, self.H, self.Dh)
+        values = self.v_proj(v_geo).tensor.reshape(B, N, D)  # (B, N, D)
 
-        # ── Weighted sum per head: (B, H, K, Dh) ────────────────────────────
-        vals = torch.einsum("b h k n, b n h d -> b h k d", attn, values)
+        # Each head independently: (B, H, K, in_dim)
+        vals = torch.einsum("b h k n, b n d -> b h k d", attn, values)
 
-        # ── Merge heads: (B*K, H*Dh) = (B*K, D) ─────────────────────────────
-        vals = vals.permute(0, 2, 1, 3).reshape(B * self.K, D)
-        vals_geo = enn.GeometricTensor(vals, self.in_type)
-        out = self.out_proj(vals_geo).tensor               # (B*K, D)
+        # ── Recombine heads equivariantly ────────────────────────────────────
+        # Reshape to (B*K, H*in_dim) and pass through equivariant out_proj
+        vals = vals.permute(0, 2, 1, 3).reshape(B * self.K, self.H * D)
+        vals_geo = enn.GeometricTensor(vals, self.concat_type)
+        out = self.out_proj(vals_geo).tensor      # (B*K, in_dim)
 
-        return out.reshape(B, self.K, D)
+        return out.reshape(B, self.K, D)          # (B, K, in_dim)
 
 
 class EquivariantFeedForward(nn.Module):
