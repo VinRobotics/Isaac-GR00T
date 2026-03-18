@@ -389,10 +389,9 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     )
     equi_vis_pool_cfg: dict = field(
         default_factory=lambda: {
-            "heads": 32,
-            "dim_head": 64,
+            "heads": 8,
         },
-        metadata={"help": "EquivariantAttentionPool config. heads*dim_head should equal inner_dim/n_group."}
+        metadata={"help": "EquivariantAttentionPool config. dim_head is derived as in_type.size // heads."}
     )
     def __init__(self, **kwargs):
         import dataclasses
