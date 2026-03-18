@@ -10,7 +10,7 @@ import tyro
 from libero.libero import benchmark
 
 from examples.Libero_abs.eval.utils import (
-    get_libero_dummy_action_abs,
+    get_libero_dummy_action,
     get_libero_env,
     get_libero_image,
     normalize_gripper_action,
@@ -66,7 +66,7 @@ class GenerateConfig:
 
 
 class GR00TPolicy:
-    """GR00T Policy wrapper for Libero environments."""
+    """GR00T Policy wrapper for Libero environments (absolute EEF action)."""
 
     LIBERO_CONFIG = {
         "proprio_size": 8,
@@ -86,7 +86,6 @@ class GR00TPolicy:
 
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.config = self.LIBERO_CONFIG
-        self.action_keys = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
         self.headless = headless
 
     def get_action(self, observation_dict, lang: str):
@@ -99,7 +98,6 @@ class GR00TPolicy:
     def _process_observation(self, obs, lang: str):
         """Convert Libero observation to GR00T format."""
         xyz = obs["robot0_eef_pos"]
-        rpy = quat2axisangle(obs["robot0_eef_quat"])
         quat = obs["robot0_eef_quat"]
         gripper = np.asarray(obs["robot0_gripper_qpos"]).mean()
         img, wrist_img = get_libero_image(obs)
@@ -109,9 +107,6 @@ class GR00TPolicy:
             "state.x": np.array([[xyz[0]]]),
             "state.y": np.array([[xyz[1]]]),
             "state.z": np.array([[xyz[2]]]),
-            # "state.roll": np.array([[rpy[0]]]),
-            # "state.pitch": np.array([[rpy[1]]]),
-            # "state.yaw": np.array([[rpy[2]]]),
             "state.rx": np.array([[quat[0]]]),
             "state.ry": np.array([[quat[1]]]),
             "state.rz": np.array([[quat[2]]]),
@@ -126,32 +121,32 @@ class GR00TPolicy:
     def _convert_to_libero_action(
         self, action_chunk: Dict[str, np.array], idx: int = 0
     ) -> np.ndarray:
-        """Convert GR00T action chunk to Libero format.
+        """Convert GR00T absolute EEF action to Libero format.
 
         Args:
             action_chunk: Dictionary of action components from GR00T policy
             idx: Index of action to extract from chunk (default: 0 for first action)
 
         Returns:
-            7-dim numpy array: [dx, dy, dz, droll, dpitch, dyaw, gripper]
+            7-dim numpy array: [x, y, z, roll, pitch, yaw, gripper] (absolute targets)
         """
-        quat = np.asarray([
-            action_chunk[f"action.rx"][idx][0],
-            action_chunk[f"action.ry"][idx][0],
-            action_chunk[f"action.rz"][idx][0],
-            action_chunk[f"action.rw"][idx][0],
+        target_xyz = np.array([
+            action_chunk["action.x"][idx][0],
+            action_chunk["action.y"][idx][0],
+            action_chunk["action.z"][idx][0],
         ])
 
-        rot = quat2axisangle(quat)
-        action_chunk["action.roll"] = [rot[0]]
-        action_chunk["action.pitch"] = [rot[1]]
-        action_chunk["action.yaw"] = [rot[2]]
-        
-        action_components = [
-            np.atleast_1d(action_chunk[f"action.{key}"][idx])[0] for key in self.action_keys
-        ]
+        target_quat = np.array([
+            action_chunk["action.rx"][idx][0],
+            action_chunk["action.ry"][idx][0],
+            action_chunk["action.rz"][idx][0],
+            action_chunk["action.rw"][idx][0],
+        ])
+        target_rot = quat2axisangle(target_quat)
 
-        action_array = np.array(action_components, dtype=np.float32)
+        gripper = np.atleast_1d(action_chunk["action.gripper"][idx])[0]
+
+        action_array = np.array([*target_xyz, *target_rot, gripper], dtype=np.float32)
         action_array = normalize_gripper_action(action_array, binarize=True)
         assert len(action_array) == 7, f"Expected 7-dim action, got {len(action_array)}"
         return action_array
@@ -176,7 +171,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
 
         # Initialize LIBERO environment and task description
-        env, task_description = get_libero_env(task, resolution=256, use_abs_controller=True)
+        env, task_description = get_libero_env(task, resolution=256)
 
         gr00t_policy = GR00TPolicy(host="localhost", port=cfg.port, headless=cfg.headless)
 
@@ -214,9 +209,14 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                     # and we need to wait for them to fall
                     if t < cfg.num_steps_wait:
-                        obs, reward, done, info = env.step(get_libero_dummy_action_abs(obs))
+                        obs, reward, done, info = env.step(get_libero_dummy_action())
                         t += 1
                         continue
+
+                    # Switch to absolute EEF control after the wait phase
+                    if t == cfg.num_steps_wait:
+                        for robot in env.env.robots:
+                            robot.controller.use_delta = False
 
                     # # Get preprocessed image
                     img, wrist_img = get_libero_image(obs)
