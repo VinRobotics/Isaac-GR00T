@@ -60,7 +60,7 @@ def get_libero_image(obs):
 
 def save_rollout_video(top_view, wrist_view, idx, success, task_description, prefix_name, log_file=None):
     """Saves an MP4 replay of an episode."""
-    rollout_dir = f"./rollouts_{prefix_name}/{DATE}"
+    rollout_dir = f"/mnt/data/sftp/data/locht1/equi_gr00t_fa_abs/rollouts_{prefix_name}/{DATE}"
     os.makedirs(rollout_dir, exist_ok=True)
     processed_task_description = (
         task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]

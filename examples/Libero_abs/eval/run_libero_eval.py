@@ -17,7 +17,7 @@ from examples.Libero_abs.eval.utils import (
     save_rollout_video,
 )
 
-log_dir = "/tmp/logs"
+log_dir = "/mnt/data/sftp/data/locht1/logs"
 os.makedirs(log_dir, exist_ok=True)  # ensures directory exists
 
 
