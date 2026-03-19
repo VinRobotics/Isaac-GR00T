@@ -56,6 +56,7 @@ class GenerateConfig:
     task_suite_name: str = "libero_spatial"          # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 5                    # Number of rollouts per task
+    # specific_task_lists: Dict[str, list] = None  # Optionally specify list of task IDs to evaluate for each suite (e.g. {"libero_spatial": [0, 1, 2], "libero_object": [0, 1], ...})
     #################################################################################################################
     # fmt: on
     """Port to connect to."""
@@ -163,7 +164,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
-    num_tasks_in_suite = task_suite.n_tasks
+    num_tasks_in_suite = task_suite.n_tasks[5]
     print(f"Task suite: {cfg.task_suite_name}")
     log_file = open(f"{log_dir}/libero_eval_{cfg.task_suite_name}.log", "w")
     log_file.write(f"Task suite: {cfg.task_suite_name}\n")
