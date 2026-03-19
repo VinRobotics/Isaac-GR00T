@@ -8,7 +8,6 @@ import torch
 import tqdm
 import tyro
 from libero.libero import benchmark
-
 from examples.Libero_abs.eval.utils import (
     get_libero_dummy_action,
     get_libero_env,
@@ -93,7 +92,7 @@ class GR00TPolicy:
         obs_dict = self._process_observation(observation_dict, lang)
         # summarize_obs(obs_dict)
         action_chunk = self.policy.get_action(obs_dict)
-        return self._convert_to_libero_action(action_chunk, 0)
+        return self._convert_to_libero_action(obs_dict, action_chunk, 0)
 
     def _process_observation(self, obs, lang: str):
         """Convert Libero observation to GR00T format."""
@@ -119,7 +118,7 @@ class GR00TPolicy:
         return new_obs
 
     def _convert_to_libero_action(
-        self, action_chunk: Dict[str, np.array], idx: int = 0
+        self, obs_dict: Dict[str, np.array], action_chunk: Dict[str, np.array], idx: int = 0
     ) -> np.ndarray:
         """Convert GR00T absolute EEF action to Libero format.
 
@@ -135,6 +134,13 @@ class GR00TPolicy:
             action_chunk["action.y"][idx][0],
             action_chunk["action.z"][idx][0],
         ])
+        state_xyz = np.array([
+            obs_dict["state.x"],
+            obs_dict["state.y"],
+            obs_dict["state.z"],
+        ]).squeeze()
+
+        delta_xyz = target_xyz - state_xyz
 
         target_quat = np.array([
             action_chunk["action.rx"][idx][0],
@@ -146,10 +152,11 @@ class GR00TPolicy:
 
         gripper = np.atleast_1d(action_chunk["action.gripper"][idx])[0]
 
-        action_array = np.array([*target_xyz, *target_rot, gripper], dtype=np.float32)
+        action_array = np.array([*delta_xyz, *target_rot, gripper], dtype=np.float32)
         action_array = normalize_gripper_action(action_array, binarize=True)
         assert len(action_array) == 7, f"Expected 7-dim action, got {len(action_array)}"
         return action_array
+
 
 
 def eval_libero(cfg: GenerateConfig) -> None:
@@ -212,11 +219,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         obs, reward, done, info = env.step(get_libero_dummy_action())
                         t += 1
                         continue
-
-                    # Switch to absolute EEF control after the wait phase
-                    if t == cfg.num_steps_wait:
-                        for robot in env.env.robots:
-                            robot.controller.use_delta = False
 
                     # # Get preprocessed image
                     img, wrist_img = get_libero_image(obs)
