@@ -7,10 +7,10 @@ import numpy as np
 import torch
 import tqdm
 import tyro
+from scipy.spatial.transform import Rotation
 from libero.libero import benchmark
 
 from examples.Libero.eval.utils import (
-    get_libero_dummy_action,
     get_libero_env,
     get_libero_image,
     normalize_gripper_action,
@@ -86,7 +86,7 @@ class GR00TPolicy:
 
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.config = self.LIBERO_CONFIG
-        self.action_keys = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+        self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
         self.headless = headless
 
     def get_action(self, observation_dict, lang: str):
@@ -133,7 +133,7 @@ class GR00TPolicy:
             idx: Index of action to extract from chunk (default: 0 for first action)
 
         Returns:
-            7-dim numpy array: [dx, dy, dz, droll, dpitch, dyaw, gripper]
+            7-dim numpy array: [x, y, z, ax, ay, az, gripper]  (absolute pos + axis-angle)
         """
         quat = np.asarray([
             action_chunk[f"action.rx"][idx][0],
@@ -141,8 +141,8 @@ class GR00TPolicy:
             action_chunk[f"action.rz"][idx][0],
             action_chunk[f"action.rw"][idx][0],
         ])
-
-        rot = quat2axisangle(quat)
+        # quat -> axis-angle via scipy (canonical, angle always in [0, π], no sign ambiguity)
+        rot = Rotation.from_quat(quat).as_rotvec()  # input: (x,y,z,w), output: axis*angle
         action_chunk["action.roll"] = [rot[0]]
         action_chunk["action.pitch"] = [rot[1]]
         action_chunk["action.yaw"] = [rot[2]]
@@ -192,6 +192,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
+            # Use absolute actions to match training data
+            for robot in env.env.robots:
+                robot.controller.use_delta = False
+
             # Setup
             t = 0
             top_view = []
@@ -214,7 +218,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                     # and we need to wait for them to fall
                     if t < cfg.num_steps_wait:
-                        obs, reward, done, info = env.step(get_libero_dummy_action())
+                        # Hold current pose (absolute) while objects settle
+                        current_ori = Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec()
+                        hold_action = np.concatenate([obs["robot0_eef_pos"], current_ori, [-1.0]])
+                        obs, reward, done, info = env.step(hold_action)
                         t += 1
                         continue
 
