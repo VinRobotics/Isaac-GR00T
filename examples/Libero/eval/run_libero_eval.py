@@ -11,7 +11,6 @@ from scipy.spatial.transform import Rotation
 from libero.libero import benchmark
 
 from examples.Libero.eval.utils import (
-    get_libero_dummy_action,
     get_libero_env,
     get_libero_image,
     normalize_gripper_action,
@@ -193,6 +192,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
+            # Use absolute actions to match training data
+            for robot in env.env.robots:
+                robot.controller.use_delta = False
+
             # Setup
             t = 0
             top_view = []
@@ -215,14 +218,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                     # and we need to wait for them to fall
                     if t < cfg.num_steps_wait:
-                        obs, reward, done, info = env.step(get_libero_dummy_action())
+                        # Hold current pose (absolute) while objects settle
+                        current_ori = Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec()
+                        hold_action = np.concatenate([obs["robot0_eef_pos"], current_ori, [-1.0]])
+                        obs, reward, done, info = env.step(hold_action)
                         t += 1
                         continue
-
-                    # Switch to absolute actions after wait period (dummy actions use delta=True)
-                    if t == cfg.num_steps_wait:
-                        for robot in env.env.robots:
-                            robot.controller.use_delta = False
 
                     # # Get preprocessed image
                     img, wrist_img = get_libero_image(obs)
