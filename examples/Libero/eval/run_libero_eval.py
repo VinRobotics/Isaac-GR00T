@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import tqdm
 import tyro
+from scipy.spatial.transform import Rotation
 from libero.libero import benchmark
 
 from examples.Libero.eval.utils import (
@@ -141,11 +142,8 @@ class GR00TPolicy:
             action_chunk[f"action.rz"][idx][0],
             action_chunk[f"action.rw"][idx][0],
         ])
-        # Ensure canonical quaternion (qw >= 0) so quat2axisangle gives angle in [0, π]
-        if quat[3] < 0:
-            quat = -quat
-
-        rot = quat2axisangle(quat)
+        # quat -> axis-angle via scipy (canonical, angle always in [0, π], no sign ambiguity)
+        rot = Rotation.from_quat(quat).as_rotvec()  # input: (x,y,z,w), output: axis*angle
         action_chunk["action.roll"] = [rot[0]]
         action_chunk["action.pitch"] = [rot[1]]
         action_chunk["action.yaw"] = [rot[2]]
@@ -195,10 +193,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
-            # Use absolute actions (not delta) to match training data
-            for robot in env.env.robots:
-                robot.controller.use_delta = False
-
             # Setup
             t = 0
             top_view = []
@@ -224,6 +218,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         obs, reward, done, info = env.step(get_libero_dummy_action())
                         t += 1
                         continue
+
+                    # Switch to absolute actions after wait period (dummy actions use delta=True)
+                    if t == cfg.num_steps_wait:
+                        for robot in env.env.robots:
+                            robot.controller.use_delta = False
+
                     # # Get preprocessed image
                     img, wrist_img = get_libero_image(obs)
 
