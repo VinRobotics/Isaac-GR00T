@@ -28,15 +28,24 @@ Key differences from EagleBackboneFA (pooled):
 
 Frame Averaging Formula:
     FA(x) = (1/|G|) * Σ_g ρ(g) · π(g⁻¹) · f(g·x)
-    
+
 Where:
 - g is a rotation from the cyclic group CN
 - f(g·x) = features from rotated image (tokens at rotated positions)
-- π(g⁻¹) = inverse spatial permutation (revert tokens to original positions)  
+- π(g⁻¹) = inverse spatial permutation (revert tokens to original positions)
 - ρ(g) = feature-space transformation (regular representation)
 
 This ensures proper per-token equivariance: f(g·x)[p] = ρ(g) · f(x)[π(g)·p]
 After spatial alignment, tokens across all rotations represent the same spatial content.
+
+Pipeline (with equivariant adapter):
+    1. FA wrapper (Phase 1): Rotate images N times, extract features, apply FA → H' (equivariant)
+    2. InvariantProjector (Phase 2): Norm-pool H' over group channels → invariant scalars
+       Optionally inject these into Eagle LLM instead of raw SigLIP tokens.
+    3. EquiAdapter (Phase 3): H_llm gates H' via zero-init linear → equivariant refined features
+    4. Output two contexts for DiT's two Equi Cross Attention blocks:
+       - equi_adapter(H', H_llm)  [equivariant] → Equi Cross Attention #1
+       - H_llm                    [invariant]   → Equi Cross Attention #2
 """
 
 import os
@@ -54,6 +63,150 @@ import gr00t
 DEFAULT_EAGLE_PATH = os.path.join(
     os.path.dirname(gr00t.__file__), "model", "backbone", "eagle2_hg_model"
 )
+
+
+class InvariantProjector(nn.Module):
+    """
+    Phase 2: Extract invariant scalars from equivariant vision features H'.
+
+    FA uses group-major layout: D = n_group * blocks, where channels
+    [g*blocks : (g+1)*blocks] all belong to group element g.
+
+    Invariant pooling: max over the n_group dimension (group-major axis).
+    max_g( (ρ(g_r) · v)[g] ) = max_g( v[(g - r) mod N] ) = max_g( v[g] ) ✓
+
+    Result: blocks invariant scalars per token.  MLP projects blocks → out_dim.
+
+    forward: [..., D] → [..., out_dim]
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, n_group: int):
+        super().__init__()
+        self.n_group = n_group
+        blocks = in_dim // n_group
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(blocks),
+            nn.Linear(blocks, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def forward(self, h_prime: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h_prime: [..., D]  equivariant features (group-major, D = n_group * blocks)
+        Returns:
+            [..., out_dim]  invariant features
+        """
+        *shape, D = h_prime.shape
+        blocks = D // self.n_group
+        # Group-major max pool: reshape → [..., n_group, blocks], max over n_group dim
+        inv = h_prime.reshape(*shape, self.n_group, blocks).max(dim=-2).values  # [..., blocks]
+        return self.mlp(inv)
+
+
+class EquiAdapter(nn.Module):
+    """
+    Phase 3: Fuse H_llm (invariant language context) with H' (equivariant vision carrier).
+
+    FA uses group-major layout: D = n_group * blocks.
+    The group action ρ(g_r) cyclically shifts the n_group chunks of size `blocks`.
+
+    Equivariant linear (group-major): apply the SAME nn.Linear to each of the n_group
+    group-slices independently.  This commutes with the group-major cyclic shift:
+        W_equi(ρ(g_r) · v)[g] = W_block(v[(g-r) mod N]) = (ρ(g_r) · W_equi(v))[g]  ✓
+
+    Gate design — per-token cross-attention (invariant):
+        q  = q_proj(GroupPool(h_prime))          # [B, n_equi, T, blocks]  invariant query
+        k,v = k_proj(H_llm), v_proj(H_llm)      # [B, T_text, blocks]     invariant keys/values
+        ctx = softmax(q @ k^T / √d) @ v          # [B, n_equi, T, blocks]  per-token language ctx
+        gate = sigmoid(ctx)                       # invariant gate per vision token ✓
+
+    Each vision token attends to the full task instruction independently, allowing
+    task-relevant spatial regions to be selectively modulated.
+
+    Zero-init of v_proj (bias = 0, weight = 0) → gate ≈ 0.5 → near-identity at init ✓
+    """
+
+    def __init__(self, d_eq: int, d_llm: int, n_group: int):
+        super().__init__()
+        self.n_group = n_group
+        self.blocks = d_eq // n_group
+        self.scale = self.blocks ** -0.5
+
+        # Invariant query from each vision token (GroupPool → blocks scalars)
+        self.q_proj = nn.Linear(self.blocks, self.blocks)
+        # Language keys and values
+        self.k_proj = nn.Linear(d_llm, self.blocks)
+        self.v_proj = nn.Linear(d_llm, self.blocks)
+        # Zero-init v_proj so gate starts at sigmoid(0) = 0.5 → near-identity residual
+        nn.init.zeros_(self.v_proj.weight)
+        nn.init.zeros_(self.v_proj.bias)
+
+        # FiLM: per-token scale (γ) and shift (β) from cross-attention context
+        # Both derived from invariant ctx → equivariance preserved ✓
+        # Zero-init so γ=1, β=0 at init → identity residual
+        self.film_gamma = nn.Linear(self.blocks, self.blocks)
+        self.film_beta  = nn.Linear(self.blocks, self.blocks)
+        nn.init.zeros_(self.film_gamma.weight)
+        nn.init.ones_(self.film_gamma.bias)   # γ starts at 1
+        nn.init.zeros_(self.film_beta.weight)
+        nn.init.zeros_(self.film_beta.bias)   # β starts at 0
+
+        # Equivariant linear in group-major: same linear applied to each group-slice
+        self.equi_proj = nn.Linear(self.blocks, self.blocks, bias=False)
+
+    def forward(self, h_prime: torch.Tensor, h_llm: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h_prime: [B, n_equi, T, D_eq]  equivariant vision features (group-major)
+            h_llm:   [B, T_text, D_llm]    invariant LLM features (task instruction)
+        Returns:
+            [B, n_equi, T, D_eq]  language-conditioned equivariant features
+        """
+        B, n_equi, T, D = h_prime.shape
+        proj_dtype = self.equi_proj.weight.dtype
+        h = h_prime.to(proj_dtype)
+
+        # ── Equivariant transform ────────────────────────────────────────────
+        h_slices = h.reshape(B, n_equi, T, self.n_group, self.blocks)
+        equi_out = self.equi_proj(h_slices).reshape(B, n_equi, T, D)
+
+        # ── Invariant query: GroupPool over n_group dim → per-token scalar ───
+        # max over group elements is invariant to cyclic feature shift
+        inv_feat = h_slices.max(dim=-2).values           # [B, n_equi, T, blocks]
+        q = self.q_proj(inv_feat)                        # [B, n_equi, T, blocks]
+
+        # ── Cross-attention to full task instruction ─────────────────────────
+        h_llm_proj = h_llm.to(proj_dtype)
+        k = self.k_proj(h_llm_proj)                      # [B, T_text, blocks]
+        v = self.v_proj(h_llm_proj)                      # [B, T_text, blocks]
+
+        # attn: [B, n_equi, T, T_text] — invariant (q,k,v all invariant)
+        attn = torch.softmax(
+            torch.einsum('bntd, bsd -> bnts', q, k) * self.scale, dim=-1
+        )
+        ctx = torch.einsum('bnts, bsd -> bntd', attn, v)  # [B, n_equi, T, blocks]
+
+        # ── FiLM + gate from per-token language context ──────────────────────
+        # All derived from invariant ctx → equivariance preserved ✓
+        gate  = torch.sigmoid(ctx)                        # [B, n_equi, T, blocks]
+        gamma = self.film_gamma(ctx)                      # [B, n_equi, T, blocks]  scale
+        beta  = self.film_beta(ctx)                       # [B, n_equi, T, blocks]  shift
+
+        def expand_to_group_major(x):
+            # [B, n_equi, T, blocks] → [B, n_equi, T, D] (group-major)
+            return x[:, :, :, None, :].expand(B, n_equi, T, self.n_group, self.blocks) \
+                                      .reshape(B, n_equi, T, D)
+
+        gate_exp  = expand_to_group_major(gate)
+        gamma_exp = expand_to_group_major(gamma)
+        beta_exp  = expand_to_group_major(beta)
+
+        # gamma * equi_out: equivariant (invariant scale × equivariant)  ✓
+        # beta:             invariant additive shift (same value per block across all groups) ✓
+        out = gamma_exp * equi_out + beta_exp
+        return h_prime + (gate_exp * out).to(h_prime.dtype)  # residual
 
 
 class EagleBackboneFATokens(nn.Module):
@@ -89,6 +242,8 @@ class EagleBackboneFATokens(nn.Module):
         num_images_per_sample: int = 1,
         rotate_image_indices: List[int] | None = None,  # Which images to rotate (None = all)
         output_type: str = 'reg',  # 'reg' for regular representation
+        # Phase 2/3: equivariant adapter
+        use_inv_projector_for_vlm: bool = True,  # Phase 2: inject inv-proj tokens into LLM
     ):
         """
         Args:
@@ -100,22 +255,30 @@ class EagleBackboneFATokens(nn.Module):
             num_images_per_sample: number of images per sample
             rotate_image_indices: which image indices to rotate (None = all)
             output_type: 'reg' for regular representation output
+            use_inv_projector_for_vlm: if True (Phase 2), replace SigLIP tokens in the
+                Eagle LLM with InvariantProjector(H') tokens instead of running SigLIP again.
         """
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here"
         assert output_type == 'reg', "Only regular representation is supported"
-        
+
         # Store config
         self.n_group = n_group
         self.num_images_per_sample = num_images_per_sample
         self.output_type = output_type
         self.project_to_dim = project_to_dim if project_to_dim else 2048
-        
+        self.use_inv_projector_for_vlm = use_inv_projector_for_vlm
+
         if rotate_image_indices is None:
             self.rotate_image_indices = list(range(num_images_per_sample))
         else:
             self.rotate_image_indices = rotate_image_indices
-        
+
+        self.non_equi_image_indices = [
+            i for i in range(num_images_per_sample)
+            if i not in self.rotate_image_indices
+        ]
+
         # Ensure project_to_dim is divisible by n_group for regular representation
         assert self.project_to_dim % n_group == 0, \
             f"project_to_dim ({self.project_to_dim}) must be divisible by n_group ({n_group})"
@@ -124,12 +287,21 @@ class EagleBackboneFATokens(nn.Module):
         config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
-        # Projection layer for vision features
-        # Vision features from Eagle are typically 2048 dim after mlp1
-        if project_to_dim is not None:
-            self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
-        else:
-            self.eagle_linear = torch.nn.Identity()
+        # Projection layers: Eagle vision/LLM dim → project_to_dim
+        # Eagle mlp1 output dim matches LLM hidden size (e.g. 2048 for InternLM2-1.8B)
+        d_eagle = self.eagle_model.language_model.config.hidden_size
+
+        # Vision projection: equivariant in group-major format.
+        # FA output uses group-major layout (D = n_group * blocks).
+        # Applying the same linear to each group-slice commutes with the group cyclic shift.
+        assert d_eagle % n_group == 0, \
+            f"d_eagle ({d_eagle}) must be divisible by n_group ({n_group}) for equivariant projection"
+        blocks_in  = d_eagle // n_group
+        blocks_out = self.project_to_dim // n_group
+        self.vision_proj = nn.Linear(blocks_in, blocks_out)
+
+        # Language projection: language hidden states are invariant — plain linear is fine.
+        self.eagle_linear = nn.Linear(d_eagle, self.project_to_dim)
 
         # Remove unused LLM layers (only if layers exist and select_layer is positive)
         # select_layer=-1 means keep all layers, select_layer=N means keep first N layers
@@ -137,20 +309,42 @@ class EagleBackboneFATokens(nn.Module):
             self.eagle_model.language_model.model.layers.pop(-1)
 
         self.select_layer = select_layer
-        
+
+        # ── Phase 2: InvariantProjector ─────────────────────────────────────
+        # Maps H' (equivariant, project_to_dim) → invariant tokens (d_eagle)
+        # for injection into the Eagle LLM in place of SigLIP tokens.
+        self.inv_projector = InvariantProjector(
+            in_dim=self.project_to_dim,
+            out_dim=d_eagle,
+            n_group=n_group,
+        )
+
+        # ── Phase 3: EquiAdapter ─────────────────────────────────────────────
+        # Fuses H_llm (invariant gate) with H' (equivariant carrier).
+        # d_llm for the gate is project_to_dim because vl_features are already projected.
+        # If non-equi cameras are present, also gate with their pooled features (same dim).
+        self.equi_adapter = EquiAdapter(
+            d_eq=self.project_to_dim,
+            d_llm=self.project_to_dim,
+            n_group=n_group,
+        )
+
         # Initialize rotation and frame averaging components
         self._init_rotation_matrices()
         self._init_permutation_matrices()
         # Token grid size: 16x16 = 256 tokens (typical for Eagle after pixel shuffle)
         self._init_token_permutation_indices(grid_size=16)
-        
+
         self.set_trainable_parameters(tune_llm, tune_visual)
-        
+
         print(f"EagleBackboneFATokens initialized:")
         print(f"  n_group (CN): {self.n_group}")
+        print(f"  d_eagle (LLM hidden): {d_eagle}")
         print(f"  project_to_dim: {self.project_to_dim}")
         print(f"  rotate_image_indices: {self.rotate_image_indices}")
+        print(f"  non_equi_image_indices: {self.non_equi_image_indices}")
         print(f"  output_type: {self.output_type}")
+        print(f"  use_inv_projector_for_vlm: {self.use_inv_projector_for_vlm}")
         print(f"  Using FULL vision tokens (not pooled)")
         print(f"  Token grid size: {self.token_grid_size}x{self.token_grid_size}")
 
@@ -273,30 +467,128 @@ class EagleBackboneFATokens(nn.Module):
         
         self.register_buffer("token_perm_indices", token_perm_indices)
 
+    # ── New layers added on top of the pretrained VLM ────────────────────────
+    # These are the only parameters that should be trained / saved / loaded.
+    _NEW_LAYER_PREFIXES = (
+        "vision_proj.",
+        "eagle_linear.",
+        "inv_projector.",
+        "equi_adapter.",
+    )
+
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
-        """Set which parameters are trainable."""
-        self.tune_llm = tune_llm
-        self.tune_visual = tune_visual
-        
-        for p in self.parameters():
-            p.requires_grad = True
-            
-        if not tune_llm:
-            self.eagle_model.language_model.requires_grad_(False)
-        if not tune_visual:
-            self.eagle_model.vision_model.requires_grad_(False)
-            self.eagle_model.mlp1.requires_grad_(False)
-            
-        print(f"Tune backbone llm: {self.tune_llm}")
-        print(f"Tune backbone visual: {self.tune_visual}")
-        
-        if not tune_llm and not tune_visual:
-            for name, p in self.named_parameters():
-                if p.requires_grad:
-                    print(f"Backbone trainable parameter: {name}")
-                    
-        if not any(p.requires_grad for p in self.parameters()):
-            print("Warning: No backbone trainable parameters found.")
+        """
+        Freeze the entire eagle_model (VLM) and train only the new equivariant layers.
+
+        tune_llm / tune_visual are kept as arguments for API compatibility but
+        the VLM is always frozen here — only vision_proj, eagle_linear,
+        inv_projector and equi_adapter are trained.
+        """
+        self.tune_llm = False
+        self.tune_visual = False
+
+        # Freeze entire VLM
+        self.eagle_model.requires_grad_(False)
+
+        # Unfreeze new equivariant layers only
+        for name, p in self.named_parameters():
+            if name.startswith(self._NEW_LAYER_PREFIXES):
+                p.requires_grad_(True)
+            else:
+                p.requires_grad_(False)
+
+        trainable = [n for n, p in self.named_parameters() if p.requires_grad]
+        print(f"Backbone trainable parameters ({len(trainable)}):")
+        for n in trainable:
+            print(f"  {n}")
+        if not trainable:
+            print("  Warning: no trainable parameters found.")
+
+    def load_pretrained_vlm(self, checkpoint_path: str) -> None:
+        """
+        Load eagle_model weights from a GR00T N1.5 checkpoint.
+
+        Handles sharded safetensors (model.safetensors.index.json),
+        single safetensors, and pytorch_model.bin formats.
+        Keys are expected to be prefixed with "backbone." in the checkpoint.
+        New layers (vision_proj, equi_adapter, etc.) that are absent from the
+        checkpoint are left with their random initialisation.
+        """
+        import json
+
+        def _load_shard(path: str) -> dict:
+            if path.endswith(".safetensors"):
+                from safetensors.torch import load_file
+                return load_file(path)
+            return torch.load(path, map_location="cpu")
+
+        # Collect full state dict from checkpoint
+        ckpt_path = checkpoint_path
+        index_file = os.path.join(ckpt_path, "model.safetensors.index.json")
+        single_sf  = os.path.join(ckpt_path, "model.safetensors")
+        single_bin = os.path.join(ckpt_path, "pytorch_model.bin")
+
+        raw: dict = {}
+        if os.path.exists(index_file):
+            with open(index_file) as f:
+                index = json.load(f)
+            shards = set(index["weight_map"].values())
+            for shard in shards:
+                raw.update(_load_shard(os.path.join(ckpt_path, shard)))
+        elif os.path.exists(single_sf):
+            raw = _load_shard(single_sf)
+        elif os.path.exists(single_bin):
+            raw = _load_shard(single_bin)
+        else:
+            raise FileNotFoundError(f"No checkpoint weights found in {ckpt_path}")
+
+        # Strip "backbone." prefix → keys match self.state_dict()
+        backbone_sd = {
+            k.removeprefix("backbone."): v
+            for k, v in raw.items()
+            if k.startswith("backbone.")
+        }
+
+        # Load into backbone; strict=False so new layers are skipped
+        missing, unexpected = self.load_state_dict(backbone_sd, strict=False)
+
+        # New-layer keys are expected to be missing — report only truly missing VLM keys
+        new_prefixes = self._NEW_LAYER_PREFIXES
+        unexpected_vlm = [k for k in missing if not k.startswith(new_prefixes)]
+        print(f"Loaded backbone weights from {ckpt_path}")
+        print(f"  New layers (random init): "
+              f"{[k for k in missing if k.startswith(new_prefixes)][:5]}"
+              f"{'...' if sum(k.startswith(new_prefixes) for k in missing) > 5 else ''}")
+        if unexpected_vlm:
+            print(f"  WARNING — unexpected missing VLM keys ({len(unexpected_vlm)}): "
+                  f"{unexpected_vlm[:5]}")
+        if unexpected:
+            print(f"  Unexpected keys in checkpoint (ignored): {unexpected[:5]}")
+
+    def new_layers_state_dict(self) -> dict:
+        """
+        Return state dict of only the new equivariant layers (vision_proj,
+        eagle_linear, inv_projector, equi_adapter).  Use this to save a
+        lightweight checkpoint after fine-tuning.
+        """
+        return {
+            k: v for k, v in self.state_dict().items()
+            if k.startswith(self._NEW_LAYER_PREFIXES)
+        }
+
+    def load_new_layers_state_dict(self, state_dict: dict, strict: bool = True) -> None:
+        """
+        Load back a checkpoint saved by new_layers_state_dict().
+        Passes strict=False to the full load so VLM keys are not required.
+        """
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        truly_missing = [k for k in missing if k.startswith(self._NEW_LAYER_PREFIXES)]
+        if truly_missing and strict:
+            raise RuntimeError(f"Missing new-layer keys: {truly_missing}")
+        if truly_missing:
+            print(f"  Warning — missing new-layer keys: {truly_missing}")
+        if unexpected:
+            print(f"  Unexpected keys (ignored): {unexpected[:5]}")
 
     def set_frozen_modules_to_eval_mode(self):
         """Set frozen modules to eval mode for proper dropout/batchnorm behavior."""
@@ -353,11 +645,13 @@ class EagleBackboneFATokens(nn.Module):
     def rotate_vl_batch(self, vl_input: dict) -> tuple:
         """
         Rotate only the equivariant images (rotate_image_indices) for FA.
-        Non-equivariant images are ignored entirely.
+        Non-equivariant images (non_equi_image_indices) are returned unrotated.
 
         Returns:
-            equi_pixels : [B * N * n_equi, C, H, W]
-            B           : original batch size
+            equi_pixels  : [B * N * n_equi, C, H, W]
+            noequi_pixels: [B * n_noequi, C, H, W]   or None if no non-equi cameras
+            img_batch    : [B, num_images_per_sample, C, H, W]
+            B            : original batch size
         """
         eagle_prefix = "eagle_"
         pixel_values = vl_input[f"{eagle_prefix}pixel_values"]
@@ -377,7 +671,17 @@ class EagleBackboneFATokens(nn.Module):
             .permute(1, 2, 0, 3, 4, 5)
             .reshape(B * self.n_group * n_equi, C, H, W)
         )
-        return equi_pixels, B
+
+        # Non-equi cameras: no rotation, just stack and flatten
+        if self.non_equi_image_indices:
+            n_noequi = len(self.non_equi_image_indices)
+            noequi_pixels = torch.stack(
+                [img_batch[:, idx] for idx in self.non_equi_image_indices], dim=1
+            ).reshape(B * n_noequi, C, H, W)  # [B*n_noequi, C, H, W]
+        else:
+            noequi_pixels = None
+
+        return equi_pixels, noequi_pixels, img_batch, B
 
     def _apply_frame_averaging(
         self, 
@@ -506,65 +810,149 @@ class EagleBackboneFATokens(nn.Module):
         
         return permuted
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Phase 2 helper: inject InvariantProjector tokens into Eagle LLM
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _forward_llm_with_injected_vision(
+        self,
+        eagle_input: dict,
+        inv_vision_tokens: torch.Tensor,
+        noequi_pixels: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Run Eagle's LLM with injected vision tokens.
+
+          - Equi cameras: inv_projector(H') tokens fill the first n_equi*T image positions.
+          - Non-equi cameras (e.g. wrist): SigLIP features fill the remaining positions.
+            These are extracted here (single pass, no rotation) and also returned so
+            forward_eagle can project and pass them to EquiAdapter + action head.
+
+        Steps:
+          1. Embed text tokens.
+          2. If noequi_pixels provided, run extract_feature on them → noequi_raw [B*n_noequi, T, D].
+          3. Fill image placeholders: equi tokens first, noequi tokens after.
+          4. Run LLM layers on combined embeddings.
+
+        Args:
+            eagle_input:       dict with 'input_ids' [B, T_total] and 'attention_mask'
+            inv_vision_tokens: [B, n_equi*T, d_eagle]  invariant equi tokens (inv_projector output)
+            noequi_pixels:     [B*n_noequi, C, H, W]   raw non-equi camera pixels (optional)
+
+        Returns:
+            hidden_states: [B, T_total, d_eagle]
+        """
+        input_ids = eagle_input["input_ids"]          # [B, T_total]
+        attn_mask = eagle_input["attention_mask"]     # [B, T_total]
+        B = input_ids.shape[0]
+
+        # Text embeddings
+        embed_layer = self.eagle_model.get_input_embeddings()
+        input_embeds = embed_layer(input_ids).clone()  # [B, T_total, d_eagle]
+
+        # Extract non-equi camera features (SigLIP + mlp1 → d_eagle dim, no rotation)
+        noequi_raw = None
+        noequi_tokens_flat = None
+        if noequi_pixels is not None:
+            noequi_raw, _ = self.eagle_model.extract_feature(noequi_pixels)  # [B*n_noequi, T, d_eagle]
+            n_noequi = len(self.non_equi_image_indices)
+            T_vis = noequi_raw.shape[1]
+            noequi_tokens_flat = noequi_raw.reshape(B, n_noequi * T_vis, -1)  # [B, n_noequi*T, d_eagle]
+
+        # Inject into image-token placeholder positions
+        img_tok_idx = getattr(self.eagle_model, "image_token_index", None)
+        if img_tok_idx is not None:
+            n_equi_tokens = inv_vision_tokens.shape[1]
+            for b in range(B):
+                positions = (input_ids[b] == img_tok_idx).nonzero(as_tuple=True)[0]
+                # Fill equi positions first
+                n_equi_fill = min(positions.shape[0], n_equi_tokens)
+                if n_equi_fill > 0:
+                    input_embeds[b, positions[:n_equi_fill]] = inv_vision_tokens[b, :n_equi_fill]
+                # Fill non-equi positions after equi
+                if noequi_tokens_flat is not None:
+                    n_noequi_fill = min(positions.shape[0] - n_equi_fill, noequi_tokens_flat.shape[1])
+                    if n_noequi_fill > 0:
+                        input_embeds[b, positions[n_equi_fill:n_equi_fill + n_noequi_fill]] = \
+                            noequi_tokens_flat[b, :n_noequi_fill]
+
+        # Run through the LLM
+        lm_output = self.eagle_model.language_model(
+            inputs_embeds=input_embeds,
+            attention_mask=attn_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        return lm_output.hidden_states[self.select_layer]  # [B, T_total, d_eagle]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Main forward through Eagle + FA + EquiAdapter
+    # ──────────────────────────────────────────────────────────────────────────
+
     def forward_eagle(self, vl_input: BatchFeature) -> tuple:
         """
-        Forward through Eagle model with frame averaging on full vision tokens.
-        
+        Forward through Eagle model with frame averaging on full vision tokens,
+        followed by InvariantProjector (Phase 2) and EquiAdapter (Phase 3).
+
         Frame Averaging for COVARIANT equivariance:
-        
-        FA(x) = (1/|G|) * Σ_h ρ(h⁻¹) · f(h·x)
-        
-        Using ρ(h⁻¹) instead of ρ(h) gives the covariant property:
-        FA(g·x) = ρ(g) · FA(x)
-        
-        Where:
-        - h·x = image rotated by h
-        - f(h·x) = features from rotated image  
-        - ρ(h⁻¹) = inverse representation = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹)
-        
+
+            FA(x) = (1/|G|) * Σ_h ρ(h⁻¹) · f(h·x)
+
+        Using ρ(h⁻¹) gives:  FA(g·x) = ρ(g) · FA(x)
+
+        After FA:
+          H'    = avg_vision_features  [B, n_equi, T, project_to_dim]  (equivariant)
+          H_llm = vl_features          [B, T_text, project_to_dim]      (invariant)
+          H_out = equi_adapter(H', H_llm)                               (equivariant, language-conditioned)
+
+        H_out is returned as BOTH:
+          - backbone_equi_vision_features [B, n_equi, T, D] for DiT self-attention prefix
+          - backbone_vision_language_features [B, n_equi*T, D] for DiT cross-attention context
+
+        The cross-attention context is the equi_adapter output (not raw H_llm), so it
+        already encodes vision equivariance AND language conditioning and can be used
+        directly in DiT cross-attention without further processing.
+
         Args:
             vl_input: Input batch with eagle_ prefixed keys
-            
+
         Returns:
-            (vision_features, language_features, attention_mask) tuple
+            (h_prime, h_prime_flat, attention_mask) tuple
+              h_prime:      [B, n_equi, T, project_to_dim] — equivariant adapted features
+              h_prime_flat: [B, n_equi*T, project_to_dim]  — same, flattened for cross-attention
         """
         eagle_prefix = "eagle_"
-        
-        # Get original batch size before rotation
-        original_input_ids = vl_input.get(f"{eagle_prefix}input_ids")
-        B = original_input_ids.shape[0]
 
-        # Prepare base eagle input (for VL / LLM pass)
+        # Prepare eagle input dict (strip prefix, drop image_sizes)
         eagle_input = {
             k.removeprefix(eagle_prefix): v
             for k, v in vl_input.items()
             if k.startswith(eagle_prefix)
         }
-        if "image_sizes" in eagle_input:
-            del eagle_input["image_sizes"]
+        eagle_input.pop("image_sizes", None)
 
-        # Rotate only equivariant cameras; non-equivariant images are skipped
-        equi_pixels, B = self.rotate_vl_batch(dict(vl_input))
+        # ── Phase 1: FA on equivariant cameras ──────────────────────────────
+        equi_pixels, noequi_pixels, img_batch, B = self.rotate_vl_batch(dict(vl_input))
         n_equi = len(self.rotate_image_indices)
 
-        # Extract features: [B*N*n_equi, T, D]
+        # [B*N*n_equi, T, vision_dim]
         equi_raw, _ = self.eagle_model.extract_feature(equi_pixels)
         num_vision_tokens = equi_raw.shape[1]
         vision_dim        = equi_raw.shape[2]
 
-        # Reshape to [B*n_equi, N, T, D]
+        # Reshape to [B*n_equi, N, T, vision_dim]
         equi_grouped = (
             equi_raw
             .reshape(B, self.n_group, n_equi, num_vision_tokens, vision_dim)
-            .permute(0, 2, 1, 3, 4)                          # [B, n_equi, N, T, D]
+            .permute(0, 2, 1, 3, 4)                           # [B, n_equi, N, T, D]
             .reshape(B * n_equi, self.n_group, num_vision_tokens, vision_dim)
         )
 
-        # Apply FA: ρ(h⁻¹) = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹) then average
+        # Apply ρ(h⁻¹) = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹), then average
         blocks = vision_dim // self.n_group
         transformed_features = []
         for h in range(self.n_group):
-            feat_h = equi_grouped[:, h]                       # [B*n_equi, T, D]
+            feat_h = equi_grouped[:, h]                        # [B*n_equi, T, D]
             if h == 0:
                 transformed_features.append(feat_h)
             else:
@@ -572,59 +960,75 @@ class EagleBackboneFATokens(nn.Module):
                 feat_h = feat_h[:, self.token_perm_indices[h_inv]]
                 feat_h = torch.roll(
                     feat_h.reshape(B * n_equi, num_vision_tokens, self.n_group, blocks),
-                    shifts=h_inv, dims=2
+                    shifts=h_inv, dims=2,
                 ).reshape(B * n_equi, num_vision_tokens, vision_dim)
                 transformed_features.append(feat_h)
 
-        # [B*n_equi, T, D] → [B, n_equi, T, D]
-        avg_vision_features = (
+        # H' = [B, n_equi, T, vision_dim]
+        h_prime_raw = (
             torch.stack(transformed_features, dim=1)
             .mean(dim=1)
             .reshape(B, n_equi, num_vision_tokens, vision_dim)
         )
+
+        # Project H' to project_to_dim via equivariant group-major projection:
+        # apply vision_proj to each of the n_group group-slices independently.
+        proj_dtype = self.vision_proj.weight.dtype
+        blocks_in = vision_dim // self.n_group
+        h_prime = self.vision_proj(
+            h_prime_raw.reshape(-1, self.n_group, blocks_in).to(proj_dtype)
+        ).reshape(B, n_equi, num_vision_tokens, self.project_to_dim)
+
+        # ── Phase 2: VLM pass ──────
+        # Equi: inv_projector(H') tokens; non-equi pixels injected at remaining positions.
+        # vl_features encodes both camera views via the LLM.
+        inv_tokens = self.inv_projector(h_prime)                      # [B, n_equi, T, d_eagle]
+        inv_tokens_flat = inv_tokens.reshape(B, n_equi * num_vision_tokens, -1)
+        vl_hidden = self._forward_llm_with_injected_vision(
+            eagle_input, inv_tokens_flat, noequi_pixels
+        )
         
-        
-        ## original
-        vl_features_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
-        vl_features = vl_features_output.hidden_states[self.select_layer]
-        vl_features = self.eagle_linear(vl_features)
-        
-        
-        return avg_vision_features, vl_features, eagle_input["attention_mask"]
+        # Project LLM hidden states → project_to_dim (language is invariant, plain linear is fine)
+        lang_dtype = self.eagle_linear.weight.dtype
+        vl_features = self.eagle_linear(vl_hidden.to(lang_dtype))         # [B, T_text, project_to_dim]
+
+        # ── Phase 3: EquiAdapter ──────────────────────────────────────────────
+        # vl_features gates h_prime; wrist info is already inside vl_features.
+        h_prime = self.equi_adapter(h_prime, vl_features)
+
+        return h_prime, eagle_input["attention_mask"]
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         """
         Forward pass with Late Frame Averaging on full vision tokens.
-        
+
         Args:
             vl_input: Input batch
-            
+
         Returns:
             BatchFeature with:
-                - backbone_vision_features: [B, n_equi, T_vision, D] equivariant cameras only
-                - backbone_language_features: [B, T_text, D_text] language features
-                - backbone_attention_mask: attention mask
+                - backbone_equi_vision_features:    [B, n_equi, T_vision, D]
+                    Equivariant adapted features for DiT self-attention prefix.
+                - backbone_vision_language_features: [B, n_equi*T_vision, D]
+                    Same features flattened — use directly as DiT cross-attention context
+                    (language-conditioned equivariant, no further processing needed).
+                - backbone_attention_mask: attention mask from Eagle tokeniser
         """
         self.set_frozen_modules_to_eval_mode()
 
-        equi_vision_embs, vl_embs, eagle_mask = self.forward_eagle(vl_input)
+        h_prime, eagle_mask = self.forward_eagle(vl_input)
 
-        # DDP compatibility hack - ensure all trainable parameters participate in loss
-        # This is needed because some parameters might not be used in certain forward paths
+        # DDP compatibility: ensure all trainable parameters participate in loss
         if self.training and self.tune_visual:
             dummy_term = torch.tensor(
-                0.0, device=vl_embs.device, dtype=vl_embs.dtype, requires_grad=True
+                0.0, device=h_prime.device, dtype=h_prime.dtype, requires_grad=True
             )
-            # Add all trainable parameters to the computation graph with zero contribution
             for param in self.parameters():
                 if param.requires_grad:
                     dummy_term = dummy_term + 0.0 * param.sum()
-            vl_embs = vl_embs + dummy_term
+            h_prime = h_prime + dummy_term
 
-        return BatchFeature(
-            data={
-                "backbone_equi_vision_features": equi_vision_embs,  # [B, num_imgs, T_vision, D_vision]
-                "backbone_vision_language_features": vl_embs,  # [B, T_text, 2048]
-                "backbone_attention_mask": eagle_mask
-            }
-        )
+        return BatchFeature(data={
+            "backbone_equi_vision_features": h_prime,   # [B, n_equi, T_vision, D]
+            "backbone_attention_mask": eagle_mask,
+        })

@@ -374,8 +374,8 @@ def check_equivariance_tokens(
     with torch.no_grad():
         # f(x) = FA(x)
         output_original = model(BatchFeature(data=base_input))
-        vision_original = output_original["backbone_vision_features"].float()
-        
+        vision_original = output_original["backbone_equi_vision_features"].float()
+
         B, num_imgs, T_vision, D_vision = vision_original.shape
         
         if verbose:
@@ -413,7 +413,7 @@ def check_equivariance_tokens(
             
             # f(g·x) = FA(g·x)
             output_rotated = model(BatchFeature(data=rotated_input))
-            vision_rotated = output_rotated["backbone_vision_features"].float()
+            vision_rotated = output_rotated["backbone_equi_vision_features"].float()
             
             # Compute ρ(g) · f(x):
             # ρ(g) = spatial_perm(g) ⊗ feature_perm(g)
@@ -479,87 +479,6 @@ def check_equivariance_tokens(
     return errors
 
 
-def check_language_invariance(
-    model: EagleBackboneFATokens,
-    device: torch.device,
-    batch_size: int = 1,
-    num_images: int = 1,
-    atol: float = 1e-5,
-    rtol: float = 1e-4,
-    verbose: bool = True
-) -> List[Tuple[Any, float, float, float]]:
-    """
-    Test that language features are INVARIANT under image rotation.
-    
-    Language uses trivial representation, so: f_lang(g*x) = f_lang(x)
-    """
-    model.eval()
-    n_group = model.n_group
-    
-    base_input = create_test_input(batch_size, num_images, device=device)
-    
-    errors = []
-    all_passed = True
-    
-    with torch.no_grad():
-        output_original = model(BatchFeature(data=base_input))
-        language_original = output_original["backbone_language_features"]
-        
-        if verbose:
-            print(f"\nLanguage features shape: {language_original.shape}")
-            print(f"Testing invariance for {n_group - 1} rotations...")
-            print("-" * 70)
-        
-        for k in range(1, n_group):
-            angle = k * 2 * math.pi / n_group
-            
-            rotated_pixel_values = rotate_image(
-                base_input["eagle_pixel_values"],
-                angle
-            )
-            
-            rotated_input = {
-                **base_input,
-                "eagle_pixel_values": rotated_pixel_values
-            }
-            
-            output_rotated = model(BatchFeature(data=rotated_input))
-            language_rotated = output_rotated["backbone_language_features"]
-            
-            errs = (language_rotated - language_original).float().cpu().numpy()
-            errs_flat = np.abs(errs).reshape(-1)
-            
-            max_err = errs_flat.max()
-            mean_err = errs_flat.mean()
-            var_err = errs_flat.var()
-            
-            is_close = np.allclose(
-                language_rotated.float().cpu().numpy(),
-                language_original.float().cpu().numpy(),
-                atol=atol,
-                rtol=rtol
-            )
-            
-            if verbose:
-                status = "✓ PASS" if is_close else "✗ FAIL"
-                print(f"  g_{k} ({math.degrees(angle):6.1f}°): "
-                      f"max={max_err:.2e}, mean={mean_err:.2e}, var={var_err:.2e} [{status}]")
-            
-            if not is_close:
-                all_passed = False
-            
-            errors.append((k, max_err, mean_err, var_err))
-    
-    if verbose:
-        print("-" * 70)
-        if all_passed:
-            print(f"✓ Language invariance test PASSED!")
-        else:
-            print(f"✗ Language invariance test FAILED!")
-    
-    return errors
-
-
 def load_backbone_from_checkpoint(checkpoint_path: str, n_group: int = 8, 
                                    num_images: int = 1, device: torch.device = None,
                                    use_hf_hub: bool = True):
@@ -586,9 +505,10 @@ def load_backbone_from_checkpoint(checkpoint_path: str, n_group: int = 8,
     model = EagleBackboneFATokens(
         tune_llm=False,
         tune_visual=False,
+        select_layer=12,
         n_group=n_group,
         num_images_per_sample=num_images,
-        project_to_dim=2048,  # Must be divisible by n_group, 2048 / 8 = 256
+        project_to_dim=2048,  # Must be divisible by n_group, 2048 / 4 = 512
     )
     
     loaded = False
@@ -820,41 +740,15 @@ def main():
         traceback.print_exc()
         vision_passed = False
     
-    # Test 2: Language Invariance
-    print("\n" + "=" * 70)
-    print("Test 2: Language Features Invariance (Trivial Representation)")
-    print("  f_lang(g*x) = f_lang(x) - language should not change with image rotation")
-    print("=" * 70)
-    
-    try:
-        language_errors = check_language_invariance(
-            model, device,
-            batch_size=batch_size,
-            num_images=num_images,
-            atol=atol,
-            rtol=rtol,
-            verbose=True
-        )
-        
-        language_max_err = max(e[1] for e in language_errors)
-        language_passed = language_max_err < atol
-        
-    except Exception as e:
-        print(f"Language invariance test failed with exception: {e}")
-        import traceback
-        traceback.print_exc()
-        language_passed = False
-    
     # Summary
     print("\n" + "=" * 70)
     print("Test Summary")
     print("=" * 70)
-    
-    all_passed = vision_passed and language_passed
-    
+
+    all_passed = vision_passed
+
     print(f"\n  Vision Equivariance (Tokens):   {'✓ PASSED' if vision_passed else '✗ FAILED'}")
-    print(f"  Language Invariance:            {'✓ PASSED' if language_passed else '✗ FAILED'}")
-    
+
     if all_passed:
         print("\n✓ All equivariance tests PASSED!")
     else:

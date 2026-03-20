@@ -40,9 +40,7 @@ from gr00t.model.action_head.action_encoder import (
     swish,
 )
 
-
-from .cross_attention_dit import DiT, SelfAttentionTransformer
-from .equivariant_cross_attention_dit import EDiT, EquivariantAttentionPool
+from .equivariant_cross_attention_dit import EDiT, EquiVisionTransformer
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -384,16 +382,6 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     backbone_language_embedding_dim: int = field(
         default=2048, metadata={"help": "Language feature dim from backbone LLM (D_llm)."}
     )
-    num_vis_queries: int = field(
-        default=8, metadata={"help": "Number of pooled query tokens per camera for equivariant vision pooling."}
-    )
-    equi_vis_pool_cfg: dict = field(
-        default_factory=lambda: {
-            "heads": 8,
-            "dim_head": 64,
-        },
-        metadata={"help": "EquivariantAttentionPool config. heads*dim_head should equal inner_dim/n_group."}
-    )
     def __init__(self, **kwargs):
         import dataclasses
         super().__init__(**kwargs)
@@ -471,39 +459,25 @@ class FlowmatchingActionHead(nn.Module):
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
-        # VL stream (invariant): backbone language features → vlln → vl_self_attention → vl_proj
-        self.vlln = (
-            nn.LayerNorm(config.backbone_language_embedding_dim) if config.use_vlln else nn.Identity()
-        )
-        self.vl_self_attention = (
-            SelfAttentionTransformer(**config.vl_self_attention_cfg)
-            if config.use_vlln
-            else nn.Identity()
-        )
-
-        # Equi vision stream (equivariant): backbone vision features → equi_vis_proj
-        # backbone_vision_features has dim = backbone_embedding_dim (= project_to_dim, regular repr)
-        self.equi_vis_in_type = enn.FieldType(
-            self.group,
-            [self.group.regular_repr] * (config.backbone_embedding_dim // self.n_group),
-        )
-        self.equi_vis_to_hidden = enn.Linear(self.equi_vis_in_type, self.model.in_type)
-
         # Equivariant 2D positional embedding for vis tokens.
         # (x, y) image coordinates are a 2D vector that transforms as irrep(1) under CN rotation.
-        # This gives equi_vis_pool spatial awareness while preserving equivariance.
         self.equi_vis_pos_type = enn.FieldType(self.group, [self.group.irrep(1)])
         self.equi_vis_pos_proj = enn.Linear(self.equi_vis_pos_type, self.model.in_type)
 
-        # Equivariant pooling: T_vis spatial tokens → num_vis_queries tokens per camera.
-        # EquivariantAttentionPool: trivial-repr keys (invariant) + equivariant out_proj.
-        #   k_proj: regular → trivial (learned Reynolds generalisation) → invariant keys ✅
-        #   scores: trivial Q · trivial K → invariant → equivariant output ✅
-        self.equi_vis_pool = EquivariantAttentionPool(
-            in_type=self.model.in_type,
-            num_queries=config.num_vis_queries,
-            **config.equi_vis_pool_cfg,
+        # 4-layer equivariant vision transformer: refine T_vis tokens per camera.
+        # h_prime stays in regular repr through all 4 SA+FFN blocks (equivariant throughout).
+        # EDiT cross_attention_type is also regular repr → vision output matches directly.
+        cross_attn_dim = diffusion_cfg.get("cross_attention_dim", 2048)
+        self.cross_attn_dim = cross_attn_dim
+        vis_attn_cfg = {
+            k: v for k, v in config.vl_self_attention_cfg.items()
+            if k != "positional_embeddings"  # handled externally via equi_vis_pos_proj
+        }
+        self.equi_vis_self_attn = EquiVisionTransformer(
+            in_type=self.model.cross_attention_type,
+            **vis_attn_cfg,
         )
+
 
         if config.add_pos_embed:
             # Equivariant temporal position embeddings for state and action tokens.
@@ -746,65 +720,58 @@ class FlowmatchingActionHead(nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def _get_vis_pos_emb(self, T: int, device: torch.device) -> torch.Tensor:
+        """
+        Compute equivariant 2-D positional embeddings for T = grid^2 vision tokens.
+
+        Positions (x, y) ∈ [-1, 1]^2 live in irrep(1) of C_N, so they transform
+        correctly under image rotations.  equi_vis_pos_proj lifts them to model.in_type.
+
+        Returns: [T, D_model]
+        """
+        grid = int(T ** 0.5)
+        assert grid * grid == T, f"T={T} must be a perfect square for 2-D pos embed"
+        ys = torch.linspace(-1, 1, grid, device=device)
+        xs = torch.linspace(-1, 1, grid, device=device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        pos = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)  # [T, 2]
+        pos_geo = enn.GeometricTensor(pos, self.equi_vis_pos_type)
+        return self.equi_vis_pos_proj(pos_geo).tensor  # [T, D_model]
+
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         """
-        Two-stream backbone processing for the FA backbone.
+        Process backbone features into DiT cross-attention context.
 
-        Equi vision stream (regular repr):
-          backbone_vision_features [B, n_img, T_vis, backbone_embedding_dim]
-          → flatten → equi_vis_to_hidden → [B, n_img*T_vis, in_type.size]
+        Equivariant cameras (e.g. top-down):
+          backbone_equi_vision_features [B, n_equi, T, D]
+            → + 2-D pos embed
+            → equi_vis_self_attn         equivariant self-attn → [B*n_equi, T, cross_attn_dim]
+            → reshape                    [B, n_equi*T, cross_attn_dim]
 
-        VL stream (trivial repr, invariant):
-          backbone_language_features [B, T_text, backbone_language_embedding_dim]
-          → vlln → vl_self_attention → vl_proj → [B, T_text, vl_cross_attention_dim]
+        Non-equivariant cameras (e.g. wrist), optional:
+          backbone_noequi_vision_features [B, n_noequi, T, D]
+            → noequi_vis_proj            plain nn.Linear → [B, n_noequi*T, cross_attn_dim]
 
-        Stores results in backbone_output.data:
-          - equi_vis_features: equivariant vision tokens [B, n_img*K, in_type.size], prepended to hidden_states
-          - vl_features:       invariant VL context for cross-attention
-          - backbone_attention_mask: language attention mask
+        Both concatenated → vl_features [B, (n_equi+n_noequi)*T, cross_attn_dim]
         """
-        equi_vision_features = backbone_output.backbone_equi_vision_features   # [B, n_img, T_vis, D_vis]
-        vision_language_features = backbone_output.backbone_vision_language_features  # [B, T_text, D_lang]
-        language_mask = backbone_output.backbone_attention_mask         # [B, T_text]
+        equi_vis = backbone_output.backbone_equi_vision_features  # [B, n_equi, T, D]
+        B, n_equi, T, D = equi_vis.shape
 
-        B, n_img, T_vis, D_vis = equi_vision_features.shape
+        # ── Add 2-D spatial positional embeddings ────────────────────────────
+        # pos_emb = self._get_vis_pos_emb(T, equi_vis.device)                     # [T, D]
+        equi_proj = equi_vis.reshape(B * n_equi, T, D) # + pos_emb.unsqueeze(0)   # [B*n_equi, T, D]
 
-        # ── Equi vision stream ───────────────────────────────────────────────
-        # Project: [B, n_img, T_vis, D_vis] → [B*n_img, T_vis, in_type.size]
-        vis_flat = equi_vision_features.reshape(B * n_img * T_vis, D_vis)
-        vis_geo = enn.GeometricTensor(vis_flat, self.equi_vis_in_type)
-        vis_proj = self.equi_vis_to_hidden(vis_geo).tensor  # [B*n_img*T_vis, in_type.size]
-        D_hidden = vis_proj.shape[-1]
-        vis_per_cam = vis_proj.reshape(B * n_img, T_vis, D_hidden)  # [B*n_img, T_vis, D_hidden]
+        # ── 4-layer equivariant vision transformer → regular repr (cross_attn_type.size) ──
+        equi_out = self.equi_vis_self_attn(equi_proj)                            # [B*n_equi, T, cross_attn_dim]
 
-        # Add equivariant 2D positional embeddings before pooling.
-        # (x, y) coords in [-1, 1] transform as irrep(1) under CN → equivariant spatial cues.
-        T_vis = vis_per_cam.shape[1]
-        h = w = int(T_vis ** 0.5)
-        idx = torch.arange(T_vis, device=vis_per_cam.device, dtype=vis_per_cam.dtype)
-        row, col = idx // w, idx % w
-        pos_2d = torch.stack([
-            2 * col / (w - 1) - 1,           # x: left=-1, right=+1
-            -(2 * row / (h - 1) - 1),         # y: top=+1, bottom=-1
-        ], dim=-1)                             # [T_vis, 2]
-        pos_emb = self.equi_vis_pos_proj(
-            enn.GeometricTensor(pos_2d, self.equi_vis_pos_type)
-        ).tensor                               # [T_vis, D_hidden]
-        vis_per_cam = vis_per_cam + pos_emb.unsqueeze(0)  # [B*n_img, T_vis, D_hidden]
+        # Flatten equi cameras: [B, n_equi*T, cross_attn_dim]  (regular repr)
+        vl_features = equi_out.reshape(B, n_equi * T, -1)
 
-        # Pool T_vis spatial tokens → num_vis_queries tokens per camera (equivariant).
-        # OrbitQueryEquiPool needs only equi_vis — no VL conditioning.
-        vis_pooled = self.equi_vis_pool(vis_per_cam)                 # [B*n_img, K, D_hidden]
-        K = vis_pooled.shape[1]
-        equi_vis_features = vis_pooled.reshape(B, n_img * K, D_hidden)  # [B, n_img*K, D_hidden]
+        # All-ones mask: no padding
+        attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
 
-        # ── VL stream ────────────────────────────────────────────────────────
-        vl_features = self.vlln(vision_language_features)           # [B, T_text, D_lang]
-        vl_features = self.vl_self_attention(vl_features)           # [B, T_text, vl_sa_inner_dim]
-
-        backbone_output.data["equi_vis_features"] = equi_vis_features
         backbone_output.data["vl_features"] = vl_features
-        backbone_output.data["backbone_attention_mask"] = language_mask
+        backbone_output.data["backbone_attention_mask"] = attn_mask
         return backbone_output
 
     def process_backbone_output_vl_features(self, backbone_output: BatchFeature) -> BatchFeature:
@@ -840,11 +807,9 @@ class FlowmatchingActionHead(nn.Module):
                 expanded = v.repeat(*factors)
                 action_input[k] = expanded
 
-        # Two-stream context from process_backbone_output.
-        equi_vis_embs = backbone_output.get("equi_vis_features")  # [B, n_img*K, D_hidden] or None
-        vl_embs = backbone_output.vl_features                     # [B, T_text, vl_cross_dim]
-        encoder_mask = backbone_output.backbone_attention_mask    # [B, T_text], 1=valid 0=pad
-        device = vl_embs.device
+        # Equi cross-attention context from process_backbone_output.
+        vl_embs = backbone_output.vl_features                     # [B, n_equi*K, cross_attn_dim]
+        encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*K], all-ones
 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
@@ -890,12 +855,8 @@ class FlowmatchingActionHead(nn.Module):
             state_features = self._add_temporal_pos_embed(state_features)
             action_features = self._add_temporal_pos_embed(action_features)
 
-        if equi_vis_embs is not None:
-            N_vis = equi_vis_embs.shape[1]
-            sa_embs = torch.cat((equi_vis_embs, state_features, action_features), dim=1)
-        else:
-            N_vis = 0
-            sa_embs = torch.cat((state_features, action_features), dim=1)
+        # State + action only — vision is cross-attention context, not a prefix
+        sa_embs = torch.cat((state_features, action_features), dim=1)
 
         model_output = self.model(
             hidden_states=sa_embs,
@@ -905,8 +866,6 @@ class FlowmatchingActionHead(nn.Module):
             return_all_hidden_states=False
         )
 
-        # Strip vis prefix tokens; keep only state+action outputs
-        model_output = model_output[:, N_vis:, :]  # [B, T+H, D]
         N_sa = model_output.shape[1]
 
         action_decoder_embodiment_id = embodiment_id.repeat(N_sa)
@@ -954,10 +913,9 @@ class FlowmatchingActionHead(nn.Module):
         
         backbone_output = self.process_backbone_output(backbone_output)
 
-        # Two-stream context from process_backbone_output.
-        equi_vis_embs = backbone_output.get("equi_vis_features")  # [B, n_img*K, D_hidden] or None
-        vl_embs = backbone_output.vl_features                     # [B, T_text, vl_cross_dim]
-        encoder_mask = backbone_output.backbone_attention_mask    # [B, T_text]
+        # Equi cross-attention context from process_backbone_output.
+        vl_embs = backbone_output.vl_features                     # [B, n_equi*K, cross_attn_dim]
+        encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*K], all-ones
 
         embodiment_id = action_input.embodiment_id
 
@@ -1008,12 +966,8 @@ class FlowmatchingActionHead(nn.Module):
             if self.config.add_pos_embed:
                 action_features = self._add_temporal_pos_embed(action_features)
 
-            if equi_vis_embs is not None:
-                N_vis = equi_vis_embs.shape[1]
-                sa_embs = torch.cat((equi_vis_embs, state_features, action_features), dim=1)
-            else:
-                N_vis = 0
-                sa_embs = torch.cat((state_features, action_features), dim=1)
+            # State + action only — vision is cross-attention context, not a prefix
+            sa_embs = torch.cat((state_features, action_features), dim=1)
 
             # Run model forward.
             model_output = self.model(
@@ -1023,8 +977,6 @@ class FlowmatchingActionHead(nn.Module):
                 timestep=timesteps_tensor,
             )
 
-            # Strip vis prefix tokens; keep only state+action outputs
-            model_output = model_output[:, N_vis:, :]  # [B, T+H, D]
             N_sa = model_output.shape[1]
 
             action_decoder_embodiment_id = embodiment_id.repeat(N_sa)

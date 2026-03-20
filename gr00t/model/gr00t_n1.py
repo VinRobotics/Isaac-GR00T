@@ -31,7 +31,7 @@ from .action_head.flow_matching_action_head import (
 )
 from .backbone import EagleBackboneFATokens
 
-BACKBONE_FEATURE_KEY = "backbone_vision_language_features"
+BACKBONE_FEATURE_KEY = "backbone_equi_vision_features"
 ACTION_KEY = "action_pred"
 LOSS_KEY = "loss"
 ERROR_MSG = "Error: unexpected input/output"
@@ -244,6 +244,7 @@ class GR00T_N1_5(PreTrainedModel):
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
         load_backbone_only = kwargs.pop("load_backbone_only", False)
+        backbone_cfg_overrides = kwargs.pop("backbone_cfg_overrides", {})
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Load backbone only: {load_backbone_only}")
@@ -267,6 +268,8 @@ class GR00T_N1_5(PreTrainedModel):
         if load_backbone_only:
             # Load only backbone weights during finetuning
             config = AutoConfig.from_pretrained(local_model_path)
+            if backbone_cfg_overrides:
+                config.backbone_cfg.update(backbone_cfg_overrides)
             pretrained_model = cls(config, local_model_path=local_model_path)
             
             # Load state dict and filter for backbone weights only

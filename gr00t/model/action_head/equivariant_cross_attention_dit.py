@@ -702,8 +702,8 @@ class EDiT(ModelMixin, ConfigMixin):
         # This ensures the model is equivariant w.r.t. state/action regardless of VL content
         self.cross_attention_type = enn.FieldType(
             self.gspace,
-            # trivial_repr has size=1, so use cross_attention_dim directly (no /n_group)
-            [self.gspace.trivial_repr] * int(self.config.cross_attention_dim)
+            # regular_repr has size=1, so use cross_attention_dim directly (no /n_group)
+            [self.gspace.regular_repr] * int(self.config.cross_attention_dim/self.n_group)
         )
         self.ff_inner_type = enn.FieldType(
             self.gspace,
@@ -866,98 +866,67 @@ class EDiT(ModelMixin, ConfigMixin):
             return output
 
 
-class EquiSelfAttentionTransformer(ModelMixin, ConfigMixin):
-    _supports_gradient_checkpointing = True
+class EquiVisionTransformer(nn.Module):
+    """
+    Multi-layer equivariant transformer for processing vision tokens (regular repr).
 
-    @register_to_config
+    Stacks N BasicTransformerBlocks in pure self-attention mode (no cross-attention).
+    All intermediate features stay in **regular repr** — equivariance preserved throughout.
+
+    If in_type.size != cross_attn_dim, a final enn.Linear(reg → reg) projects to the
+    correct output size matching EDiT's cross_attention_type.
+
+    Args:
+        in_type:       FieldType of input vision tokens (regular repr)
+        cross_attn_type: FieldType expected by EDiT cross-attention (regular repr)
+        num_layers:    number of SA blocks (default 4)
+        num_attention_heads: attention heads
+        attention_head_dim:  dimension per head
+        dropout:       dropout probability
+        activation_fn: FFN activation
+    """
+
     def __init__(
         self,
-        n_group: int = 8,
+        in_type: enn.FieldType,
+        num_layers: int = 4,
         num_attention_heads: int = 8,
         attention_head_dim: int = 64,
-        output_dim: int = 26,
-        num_layers: int = 12,
-        dropout: float = 0.1,
-        attention_bias: bool = True,
-        activation_fn: str = "gelu-approximate",
-        num_embeds_ada_norm: Optional[int] = 1000,
-        upcast_attention: bool = False,
-        max_num_positional_embeddings: int = 512,
-        compute_dtype=torch.float32,
-        final_dropout: bool = True,
-        positional_embeddings: Optional[str] = "sinusoidal",
-        interleave_self_attention=False,
-        use_relative_position_bias: bool = False,
-        max_relative_position: int = 512,
+        dropout: float = 0.0,
+        final_dropout: bool = False,
+        activation_fn: str = "geglu",
     ):
         super().__init__()
-        self.attention_head_dim = attention_head_dim
-        self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
-        self.gradient_checkpointing = False
-        self.n_group = n_group
-        
-        # Setup ESCNN group space
-        G = CyclicGroup(n_group)
-        self.gspace = escnn.gspaces.no_base_space(G)
-        
-        # Define field types for equivariant layers
-        # Each field type contains multiple regular representations
-        self.in_type = enn.FieldType(
-            self.gspace, 
-            [self.gspace.regular_repr] * int(self.inner_dim/self.n_group)
-        )
-        # Cross-attention uses TRIVIAL representation for INVARIANT VL features
-        # This ensures the model is equivariant w.r.t. state/action regardless of VL content
-        self.ff_inner_type = enn.FieldType(
-            self.gspace,
-            [self.gspace.regular_repr] * int(self.inner_dim*4/self.n_group)
-        )
-        self.out_type = enn.FieldType(
-            self.gspace,
-            [self.gspace.regular_repr] * int(self.config.output_dim/self.n_group)
-        )
+        self.in_type = in_type
+        gspace = in_type.gspace
+        n_group = gspace.fibergroup.order()
 
-        self.transformer_blocks = nn.ModuleList(
-            [
-                BasicTransformerBlock(
-                    in_type=self.in_type,
-                    cross_attention_type=self.in_type,
-                    inner_type=self.ff_inner_type,
-                    temb_type=None,  # No timestep embedding for self-attention transformer
-                    num_attention_heads=self.config.num_attention_heads,
-                    attention_head_dim=self.config.attention_head_dim,
-                    dropout=self.config.dropout,
-                    activation_fn=self.config.activation_fn,
-                    attention_bias=self.config.attention_bias,
-                    norm_type="layer_norm",  # Use layer_norm, not ada_norm (no timestep)
-                    norm_eps=1e-5,
-                    final_dropout=final_dropout,
-                    use_relative_position_bias=use_relative_position_bias,
-                    max_relative_position=max_relative_position,
-                )
-                for _ in range(self.config.num_layers)
-            ]
-        )
-        print(
-            "Total number of SelfAttentionTransformer parameters: ",
-            sum(p.numel() for p in self.parameters() if p.requires_grad),
-        )
+        # FFN inner dim: 4× blocks of regular repr
+        blocks = in_type.size // n_group
+        inner_type = enn.FieldType(gspace, [gspace.regular_repr] * (blocks * 4))
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,  # Shape: (B, T, D)
-        return_all_hidden_states: bool = False,
-    ):
-        # Process through transformer blocks - single pass through the blocks
-        hidden_states = hidden_states.contiguous()
-        all_hidden_states = [hidden_states]
+        self.blocks = nn.ModuleList([
+            BasicTransformerBlock(
+                in_type=in_type,
+                cross_attention_type=in_type,  # self-attn only; cross branch never called
+                inner_type=inner_type,
+                temb_type=None,
+                num_attention_heads=num_attention_heads,
+                attention_head_dim=attention_head_dim,
+                dropout=dropout,
+                activation_fn=activation_fn,
+                norm_type="layer_norm",
+                final_dropout=final_dropout,
+            )
+            for _ in range(num_layers)
+        ])
 
-        # Process through transformer blocks
-        for block in self.transformer_blocks:
-            hidden_states = block(hidden_states)
-            all_hidden_states.append(hidden_states)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x   : (B, T, in_type.size)   equivariant regular repr vision tokens
+        out : (B, T, cross_attn_type.size)  regular repr, ready for EDiT cross-attention
+        """
+        for block in self.blocks:
+            x = block(x)  # pure self-attention, no encoder_hidden_states
+        return x
 
-        if return_all_hidden_states:
-            return hidden_states, all_hidden_states
-        else:
-            return hidden_states
