@@ -86,7 +86,7 @@ class GR00TPolicy:
 
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.config = self.LIBERO_CONFIG
-        self.action_keys = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+        self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
         self.headless = headless
 
     def get_action(self, observation_dict, lang: str):
@@ -133,7 +133,7 @@ class GR00TPolicy:
             idx: Index of action to extract from chunk (default: 0 for first action)
 
         Returns:
-            7-dim numpy array: [dx, dy, dz, droll, dpitch, dyaw, gripper]
+            7-dim numpy array: [x, y, z, ax, ay, az, gripper]  (absolute pos + axis-angle)
         """
         quat = np.asarray([
             action_chunk[f"action.rx"][idx][0],
