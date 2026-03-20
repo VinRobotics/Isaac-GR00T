@@ -23,7 +23,6 @@ def get_libero_env(task, resolution=256):
         "bddl_file_name": task_bddl_file,
         "camera_heights": resolution,
         "camera_widths": resolution,
-        "controller_configs": {"type": "OSC_POSE", "use_delta": False},
     }
     env = OffScreenRenderEnv(**env_args)
     env.seed(

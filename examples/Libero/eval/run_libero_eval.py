@@ -192,6 +192,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
+            # Use absolute actions (not delta) to match training data
+            for robot in env.env.robots:
+                robot.controller.use_delta = False
+
             # Setup
             t = 0
             top_view = []
