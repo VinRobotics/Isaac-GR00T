@@ -217,6 +217,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         obs, reward, done, info = env.step(get_libero_dummy_action())
                         t += 1
                         continue
+                    for robot in env.env.robots:
+                        robot.controller.use_delta = False
 
                     # # Get preprocessed image
                     img, wrist_img = get_libero_image(obs)
