@@ -141,6 +141,9 @@ class GR00TPolicy:
             action_chunk[f"action.rz"][idx][0],
             action_chunk[f"action.rw"][idx][0],
         ])
+        # Ensure canonical quaternion (qw >= 0) so quat2axisangle gives angle in [0, π]
+        if quat[3] < 0:
+            quat = -quat
 
         rot = quat2axisangle(quat)
         action_chunk["action.roll"] = [rot[0]]
