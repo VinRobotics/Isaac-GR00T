@@ -2,71 +2,62 @@
 
 import math
 import os
+import time
 
 import imageio
 import numpy as np
-import tensorflow as tf
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
-from robot_utils import (
-    DATE,
-    DATE_TIME,
-)
+DATE = time.strftime("%Y_%m_%d")
+DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 
 
-def get_libero_env(task, model_family, resolution=256):
+def get_libero_env(task, resolution=256):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
-    task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    task_bddl_file = os.path.join(
+        get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
+    )
+    env_args = {
+        "bddl_file_name": task_bddl_file,
+        "camera_heights": resolution,
+        "camera_widths": resolution,
+    }
     env = OffScreenRenderEnv(**env_args)
-    env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
+    env.seed(
+        0
+    )  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
 
 
-def get_libero_dummy_action(model_family: str):
+def get_libero_dummy_action():
     """Get dummy/no-op action, used to roll out the simulation while the robot does nothing."""
     return [0, 0, 0, 0, 0, 0, -1]
 
 
-def resize_image(img, resize_size):
-    """
-    Takes numpy array corresponding to a single image and returns resized image as numpy array.
-
-    NOTE (Moo Jin): To make input images in distribution with respect to the inputs seen at training time, we follow
-                    the same resizing scheme used in the Octo dataloader, which OpenVLA uses for training.
-    """
-    assert isinstance(resize_size, tuple)
-    # Resize to image size expected by model
-    img = tf.image.encode_jpeg(img)  # Encode as JPEG, as done in RLDS dataset builder
-    img = tf.io.decode_image(img, expand_animations=False, dtype=tf.uint8)  # Immediately decode back
-    img = tf.image.resize(img, resize_size, method="lanczos3", antialias=True)
-    img = tf.cast(tf.clip_by_value(tf.round(img), 0, 255), tf.uint8)
-    img = img.numpy()
-    return img
-
-
-def get_libero_image(obs, resize_size):
+def get_libero_image(obs):
     """Extracts image from observations and preprocesses it."""
-    assert isinstance(resize_size, int) or isinstance(resize_size, tuple)
-    if isinstance(resize_size, int):
-        resize_size = (resize_size, resize_size)
     img = obs["agentview_image"]
     img = img[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
-    img = resize_image(img, resize_size)
-    return img
+    wrist_img = obs["robot0_eye_in_hand_image"]
+    wrist_img = wrist_img[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
+
+    return img, wrist_img
 
 
-def save_rollout_video(rollout_images, idx, success, task_description, log_file=None):
+def save_rollout_video(top_view, wrist_view, idx, success, task_description, prefix_name, log_file=None):
     """Saves an MP4 replay of an episode."""
-    rollout_dir = f"./rollouts/{DATE}"
+    rollout_dir = f"./rollouts_{prefix_name}/{DATE}"
     os.makedirs(rollout_dir, exist_ok=True)
-    processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
+    processed_task_description = (
+        task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
+    )
     mp4_path = f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}.mp4"
     video_writer = imageio.get_writer(mp4_path, fps=30)
-    for img in rollout_images:
-        video_writer.append_data(img)
+    for img1, img2 in zip(top_view, wrist_view):
+        combined = np.hstack((img1, img2))
+        video_writer.append_data(combined)
     video_writer.close()
     print(f"Saved rollout MP4 at path {mp4_path}")
     if log_file is not None:
@@ -99,3 +90,18 @@ def quat2axisangle(quat):
         return np.zeros(3)
 
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+
+
+def normalize_gripper_action(action, binarize=True):
+    """
+    Changes gripper action (last dimension of action vector) from [0,1] to [+1,-1].
+
+    Normalization formula: y = 1 - 2 * (x - orig_low) / (orig_high - orig_low)
+    """
+    orig_low, orig_high = 0.0, 1.0
+    action[..., -1] = 1 - 2 * (action[..., -1] - orig_low) / (orig_high - orig_low)
+
+    if binarize:
+        action[..., -1] = np.sign(action[..., -1])
+
+    return action

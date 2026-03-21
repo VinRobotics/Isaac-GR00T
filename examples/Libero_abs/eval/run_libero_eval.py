@@ -1,7 +1,7 @@
 import os
 import pprint
 from dataclasses import dataclass
-
+from typing import Dict
 import cv2
 import numpy as np
 import torch
@@ -42,7 +42,6 @@ def show_obs_images_cv2(new_obs):
     # convert RGB -> BGR for OpenCV
     img_agent_bgr = cv2.cvtColor(img_agent, cv2.COLOR_RGB2BGR)
     img_wrist_bgr = cv2.cvtColor(img_wrist, cv2.COLOR_RGB2BGR)
-
     # show in separate windows
     cv2.imshow("Agent View", img_agent_bgr)
     cv2.imshow("Wrist View", img_wrist_bgr)
@@ -87,7 +86,7 @@ class GR00TPolicy:
 
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.config = self.LIBERO_CONFIG
-        self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
+        self.action_keys = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
         self.headless = headless
 
     def get_action(self, observation_dict, lang: str):
@@ -100,8 +99,10 @@ class GR00TPolicy:
     def _process_observation(self, obs, lang: str):
         """Convert Libero observation to GR00T format."""
         xyz = obs["robot0_eef_pos"]
-        rpy = quat2axisangle(obs["robot0_eef_quat"])
-        gripper = obs["robot0_gripper_qpos"]
+        quat = obs["robot0_eef_quat"].copy()
+        if quat[3] < 0:  # enforce w >= 0 for consistent representation
+            quat = -quat
+        gripper = np.asarray(obs["robot0_gripper_qpos"]).mean()
         img, wrist_img = get_libero_image(obs)
         new_obs = {
             "video.image": np.expand_dims(img, axis=0),
@@ -109,10 +110,14 @@ class GR00TPolicy:
             "state.x": np.array([[xyz[0]]]),
             "state.y": np.array([[xyz[1]]]),
             "state.z": np.array([[xyz[2]]]),
-            "state.roll": np.array([[rpy[0]]]),
-            "state.pitch": np.array([[rpy[1]]]),
-            "state.yaw": np.array([[rpy[2]]]),
-            "state.gripper": np.expand_dims(gripper, axis=0),
+            # "state.roll": np.array([[rpy[0]]]),
+            # "state.pitch": np.array([[rpy[1]]]),
+            # "state.yaw": np.array([[rpy[2]]]),
+            "state.rx": np.array([[quat[0]]]),
+            "state.ry": np.array([[quat[1]]]),
+            "state.rz": np.array([[quat[2]]]),
+            "state.rw": np.array([[quat[3]]]),
+            "state.gripper": np.array([[gripper]]),
             "annotation.human.action.task_description": [lang],
         }
         if not self.headless:
@@ -120,7 +125,7 @@ class GR00TPolicy:
         return new_obs
 
     def _convert_to_libero_action(
-        self, action_chunk: dict[str, np.array], idx: int = 0
+        self, action_chunk: Dict[str, np.array], idx: int = 0
     ) -> np.ndarray:
         """Convert GR00T action chunk to Libero format.
 
@@ -131,9 +136,22 @@ class GR00TPolicy:
         Returns:
             7-dim numpy array: [dx, dy, dz, droll, dpitch, dyaw, gripper]
         """
+        quat = np.asarray([
+            action_chunk[f"action.rx"][idx][0],
+            action_chunk[f"action.ry"][idx][0],
+            action_chunk[f"action.rz"][idx][0],
+            action_chunk[f"action.rw"][idx][0],
+        ])
+
+        rot = quat2axisangle(quat)
+        action_chunk["action.roll"] = [rot[0]]
+        action_chunk["action.pitch"] = [rot[1]]
+        action_chunk["action.yaw"] = [rot[2]]
+        
         action_components = [
             np.atleast_1d(action_chunk[f"action.{key}"][idx])[0] for key in self.action_keys
         ]
+
         action_array = np.array(action_components, dtype=np.float32)
         action_array = normalize_gripper_action(action_array, binarize=True)
         assert len(action_array) == 7, f"Expected 7-dim action, got {len(action_array)}"
@@ -175,6 +193,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
+            # Use absolute actions to match training data
+            for robot in env.env.robots:
+                robot.controller.use_delta = False
+
             # Setup
             t = 0
             top_view = []
@@ -197,7 +219,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                     # and we need to wait for them to fall
                     if t < cfg.num_steps_wait:
-                        obs, reward, done, info = env.step(get_libero_dummy_action())
+                        # Hold current pose (absolute) while objects settle
+                        current_ori = quat2axisangle(obs["robot0_eef_quat"])
+                        hold_action = np.concatenate([obs["robot0_eef_pos"], current_ori, [-1.0]])
+                        obs, reward, done, info = env.step(hold_action)
                         t += 1
                         continue
 
@@ -238,6 +263,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 success=done,
                 task_description=task_description,
                 log_file=log_file,
+                prefix_name=cfg.task_suite_name
             )
 
             # Log current results
