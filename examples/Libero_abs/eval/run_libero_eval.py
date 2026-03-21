@@ -86,7 +86,7 @@ class GR00TPolicy:
 
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.config = self.LIBERO_CONFIG
-        self.action_keys = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+        self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
         self.headless = headless
 
     def get_action(self, observation_dict, lang: str):
