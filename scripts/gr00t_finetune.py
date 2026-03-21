@@ -137,6 +137,15 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+    use_advantage_conditioning: bool = True
+    """"""
+
+    advantage_cfg_dropout_prob: float = 0.3
+    """"""
+
+    cfg_guidance_weight: float = 1.0
+    """"""
+
 
 #####################################################################################
 # Helper functions
@@ -355,6 +364,11 @@ def main(config: ArgsConfig):
         model.action_head.set_trainable_parameters(
             tune_projector=config.tune_projector, tune_diffusion_model=config.tune_diffusion_model
         )
+
+    if config.use_advantage_conditioning:
+        model.action_head.config.use_advantage_conditioning = config.use_action_conditioning
+        model.action_head.config.advantage_cfg_dropout_prob = config.advantage_cfg_dropout_prob
+        model.action_head.config.cfg_guidance_weight = config.cfg_guidance_weight
 
     # Set the model's compute_dtype to bfloat16
     model.compute_dtype = "bfloat16"

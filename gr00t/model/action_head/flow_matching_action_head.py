@@ -131,6 +131,40 @@ class MultiEmbodimentActionEncoder(nn.Module):
         # 5) Finally W3 => (B, T, w)
         x = self.W3(x, cat_ids)
         return x
+    
+
+class AdvantageEmbedding(nn.Module):
+    """
+    Encodes the binary advantage indicator I_t from RECAP (π*0.6, §IV-B).
+ 
+    Three indices:
+        NULL_IDX (0)  – unconditional token used during CFG dropout and the
+                        unconditional forward pass at inference.
+        NEG_IDX  (1)  – A(o, a) ≤ ε_ℓ  →  "Advantage: negative"
+        POS_IDX  (2)  – A(o, a)  > ε_ℓ  →  "Advantage: positive"
+ 
+    The embedding is appended to encoder_hidden_states so the cross-attention
+    in DiT can condition the velocity field on optimality.
+    """
+ 
+    NULL_IDX: int = 0
+    NEG_IDX:  int = 1
+    POS_IDX:  int = 2
+ 
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+        self.embedding = nn.Embedding(3, embedding_dim)
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+ 
+    def forward(self, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            labels: (B,) long tensor with values in {NULL_IDX, NEG_IDX, POS_IDX}
+        Returns:
+            (B, 1, embedding_dim) — one token per batch element
+        """
+        return self.embedding(labels).unsqueeze(1)
+
 
 
 @dataclass
@@ -185,6 +219,40 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     num_target_vision_tokens: int = field(
         default=32, metadata={"help": "Number of target vision tokens."}
     )
+
+    use_advantage_conditioning: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable RECAP-style advantage conditioning. "
+                "Requires `advantage_label` in action_input during training."
+            )
+        },
+    )
+    advantage_cfg_dropout_prob: float = field(
+        default=0.3,
+        metadata={
+            "help": (
+                "Probability of replacing the advantage token with the null token "
+                "during training. "
+                "Enables both conditional and unconditional inference at test time."
+            )
+        },
+    )
+    cfg_guidance_weight: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "CFGRL guidance weight w "
+                "w=1 samples directly from the advantage-conditioned policy. "
+                "w>1 amplifies the optimality signal: "
+                "  v_guided = v_null + w * (v_pos − v_null). "
+                "Provably improves expected return for any w≥1 (CFGRL Remark 2). "
+                "Typical useful range: [1.5, 2.5]"
+            )
+        },
+    )
+
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -299,6 +367,44 @@ class FlowmatchingActionHead(nn.Module):
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
+ 
+    def _apply_advantage_conditioning(
+        self,
+        vl_embs: torch.Tensor,
+        vl_attn_mask: torch.Tensor | None,
+        advantage_label: torch.Tensor | None,
+        *,
+        force_null: bool = False,
+    ):
+        """
+        Append a single advantage token to the cross-attention context.
+ 
+        During training, a CFG dropout mask randomly replaces the supplied.
+        """
+        B, _, D = vl_embs.shape
+        device = vl_embs.device
+ 
+        if advantage_label is None or force_null:
+            labels = torch.full(
+                (B,), AdvantageEmbedding.NULL_IDX, dtype=torch.long, device=device
+            )
+        else:
+            labels = advantage_label.to(device=device)
+            # CFG dropout during training
+            if self.training:
+                drop = torch.rand(B, device=device) < self.config.advantage_cfg_dropout_prob
+                labels = labels.masked_fill(drop, AdvantageEmbedding.NULL_IDX)
+ 
+        adv_token = self.advantage_embedding(labels)          # (B, 1, D)
+        vl_embs_aug = torch.cat([vl_embs, adv_token], dim=1) # (B, S+1, D)
+ 
+        if vl_attn_mask is not None:
+            extra = torch.ones(B, 1, dtype=vl_attn_mask.dtype, device=device)
+            vl_attn_mask_aug = torch.cat([vl_attn_mask, extra], dim=1)
+        else:
+            vl_attn_mask_aug = None
+ 
+        return vl_embs_aug, vl_attn_mask_aug
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
@@ -327,10 +433,18 @@ class FlowmatchingActionHead(nn.Module):
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
+        vl_attn_mask = backbone_output.backbone_attention_mask
         device = vl_embs.device
 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
+
+        # Inject advantage token
+        if self.config.use_advantage_conditioning:
+            adv_label = action_input.get("advantage_label", None)
+            vl_embs, vl_attn_mask = self._apply_advantage_conditioning(
+                vl_embs, vl_attn_mask, adv_label
+            )
 
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
@@ -386,6 +500,7 @@ class FlowmatchingActionHead(nn.Module):
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
+        vl_attn_mask = backbone_output.backbone_attention_mask
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
@@ -399,6 +514,28 @@ class FlowmatchingActionHead(nn.Module):
             dtype=vl_embs.dtype,
             device=device,
         )
+
+        # Prepare advantage-conditioned and unconditional encoder contexts
+        use_adv = self.config.use_advantage_conditioning
+        w = self.config.cfg_guidance_weight
+        dual_pass = use_adv and (w != 1.0)
+ 
+        if use_adv:
+            # Conditional context: I_t = POS
+            vl_embs_cond, vl_attn_mask_cond = self._apply_advantage_conditioning(
+                vl_embs, vl_attn_mask,
+                advantage_label=torch.full(
+                    (batch_size,), AdvantageEmbedding.POS_IDX, dtype=torch.long, device=device
+                ),
+            )
+            if dual_pass:
+                # Unconditional context: I_t = NULL
+                vl_embs_null, vl_attn_mask_null = self._apply_advantage_conditioning(
+                    vl_embs, vl_attn_mask,
+                    advantage_label=None,   # → all NULL_IDX
+                )
+        else:
+            vl_embs_cond, vl_attn_mask_cond = vl_embs, vl_attn_mask
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
@@ -426,10 +563,21 @@ class FlowmatchingActionHead(nn.Module):
             # Run model forward.
             model_output = self.model(
                 hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
+                encoder_hidden_states=vl_embs_cond,
+                encoder_attention_mask=vl_attn_mask_cond,
                 timestep=timesteps_tensor,
             )
             pred = self.action_decoder(model_output, embodiment_id)
+
+            if dual_pass:
+                model_output_uncond = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs_null,
+                    encoder_attention_mask=vl_attn_mask_null,
+                    timestep=timesteps_tensor,
+                )
+                pred_uncond = self.action_decoder(model_output_uncond, embodiment_id)
+                pred = pred_uncond + w * (pred - pred_uncond)
 
             pred_velocity = pred[:, -self.action_horizon :]
 
