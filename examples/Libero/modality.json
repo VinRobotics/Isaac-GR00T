@@ -26,7 +26,7 @@
         },
         "gripper": {
             "start": 6,
-            "end": 8
+            "end": 7
         }
     },
     "action": {
@@ -42,7 +42,7 @@
             "start": 2,
             "end": 3
         },
-        "roll": {
+         "roll": {
             "start": 3,
             "end": 4
         },

@@ -1555,20 +1555,18 @@ class EquiLiberoConfig(BaseDataConfig):
         "state.x",
         "state.y",
         "state.z",
-        "state.rx",
-        "state.ry",
-        "state.rz",
-        "state.rw",
+        "state.roll",
+        "state.pitch",
+        "state.yaw",
         "state.gripper",
     ]
     action_keys = [
         "action.x",
         "action.y",
         "action.z",
-        "action.rx",
-        "action.ry",
-        "action.rz",
-        "action.rw",
+        "action.roll",
+        "action.pitch",
+        "action.yaw",
         "action.gripper",
     ]
     language_keys = ["annotation.human.action.task_description"]
@@ -1576,7 +1574,7 @@ class EquiLiberoConfig(BaseDataConfig):
     state_indices = [0]
     action_indices = list(range(16))
     num_hand = 1
-    rot_type="quaternion"
+    rot_type="euler_angles"
 
     def modality_config(self):
         video_modality = ModalityConfig(
@@ -1644,7 +1642,7 @@ class EquiLiberoConfig(BaseDataConfig):
                     "state.y": "min_max",
                     "state.z": "min_max",
                     "state.gripper": "min_max",
-                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
+                    # roll, pitch, yaw are euler angles — not normalized
                 },
             ),
             # action transforms
