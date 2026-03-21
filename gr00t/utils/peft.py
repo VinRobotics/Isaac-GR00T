@@ -14,12 +14,27 @@ def _wrap_forward(model):
     return model
 
 
-def get_lora_model(model, rank=32, lora_alpha=16, lora_dropout=0.1, action_head_only=True):
+def get_lora_model(model, rank=32, lora_alpha=16, lora_dropout=0.1, lora_full_model=False, 
+                   lora_vision=False, lora_language=False):
     target_modules = []
+
+    lora_vision_language = lora_vision and lora_language
 
     # Inspect model structure to find the correct paths
     for name, module in model.named_modules():
-        if action_head_only and "action_head" not in name:
+        is_have_lora = False
+        if lora_full_model:
+            is_have_lora = True
+        elif not lora_full_model and "action_head" in name:
+            is_have_lora = True
+        elif lora_vision_language and "vision_model" in name and "language_model" in name:
+            is_have_lora = True
+        elif lora_vision and "vision_model" in name:
+            is_have_lora = True
+        elif lora_language and "language_model" in name:
+            is_have_lora = True
+        
+        if not is_have_lora:
             continue
 
         # Look for linear layers in attention mechanisms
