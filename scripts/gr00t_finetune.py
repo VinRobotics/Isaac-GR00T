@@ -110,6 +110,12 @@ class ArgsConfig:
     lora_full_model: bool = False
     """Whether to use the full model for LORA. If False, only the action head will be trained."""
 
+    lora_vision: bool = False
+    """Whether to use the vision model for LORA."""
+
+    lora_language: bool = False
+    """Whether to use the language model for LORA."""
+
     dataloader_num_workers: int = 12
     """Number of workers for data loading per GPU."""
 
@@ -380,7 +386,9 @@ def main(config: ArgsConfig):
             rank=config.lora_rank,
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
-            action_head_only=not config.lora_full_model,
+            lora_full_model=config.lora_full_model,
+            lora_vision=config.lora_vision,
+            lora_language=config.lora_language,
         )
 
     # 2.1 modify training args
