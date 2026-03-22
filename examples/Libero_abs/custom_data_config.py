@@ -37,18 +37,20 @@ class LiberoDataConfig(BaseDataConfig):
         "state.x",
         "state.y",
         "state.z",
-        "state.roll",
-        "state.pitch",
-        "state.yaw",
+        "state.rx",
+        "state.ry",
+        "state.rz",
+        "state.rw",
         "state.gripper",
     ]
     action_keys = [
         "action.x",
         "action.y",
         "action.z",
-        "action.roll",
-        "action.pitch",
-        "action.yaw",
+        "action.rx",
+        "action.ry",
+        "action.rz",
+        "action.rw",
         "action.gripper",
     ]
     language_keys = ["annotation.human.action.task_description"]
@@ -68,9 +70,10 @@ class LiberoDataConfig(BaseDataConfig):
                     "action.x": "mean_std",
                     "action.y": "mean_std",
                     "action.z": "mean_std",
-                    "action.roll": "mean_std",
-                    "action.pitch": "mean_std",
-                    "action.yaw": "mean_std",
+                    "action.rx": "mean_std",
+                    "action.ry": "mean_std",
+                    "action.rz": "mean_std",
+                    "action.rw": "mean_std",
                     "action.gripper": "min_max",
                 },
             )
@@ -116,5 +119,5 @@ class LiberoDataConfig(BaseDataConfig):
 class LiberoDataConfigMeanStd(LiberoDataConfig):
     """Apply mean_std normalization to actions other than gripper."""
 
-    def transform(self) -> ModalityTransform:
-        return super().transform(action_norm="mean_std")
+    def transform(self, action_norm: str = "mean_std") -> ModalityTransform:
+        return super().transform(action_norm=action_norm)

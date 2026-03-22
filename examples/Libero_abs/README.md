@@ -35,9 +35,9 @@ To evaluate, first start the inference server with our provided checkpoint:
 
 ```bash
 python scripts/inference_service.py \
-    --model_path youliangtan/gr00t-n1.5-libero-spatial-posttrain \
+    --model_path /mnt/data/sftp/data/locht1/vr_checkpoints/gr00t_libero_10_no_noops_abs_s10k_bs128/checkpoint-10000 \
     --server \
-    --data_config examples.Libero.custom_data_config:LiberoDataConfig \
+    --data_config equi_libero \
     --denoising-steps 8 \
     --port 5555 \
     --embodiment-tag new_embodiment
@@ -74,7 +74,7 @@ pip install robosuite==1.4.0
 Then run the evaluation:
 ```bash
 cd examples/Libero/eval
-python run_libero_eval.py --task_suite_name libero_spatial
+python run_libero_eval.py --task_suite_name libero_10 --headless --port 5555
 ```
 
 ----
