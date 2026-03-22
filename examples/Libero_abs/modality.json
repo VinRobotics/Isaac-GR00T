@@ -12,20 +12,24 @@
             "start": 2,
             "end": 3
         },
-        "roll": {
+        "rx": {
             "start": 3,
             "end": 4
         },
-        "pitch": {
+        "ry": {
             "start": 4,
             "end": 5
         },
-        "yaw": {
+        "rz": {
             "start": 5,
             "end": 6
         },
-        "gripper": {
+        "rw": {
             "start": 6,
+            "end": 7
+        },
+        "gripper": {
+            "start": 7,
             "end": 8
         }
     },
@@ -42,21 +46,25 @@
             "start": 2,
             "end": 3
         },
-        "roll": {
+        "rx": {
             "start": 3,
             "end": 4
         },
-        "pitch": {
+        "ry": {
             "start": 4,
             "end": 5
         },
-        "yaw": {
+        "rz": {
             "start": 5,
             "end": 6
         },
-        "gripper": {
+        "rw": {
             "start": 6,
             "end": 7
+        },
+        "gripper": {
+            "start": 7,
+            "end": 8
         }
     },
     "video": {

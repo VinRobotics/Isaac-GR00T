@@ -1200,10 +1200,10 @@ class EquiLiberoConfig(BaseDataConfig):
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.x": "min_max",
-                    "state.y": "min_max",
-                    "state.z": "min_max",
-                    "state.gripper": "min_max",
+                    "state.x": "mean_std",
+                    "state.y": "mean_std",
+                    "state.z": "mean_std",
+                    "state.gripper": "mean_std",
                     # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
                 },
             ),
@@ -1212,10 +1212,10 @@ class EquiLiberoConfig(BaseDataConfig):
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.x": "min_max",
-                    "action.y": "min_max",
-                    "action.z": "min_max",
-                    "action.gripper": "min_max",
+                    "action.x": "mean_std",
+                    "action.y": "mean_std",
+                    "action.z": "mean_std",
+                    "action.gripper": "mean_std",
                     # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
                 },
             ),
