@@ -8,6 +8,9 @@ import torch
 import tqdm
 import tyro
 from libero.libero import benchmark
+from scipy.spatial.transform import Rotation
+
+
 from examples.Libero_abs.eval.utils import (
     get_libero_dummy_action,
     get_libero_env,
@@ -65,7 +68,7 @@ class GenerateConfig:
 
 
 class GR00TPolicy:
-    """GR00T Policy wrapper for Libero environments (absolute EEF action)."""
+    """GR00T Policy wrapper for Libero environments."""
 
     LIBERO_CONFIG = {
         "proprio_size": 8,
@@ -85,6 +88,7 @@ class GR00TPolicy:
 
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.config = self.LIBERO_CONFIG
+        self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
         self.headless = headless
 
     def get_action(self, observation_dict, lang: str):
@@ -92,12 +96,14 @@ class GR00TPolicy:
         obs_dict = self._process_observation(observation_dict, lang)
         # summarize_obs(obs_dict)
         action_chunk = self.policy.get_action(obs_dict)
-        return self._convert_to_libero_action(obs_dict, action_chunk, 0)
+        return self._convert_to_libero_action(action_chunk, 0)
 
     def _process_observation(self, obs, lang: str):
         """Convert Libero observation to GR00T format."""
         xyz = obs["robot0_eef_pos"]
-        quat = obs["robot0_eef_quat"]
+        quat = obs["robot0_eef_quat"].copy()
+        if quat[3] < 0:  # enforce w >= 0 for consistent representation
+            quat = -quat
         gripper = np.asarray(obs["robot0_gripper_qpos"]).mean()
         img, wrist_img = get_libero_image(obs)
         new_obs = {
@@ -106,6 +112,9 @@ class GR00TPolicy:
             "state.x": np.array([[xyz[0]]]),
             "state.y": np.array([[xyz[1]]]),
             "state.z": np.array([[xyz[2]]]),
+            # "state.roll": np.array([[rpy[0]]]),
+            # "state.pitch": np.array([[rpy[1]]]),
+            # "state.yaw": np.array([[rpy[2]]]),
             "state.rx": np.array([[quat[0]]]),
             "state.ry": np.array([[quat[1]]]),
             "state.rz": np.array([[quat[2]]]),
@@ -118,45 +127,37 @@ class GR00TPolicy:
         return new_obs
 
     def _convert_to_libero_action(
-        self, obs_dict: Dict[str, np.array], action_chunk: Dict[str, np.array], idx: int = 0
+        self, action_chunk: Dict[str, np.array], idx: int = 0
     ) -> np.ndarray:
-        """Convert GR00T absolute EEF action to Libero format.
+        """Convert GR00T action chunk to Libero format.
 
         Args:
             action_chunk: Dictionary of action components from GR00T policy
             idx: Index of action to extract from chunk (default: 0 for first action)
 
         Returns:
-            7-dim numpy array: [x, y, z, roll, pitch, yaw, gripper] (absolute targets)
+            7-dim numpy array: [dx, dy, dz, droll, dpitch, dyaw, gripper]
         """
-        target_xyz = np.array([
-            action_chunk["action.x"][idx][0],
-            action_chunk["action.y"][idx][0],
-            action_chunk["action.z"][idx][0],
+        quat = np.asarray([
+            action_chunk[f"action.rx"][idx][0],
+            action_chunk[f"action.ry"][idx][0],
+            action_chunk[f"action.rz"][idx][0],
+            action_chunk[f"action.rw"][idx][0],
         ])
-        state_xyz = np.array([
-            obs_dict["state.x"],
-            obs_dict["state.y"],
-            obs_dict["state.z"],
-        ]).squeeze()
 
-        delta_xyz = target_xyz - state_xyz
+        rot = Rotation.from_quat(quat).as_rotvec()
+        action_chunk["action.roll"] = [rot[0]]
+        action_chunk["action.pitch"] = [rot[1]]
+        action_chunk["action.yaw"] = [rot[2]]
+        
+        action_components = [
+            np.atleast_1d(action_chunk[f"action.{key}"][idx])[0] for key in self.action_keys
+        ]
 
-        target_quat = np.array([
-            action_chunk["action.rx"][idx][0],
-            action_chunk["action.ry"][idx][0],
-            action_chunk["action.rz"][idx][0],
-            action_chunk["action.rw"][idx][0],
-        ])
-        target_rot = quat2axisangle(target_quat)
-
-        gripper = np.atleast_1d(action_chunk["action.gripper"][idx])[0]
-
-        action_array = np.array([*delta_xyz, *target_rot, gripper], dtype=np.float32)
+        action_array = np.array(action_components, dtype=np.float32)
         action_array = normalize_gripper_action(action_array, binarize=True)
         assert len(action_array) == 7, f"Expected 7-dim action, got {len(action_array)}"
         return action_array
-
 
 
 def eval_libero(cfg: GenerateConfig) -> None:
@@ -194,6 +195,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
+            # Use absolute actions to match training data
+            for robot in env.env.robots:
+                robot.controller.use_delta = False
+
             # Setup
             t = 0
             top_view = []
@@ -216,7 +221,13 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                     # and we need to wait for them to fall
                     if t < cfg.num_steps_wait:
-                        obs, reward, done, info = env.step(get_libero_dummy_action())
+                        # Hold current pose (absolute) while objects settle
+                        quat = obs["robot0_eef_quat"].copy()
+                        if quat[3] < 0:  # enforce w >= 0 for consistent representation
+                            quat = -quat
+                        current_ori = Rotation.from_quat(quat).as_rotvec()
+                        hold_action = np.concatenate([obs["robot0_eef_pos"], current_ori, [-1.0]])
+                        obs, reward, done, info = env.step(hold_action)
                         t += 1
                         continue
 

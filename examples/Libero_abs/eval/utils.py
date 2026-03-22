@@ -13,7 +13,7 @@ DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 
 
-def get_libero_env(task, resolution=256, use_abs_controller=False):
+def get_libero_env(task, resolution=256):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = os.path.join(
@@ -24,11 +24,6 @@ def get_libero_env(task, resolution=256, use_abs_controller=False):
         "camera_heights": resolution,
         "camera_widths": resolution,
     }
-    if use_abs_controller:
-        import robosuite as suite
-        controller_config = suite.load_controller_config(default_controller="OSC_POSE")
-        controller_config["control_delta"] = False
-        env_args["controller_configs"] = controller_config
     env = OffScreenRenderEnv(**env_args)
     env.seed(
         0
@@ -37,15 +32,8 @@ def get_libero_env(task, resolution=256, use_abs_controller=False):
 
 
 def get_libero_dummy_action():
-    """Get dummy/no-op action for delta EEF control (zero displacement, gripper open)."""
+    """Get dummy/no-op action, used to roll out the simulation while the robot does nothing."""
     return [0, 0, 0, 0, 0, 0, -1]
-
-
-def get_libero_dummy_action_abs(obs):
-    """Get dummy/no-op action for absolute EEF control (hold current pose, gripper open)."""
-    xyz = obs["robot0_eef_pos"]
-    rpy = quat2axisangle(obs["robot0_eef_quat"])
-    return [xyz[0], xyz[1], xyz[2], rpy[0], rpy[1], rpy[2], -1]
 
 
 def get_libero_image(obs):
