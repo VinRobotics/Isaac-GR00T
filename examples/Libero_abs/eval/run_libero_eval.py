@@ -8,8 +8,10 @@ import torch
 import tqdm
 import tyro
 from libero.libero import benchmark
+from scipy.spatial.transform import Rotation
 
-from examples.Libero.eval.utils import (
+
+from examples.Libero_abs.eval.utils import (
     get_libero_dummy_action,
     get_libero_env,
     get_libero_image,
@@ -143,7 +145,7 @@ class GR00TPolicy:
             action_chunk[f"action.rw"][idx][0],
         ])
 
-        rot = quat2axisangle(quat)
+        rot = Rotation.from_quat(quat).as_rotvec()
         action_chunk["action.roll"] = [rot[0]]
         action_chunk["action.pitch"] = [rot[1]]
         action_chunk["action.yaw"] = [rot[2]]
@@ -220,7 +222,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # and we need to wait for them to fall
                     if t < cfg.num_steps_wait:
                         # Hold current pose (absolute) while objects settle
-                        current_ori = quat2axisangle(obs["robot0_eef_quat"])
+                        quat = obs["robot0_eef_quat"].copy()
+                        if quat[3] < 0:  # enforce w >= 0 for consistent representation
+                            quat = -quat
+                        current_ori = Rotation.from_quat(quat).as_rotvec()
                         hold_action = np.concatenate([obs["robot0_eef_pos"], current_ori, [-1.0]])
                         obs, reward, done, info = env.step(hold_action)
                         t += 1
