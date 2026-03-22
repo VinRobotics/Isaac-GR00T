@@ -35,7 +35,7 @@ To evaluate, first start the inference server with our provided checkpoint:
 
 ```bash
 python scripts/inference_service.py \
-    --model_path /mnt/data/sftp/data/locht1/vr_checkpoints/gr00t_libero_10_no_noops_abs_s10k_bs128/checkpoint-10000 \
+    --model_path /mnt/data/sftp/data/locht1/vr_checkpoints/gr00t_edit_libero_10_no_noops_abs_s10k_bs128/checkpoint-10000 \
     --server \
     --data_config equi_libero \
     --denoising-steps 8 \

@@ -195,9 +195,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
-            # Use absolute actions to match training data
+            # Start in delta mode for the wait phase; switch to absolute after
             for robot in env.env.robots:
-                robot.controller.use_delta = False
+                robot.controller.use_delta = True
 
             # Setup
             t = 0
@@ -221,15 +221,15 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                     # and we need to wait for them to fall
                     if t < cfg.num_steps_wait:
-                        # Hold current pose (absolute) while objects settle
-                        quat = obs["robot0_eef_quat"].copy()
-                        if quat[3] < 0:  # enforce w >= 0 for consistent representation
-                            quat = -quat
-                        current_ori = Rotation.from_quat(quat).as_rotvec()
-                        hold_action = np.concatenate([obs["robot0_eef_pos"], current_ori, [-1.0]])
-                        obs, reward, done, info = env.step(hold_action)
+                        # Send zero delta to stay in place while objects settle
+                        obs, reward, done, info = env.step(get_libero_dummy_action())
                         t += 1
                         continue
+
+                    # Switch to absolute actions after wait phase
+                    if t == cfg.num_steps_wait:
+                        for robot in env.env.robots:
+                            robot.controller.use_delta = False
 
                     # # Get preprocessed image
                     img, wrist_img = get_libero_image(obs)
