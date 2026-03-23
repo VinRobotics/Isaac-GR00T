@@ -757,15 +757,15 @@ class FlowmatchingActionHead(nn.Module):
         equi_vis = backbone_output.backbone_equi_vision_features  # [B, n_equi, T, D]
         B, n_equi, T, D = equi_vis.shape
 
-        # ── Add 2-D spatial positional embeddings ────────────────────────────
-        # pos_emb = self._get_vis_pos_emb(T, equi_vis.device)                     # [T, D]
-        equi_proj = equi_vis.reshape(B * n_equi, T, D) # + pos_emb.unsqueeze(0)   # [B*n_equi, T, D]
+        # ── Reshape for cross-attention ───────────────────────────────────────
+        # Skip equi_vis_self_attn (pure vision self-attention without language).
+        # equiAdapter in the backbone already embeds language conditioning per-token;
+        # running self-attention here would average it out across tokens, diluting
+        # the per-token language signal needed to distinguish tasks by instruction.
+        equi_proj = equi_vis.reshape(B * n_equi, T, D)                           # [B*n_equi, T, D]
 
-        # ── 4-layer equivariant vision transformer → regular repr (cross_attn_type.size) ──
-        equi_out = self.equi_vis_self_attn(equi_proj)                            # [B*n_equi, T, cross_attn_dim]
-
-        # Flatten equi cameras: [B, n_equi*T, cross_attn_dim]  (regular repr)
-        vl_features = equi_out.reshape(B, n_equi * T, -1)
+        # Flatten equi cameras: [B, n_equi*T, D]  (regular repr, language-conditioned)
+        vl_features = equi_proj.reshape(B, n_equi * T, -1)
 
         # All-ones mask: no padding
         attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
