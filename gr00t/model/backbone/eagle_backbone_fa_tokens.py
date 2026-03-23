@@ -60,6 +60,7 @@ from transformers.feature_extraction_utils import BatchFeature
 import escnn
 import escnn.nn as enn
 from escnn.group import CyclicGroup
+from gr00t.model.action_head.equivariant_cross_attention_dit import BasicTransformerBlock
 
 import gr00t
 
@@ -110,97 +111,96 @@ class InvariantProjector(nn.Module):
 
 class EquiAdapter(nn.Module):
     """
-    Phase 3: Fuse H_llm (invariant language context) with H' (equivariant vision carrier).
+    Phase 3: Language-conditioned equivariant adapter using transformer blocks.
 
-    Uses escnn for the equivariant operations to guarantee equivariance formally.
+    Architecture: num_layers × (SA block + CA block)
 
-    Architecture:
-      equi_proj:  enn.Linear(regular_type, regular_type)
-        Full equivariant linear (block-circulant) — strictly more expressive than
-        applying the same nn.Linear to each group-slice independently.
-        Learns cross-rotation interactions: features from rotation g can influence
-        output at rotation g' through the learned cyclic convolution filter.
-        Parameters: blocks² × n_group  vs.  blocks²  for the manual approach.
+      SA block — BasicTransformerBlock with self-attention (regular → regular):
+        Equivariant self-attention lets vision tokens communicate spatially.
+        cross_attention_type = equi_type → _equivariant_qkv = True
+        (ρ(g)Q)ᵀ(ρ(g)K) = QᵀK for unitary reprs → attention weights invariant ✓
+        Weighted sum of equivariant V → equivariant output ✓
 
-      group_pool: enn.GroupPooling(regular_type)
-        Max-pool over group elements → trivial (invariant) representation.
-        enn.GroupPooling is escnn-verified invariant.
+      CA block — BasicTransformerBlock with cross-attention (regular ← trivial):
+        Language (invariant/trivial) conditions equivariant vision features.
+        cross_attention_type = lang_trivial_type → _equivariant_qkv = False
+        Q: equi → trivial (Reynolds averaging) → invariant attention scores ✓
+        K,V: trivial language → trivial; weighted mix gives equivariant residual ✓
 
-    Gate — multi-head per-token cross-attention (invariant):
-        q  = q_proj(group_pool(h_prime))         # [B, n_equi, T, H, dh]  invariant
-        k,v = k_proj(H_llm), v_proj(H_llm)      # [B, T_text, H, dh]
-        ctx = Σ_h softmax(q_h @ k_h^T / √dh) @ v_h   # multi-head
-        ctx = out_proj(concat heads)             # [B, n_equi, T, blocks]
-
-    FiLM (invariant → equivariant):
-        gamma, beta derived from invariant ctx → applied element-wise (same per group-slice)
-        ρ(g) · (γ * W·x + β) = γ * W·(ρ(g)·x) + β  ✓   (W equivariant, γ/β invariant)
-
-    Zero-init of v_proj + out_proj → ctx=0 at init → gate=0.5, γ=1, β=0 (near-identity) ✓
+    norm_type = 'layer_norm' (pre-LN, EquivariantLayerNorm on group-major layout).
+    Identity init: zero-init o_proj + ff.fc2 → output = 0 + residual = identity ✓
     """
 
-    def __init__(self, d_eq: int, d_llm: int, n_group: int, num_heads: int = 4):
+    def __init__(
+        self,
+        d_eq: int,
+        d_llm: int,
+        n_group: int,
+        num_heads: int = 32,
+        attention_head_dim: int = 64,
+        num_layers: int = 4,
+    ):
         super().__init__()
         self.n_group = n_group
-        self.blocks = d_eq // n_group   # channels per group element = size of one regular slice
-        self.num_heads = num_heads
-        assert self.blocks % num_heads == 0, (
-            f"blocks ({self.blocks}) must be divisible by num_heads ({num_heads})"
+        self.d_llm = d_llm
+        blocks = d_eq // n_group
+        scalar_dim = num_heads * attention_head_dim
+        # scalar_dim must be divisible by n_group for _equivariant_qkv=True in SA
+        # With num_heads=32, head_dim=64: scalar_dim=2048=d_eq, 2048%8=0 ✓
+        assert scalar_dim % n_group == 0, (
+            f"num_heads*attention_head_dim ({scalar_dim}) must be divisible by n_group ({n_group})"
         )
-        self.head_dim = self.blocks // num_heads
-        self.scale = self.head_dim ** -0.5
 
-        # ── escnn setup ──────────────────────────────────────────────────────
-        # LAYOUT NOTE:
-        #   Backbone uses group-major:  D = n_group * blocks  →  reshape [n_group, blocks]
-        #   escnn uses repr-major:      D = blocks * n_group  →  reshape [blocks, n_group]
-        # These are matrix transposes.  _to_escnn / _from_escnn convert between them.
         G = CyclicGroup(n_group)
-        self.gspace = escnn.gspaces.no_base_space(G)
-        # escnn repr-major: `blocks` copies of regular_repr, total size = blocks × n_group = d_eq
-        self.equi_type = enn.FieldType(
-            self.gspace, [self.gspace.regular_repr] * self.blocks
-        )
+        gs = escnn.gspaces.no_base_space(G)
 
-        # ── Equivariant projection (full block-circulant, escnn-verified) ────
-        # enn.Linear(reg→reg): n_group × more params than same-W-per-slice.
-        # Learns cross-rotation interactions: output[g] = Σ_{Δ} W[Δ] · input[(g-Δ)%N]
-        self.equi_proj = enn.Linear(self.equi_type, self.equi_type, bias=False)
+        # Regular repr type for equivariant vision features
+        equi_type = enn.FieldType(gs, [gs.regular_repr] * blocks)
+        # Trivial repr type for invariant language features (1 trivial per dim)
+        lang_type = enn.FieldType(gs, [gs.trivial_repr] * d_llm)
+        # Inner FF type (same width = no expansion, parameter-efficient for adapter)
+        ff_inner_type = enn.FieldType(gs, [gs.regular_repr] * blocks)
 
-        # ── Invariant GroupPooling (escnn-verified) ───────────────────────────
-        # Maps regular_repr → trivial (max over group orbit) → invariant scalars ✓
-        self.group_pool = enn.GroupPooling(self.equi_type)
+        # SA blocks: equivariant self-attention (regular → regular)
+        self.sa_blocks = nn.ModuleList([
+            BasicTransformerBlock(
+                in_type=equi_type,
+                cross_attention_type=equi_type,  # SA: same type → _equivariant_qkv=True
+                inner_type=ff_inner_type,
+                num_attention_heads=num_heads,
+                attention_head_dim=attention_head_dim,
+                norm_type="layer_norm",
+            )
+            for _ in range(num_layers)
+        ])
 
-        # ── Multi-head cross-attention (all invariant → equivariance preserved) ─
-        self.q_proj  = nn.Linear(self.blocks, self.blocks)
-        self.k_proj  = nn.Linear(d_llm, self.blocks)
-        self.v_proj  = nn.Linear(d_llm, self.blocks)
-        self.out_proj = nn.Linear(self.blocks, self.blocks)
-        # Zero-init v_proj + out_proj → ctx=0 at init
-        nn.init.zeros_(self.v_proj.weight);  nn.init.zeros_(self.v_proj.bias)
-        nn.init.zeros_(self.out_proj.weight); nn.init.zeros_(self.out_proj.bias)
+        # CA blocks: cross-attention with trivial language (regular ← trivial)
+        self.ca_blocks = nn.ModuleList([
+            BasicTransformerBlock(
+                in_type=equi_type,
+                cross_attention_type=lang_type,  # CA: trivial language → _equivariant_qkv=False
+                inner_type=ff_inner_type,
+                num_attention_heads=num_heads,
+                attention_head_dim=attention_head_dim,
+                norm_type="layer_norm",
+            )
+            for _ in range(num_layers)
+        ])
 
-        # ── FiLM: invariant ctx → scale γ and shift β ───────────────────────
-        # Derived from invariant ctx → applied element-wise → equivariance preserved ✓
-        self.film_gamma = nn.Linear(self.blocks, self.blocks)
-        self.film_beta  = nn.Linear(self.blocks, self.blocks)
-        nn.init.zeros_(self.film_gamma.weight); nn.init.ones_(self.film_gamma.bias)
-        nn.init.zeros_(self.film_beta.weight);  nn.init.zeros_(self.film_beta.bias)
-
-    # ── Layout converters ────────────────────────────────────────────────────
-    def _to_escnn(self, x: torch.Tensor) -> torch.Tensor:
-        """Group-major → escnn repr-major.
-        Backbone: [*, D]  D=N*B  reshape→[*, N, B]  (outer=group, inner=block)
-        escnn:    [*, D]  D=B*N  reshape→[*, B, N]  (outer=copy,  inner=group)
-        Convert:  reshape[*, N, B] → transpose → reshape[*, B, N] → flatten[*, D]
-        """
-        *s, D = x.shape
-        return x.reshape(*s, self.n_group, self.blocks).transpose(-2, -1).reshape(*s, D)
-
-    def _from_escnn(self, x: torch.Tensor) -> torch.Tensor:
-        """escnn repr-major → group-major. Inverse of _to_escnn."""
-        *s, D = x.shape
-        return x.reshape(*s, self.blocks, self.n_group).transpose(-2, -1).reshape(*s, D)
+        # Zero-init output projections → all blocks start as identity ✓
+        # SA: zero o_proj so attn output = 0; zero fc2 so FF output = 0
+        # CA: also zero v_proj so language has no effect at init
+        for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
+            for p in sa_blk.attn1.o_proj.parameters():
+                nn.init.zeros_(p)
+            for p in sa_blk.ff.fc2.parameters():
+                nn.init.zeros_(p)
+            for p in ca_blk.attn1.v_proj.parameters():
+                nn.init.zeros_(p)
+            for p in ca_blk.attn1.o_proj.parameters():
+                nn.init.zeros_(p)
+            for p in ca_blk.ff.fc2.parameters():
+                nn.init.zeros_(p)
 
     def forward(self, h_prime: torch.Tensor, h_llm: torch.Tensor) -> torch.Tensor:
         """
@@ -211,55 +211,23 @@ class EquiAdapter(nn.Module):
             [B, n_equi, T, D_eq]  language-conditioned equivariant features
         """
         B, n_equi, T, D = h_prime.shape
-        H, dh = self.num_heads, self.head_dim
+        dt = next(self.sa_blocks[0].parameters()).dtype
 
-        # Cast to escnn module dtype (float32 for escnn operations)
-        escnn_dtype = next(self.equi_proj.parameters()).dtype
-        h = h_prime.to(escnn_dtype)
+        # Flatten cameras into batch for transformer processing: [B*n_equi, T, D]
+        h = h_prime.to(dt).reshape(B * n_equi, T, D)
 
-        # Convert group-major → escnn repr-major, flatten for escnn: [B*n_equi*T, D]
-        h_flat = self._to_escnn(h.reshape(B * n_equi * T, D))
-        h_geo  = enn.GeometricTensor(h_flat, self.equi_type)
+        # Expand language context to all cameras: [B*n_equi, T_lang, D_llm]
+        T_lang = h_llm.shape[1]
+        ll = (h_llm.to(dt)
+              .unsqueeze(1)
+              .expand(-1, n_equi, -1, -1)
+              .reshape(B * n_equi, T_lang, self.d_llm))
 
-        # ── Equivariant projection (full block-circulant, escnn-verified) ────
-        # Convert result back to backbone's group-major layout
-        equi_out = self._from_escnn(
-            self.equi_proj(h_geo).tensor.reshape(B * n_equi * T, D)
-        ).reshape(B, n_equi, T, D)
+        for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
+            h = sa_blk(h)                                   # SA: spatial token mixing
+            h = ca_blk(h, encoder_hidden_states=ll)         # CA: language conditioning
 
-        # ── Invariant query via escnn GroupPooling (max over group orbit) ────
-        # Layout-independent: output is `blocks` invariant scalars per token ✓
-        inv_feat = self.group_pool(h_geo).tensor.reshape(B, n_equi, T, self.blocks)
-
-        # ── Multi-head cross-attention to task instruction ───────────────────
-        # q, k, v all operate on invariant scalars → ctx is invariant ✓
-        h_llm_proj = h_llm.to(escnn_dtype)
-        T_lang = h_llm_proj.shape[1]
-
-        q = self.q_proj(inv_feat).reshape(B, n_equi, T, H, dh)
-        k = self.k_proj(h_llm_proj).reshape(B, T_lang, H, dh)
-        v = self.v_proj(h_llm_proj).reshape(B, T_lang, H, dh)
-
-        attn = torch.einsum('bntHd, bsHd -> bntHs', q, k) * self.scale
-        attn = torch.softmax(attn, dim=-1)
-        ctx  = self.out_proj(
-            torch.einsum('bntHs, bsHd -> bntHd', attn, v).reshape(B, n_equi, T, self.blocks)
-        )  # [B, n_equi, T, blocks]
-
-        # ── FiLM: invariant ctx modulates equivariant equi_out ───────────────
-        gate  = torch.sigmoid(ctx)           # [B, n_equi, T, blocks]
-        gamma = self.film_gamma(ctx)         # [B, n_equi, T, blocks]
-        beta  = self.film_beta(ctx)          # [B, n_equi, T, blocks]
-
-        # Expand invariant scalars to group-major: same value per group-slice → invariant ✓
-        def expand_to_group_major(x):
-            return x[:, :, :, None, :].expand(B, n_equi, T, self.n_group, self.blocks) \
-                                      .reshape(B, n_equi, T, D)
-
-        # gamma * equi_out: equivariant (invariant × equivariant) ✓
-        # beta:             invariant additive shift ✓
-        out = expand_to_group_major(gamma) * equi_out + expand_to_group_major(beta)
-        return h_prime + (expand_to_group_major(gate) * out).to(h_prime.dtype)
+        return h.reshape(B, n_equi, T, D).to(h_prime.dtype)
 
 
 class EagleBackboneFATokens(nn.Module):
@@ -297,8 +265,9 @@ class EagleBackboneFATokens(nn.Module):
         output_type: str = 'reg',  # 'reg' for regular representation
         # Phase 2/3: equivariant adapter
         use_inv_projector_for_vlm: bool = True,  # Phase 2: inject inv-proj tokens into LLM
-        equi_adapter_num_heads: int = 4,  # Multi-head cross-attention in equiAdapter (per head: blocks/num_heads)
-        equi_adapter_num_layers: int = 2, # Stack N equiAdapter layers for deeper language conditioning
+        equi_adapter_num_heads: int = 32,        # heads in SA/CA; matches N1.5 vl_self_attention num_attention_heads=32
+        equi_adapter_attention_head_dim: int = 64, # head dim; matches N1.5 vl_self_attention attention_head_dim=64
+        equi_adapter_num_layers: int = 4,        # SA+CA blocks; matches N1.5 vl_self_attention_cfg.num_layers=4
     ):
         """
         Args:
@@ -324,6 +293,7 @@ class EagleBackboneFATokens(nn.Module):
         self.project_to_dim = project_to_dim if project_to_dim else 2048
         self.use_inv_projector_for_vlm = use_inv_projector_for_vlm
         self.equi_adapter_num_heads = equi_adapter_num_heads
+        self.equi_adapter_attention_head_dim = equi_adapter_attention_head_dim
         self.equi_adapter_num_layers = equi_adapter_num_layers
 
         if rotate_image_indices is None:
@@ -376,20 +346,18 @@ class EagleBackboneFATokens(nn.Module):
             n_group=n_group,
         )
 
-        # ── Phase 3: EquiAdapter stack ───────────────────────────────────────
-        # Stacked equi_adapter_num_layers adapters for deeper language conditioning.
-        # Layer 0: coarse language conditioning (verbs, objects)
-        # Layer 1: refined conditioning on already-modulated features
-        # Each layer uses multi-head cross-attention (equi_adapter_num_heads heads).
-        self.equi_adapters = nn.ModuleList([
-            EquiAdapter(
-                d_eq=self.project_to_dim,
-                d_llm=self.project_to_dim,
-                n_group=n_group,
-                num_heads=equi_adapter_num_heads,
-            )
-            for _ in range(equi_adapter_num_layers)
-        ])
+        # ── Phase 3: EquiAdapter (num_layers × SA+CA blocks) ────────────────
+        # Each block: equivariant SA (spatial token mixing) + CA (language conditioning).
+        # SA block: regular self-attention, tokens communicate across spatial positions.
+        # CA block: cross-attention to invariant language (trivial repr) via task descriptor.
+        self.equi_adapter = EquiAdapter(
+            d_eq=self.project_to_dim,
+            d_llm=self.project_to_dim,
+            n_group=n_group,
+            num_heads=equi_adapter_num_heads,
+            attention_head_dim=equi_adapter_attention_head_dim,
+            num_layers=equi_adapter_num_layers,
+        )
 
         # Initialize rotation and frame averaging components
         self._init_rotation_matrices()
@@ -407,8 +375,9 @@ class EagleBackboneFATokens(nn.Module):
         print(f"  non_equi_image_indices: {self.non_equi_image_indices}")
         print(f"  output_type: {self.output_type}")
         print(f"  use_inv_projector_for_vlm: {self.use_inv_projector_for_vlm}")
-        print(f"  equi_adapter_num_layers: {self.equi_adapter_num_layers}")
-        print(f"  equi_adapter_num_heads:  {self.equi_adapter_num_heads}")
+        print(f"  equi_adapter_num_layers:       {self.equi_adapter_num_layers} (SA+CA blocks)")
+        print(f"  equi_adapter_num_heads:        {self.equi_adapter_num_heads}")
+        print(f"  equi_adapter_attention_head_dim: {self.equi_adapter_attention_head_dim}  (scalar_dim={self.equi_adapter_num_heads * self.equi_adapter_attention_head_dim})")
         print(f"  Using FULL vision tokens (not pooled)")
         print(f"  Token grid size: {self.token_grid_size}x{self.token_grid_size}")
 
@@ -537,7 +506,7 @@ class EagleBackboneFATokens(nn.Module):
         "vision_proj.",
         "eagle_linear.",
         "inv_projector.",
-        "equi_adapters.",
+        "equi_adapter.",
     )
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
@@ -1057,33 +1026,9 @@ class EagleBackboneFATokens(nn.Module):
         vl_features = self.eagle_linear(vl_hidden.to(lang_dtype))         # [B, T_total, project_to_dim]
 
         # ── Phase 3: EquiAdapter ──────────────────────────────────────────────
-        # Build a STRONG language context for equiAdapter cross-attention.
-        #
-        # Problem: vl_features has T_total tokens = ~256 image placeholders + ~50 text tokens.
-        # equiAdapter cross-attends to all T_total — image tokens numerically dominate
-        # and dilute the language signal, making task discrimination via language weak.
-        #
-        # Fix: mean-pool TEXT-only token positions → one undiluted task descriptor token.
-        # Prepend it to vl_features so equiAdapter always has a strong language anchor
-        # at position 0, without discarding spatial vision context at other positions.
-        img_tok_idx = getattr(self.eagle_model, "image_token_index", None)
-        if img_tok_idx is not None:
-            # text_mask: 1.0 where token is text (not image placeholder)
-            text_mask = (eagle_input["input_ids"] != img_tok_idx).to(vl_features.dtype)  # [B, T_total]
-            text_mask_exp = text_mask.unsqueeze(-1)                                        # [B, T_total, 1]
-            task_token = (
-                (vl_features * text_mask_exp).sum(1)
-                / text_mask_exp.sum(1).clamp(min=1)
-            )  # [B, project_to_dim]  — pure language mean-pool
-            # Prepend as position 0: equiAdapter can attend to it with high weight
-            lang_ctx = torch.cat([task_token.unsqueeze(1), vl_features], dim=1)  # [B, 1+T_total, D]
-        else:
-            lang_ctx = vl_features
-
-        # lang_ctx gates h_prime; position 0 is a strong undiluted task descriptor.
-        # Apply stacked equi_adapters: each layer refines language conditioning.
-        for adapter in self.equi_adapters:
-            h_prime = adapter(h_prime, lang_ctx)
+        # EquiAdapter: num_layers × (SA spatial mixing + CA language conditioning).
+        # CA blocks learn to focus on text tokens through attention — no manual task token needed.
+        h_prime = self.equi_adapter(h_prime, vl_features)
 
         return h_prime, eagle_input["attention_mask"]
 
