@@ -386,6 +386,7 @@ class Gr00tPolicy(BasePolicy):
             # Update the action head config
             new_action_head_config = model.action_head.config
             new_action_head_config.action_horizon = expected_action_horizon
+            new_action_head_config.use_advantage_conditioning = True
 
             # Import the FlowmatchingActionHead class
             from gr00t.model.action_head.flow_matching_action_head import (
