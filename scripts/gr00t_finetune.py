@@ -372,9 +372,11 @@ def main(config: ArgsConfig):
         )
 
     if config.use_advantage_conditioning:
-        model.action_head.config.use_advantage_conditioning = config.use_action_conditioning
+        print("Using Advantage Conditioning!!!")
+        model.action_head.config.use_advantage_conditioning = config.use_advantage_conditioning
         model.action_head.config.advantage_cfg_dropout_prob = config.advantage_cfg_dropout_prob
         model.action_head.config.cfg_guidance_weight = config.cfg_guidance_weight
+        model.action_head.init_advantage_conditioning()
 
     # Set the model's compute_dtype to bfloat16
     model.compute_dtype = "bfloat16"

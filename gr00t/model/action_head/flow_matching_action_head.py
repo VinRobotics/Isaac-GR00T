@@ -315,6 +315,18 @@ class FlowmatchingActionHead(nn.Module):
         self.config = config
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
+    def init_advantage_conditioning(self):
+        print("Action Config: ", self.config)
+        if self.config.use_advantage_conditioning:
+            self.advantage_embedding = AdvantageEmbedding(2048)
+            print(
+                f"[RECAP] Advantage conditioning ENABLED  "
+                f"(cfg_dropout={self.config.advantage_cfg_dropout_prob}, "
+                f"cfg_guidance_weight={self.config.cfg_guidance_weight})"
+            )
+        else:
+            self.advantage_embedding = None
+
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
         self.tune_diffusion_model = tune_diffusion_model
@@ -441,7 +453,8 @@ class FlowmatchingActionHead(nn.Module):
 
         # Inject advantage token
         if self.config.use_advantage_conditioning:
-            adv_label = action_input.get("advantage_label", None)
+            # adv_label = action_input.get("advantage_label", None)
+            adv_label = action_input.get("advantage_label", torch.full([action_input.action.shape[0],], AdvantageEmbedding.POS_IDX))
             vl_embs, vl_attn_mask = self._apply_advantage_conditioning(
                 vl_embs, vl_attn_mask, adv_label
             )
