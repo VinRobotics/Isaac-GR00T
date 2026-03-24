@@ -38,13 +38,16 @@ Where:
 This ensures proper per-token equivariance: f(g·x)[p] = ρ(g) · f(x)[π(g)·p]
 After spatial alignment, tokens across all rotations represent the same spatial content.
 
-Pipeline (with equivariant adapter):
-    1. FA wrapper (Phase 1): Rotate images N times, extract features, apply FA → H' (equivariant)
-    2. InvariantProjector (Phase 2): Norm-pool H' over group channels → invariant scalars
-       Optionally inject these into Eagle LLM instead of raw SigLIP tokens.
-    3. EquiAdapter (Phase 3): H_llm gates H' via zero-init linear → equivariant refined features
-    4. Output two contexts for DiT's Equi Cross Attention blocks:
-       - equi_adapter(H', H_llm)  [equivariant] → Equi Cross Attention 
+Pipeline (EquiLLM-style adapter):
+    1. FA (Phase 1): Rotate images N times, extract features, apply FA → H' (equivariant)
+    2. InvariantProjector + Eagle LLM (Phase 2): inv_proj(H') injected into LLM → vl_hidden.
+       vl_hidden has both image and language token hidden states (full cross-modal context).
+       Text-only positions of vl_hidden projected to project_to_dim → h_lang.
+    3. EquiAdapter (Phase 3): EquiLLM-style skip-connection adapter.
+       Skip: H' bypasses LLM → adapter directly (same as EquiLLM H' skip connection).
+       cat(H'_flat, h_lang) → SA on combined sequence → CA ← vl_hidden (full image+lang)
+    4. Output: [B, n_equi*T_vis + T_lang, D]
+       [:n_equi*T_vis] equivariant vision tokens; [n_equi*T_vis:] language tokens
 """
 
 import os
@@ -111,24 +114,27 @@ class InvariantProjector(nn.Module):
 
 class EquiAdapter(nn.Module):
     """
-    Phase 3: Language-conditioned equivariant adapter using transformer blocks.
+    Phase 3: EquiLLM-style adapter.
 
-    Architecture: num_layers × (SA block + CA block)
+    Architecture: num_layers × (SA + CA)
 
-      SA block — BasicTransformerBlock with self-attention (regular → regular):
-        Equivariant self-attention lets vision tokens communicate spatially.
-        cross_attention_type = equi_type → _equivariant_qkv = True
-        (ρ(g)Q)ᵀ(ρ(g)K) = QᵀK for unitary reprs → attention weights invariant ✓
-        Weighted sum of equivariant V → equivariant output ✓
+      Input: cat([H'.reshape(B, n_equi*T, D), lang_embed(h_lang)], dim=1) → [B, n_equi*T + T_lang, D]
+        H'     — equivariant vision tokens (regular repr, group-major)
+        h_lang — invariant language tokens, projected to regular repr via trivial embedding:
+                 lang_embed: R^d_llm → R^blocks (invariant subspace)
+                 expand: [v,v,...,v] × n_group → R^D  (trivial element in regular repr)
+                 Cyclic shift of [v,v,...,v] = [v,v,...,v] → invariant ✓
 
-      CA block — BasicTransformerBlock with cross-attention (regular ← trivial):
-        Language (invariant/trivial) conditions equivariant vision features.
-        cross_attention_type = lang_trivial_type → _equivariant_qkv = False
-        Q: equi → trivial (Reynolds averaging) → invariant attention scores ✓
-        K,V: trivial language → trivial; weighted mix gives equivariant residual ✓
+      SA block — equivariant self-attention on the combined sequence (regular → regular):
+        Vision tokens mix with each other AND with language tokens in one sequence.
 
-    norm_type = 'layer_norm' (pre-LN, EquivariantLayerNorm on group-major layout).
-    Identity init: zero-init o_proj + ff.fc2 → output = 0 + residual = identity ✓
+      CA block — cross-attention from combined sequence to vl_hidden (regular ← trivial):
+        vl_hidden contains BOTH image and language tokens from the VLM — full context.
+
+    Output: [B, n_equi*T + T_lang, D]  (same layout as input, updated features)
+
+    Identity init: zero-init o_proj + ff.fc2 → SA output = 0 + residual = identity ✓
+                   zero-init v_proj + o_proj on CA → CA output = 0 at init ✓
     """
 
     def __init__(
@@ -143,10 +149,10 @@ class EquiAdapter(nn.Module):
         super().__init__()
         self.n_group = n_group
         self.d_llm = d_llm
+        self.d_eq = d_eq
         blocks = d_eq // n_group
+        self.blocks = blocks
         scalar_dim = num_heads * attention_head_dim
-        # scalar_dim must be divisible by n_group for _equivariant_qkv=True in SA
-        # With num_heads=32, head_dim=64: scalar_dim=2048=d_eq, 2048%8=0 ✓
         assert scalar_dim % n_group == 0, (
             f"num_heads*attention_head_dim ({scalar_dim}) must be divisible by n_group ({n_group})"
         )
@@ -154,18 +160,17 @@ class EquiAdapter(nn.Module):
         G = CyclicGroup(n_group)
         gs = escnn.gspaces.no_base_space(G)
 
-        # Regular repr type for equivariant vision features
-        equi_type = enn.FieldType(gs, [gs.regular_repr] * blocks)
-        # Trivial repr type for invariant language features (1 trivial per dim)
-        lang_type = enn.FieldType(gs, [gs.trivial_repr] * d_llm)
-        # Inner FF type (same width = no expansion, parameter-efficient for adapter)
+        # Combined sequence type: all tokens live in regular repr space
+        equi_type     = enn.FieldType(gs, [gs.regular_repr] * blocks)
+        # vl_hidden context type: LLM output is invariant (trivial repr)
+        vl_type       = enn.FieldType(gs, [gs.trivial_repr] * d_llm)
         ff_inner_type = enn.FieldType(gs, [gs.regular_repr] * blocks)
 
-        # SA blocks: equivariant self-attention (regular → regular)
+        # SA: equivariant SA on combined [h_prime, h_lang] sequence
         self.sa_blocks = nn.ModuleList([
             BasicTransformerBlock(
                 in_type=equi_type,
-                cross_attention_type=equi_type,  # SA: same type → _equivariant_qkv=True
+                cross_attention_type=equi_type,
                 inner_type=ff_inner_type,
                 num_attention_heads=num_heads,
                 attention_head_dim=attention_head_dim,
@@ -174,11 +179,11 @@ class EquiAdapter(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # CA blocks: cross-attention with trivial language (regular ← trivial)
+        # CA: combined sequence ← vl_hidden (both image + language, trivial repr)
         self.ca_blocks = nn.ModuleList([
             BasicTransformerBlock(
                 in_type=equi_type,
-                cross_attention_type=lang_type,  # CA: trivial language → _equivariant_qkv=False
+                cross_attention_type=vl_type,
                 inner_type=ff_inner_type,
                 num_attention_heads=num_heads,
                 attention_head_dim=attention_head_dim,
@@ -187,9 +192,12 @@ class EquiAdapter(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # Zero-init output projections → all blocks start as identity ✓
-        # SA: zero o_proj so attn output = 0; zero fc2 so FF output = 0
-        # CA: also zero v_proj so language has no effect at init
+        # lang_embed: project h_lang (arbitrary R^d_llm) → invariant subspace (R^blocks),
+        # then expand to regular repr via trivial embedding: [v,v,...,v] × n_group.
+        # This ensures h_lang lives correctly in regular repr before concat with h_prime.
+        self.lang_embed = nn.Linear(d_llm, blocks)
+
+        # Identity init
         for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
             for p in sa_blk.attn1.o_proj.parameters():
                 nn.init.zeros_(p)
@@ -202,32 +210,46 @@ class EquiAdapter(nn.Module):
             for p in ca_blk.ff.fc2.parameters():
                 nn.init.zeros_(p)
 
-    def forward(self, h_prime: torch.Tensor, h_llm: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        h_prime: torch.Tensor,
+        h_lang: torch.Tensor,
+        vl_hidden: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Args:
-            h_prime: [B, n_equi, T, D_eq]  equivariant vision features (group-major layout)
-            h_llm:   [B, T_text, D_llm]    invariant LLM features (task instruction)
+            h_prime:   [B, n_equi, T_vis, D]   equivariant vision features (group-major)
+            h_lang:    [B, T_lang, D]           invariant language features (projected via lang_embed into regular repr)
+            vl_hidden: [B, T_total, D]          full VLM output (image + language, trivial repr)
         Returns:
-            [B, n_equi, T, D_eq]  language-conditioned equivariant features
+            [B, n_equi*T_vis + T_lang, D]
         """
         B, n_equi, T, D = h_prime.shape
         dt = next(self.sa_blocks[0].parameters()).dtype
 
-        # Flatten cameras into batch for transformer processing: [B*n_equi, T, D]
-        h = h_prime.to(dt).reshape(B * n_equi, T, D)
+        # Embed h_lang as trivial element in regular repr space:
+        #   1. lang_embed: [B, T_lang, d_llm] → [B, T_lang, blocks]  (invariant subspace)
+        #   2. expand × n_group:               → [B, T_lang, n_group, blocks]
+        #   3. reshape:                        → [B, T_lang, D]       (group-major layout)
+        # Result: [v,v,...,v] per token — a proper trivial-in-regular element ✓
+        h_lang_inv = self.lang_embed(h_lang.to(dt))                    # [B, T_lang, blocks]
+        h_lang_reg = (h_lang_inv
+                      .unsqueeze(-2)
+                      .expand(-1, -1, self.n_group, -1)
+                      .reshape(B, -1, self.d_eq))                      # [B, T_lang, D]
 
-        # Expand language context to all cameras: [B*n_equi, T_lang, D_llm]
-        T_lang = h_llm.shape[1]
-        ll = (h_llm.to(dt)
-              .unsqueeze(1)
-              .expand(-1, n_equi, -1, -1)
-              .reshape(B * n_equi, T_lang, self.d_llm))
+        # Concat into combined sequence: [B, n_equi*T + T_lang, D]
+        h_flat = h_prime.to(dt).reshape(B, n_equi * T, D)
+        h = torch.cat([h_flat, h_lang_reg], dim=1)
+
+        # vl_hidden as CA context: [B, T_total, D]
+        vl = vl_hidden.to(dt)
 
         for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
-            h = sa_blk(h)                                   # SA: spatial token mixing
-            h = ca_blk(h, encoder_hidden_states=ll)         # CA: language conditioning
+            h = sa_blk(h)                              # SA: combined sequence self-attends
+            h = ca_blk(h, encoder_hidden_states=vl)   # CA: combined ← full VLM context
 
-        return h.reshape(B, n_equi, T, D).to(h_prime.dtype)
+        return h.to(h_prime.dtype)
 
 
 class EagleBackboneFATokens(nn.Module):
@@ -852,7 +874,7 @@ class EagleBackboneFATokens(nn.Module):
         eagle_input: dict,
         inv_vision_tokens: torch.Tensor,
         noequi_pixels: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run Eagle's LLM with injected vision tokens.
 
@@ -916,7 +938,16 @@ class EagleBackboneFATokens(nn.Module):
             output_hidden_states=True,
             return_dict=True,
         )
-        return lm_output.hidden_states[self.select_layer]  # [B, T_total, d_eagle]
+        hidden = lm_output.hidden_states[self.select_layer]  # [B, T_total, d_eagle]
+
+        # text_mask: True at positions that are NOT image-token placeholders
+        # Used by forward_eagle to extract language-only hidden states for EquiAdapter.
+        if img_tok_idx is not None:
+            text_mask = (input_ids != img_tok_idx)           # [B, T_total]
+        else:
+            text_mask = torch.ones(B, input_ids.shape[1], dtype=torch.bool, device=input_ids.device)
+
+        return hidden, text_mask
 
     # ──────────────────────────────────────────────────────────────────────────
     # Main forward through Eagle + FA + EquiAdapter
@@ -935,7 +966,7 @@ class EagleBackboneFATokens(nn.Module):
 
         After FA:
           H'    = avg_vision_features  [B, n_equi, T, project_to_dim]  (equivariant)
-          H_llm = vl_features          [B, T_text, project_to_dim]      (invariant)
+          H_llm = vl_features          [B, T_total, project_to_dim]     (invariant, image+lang)
           H_out = equi_adapter(H', H_llm)                               (equivariant, language-conditioned)
 
         H_out is returned as BOTH:
@@ -1017,20 +1048,26 @@ class EagleBackboneFATokens(nn.Module):
         # vl_features encodes both camera views via the LLM.
         inv_tokens = self.inv_projector(h_prime)                      # [B, n_equi, T, d_eagle]
         inv_tokens_flat = inv_tokens.reshape(B, n_equi * num_vision_tokens, -1)
-        vl_hidden = self._forward_llm_with_injected_vision(
+        vl_hidden, text_mask = self._forward_llm_with_injected_vision(
             eagle_input, inv_tokens_flat, noequi_pixels
         )
-        
-        # Project LLM hidden states → project_to_dim (language is invariant, plain linear is fine)
+
+        # Project full vl_hidden → project_to_dim (used both as CA context and h_lang source)
         lang_dtype = self.eagle_linear.weight.dtype
         vl_features = self.eagle_linear(vl_hidden.to(lang_dtype))         # [B, T_total, project_to_dim]
 
-        # ── Phase 3: EquiAdapter ──────────────────────────────────────────────
-        # EquiAdapter: num_layers × (SA spatial mixing + CA language conditioning).
-        # CA blocks learn to focus on text tokens through attention — no manual task token needed.
-        h_prime = self.equi_adapter(h_prime, vl_features)
+        # Extract text-only positions as h_lang (initial state of language tokens in adapter).
+        # text_mask is batch-consistent (fixed template), so first sample's mask suffices.
+        # These tokens have VLM cross-modal understanding (text attended to images inside LLM).
+        text_pos = text_mask[0]                                            # [T_total] bool
+        h_lang = vl_features[:, text_pos, :]                              # [B, T_lang, project_to_dim]
 
-        return h_prime, eagle_input["attention_mask"]
+        # ── Phase 3: EquiAdapter ──────────────────────────────────────────────
+        # cat(h_prime_flat, h_lang) → SA on combined → CA ← vl_features (full image+lang context)
+        # Output: [B, n_equi*T_vis + T_lang, project_to_dim]
+        h_prime_llm = self.equi_adapter(h_prime, h_lang, vl_features)
+
+        return h_prime_llm, eagle_input["attention_mask"]
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         """
@@ -1041,28 +1078,27 @@ class EagleBackboneFATokens(nn.Module):
 
         Returns:
             BatchFeature with:
-                - backbone_equi_vision_features:    [B, n_equi, T_vision, D]
-                    Equivariant adapted features for DiT self-attention prefix.
-                - backbone_vision_language_features: [B, n_equi*T_vision, D]
-                    Same features flattened — use directly as DiT cross-attention context
-                    (language-conditioned equivariant, no further processing needed).
+                - backbone_equi_vision_features: [B, n_equi*T_vision + T_lang, D]
+                    First n_equi*T_vision tokens: equivariant vision features (group-major).
+                    Last T_lang tokens: invariant language features (vision-conditioned via
+                    Reynolds cross-attention). Use directly as DiT cross-attention context.
                 - backbone_attention_mask: attention mask from Eagle tokeniser
         """
         self.set_frozen_modules_to_eval_mode()
 
-        h_prime, eagle_mask = self.forward_eagle(vl_input)
+        h_prime_llm, eagle_mask = self.forward_eagle(vl_input)
 
         # DDP compatibility: ensure all trainable parameters participate in loss
         if self.training and self.tune_visual:
             dummy_term = torch.tensor(
-                0.0, device=h_prime.device, dtype=h_prime.dtype, requires_grad=True
+                0.0, device=h_prime_llm.device, dtype=h_prime_llm.dtype, requires_grad=True
             )
             for param in self.parameters():
                 if param.requires_grad:
                     dummy_term = dummy_term + 0.0 * param.sum()
-            h_prime = h_prime + dummy_term
+            h_prime_llm = h_prime_llm + dummy_term
 
         return BatchFeature(data={
-            "backbone_equi_vision_features": h_prime,   # [B, n_equi, T_vision, D]
+            "backbone_equi_vision_features": h_prime_llm,  # [B, n_equi*T_vision + T_lang, D]
             "backbone_attention_mask": eagle_mask,
         })
