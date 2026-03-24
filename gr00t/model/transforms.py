@@ -313,6 +313,10 @@ class GR00TTransform(InvertibleModalityTransform):
         transformed_data["state"] = state
         transformed_data["state_mask"] = state_mask
 
+        # 2.1) Prepare reward
+        reward = data.get("reward.current", None)
+        transformed_data["reward"] = reward
+
         if self.training:
             # 3) Prepare actions
             transformed_data["segmentation_target"] = np.zeros((2,))

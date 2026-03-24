@@ -833,6 +833,54 @@ class LeRobotSingleDataset(Dataset):
         for i in range(len(step_indices)):
             task_indices.append(self.curr_traj_data[original_key][step_indices[i]].item())
         return self.tasks.loc[task_indices]["task"].tolist()
+    
+    def get_reward(
+        self,
+        trajectory_id: int,
+        key: str,
+        base_index: int,
+    ) -> list[float]:
+        """Get the reward data for a trajectory by step indices.
+
+        Args:
+            dataset (BaseSingleDataset): The dataset to retrieve the data from.
+            trajectory_id (int): The ID of the trajectory.
+            key (str): The key of the reward.
+            base_index (int): The base index of the trajectory.
+
+        Returns:
+            list[str]: The reward data for the trajectory and step indices. If no matching data is found, return empty strings.
+        """
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        # Get the step indices
+        step_indices = self.delta_indices[key] + base_index
+        # Get the trajectory index
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        # Get the maximum length of the trajectory
+        max_length = self.trajectory_lengths[trajectory_index]
+        # Get the end times corresponding to the closest indices
+        step_indices = np.maximum(step_indices, 0)
+        step_indices = np.minimum(step_indices, max_length - 1)
+        # Get the rewards
+        task_indices: list[int] = []
+        assert key.startswith(
+            "reward."
+        ), f"Reward key must start with 'reward.', got {key}"
+        subkey = key.replace("reward.", "")
+        reward_meta = self.lerobot_modality_meta.reward
+        assert reward_meta is not None, f"reward metadata is None for {subkey}"
+        assert (
+            subkey in reward_meta
+        ), f"reward key {subkey} not found in metadata, available reward keys: {reward_meta.keys()}"
+        subkey_meta = reward_meta[subkey]
+        original_key = subkey_meta.original_key
+        if original_key is None:
+            original_key = key
+        rewards = list()
+        for i in range(len(step_indices)):
+            rewards.append(self.curr_traj_data[original_key][step_indices[i]].item())
+        # return self.tasks.loc[task_indices]["task"].tolist()
+        return rewards
 
     def get_data_by_modality(
         self,
@@ -859,6 +907,8 @@ class LeRobotSingleDataset(Dataset):
             return self.get_state_or_action(trajectory_id, modality, key, base_index)
         elif modality == "language":
             return self.get_language(trajectory_id, key, base_index)
+        elif modality == "reward":
+            return self.get_reward(trajectory_id, key, base_index)
         else:
             raise ValueError(f"Invalid modality: {modality}")
 

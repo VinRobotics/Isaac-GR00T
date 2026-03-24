@@ -117,6 +117,10 @@ class LeRobotModalityMetadata(BaseModel):
         default=None,
         description="The metadata for the annotation modality. The keys are the new names of each annotation modality.",
     )
+    reward: Optional[dict[str, LeRobotModalityField]] = Field(
+        default=None,
+        description="The metadata for the reward modality. The keys are the new names of each reward modality"
+    )
 
     def get_key_meta(self, key: str) -> LeRobotModalityField:
         """Get the metadata for a key in the LeRobot modality metadata.
@@ -163,6 +167,15 @@ class LeRobotModalityMetadata(BaseModel):
                     f"Key: {key}, annotation key {subkey} not found in metadata, available annotation keys: {self.annotation.keys()}"
                 )
             return self.annotation[subkey]
+        elif modality == "reward":
+            assert (
+                self.reward is not None
+            ), "Trying to get annotation metadata for a dataset with no annotations"
+            if subkey not in self.reward:
+                raise ValueError(
+                    f"Key: {key}, reward key {subkey} not found in metadata, available reward keys: {self.reward.keys()}"
+                )
+            return self.reward[subkey]
         else:
             raise ValueError(f"Key: {key}, unexpected modality: {modality}")
 
