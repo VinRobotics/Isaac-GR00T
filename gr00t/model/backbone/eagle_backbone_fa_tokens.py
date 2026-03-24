@@ -410,76 +410,123 @@ class EagleBackboneFATokens(nn.Module):
     def _init_token_permutation_indices(self, grid_size: int = 16):
         """
         Initialize token permutation indices for different rotations.
-        
+
         Vision tokens are arranged in a grid (e.g., 16x16 = 256 tokens).
-        When the image is rotated, the token positions must be permuted accordingly.
-        
-        For 90° CCW rotation: position (i,j) gets content from (j, N-1-i)
-        We compute permutation for each rotation amount.
-        
-        perm[r][idx] = the source index in unrotated features that ends up at idx
-                       after rotating by r steps
-        
+        When the image is rotated by g, token at spatial position q moves to
+        position p where perm[r][p] = q  ("position p gets content from q").
+
+        Convention matches _apply_rotations_to_images / F.affine_grid with
+        matrix [[cos(a), sin(a)], [-sin(a), cos(a)]], i.e. CW rotation by
+        angle a = r * 2π/N.  For dest pixel (i, j) the source pixel is:
+
+            src_col = center + cos(a)*(j-center) + sin(a)*(i-center)
+            src_row = center - sin(a)*(j-center) + cos(a)*(i-center)
+
+        For exact 90° multiples nearest-neighbor is lossless (no two dest
+        positions round to the same source).  For non-90° angles (C8 odd
+        steps) naive rounding creates collisions; those are resolved with a
+        greedy bijective assignment that minimises total displacement.
+
+        perm[r][dest] = source index  (dest gets content from source)
+
         Args:
             grid_size: size of the token grid (sqrt of num_tokens)
         """
         self.token_grid_size = grid_size
         num_tokens = grid_size * grid_size
         N = grid_size
-        
-        # Create permutation indices for each rotation
-        # For C4/C8, each rotation is by 360/n_group degrees CCW
+        center = (N - 1) / 2
+
         token_perm_indices = torch.zeros(self.n_group, num_tokens, dtype=torch.long)
-        
-        # Helper function for single 90° CCW rotation
-        # After 90° CCW: position (i,j) contains content from (j, N-1-i)
-        def rotate_90_ccw_source(i, j, N):
-            return j, N - 1 - i
-        
+
         for r in range(self.n_group):
-            # Number of 90° rotations (for C4: r=0,1,2,3 means 0,1,2,3 times 90°)
-            # For C8: r=0,1,2,3,4,5,6,7 means 0,45,90,... degrees
-            # We handle C4 specially for exact permutation
-            
-            if self.n_group == 4:
-                # C4: each step is 90°
-                num_90_rotations = r
-            elif self.n_group == 8:
-                # C8: only r=0,2,4,6 give exact 90° multiples
-                # For r=1,3,5,7 (45° steps), we approximate
-                num_90_rotations = r // 2  # 0,0,1,1,2,2,3,3
-            else:
-                # General case using rotation formula
-                num_90_rotations = 0
-            
+            # CW rotation angle matching affine_grid convention
+            angle = r * 2 * math.pi / self.n_group
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+
+            # Compute continuous source position for each destination
+            float_src_row = []
+            float_src_col = []
             for i in range(N):
                 for j in range(N):
-                    orig_idx = i * N + j
-                    
-                    # Find source position after num_90_rotations
-                    src_i, src_j = i, j
-                    for _ in range(num_90_rotations):
-                        src_i, src_j = rotate_90_ccw_source(src_i, src_j, N)
-                    
-                    # Handle non-90° rotations (for C8 odd indices)
-                    if self.n_group == 8 and r % 2 == 1:
-                        # For 45° offsets, use approximate rotation
-                        # This won't be exact, but we use it for FA
-                        angle = r * 2 * math.pi / self.n_group
-                        ci = src_i - (N - 1) / 2
-                        cj = src_j - (N - 1) / 2
-                        cos_t = math.cos(-angle + num_90_rotations * math.pi / 2)
-                        sin_t = math.sin(-angle + num_90_rotations * math.pi / 2)
-                        new_ci = cos_t * ci - sin_t * cj
-                        new_cj = sin_t * ci + cos_t * cj
-                        src_i = int(round(new_ci + (N - 1) / 2))
-                        src_j = int(round(new_cj + (N - 1) / 2))
-                        src_i = max(0, min(N - 1, src_i))
-                        src_j = max(0, min(N - 1, src_j))
-                    
-                    src_idx = src_i * N + src_j
-                    token_perm_indices[r, orig_idx] = src_idx
-        
+                    ci = j - center   # col offset
+                    ri = i - center   # row offset
+                    float_src_col.append(center + cos_a * ci + sin_a * ri)
+                    float_src_row.append(center - sin_a * ci + cos_a * ri)
+
+            # For exact 90° multiples, nearest-neighbor is a lossless bijection
+            is_exact_90 = abs(math.sin(angle) ** 2 - round(math.sin(angle) ** 2)) < 1e-9
+
+            if is_exact_90:
+                for dest in range(num_tokens):
+                    si = int(round(float_src_row[dest]))
+                    sj = int(round(float_src_col[dest]))
+                    si = max(0, min(N - 1, si))
+                    sj = max(0, min(N - 1, sj))
+                    token_perm_indices[r, dest] = si * N + sj
+            else:
+                # Greedy bijective assignment: process destinations in order of
+                # increasing rounding error so best-fitting assignments go first.
+                rounding_err = [
+                    (float_src_row[d] - round(float_src_row[d])) ** 2
+                    + (float_src_col[d] - round(float_src_col[d])) ** 2
+                    for d in range(num_tokens)
+                ]
+                dests_sorted = sorted(range(num_tokens), key=lambda d: rounding_err[d])
+
+                assigned_src = [0] * num_tokens
+                used_srcs: set = set()
+
+                for dest in dests_sorted:
+                    sr = float_src_row[dest]
+                    sc = float_src_col[dest]
+                    best_idx = None
+                    best_dist = float("inf")
+                    # Expand search radius until an unused source is found
+                    for radius in range(N):
+                        for di in range(-radius, radius + 1):
+                            for dj in range(-radius, radius + 1):
+                                if max(abs(di), abs(dj)) != radius:
+                                    continue
+                                si = int(round(sr)) + di
+                                sj = int(round(sc)) + dj
+                                if not (0 <= si < N and 0 <= sj < N):
+                                    continue
+                                idx = si * N + sj
+                                if idx in used_srcs:
+                                    continue
+                                dist = (sr - si) ** 2 + (sc - sj) ** 2
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    best_idx = idx
+                        if best_idx is not None:
+                            break
+                    if best_idx is None:
+                        # Fallback: first unused source (should not happen)
+                        best_idx = next(i for i in range(num_tokens) if i not in used_srcs)
+                    assigned_src[dest] = best_idx
+                    used_srcs.add(best_idx)
+
+                for dest in range(num_tokens):
+                    token_perm_indices[r, dest] = assigned_src[dest]
+
+        # Enforce inverse property for non-exact rotations:
+        # _permute_tokens_for_rotation(·, r, inverse=True) uses perm[(n-r)%n].
+        # For exact 90° steps the group structure already guarantees this; for
+        # approximate (greedy) rotations we must set perm[(n-r)%n] = perm[r]⁻¹
+        # explicitly so that forward ∘ inverse == identity.
+        arange = torch.arange(num_tokens, dtype=torch.long)
+        for r in range(1, self.n_group):
+            angle = r * 2 * math.pi / self.n_group
+            is_exact_90 = abs(math.sin(angle) ** 2 - round(math.sin(angle) ** 2)) < 1e-9
+            if not is_exact_90:
+                r_inv = (self.n_group - r) % self.n_group
+                if r_inv > r:  # process each pair once
+                    inv_perm = torch.zeros(num_tokens, dtype=torch.long)
+                    inv_perm[token_perm_indices[r]] = arange
+                    token_perm_indices[r_inv] = inv_perm
+
         self.register_buffer("token_perm_indices", token_perm_indices)
 
     # ── New layers added on top of the pretrained VLM ────────────────────────
