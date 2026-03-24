@@ -189,24 +189,43 @@ class EquivariantAttention(nn.Module):
         self.Dh = dim_head
         self.scalar_dim = self.H * self.Dh
 
-        # Use regular repr for Q/K/V when both in_type and cross_type are regular
-        # (dot product of same unitary repr is invariant: (ρ(g)q)ᵀ(ρ(g)k) = qᵀk)
+        # Determine attention mode based on field types.
         cross_reprs = self.cross_type.representations
         in_reprs = in_type.representations
-        self._equivariant_qkv = (
+        both_regular = (
             all(r == gspace.regular_repr for r in cross_reprs) and
             all(r == gspace.regular_repr for r in in_reprs) and
             (self.scalar_dim % self.G == 0)
         )
+        self._equivariant_qkv = both_regular
 
-        if self._equivariant_qkv:
-            # Regular FieldType for Q, K, V — fully equivariant projections
+        if both_regular:
+            # InvQK + EquiV attention:
+            #
+            #   Q, K  ← enn.Linear(regular → trivial)  by Schur: W·ρ(g)=W → mean over G-orbit
+            #   V     ← enn.Linear(regular → regular)  equivariant, circulant
+            #   o_proj← enn.Linear(regular → regular)  equivariant, circulant
+            #
+            # Equivariance proof (same as EquivariantAttentionPool):
+            #   attn_weight = softmax(Q_inv · K_inv)  — invariant (trivial scalars) ✓
+            #   out = Σ_k  attn_weight_k · V_k        — invariant_scalar × equivariant = equivariant ✓
+            #
+            # Capacity vs old circulant Q,K:
+            #   Old  enn.Linear(regular*n_in, regular*n_out): n_in*n_out*G params, circulant constraint
+            #   New  enn.Linear(regular*n_in, trivial*scalar_dim): n_in*scalar_dim params, UNCONSTRAINED
+            #   (Schur: Hom_G(regular,trivial) = mean map → n_in free params per output → same count)
+            #   → same param count, zero circulant constraint on attention patterns
+            #
             n_regular = self.scalar_dim // self.G
-            self.qkv_type = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
-            self.q_proj = enn.Linear(in_type, self.qkv_type, bias=bias)
-            self.k_proj = enn.Linear(self.cross_type, self.qkv_type, bias=bias)
+            self.qkv_type   = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
+            self.inv_qk_type = enn.FieldType(gspace, [gspace.trivial_repr] * self.scalar_dim)
+
+            # Q, K: regular → trivial (escnn enforces group-mean → unconstrained output)
+            self.q_proj = enn.Linear(in_type,          self.inv_qk_type, bias=bias)
+            self.k_proj = enn.Linear(self.cross_type,  self.inv_qk_type, bias=bias)
+            # V, o_proj: equivariant (circulant) to preserve equivariant values
             self.v_proj = enn.Linear(self.cross_type, self.qkv_type, bias=bias)
-            self.o_proj = enn.Linear(self.qkv_type, in_type, bias=out_bias)
+            self.o_proj = enn.Linear(self.qkv_type,   in_type,       bias=out_bias)
         else:
             # Scalar FieldType for Q, K, V (cross-attention with trivial VL features)
             self.qkv_type = enn.FieldType(gspace, [gspace.trivial_repr] * self.scalar_dim)
@@ -269,24 +288,16 @@ class EquivariantAttention(nn.Module):
         B2, Tk, _ = encoder_hidden_states.shape
         assert B == B2
 
-        # Wrap into geometric tensors
-        q_geo = enn.GeometricTensor(
-            einops.rearrange(hidden_states, "b t d -> (b t) d"),
-            self.in_type
-        )
-        k_geo = enn.GeometricTensor(
-            einops.rearrange(encoder_hidden_states, "b t d -> (b t) d"),
-            self.cross_type
-        )
-        v_geo = enn.GeometricTensor(
-            einops.rearrange(encoder_hidden_states, "b t d -> (b t) d"),
-            self.cross_type
-        )
+        # Flatten for projection
+        q_flat = einops.rearrange(hidden_states,         "b t d -> (b t) d")
+        k_flat = einops.rearrange(encoder_hidden_states, "b t d -> (b t) d")
 
-        # ESCNN equivariant projection → scalar fields
-        Q = self.q_proj(q_geo).tensor     # (B*Tq, scalar_dim)
-        K = self.k_proj(k_geo).tensor     # (B*Tk, scalar_dim)
-        V = self.v_proj(v_geo).tensor     # (B*Tk, scalar_dim)
+        q_geo = enn.GeometricTensor(q_flat, self.in_type)
+        k_geo = enn.GeometricTensor(k_flat, self.cross_type)
+
+        Q = self.q_proj(q_geo).tensor    # (B*Tq, scalar_dim)  — trivial repr (invariant)
+        K = self.k_proj(k_geo).tensor    # (B*Tk, scalar_dim)  — trivial repr (invariant)
+        V = self.v_proj(k_geo).tensor    # (B*Tk, scalar_dim)  — regular repr (equivariant)
 
         # reshape back
         Q = einops.rearrange(Q, "(b t) d -> b t d", b=B)

@@ -322,9 +322,9 @@ class EagleBackboneFATokens(nn.Module):
         self.select_layer = select_layer
 
         # ── Phase 2: Invariant FA projector ─────────────────────────────────
-        # FA_inv(x) = (1/|G|) Σ_g π(g⁻¹)·f(g·x)  — spatial align only, no feature roll.
-        # Proof: FA_inv(r·x) = (1/|G|) Σ_g π(g⁻¹)·f(g·r·x)
-        #        let h=g·r → = (1/|G|) Σ_h π((h·r⁻¹)⁻¹)·f(h·x)  = FA_inv(x) ✓
+        # FA_inv(x) = (1/|G|) Σ_g f(g·x)  — plain average, no transformation.
+        # Proof: FA_inv(r·x)[p] = (1/|G|) Σ_g f(g·r·x)[p]
+        #        = (1/|G|) Σ_h f(h·x)[p]   [h=g·r, same sum over G]  = FA_inv(x) ✓
         # Output lives in vision_dim (= d_eagle) space; project to d_eagle for VLM injection.
         self.inv_fa_proj = nn.Linear(d_eagle, d_eagle)
 
@@ -972,28 +972,33 @@ class EagleBackboneFATokens(nn.Module):
             .reshape(B * n_equi, self.n_group, num_vision_tokens, vision_dim)
         )
 
-        # Apply ρ(h⁻¹) = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹) for equivariant FA,
-        # and  π(h⁻¹) only (no feature roll) for invariant FA — both in one loop.
+        # Two FA streams computed from the same rotated features in one loop:
+        #
+        #   Equivariant:  ρ(h⁻¹) ⊗ π(h⁻¹) applied before averaging → FA_equi(r·x) = ρ(r)·FA_equi(x)
+        #   Invariant:    no transformation before averaging          → FA_inv(r·x)  = FA_inv(x)
+        #
+        # Invariance proof for plain average:
+        #   FA_inv(r·x)[p] = (1/|G|) Σ_g f(g·r·x)[p]
+        #                  = (1/|G|) Σ_h f(h·x)[p]   [h = g·r, same sum over G]
+        #                  = FA_inv(x)[p]  ✓
         blocks = vision_dim // self.n_group
         transformed_equi = []
         transformed_inv  = []
         for h in range(self.n_group):
             feat_h = equi_grouped[:, h]                        # [B*n_equi, T, D]
+            # Invariant stream: no transformation, just collect raw features
+            transformed_inv.append(feat_h)
             if h == 0:
                 transformed_equi.append(feat_h)
-                transformed_inv.append(feat_h)
             else:
                 h_inv = (self.n_group - h) % self.n_group
-                # Spatial alignment shared by both streams
-                feat_spatial = feat_h[:, self.token_perm_indices[h_inv]]  # π(h⁻¹)
-                # Equivariant stream: π(h⁻¹) + ρ(h⁻¹) (feature roll)
+                # Equivariant stream: π(h⁻¹) + ρ(h⁻¹)
                 feat_equi = torch.roll(
-                    feat_spatial.reshape(B * n_equi, num_vision_tokens, self.n_group, blocks),
+                    feat_h[:, self.token_perm_indices[h_inv]]
+                    .reshape(B * n_equi, num_vision_tokens, self.n_group, blocks),
                     shifts=h_inv, dims=2,
                 ).reshape(B * n_equi, num_vision_tokens, vision_dim)
                 transformed_equi.append(feat_equi)
-                # Invariant stream: π(h⁻¹) only, no feature roll
-                transformed_inv.append(feat_spatial)
 
         # H' equivariant = [B, n_equi, T, vision_dim]
         h_prime_raw = (
@@ -1001,7 +1006,7 @@ class EagleBackboneFATokens(nn.Module):
             .mean(dim=1)
             .reshape(B, n_equi, num_vision_tokens, vision_dim)
         )
-        # H' invariant = [B, n_equi, T, vision_dim]  (no feature roll → invariant)
+        # H' invariant = [B, n_equi, T, vision_dim]  (plain average — truly invariant)
         h_inv_raw = (
             torch.stack(transformed_inv, dim=1)
             .mean(dim=1)
