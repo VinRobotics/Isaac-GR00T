@@ -754,24 +754,23 @@ class FlowmatchingActionHead(nn.Module):
 
         Both concatenated → vl_features [B, (n_equi+n_noequi)*T, cross_attn_dim]
         """
-        equi_vis = backbone_output.backbone_equi_vision_features  # [B, n_equi, T, D]
-        B, n_equi, T, D = equi_vis.shape
-
-        # ── Reshape for cross-attention ───────────────────────────────────────
-        # Skip equi_vis_self_attn (pure vision self-attention without language).
-        # equiAdapter in the backbone already embeds language conditioning per-token;
-        # running self-attention here would average it out across tokens, diluting
-        # the per-token language signal needed to distinguish tasks by instruction.
-        equi_proj = equi_vis.reshape(B * n_equi, T, D)                           # [B*n_equi, T, D]
-
-        # Flatten equi cameras: [B, n_equi*T, D]  (regular repr, language-conditioned)
-        vl_features = equi_proj.reshape(B, n_equi * T, -1)
-
-        # All-ones mask: no padding
-        attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
+        equi_vis = backbone_output.backbone_equi_vision_features
+        if equi_vis.dim() == 3:
+            # Backbone returns flat [B, n_equi*T_vis + T_lang, D] — use as-is
+            B = equi_vis.shape[0]
+            vl_features = equi_vis
+            if "backbone_attention_mask" not in backbone_output:
+                attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
+                backbone_output.data["backbone_attention_mask"] = attn_mask
+        else:
+            # Legacy 4D path: [B, n_equi, T, D]
+            B, n_equi, T, D = equi_vis.shape
+            equi_proj = equi_vis.reshape(B * n_equi, T, D)
+            vl_features = equi_proj.reshape(B, n_equi * T, -1)
+            attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
+            backbone_output.data["backbone_attention_mask"] = attn_mask
 
         backbone_output.data["vl_features"] = vl_features
-        backbone_output.data["backbone_attention_mask"] = attn_mask
         return backbone_output
 
     def process_backbone_output_vl_features(self, backbone_output: BatchFeature) -> BatchFeature:
