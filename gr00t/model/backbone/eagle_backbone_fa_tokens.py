@@ -40,7 +40,8 @@ After spatial alignment, tokens across all rotations represent the same spatial 
 
 Pipeline (EquiLLM-style adapter):
     1. FA (Phase 1): Rotate images N times, extract features, apply FA → H' (equivariant)
-    2. InvariantProjector + Eagle LLM (Phase 2): inv_proj(H') injected into LLM → vl_hidden.
+    2. Invariant FA + Eagle LLM (Phase 2): FA_inv(H') injected into LLM → vl_hidden.
+       FA_inv = (1/|G|) Σ_g π(g⁻¹)·f(g·x)  — spatial align only, no feature roll → invariant.
        vl_hidden has both image and language token hidden states (full cross-modal context).
        Text-only positions of vl_hidden projected to project_to_dim → h_lang.
     3. EquiAdapter (Phase 3): EquiLLM-style skip-connection adapter.
@@ -71,45 +72,6 @@ DEFAULT_EAGLE_PATH = os.path.join(
     os.path.dirname(gr00t.__file__), "model", "backbone", "eagle2_hg_model"
 )
 
-
-class InvariantProjector(nn.Module):
-    """
-    Phase 2: Extract invariant scalars from equivariant vision features H'.
-
-    FA uses group-major layout: D = n_group * blocks, where channels
-    [g*blocks : (g+1)*blocks] all belong to group element g.
-
-    Invariant pooling: max over the n_group dimension (group-major axis).
-    max_g( (ρ(g_r) · v)[g] ) = max_g( v[(g - r) mod N] ) = max_g( v[g] ) ✓
-
-    Result: blocks invariant scalars per token.  MLP projects blocks → out_dim.
-
-    forward: [..., D] → [..., out_dim]
-    """
-
-    def __init__(self, in_dim: int, out_dim: int, n_group: int):
-        super().__init__()
-        self.n_group = n_group
-        blocks = in_dim // n_group
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(blocks),
-            nn.Linear(blocks, out_dim),
-            nn.GELU(),
-            nn.Linear(out_dim, out_dim),
-        )
-
-    def forward(self, h_prime: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            h_prime: [..., D]  equivariant features (group-major, D = n_group * blocks)
-        Returns:
-            [..., out_dim]  invariant features
-        """
-        *shape, D = h_prime.shape
-        blocks = D // self.n_group
-        # Group-major max pool: reshape → [..., n_group, blocks], max over n_group dim
-        inv = h_prime.reshape(*shape, self.n_group, blocks).max(dim=-2).values  # [..., blocks]
-        return self.mlp(inv)
 
 
 class EquiAdapter(nn.Module):
@@ -359,14 +321,12 @@ class EagleBackboneFATokens(nn.Module):
 
         self.select_layer = select_layer
 
-        # ── Phase 2: InvariantProjector ─────────────────────────────────────
-        # Maps H' (equivariant, project_to_dim) → invariant tokens (d_eagle)
-        # for injection into the Eagle LLM in place of SigLIP tokens.
-        self.inv_projector = InvariantProjector(
-            in_dim=self.project_to_dim,
-            out_dim=d_eagle,
-            n_group=n_group,
-        )
+        # ── Phase 2: Invariant FA projector ─────────────────────────────────
+        # FA_inv(x) = (1/|G|) Σ_g π(g⁻¹)·f(g·x)  — spatial align only, no feature roll.
+        # Proof: FA_inv(r·x) = (1/|G|) Σ_g π(g⁻¹)·f(g·r·x)
+        #        let h=g·r → = (1/|G|) Σ_h π((h·r⁻¹)⁻¹)·f(h·x)  = FA_inv(x) ✓
+        # Output lives in vision_dim (= d_eagle) space; project to d_eagle for VLM injection.
+        self.inv_fa_proj = nn.Linear(d_eagle, d_eagle)
 
         # ── Phase 3: EquiAdapter (num_layers × SA+CA blocks) ────────────────
         # Each block: equivariant SA (spatial token mixing) + CA (language conditioning).
@@ -527,7 +487,7 @@ class EagleBackboneFATokens(nn.Module):
     _NEW_LAYER_PREFIXES = (
         "vision_proj.",
         "eagle_linear.",
-        "inv_projector.",
+        "inv_fa_proj.",
         "equi_adapter.",
     )
 
@@ -956,7 +916,7 @@ class EagleBackboneFATokens(nn.Module):
     def forward_eagle(self, vl_input: BatchFeature) -> tuple:
         """
         Forward through Eagle model with frame averaging on full vision tokens,
-        followed by InvariantProjector (Phase 2) and EquiAdapter (Phase 3).
+        followed by Invariant FA projection (Phase 2) and EquiAdapter (Phase 3).
 
         Frame Averaging for COVARIANT equivariance:
 
@@ -1012,25 +972,38 @@ class EagleBackboneFATokens(nn.Module):
             .reshape(B * n_equi, self.n_group, num_vision_tokens, vision_dim)
         )
 
-        # Apply ρ(h⁻¹) = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹), then average
+        # Apply ρ(h⁻¹) = spatial_perm(h⁻¹) ⊗ feature_perm(h⁻¹) for equivariant FA,
+        # and  π(h⁻¹) only (no feature roll) for invariant FA — both in one loop.
         blocks = vision_dim // self.n_group
-        transformed_features = []
+        transformed_equi = []
+        transformed_inv  = []
         for h in range(self.n_group):
             feat_h = equi_grouped[:, h]                        # [B*n_equi, T, D]
             if h == 0:
-                transformed_features.append(feat_h)
+                transformed_equi.append(feat_h)
+                transformed_inv.append(feat_h)
             else:
                 h_inv = (self.n_group - h) % self.n_group
-                feat_h = feat_h[:, self.token_perm_indices[h_inv]]
-                feat_h = torch.roll(
-                    feat_h.reshape(B * n_equi, num_vision_tokens, self.n_group, blocks),
+                # Spatial alignment shared by both streams
+                feat_spatial = feat_h[:, self.token_perm_indices[h_inv]]  # π(h⁻¹)
+                # Equivariant stream: π(h⁻¹) + ρ(h⁻¹) (feature roll)
+                feat_equi = torch.roll(
+                    feat_spatial.reshape(B * n_equi, num_vision_tokens, self.n_group, blocks),
                     shifts=h_inv, dims=2,
                 ).reshape(B * n_equi, num_vision_tokens, vision_dim)
-                transformed_features.append(feat_h)
+                transformed_equi.append(feat_equi)
+                # Invariant stream: π(h⁻¹) only, no feature roll
+                transformed_inv.append(feat_spatial)
 
-        # H' = [B, n_equi, T, vision_dim]
+        # H' equivariant = [B, n_equi, T, vision_dim]
         h_prime_raw = (
-            torch.stack(transformed_features, dim=1)
+            torch.stack(transformed_equi, dim=1)
+            .mean(dim=1)
+            .reshape(B, n_equi, num_vision_tokens, vision_dim)
+        )
+        # H' invariant = [B, n_equi, T, vision_dim]  (no feature roll → invariant)
+        h_inv_raw = (
+            torch.stack(transformed_inv, dim=1)
             .mean(dim=1)
             .reshape(B, n_equi, num_vision_tokens, vision_dim)
         )
@@ -1044,10 +1017,12 @@ class EagleBackboneFATokens(nn.Module):
         ).reshape(B, n_equi, num_vision_tokens, self.project_to_dim)
 
         # ── Phase 2: VLM pass ──────
-        # Equi: inv_projector(H') tokens; non-equi pixels injected at remaining positions.
-        # vl_features encodes both camera views via the LLM.
-        inv_tokens = self.inv_projector(h_prime)                      # [B, n_equi, T, d_eagle]
-        inv_tokens_flat = inv_tokens.reshape(B, n_equi * num_vision_tokens, -1)
+        # Invariant FA tokens (no feature roll) projected to d_eagle for VLM injection.
+        # h_inv_raw is invariant by construction: spatial-aligned average without ρ(h⁻¹).
+        inv_dtype = self.inv_fa_proj.weight.dtype
+        inv_tokens_flat = self.inv_fa_proj(
+            h_inv_raw.reshape(B, n_equi * num_vision_tokens, vision_dim).to(inv_dtype)
+        )                                                              # [B, n_equi*T, d_eagle]
         vl_hidden, text_mask = self._forward_llm_with_injected_vision(
             eagle_input, inv_tokens_flat, noequi_pixels
         )
