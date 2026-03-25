@@ -331,17 +331,21 @@ def check_equivariance_tokens(
 ) -> List[Tuple[Any, float, float, float]]:
     """
     Test equivariance of EagleBackboneFATokens output.
-    
-    Equivariance property: f(g·x) = ρ(g) · f(x)
-    
-    Where:
-    - g·x = rotated input image
-    - f = FA backbone
-    - ρ(g) = output representation = spatial_perm(g) ⊗ feature_perm(g)
-    
-    The FA construction guarantees this property:
-    FA(g·x) = ρ(g) · FA(x)
-    
+
+    The backbone forward() returns:
+        backbone_equi_vision_features: [B, n_equi*T_vision + T_lang, D]
+    where:
+      - first n_equi*T_vision tokens are equivariant vision features (group-major)
+      - remaining T_lang tokens are invariant language features
+
+    Equivariance property (vision tokens only):
+        vision_tokens(f(g·x)) = ρ(g) · vision_tokens(f(x))
+
+    Where ρ(g) = spatial_perm(g) ⊗ feature_perm(g)
+
+    Invariance property (language tokens):
+        lang_tokens(f(g·x)) ≈ lang_tokens(f(x))   (up to tolerance)
+
     Args:
         model: EagleBackboneFATokens model
         device: torch device
@@ -351,131 +355,153 @@ def check_equivariance_tokens(
         atol: absolute tolerance
         rtol: relative tolerance
         verbose: print detailed results
-        
+
     Returns:
         List of tuples: (group_element, max_error, mean_error, variance)
     """
     model.eval()
     n_group = model.n_group
     grid_size = model.token_grid_size
+    n_equi = len(model.rotate_image_indices)
+    T_vision = grid_size * grid_size   # e.g. 16*16 = 256
+    n_vis_tokens = n_equi * T_vision
 
     # Create base input and save visualization
-    base_input = create_test_input(batch_size, num_images, device=device, 
-                                   save_visualization=True, 
+    base_input = create_test_input(batch_size, num_images, device=device,
+                                   save_visualization=True,
                                    save_path="test_tokens_input_image.png")
-    
+
     errors = []
     all_passed = True
     group = gspaces.no_base_space(CyclicGroup(n_group))
-    
+
     # Get token permutation indices from model
     token_perm_indices = model.token_perm_indices
-    
-    with torch.no_grad():
-        # f(x) = FA(x)
-        output_original = model(BatchFeature(data=base_input))
-        vision_original = output_original["backbone_equi_vision_features"].float()
 
-        B, num_imgs, T_vision, D_vision = vision_original.shape
-        
+    with torch.no_grad():
+        # f(x): raw output [B, n_equi*T_vision + T_lang, D]
+        output_original = model(BatchFeature(data=base_input))
+        raw_original = output_original["backbone_equi_vision_features"].float()
+
+        B, total_tokens, D_vision = raw_original.shape
+        T_lang = total_tokens - n_vis_tokens
+
+        # Extract vision tokens and reshape to [B, n_equi, T_vision, D]
+        vision_original = raw_original[:, :n_vis_tokens, :].reshape(B, n_equi, T_vision, D_vision)
+        # Language tokens (invariant): [B, T_lang, D]
+        lang_original = raw_original[:, n_vis_tokens:, :]
+
         if verbose:
-            print(f"\nVision features shape: {vision_original.shape}")
+            print(f"\nBackbone output shape: {raw_original.shape}")
             print(f"  Batch size: {B}")
-            print(f"  Num images: {num_imgs}")
-            print(f"  Num vision tokens: {T_vision}")
+            print(f"  n_equi cameras: {n_equi}")
+            print(f"  Num vision tokens per camera: {T_vision}")
+            print(f"  Num language tokens: {T_lang}")
             print(f"  Vision dim: {D_vision}")
             print(f"  Token grid: {grid_size}x{grid_size}")
             print(f"N_group (CN): C{n_group}")
             print("-" * 70)
-            print("Testing EQUIVARIANCE: f(g·x) ≈ ρ(g) · f(x)")
+            print("Testing EQUIVARIANCE (vision): f(g·x) ≈ ρ(g) · f(x)")
+            print("Testing INVARIANCE (language): lang(f(g·x)) ≈ lang(f(x))")
             print("Where ρ(g) = spatial_perm(g) ⊗ feature_perm(g)")
             print("-" * 70)
-        
+
         for k in list(group.testing_elements):
             angle = k.value * 2 * math.pi / n_group
             r = k.value
-            
+
             if verbose:
                 print(f"  Testing g_{r} ({math.degrees(angle):6.1f}°)...")
-            
+
             # g·x: Rotate the input images
             rotated_pixel_values = rotate_image(
                 base_input["eagle_pixel_values"],
                 angle
             )
-            
+
             save_test_image(rotated_pixel_values, f"test_tokens_rotated_image_g{r}.png")
-            
+
             rotated_input = {
                 **base_input,
                 "eagle_pixel_values": rotated_pixel_values
             }
-            
-            # f(g·x) = FA(g·x)
+
+            # f(g·x): raw output [B, n_equi*T_vision + T_lang, D]
             output_rotated = model(BatchFeature(data=rotated_input))
-            vision_rotated = output_rotated["backbone_equi_vision_features"].float()
-            
-            # Compute ρ(g) · f(x):
+            raw_rotated = output_rotated["backbone_equi_vision_features"].float()
+
+            # Extract vision and language from rotated output
+            vision_rotated = raw_rotated[:, :n_vis_tokens, :].reshape(B, n_equi, T_vision, D_vision)
+            lang_rotated = raw_rotated[:, n_vis_tokens:, :]
+
+            # Compute ρ(g) · f(x) for vision tokens:
             # ρ(g) = spatial_perm(g) ⊗ feature_perm(g)
-            # 1. Spatial permutation: token at p moves to π(g)(p)
-            # 2. Feature permutation: regular repr cyclic shift by r
-            
+            # Applied identically across all n_equi cameras.
             if r == 0:
-                expected = vision_original
+                expected_vision = vision_original
+                expected_lang = lang_original
             else:
-                # Reshape: [B, num_imgs, T, D] -> [B*num_imgs, T, D]
-                vis_flat = vision_original.reshape(B * num_imgs, T_vision, D_vision)
-                
+                # Reshape: [B, n_equi, T, D] -> [B*n_equi, T, D]
+                vis_flat = vision_original.reshape(B * n_equi, T_vision, D_vision)
+
                 # Step 1: Spatial permutation π(g)
                 # token_perm_indices[r][i] = source index that moves TO position i
-                # We want: result[i] = input[π(g)(i)] which is input[perm[i]]
                 spatial_perm = token_perm_indices[r]
                 vis_permuted = vis_flat[:, spatial_perm, :]
-                
+
                 # Step 2: Feature permutation (regular representation)
                 # ρ_reg(g_r) shifts blocks by r positions
                 blocks = D_vision // n_group
-                vis_blocks = vis_permuted.reshape(B * num_imgs, T_vision, n_group, blocks)
+                vis_blocks = vis_permuted.reshape(B * n_equi, T_vision, n_group, blocks)
                 vis_shifted = torch.roll(vis_blocks, shifts=r, dims=2)
-                vis_transformed = vis_shifted.reshape(B * num_imgs, T_vision, D_vision)
-                
-                expected = vis_transformed.reshape(B, num_imgs, T_vision, D_vision)
-            
-            # Check: f(g·x) ≈ ρ(g) · f(x)
-            errs = (vision_rotated - expected).float().cpu().numpy()
-            errs_flat = np.abs(errs).reshape(-1)
-            
-            max_err = errs_flat.max()
-            mean_err = errs_flat.mean()
-            var_err = errs_flat.var()
-            
-            is_close = mean_err < atol
-            
-            status = "✓ PASS" if is_close else "✗ FAIL"
+                vis_transformed = vis_shifted.reshape(B * n_equi, T_vision, D_vision)
+
+                expected_vision = vis_transformed.reshape(B, n_equi, T_vision, D_vision)
+                # Language tokens are invariant → no transformation
+                expected_lang = lang_original
+
+            # ── Vision equivariance check ──────────────────────────────────────
+            vis_errs = (vision_rotated - expected_vision).float().cpu().numpy()
+            vis_errs_flat = np.abs(vis_errs).reshape(-1)
+            max_err  = vis_errs_flat.max()
+            mean_err = vis_errs_flat.mean()
+            var_err  = vis_errs_flat.var()
+            vis_passed = mean_err < atol
+
+            # ── Language invariance check ──────────────────────────────────────
+            lang_errs = (lang_rotated - expected_lang).float().cpu().numpy()
+            lang_mean = np.abs(lang_errs).mean()
+            lang_passed = lang_mean < atol
+
+            is_close = vis_passed  # primary criterion is vision equivariance
+
+            vis_status  = "✓" if vis_passed  else "✗"
+            lang_status = "✓" if lang_passed else "✗"
             if verbose:
                 print(f"    g_{r} ({math.degrees(angle):6.1f}°): "
-                      f"max={max_err:.2e}, mean={mean_err:.2e} [{status}]")
-            
+                      f"vis max={max_err:.2e}, mean={mean_err:.2e} [{vis_status}]  "
+                      f"lang mean={lang_mean:.2e} [{lang_status}]")
+
             if not is_close:
                 all_passed = False
                 if verbose:
-                    print(f"    ERROR: f(g·x) ≠ ρ(g)·f(x) for g_{r}!")
-            
+                    print(f"    ERROR: vision equivariance f(g·x) ≠ ρ(g)·f(x) for g_{r}!")
+
             errors.append((k, max_err, mean_err, var_err))
-    
+
     if verbose:
         print("-" * 70)
         if all_passed:
             print(f"✓ All equivariance tests PASSED!")
         else:
             print(f"✗ Some equivariance tests FAILED!")
-        
-        max_errors = [e[1] for e in errors]
+
+        max_errors  = [e[1] for e in errors]
         mean_errors = [e[2] for e in errors]
         print(f"\nSummary:")
-        print(f"  Overall max error: {max(max_errors):.2e}")
+        print(f"  Overall max error:  {max(max_errors):.2e}")
         print(f"  Overall mean error: {np.mean(mean_errors):.2e}")
-    
+
     return errors
 
 
@@ -715,7 +741,7 @@ def main():
     print("\n" + "=" * 70)
     print("Test 1: Vision Features Equivariance (Full Tokens)")
     print("  f(g*x) = g*f(x) where g is rotation, f is backbone")
-    print("  Output shape: [B, num_imgs, T_vision, D_vision]")
+    print("  Output shape: [B, n_equi*T_vision + T_lang, D]  (vision + language tokens)")
     print("=" * 70)
     
     try:
