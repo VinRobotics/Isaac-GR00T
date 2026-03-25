@@ -862,7 +862,6 @@ class LeRobotSingleDataset(Dataset):
         step_indices = np.maximum(step_indices, 0)
         step_indices = np.minimum(step_indices, max_length - 1)
         # Get the rewards
-        task_indices: list[int] = []
         assert key.startswith(
             "reward."
         ), f"Reward key must start with 'reward.', got {key}"
@@ -878,7 +877,10 @@ class LeRobotSingleDataset(Dataset):
             original_key = key
         rewards = list()
         for i in range(len(step_indices)):
-            rewards.append(self.curr_traj_data[original_key][step_indices[i]].item())
+            if original_key not in self.curr_traj_data.columns:
+                rewards.append(0)
+            else:
+                rewards.append(self.curr_traj_data[original_key][step_indices[i]].item())
         # return self.tasks.loc[task_indices]["task"].tolist()
         return rewards
 

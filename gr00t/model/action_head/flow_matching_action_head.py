@@ -453,8 +453,11 @@ class FlowmatchingActionHead(nn.Module):
 
         # Inject advantage token
         if self.config.use_advantage_conditioning:
-            # adv_label = action_input.get("advantage_label", None)
-            adv_label = action_input.get("advantage_label", torch.full([action_input.action.shape[0],], AdvantageEmbedding.POS_IDX))
+            assert "reward" in action_input.keys(), f"No reward found in {action_input.keys()=}"
+            reward = torch.squeeze(action_input["reward"], dim=-1)
+
+            adv_label = torch.where(reward < 0, AdvantageEmbedding.NEG_IDX, AdvantageEmbedding.POS_IDX)
+
             vl_embs, vl_attn_mask = self._apply_advantage_conditioning(
                 vl_embs, vl_attn_mask, adv_label
             )
