@@ -110,12 +110,15 @@ class EagleBackbone(nn.Module):
         eagle_features = eagle_output.hidden_states[self.select_layer]
 
         eagle_features = self.eagle_linear(eagle_features)
-        return eagle_features, eagle_input["attention_mask"]
+        
+        visual_mask = (eagle_input["input_ids"] == self.eagle_model.image_token_index)
+        
+        return eagle_features, eagle_input["attention_mask"], visual_mask
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
 
-        eagle_embeds, eagle_mask = self.forward_eagle(vl_input)
+        eagle_embeds, eagle_mask, eagle_visual_mask = self.forward_eagle(vl_input)
 
         # YL (TODO HACK): to resolve DDP issue when tune_visual=True
         # Ensure all trainable parameters in vision_model are used in the forward pass for DDP compatibility
@@ -129,5 +132,5 @@ class EagleBackbone(nn.Module):
             eagle_embeds = eagle_embeds + dummy_term
 
         return BatchFeature(
-            data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
+            data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask, "backbone_visual_mask": eagle_visual_mask}
         )  # [B, T2, hidden_size]

@@ -137,6 +137,8 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+    state_dropout_prob: float = 0.0
+    alt_cond_injection: bool = False
 
 #####################################################################################
 # Helper functions
@@ -265,6 +267,8 @@ def main(config: ArgsConfig):
         tune_visual=config.tune_visual,  # backbone's vision tower
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
+        state_dropout_prob=config.state_dropout_prob,
+        alt_cond_injection=config.alt_cond_injection,
     )
 
     if config.use_action_conditioning:
@@ -397,7 +401,7 @@ def main(config: ArgsConfig):
         save_strategy="steps",
         save_steps=config.save_steps,
         # evaluation_strategy="no",
-        save_total_limit=5,
+        save_total_limit=None,
         report_to=config.report_to,
         seed=42,
         do_eval=False,

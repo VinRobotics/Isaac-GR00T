@@ -24,13 +24,21 @@ from gr00t.data.transform.state_action import (
     StateActionSinCosTransform,
     StateActionToTensor,
     StateActionTransform,
+    StateActionPerturbationVRH31,
+    StateActionDropout,
 )
 from gr00t.data.transform.video import (
     VideoColorJitter,
+    VideoCropCenter,
+    VideoCropTopLeft,
     VideoCrop,
     VideoResize,
     VideoToNumpy,
     VideoToTensor,
+    VideoRandomlyRandomAffine,
+    VideoRandomPerspective,
+    VideoRandomPosterize,
+    VideoRandomlyGaussianNoise,
 )
 from gr00t.model.transforms import GR00TTransform
 
@@ -1322,7 +1330,426 @@ class VRH2TwotHand2CamVelEffConfig(BaseDataConfig):
 ###########################################################################################
 
 class VRH3TwotHandConfig(BaseDataConfig):
-    video_keys = ["video.cam_front"]
+    video_keys = ["video.cam_head"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH3TwotHandRVTConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_virtual_left", "video.cam_virtual_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH3TwotHandRVTConfig2(BaseDataConfig):
+    video_keys = [
+        "video.cam_head", 
+        "video.cam_virtual_leftTD", 
+        "video.cam_virtual_rightTD",
+        "video.cam_virtual_leftBU", 
+        "video.cam_virtual_rightBU"
+    ]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH3TwotHandRVTConfig3(BaseDataConfig):
+    video_keys = [
+        "video.cam_head",
+        "video.cam_virtual_head", 
+        "video.cam_virtual_leftTD", 
+        "video.cam_virtual_rightTD",
+        "video.cam_virtual_leftBU", 
+        "video.cam_virtual_rightBU"
+    ]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH3TwotHandRVTConfig4(BaseDataConfig):
+    video_keys = [
+        "video.cam_virtual_head", 
+        "video.cam_virtual_leftTD", 
+        "video.cam_virtual_rightTD",
+        "video.cam_virtual_leftBU", 
+        "video.cam_virtual_rightBU"
+    ]
     state_keys = [
         "state.left_arm",
         "state.right_arm",
@@ -1597,6 +2024,4387 @@ class AlohaRightArm30Config(BaseDataConfig):
 
 ###########################################################################################
 
+class VRH3TwotHandExtraVirtualConfig(BaseDataConfig):
+    video_keys = [
+        "video.cam_head", 
+        "video.cam_left", 
+        "video.cam_right", 
+        "video.cam_virtual_leftBU",
+        "video.cam_virtual_rightBU"
+    ]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH3TwotHandExtraOnlyVirtualConfig(BaseDataConfig):
+    video_keys = [
+        "video.cam_virtual_head", 
+        "video.cam_virtual_left", 
+        "video.cam_virtual_right", 
+        "video.cam_virtual_leftBU",
+        "video.cam_virtual_rightBU"
+    ]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH3TwotHandDoubleExtraVirtualConfig(BaseDataConfig):
+    video_keys = [
+        "video.cam_head", 
+        "video.cam_left", 
+        "video.cam_right", 
+        "video.cam_virtual_leftBU",
+        "video.cam_virtual_rightBU",
+        "video.cam_virtual_leftTD",
+        "video.cam_virtual_rightTD"
+    ]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH3TwotHandDoubleExtraOnlyVirtualConfig(BaseDataConfig):
+    video_keys = [
+        "video.cam_virtual_head", 
+        "video.cam_virtual_left", 
+        "video.cam_virtual_right", 
+        "video.cam_virtual_leftBU",
+        "video.cam_virtual_rightBU",
+        "video.cam_virtual_leftTD",
+        "video.cam_virtual_rightTD",
+        
+    ]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH3TwotHandVirtualConfig(BaseDataConfig):
+    video_keys = [
+        "video.cam_virtual_head", 
+        "video.cam_virtual_leftTD", 
+        "video.cam_virtual_rightTD",
+        "video.cam_virtual_leftBU", 
+        "video.cam_virtual_rightBU"
+    ]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH31TwoArmsConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH31TwoArmsQuant2Config(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH31TwoArmsQuant3Config(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_arm",
+        "state.effort_right_arm",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 48, 3))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH31TwoArmsExcludeEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH31TwoArmsQuant2ExcludeEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH31TwoArmsQuant3ExcludeEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_arm",
+        "state.velocity_right_arm",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 48, 3))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH31TwoArmsIncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH31TwoArmsQuant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH31TwoArmsCropIncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCropCenter(apply_to=["video.cam_head"], height=int(336 * 1.05), width=int(224 * 1.05), scale=0.95),
+            VideoCropTopLeft(apply_to=["video.cam_right"], height=int(336 * 1.05), width=int(224 * 1.05), scale=0.95),
+            VideoCrop(apply_to=["video.cam_left"], scale=0.95),
+            VideoResize(apply_to=["video.cam_head", "video.cam_right"], height=224, width=224, interpolation="linear"),
+            VideoResize(apply_to=["video.cam_left"], height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH31TwoArmsHor50IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(51))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH31TwoArmsHor50Quant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 102, 2))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH31TwoArmsHor50CropIncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(51))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCropCenter(apply_to=["video.cam_head"], height=int(336 * 1.05), width=int(224 * 1.05), scale=0.95),
+            VideoCropTopLeft(apply_to=["video.cam_right"], height=int(336 * 1.05), width=int(224 * 1.05), scale=0.95),
+            VideoCrop(apply_to=["video.cam_left"], scale=0.95),
+            VideoResize(apply_to=["video.cam_head", "video.cam_right"], height=224, width=224, interpolation="linear"),
+            VideoResize(apply_to=["video.cam_left"], height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH31TwoArmsHor50Quant2CropIncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 102, 2))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCropCenter(apply_to=["video.cam_head"], height=int(336 * 1.05), width=int(224 * 1.05), scale=0.95),
+            VideoCropTopLeft(apply_to=["video.cam_right"], height=int(336 * 1.05), width=int(224 * 1.05), scale=0.95),
+            VideoCrop(apply_to=["video.cam_left"], scale=0.95),
+            VideoResize(apply_to=["video.cam_head", "video.cam_right"], height=224, width=224, interpolation="linear"),
+            VideoResize(apply_to=["video.cam_left"], height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH31LeftArmIncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        # "state.right_arm",
+        "state.left_hand",
+        # "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        # "action.right_arm",
+        "action.left_hand",
+        # "action.right_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH31LeftArmQuant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        # "state.right_arm",
+        "state.left_hand",
+        # "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        # "action.right_arm",
+        "action.left_hand",
+        # "action.right_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH31LeftArmExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        # "state.right_arm",
+        "state.left_hand",
+        # "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        # "action.right_arm",
+        "action.left_hand",
+        # "action.right_hand",
+        # "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH31LeftArmQuant2ExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        # "state.right_arm",
+        "state.left_hand",
+        # "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        # "action.right_arm",
+        "action.left_hand",
+        # "action.right_hand",
+        # "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH31LeftArm_Chunk8Step3_Hor50Quant2_IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        # "state.right_arm",
+        "state.left_hand",
+        # "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        # "state.effort_left_arm",
+        # "state.effort_right_arm",
+        # "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        # "action.right_arm",
+        "action.left_hand",
+        # "action.right_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = list(range(-24, 1, 3))
+    action_indices = list(range(0, 102, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH31LeftArmIncludeTaskProgressExcludeVelocityConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_arm",
+        # "state.right_arm",
+        "state.left_hand",
+        # "state.right_hand",
+        # "state.velocity_left_arm",
+        # "state.velocity_right_arm",
+        # "state.velocity_left_hand",
+        # "state.velocity_right_hand",
+        "state.effort_left_arm",
+        # "state.effort_right_arm",
+        "state.effort_left_hand",
+        # "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        # "action.right_arm",
+        "action.left_hand",
+        # "action.right_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+                # target_rotations={
+                #     "state.end_effector_rotation_relative": "rotation_6d",
+                #     "state.base_rotation": "rotation_6d",
+                # },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311LeftArmStereoQuant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_head_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand"
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311LeftArmStereoQuant3IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_head_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand"
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 48, 3))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311GripperOpenQuant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.gripper_open"
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.gripper_open",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311GripperOpenStereoQuant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_head_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.gripper_open"
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.gripper_open",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311GripperOpenStereoQuant3IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_head_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.gripper_open"
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.gripper_open",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 48, 3))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311_WholeBody_LeftArmHor16Quant2_StereoIncludeTaskProgressConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_head_right"]
+    state_keys = [
+        "state.left_hip",
+        "state.left_knee",
+        "state.left_ankle",
+        "state.right_hip",
+        "state.right_knee",
+        "state.right_ankle",
+        "state.waist",
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.right_shoulder",
+        "state.right_elbow",
+        "state.right_wrist",
+        "state.head",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_hip",
+        "state.velocity_left_knee",
+        "state.velocity_left_ankle",
+        "state.velocity_right_hip",
+        "state.velocity_right_knee",
+        "state.velocity_right_ankle",
+        "state.velocity_waist",
+        "state.velocity_left_shoulder",
+        "state.velocity_left_elbow",
+        "state.velocity_left_wrist",
+        "state.velocity_right_shoulder",
+        "state.velocity_right_elbow",
+        "state.velocity_right_wrist",
+        "state.velocity_head",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_hip",
+        "state.effort_left_knee",
+        "state.effort_left_ankle",
+        "state.effort_right_hip",
+        "state.effort_right_knee",
+        "state.effort_right_ankle",
+        "state.effort_waist",
+        "state.effort_left_shoulder",
+        "state.effort_left_elbow",
+        "state.effort_left_wrist",
+        "state.effort_right_shoulder",
+        "state.effort_right_elbow",
+        "state.effort_right_wrist",
+        "state.effort_head",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311_WholeBodyChunk9Step2_LeftArmHor16Quant2_StereoIncludeTaskProgressConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_head_right"]
+    state_keys = [
+        "state.left_hip",
+        "state.left_knee",
+        "state.left_ankle",
+        "state.right_hip",
+        "state.right_knee",
+        "state.right_ankle",
+        "state.waist",
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.right_shoulder",
+        "state.right_elbow",
+        "state.right_wrist",
+        "state.head",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_hip",
+        "state.velocity_left_knee",
+        "state.velocity_left_ankle",
+        "state.velocity_right_hip",
+        "state.velocity_right_knee",
+        "state.velocity_right_ankle",
+        "state.velocity_waist",
+        "state.velocity_left_shoulder",
+        "state.velocity_left_elbow",
+        "state.velocity_left_wrist",
+        "state.velocity_right_shoulder",
+        "state.velocity_right_elbow",
+        "state.velocity_right_wrist",
+        "state.velocity_head",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_hip",
+        "state.effort_left_knee",
+        "state.effort_left_ankle",
+        "state.effort_right_hip",
+        "state.effort_right_knee",
+        "state.effort_right_ankle",
+        "state.effort_waist",
+        "state.effort_left_shoulder",
+        "state.effort_left_elbow",
+        "state.effort_left_wrist",
+        "state.effort_right_shoulder",
+        "state.effort_right_elbow",
+        "state.effort_right_wrist",
+        "state.effort_head",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = list(range(-16, 1, 2))
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311_WholeBodyChunk9Step2_LeftArmHor16Quant3_StereoIncludeTaskProgressConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_head_right"]
+    state_keys = [
+        "state.left_hip",
+        "state.left_knee",
+        "state.left_ankle",
+        "state.right_hip",
+        "state.right_knee",
+        "state.right_ankle",
+        "state.waist",
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.right_shoulder",
+        "state.right_elbow",
+        "state.right_wrist",
+        "state.head",
+        "state.left_hand",
+        "state.right_hand",
+        "state.velocity_left_hip",
+        "state.velocity_left_knee",
+        "state.velocity_left_ankle",
+        "state.velocity_right_hip",
+        "state.velocity_right_knee",
+        "state.velocity_right_ankle",
+        "state.velocity_waist",
+        "state.velocity_left_shoulder",
+        "state.velocity_left_elbow",
+        "state.velocity_left_wrist",
+        "state.velocity_right_shoulder",
+        "state.velocity_right_elbow",
+        "state.velocity_right_wrist",
+        "state.velocity_head",
+        "state.velocity_left_hand",
+        "state.velocity_right_hand",
+        "state.effort_left_hip",
+        "state.effort_left_knee",
+        "state.effort_left_ankle",
+        "state.effort_right_hip",
+        "state.effort_right_knee",
+        "state.effort_right_ankle",
+        "state.effort_waist",
+        "state.effort_left_shoulder",
+        "state.effort_left_elbow",
+        "state.effort_left_wrist",
+        "state.effort_right_shoulder",
+        "state.effort_right_elbow",
+        "state.effort_right_wrist",
+        "state.effort_head",
+        "state.effort_left_hand",
+        "state.effort_right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = list(range(-16, 1, 2))
+    action_indices = list(range(0, 48, 3))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH311LeftArmAugImgQuant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoRandomlyRandomAffine(
+                apply_to=self.video_keys[:1],
+                degrees=10,
+                translate=(0.05, 0.05),
+                scale=(0.85, 1.05),
+                shear=[-10, 10, -10, 10],
+                height=600,
+                width=960,
+                p=0.5
+            ),
+            VideoRandomPerspective(
+                apply_to=self.video_keys[:1],
+                distortion_scale=0.15,
+                p=0.5
+            ),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoRandomlyRandomAffine(
+                apply_to=self.video_keys[1:],
+                degrees=10,
+                translate=(0.05, 0.05),
+                scale=(0.85, 1.05),
+                shear=[-10, 10, -10, 10],
+                height=480,
+                width=640,
+                p=0.5
+            ),
+            VideoRandomPerspective(
+                apply_to=self.video_keys[1:],
+                distortion_scale=0.15,
+                p=0.5
+            ),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
+
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoRandomPosterize(apply_to=self.video_keys, bits=4, p=0.3),
+            VideoRandomlyGaussianNoise(apply_to=self.video_keys, mean=0.0, sigma=0.05, p=0.7),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            # StateActionPerturbationVRH31(
+            #     apply_to=self.state_keys,
+            #     perturbation_prob=0.7,
+            #     min_noises={
+            #         "state.left_shoulder": [-0.075, -0.075, -0.075],
+            #         "state.left_elbow": [-0.075],
+            #         "state.left_wrist": [-0.075, -0.075, -0.075],
+            #         "state.left_hand": [-0.075, -0.075, -0.075, -0.075, -0.075, -0.075],
+            #     },
+            #     max_noises={
+            #         "state.left_shoulder": [0.075, 0.075, 0.075],
+            #         "state.left_elbow": [0.075],
+            #         "state.left_wrist": [0.075, 0.075, 0.075],
+            #         "state.left_hand": [0.075, 0.075, 0.075, 0.075, 0.075, 0.075],
+            #     },
+            #     min_state_limits={
+            #         "state.left_shoulder": [-3.14, 0.0, -2.967],
+            #         "state.left_elbow": [-0.524],
+            #         "state.left_wrist": [-2.967, -1.134, -0.96],
+            #         "state.left_hand": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            #     },
+            #     max_state_limits={
+            #         "state.left_shoulder": [1.047, 2.356, 2.967],
+            #         "state.left_elbow": [1.571],
+            #         "state.left_wrist": [2.967, 0.698, 0.96],
+            #         "state.left_hand": [1.658, 0.62, 1.4381, 1.4381, 1.4381, 1.4381],
+            #     },
+            # ),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311LeftArmRandDropoutQuant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoRandomlyRandomAffine(
+                apply_to=self.video_keys[:1],
+                degrees=10,
+                translate=(0.05, 0.05),
+                scale=(0.85, 1.05),
+                shear=[-10, 10, -10, 10],
+                height=600,
+                width=960,
+                p=0.5
+            ),
+            VideoRandomPerspective(
+                apply_to=self.video_keys[:1],
+                distortion_scale=0.15,
+                p=0.5
+            ),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoRandomlyRandomAffine(
+                apply_to=self.video_keys[1:],
+                degrees=10,
+                translate=(0.05, 0.05),
+                scale=(0.85, 1.05),
+                shear=[-10, 10, -10, 10],
+                height=480,
+                width=640,
+                p=0.5
+            ),
+            VideoRandomPerspective(
+                apply_to=self.video_keys[1:],
+                distortion_scale=0.15,
+                p=0.5
+            ),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
+
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoRandomPosterize(apply_to=self.video_keys, bits=4, p=0.3),
+            VideoRandomlyGaussianNoise(apply_to=self.video_keys, mean=0.0, sigma=0.05, p=0.7),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionPerturbationVRH31(
+                apply_to=self.state_keys,
+                perturbation_prob=0.7,
+                min_noises={
+                    "state.left_shoulder": [-0.05, -0.05, -0.05],
+                    "state.left_elbow": [-0.05],
+                    "state.left_wrist": [-0.05, -0.05, -0.05],
+                    "state.left_hand": [-0.05, -0.05, -0.05, -0.05, -0.05, -0.05],
+                },
+                max_noises={
+                    "state.left_shoulder": [0.05, 0.05, 0.05],
+                    "state.left_elbow": [0.05],
+                    "state.left_wrist": [0.05, 0.05, 0.05],
+                    "state.left_hand": [0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
+                },
+                min_state_limits={
+                    "state.left_shoulder": [-3.14, 0.0, -2.967],
+                    "state.left_elbow": [-0.524],
+                    "state.left_wrist": [-2.967, -1.134, -0.96],
+                    "state.left_hand": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                },
+                max_state_limits={
+                    "state.left_shoulder": [1.047, 2.356, 2.967],
+                    "state.left_elbow": [1.571],
+                    "state.left_wrist": [2.967, 0.698, 0.96],
+                    "state.left_hand": [1.658, 0.62, 1.4381, 1.4381, 1.4381, 1.4381],
+                },
+            ),
+            StateActionDropout(apply_to=self.state_keys, dropout_prob=0.3),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311LeftArmQuant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311LeftArmQuant2ExcludeVelocityConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand",
+        "state.effort_left_shoulder",
+        "state.effort_left_elbow",
+        "state.effort_left_wrist",
+        "state.effort_left_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311LeftArmQuant2ExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311LeftArmQuant2IncludeTaskProgressConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand",
+        "state.velocity_left_shoulder",
+        "state.velocity_left_elbow",
+        "state.velocity_left_wrist",
+        "state.velocity_left_hand",
+        "state.effort_left_shoulder",
+        "state.effort_left_elbow",
+        "state.effort_left_wrist",
+        "state.effort_left_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311LeftArmQuant2IncludeDropoutExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            StateActionDropout(apply_to=self.state_keys, dropout_prob=0.3),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311LeftArmQuant2IncludeDropoutTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            StateActionDropout(apply_to=self.state_keys, dropout_prob=0.3),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311LeftArmRVTQuant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_head", "video.cam_virtual_view3", "video.cam_left", "video.cam_right"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys[:2]),
+            VideoCrop(apply_to=self.video_keys[:2], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:2], height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[2:]),
+            VideoCrop(apply_to=self.video_keys[2:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[2:], height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
+class VRH311LeftArmStereo4RVTQuant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_virtual_head", "video.cam_virtual_view3", "video.cam_virtual_view0", "video.cam_virtual_view2"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+    
+###########################################################################################
+
+class VRH311LeftArmStereo5RVTQuant2IncludeTaskProgressExcludeVelocityEffortConfig(BaseDataConfig):
+    video_keys = ["video.cam_virtual_head", "video.cam_head_right", "video.cam_virtual_view3", "video.cam_virtual_view0", "video.cam_virtual_view2"]
+    state_keys = [
+        "state.left_shoulder",
+        "state.left_elbow",
+        "state.left_wrist",
+        "state.left_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.left_hand",
+        "action.task_progress",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(0, 32, 2))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.state_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+###########################################################################################
+
 DATA_CONFIG_MAP = {
     "fourier_gr1_arms_waist": FourierGr1ArmsWaistDataConfig(),
     "fourier_gr1_arms_only": FourierGr1ArmsOnlyDataConfig(),
@@ -1617,6 +6425,58 @@ DATA_CONFIG_MAP = {
     "vrh2_two_hand_2_cam": VRH2TwotHand2CamConfig(),
     "vrh2_two_hand_2_cam_vel_eff": VRH2TwotHand2CamVelEffConfig(),
     "vrh3_two_hand": VRH3TwotHandConfig(),
+    "vrh3_two_hand_rvt": VRH3TwotHandRVTConfig(),
+    "vrh3_two_hand_rvt2": VRH3TwotHandRVTConfig2(),
+    "vrh3_two_hand_rvt3": VRH3TwotHandRVTConfig3(),
+    "vrh3_two_hand_rvt4": VRH3TwotHandRVTConfig4(),
+    "vrh3_two_hand_extra_virtual": VRH3TwotHandExtraVirtualConfig(),
+    "vrh3_two_hand_extra_only_virtual": VRH3TwotHandExtraOnlyVirtualConfig(),
+    "vrh3_two_hand_double_extra_virtual": VRH3TwotHandDoubleExtraVirtualConfig(),
+    "vrh3_two_hand_double_extra_only_virtual": VRH3TwotHandDoubleExtraOnlyVirtualConfig(),
+    "vrh3_two_hand_virtual": VRH3TwotHandVirtualConfig(),
+    "vr_h31_two_arms": VRH31TwoArmsConfig(),
+    "vr_h31_two_arms_quant2": VRH31TwoArmsQuant2Config(),
+    "vr_h31_two_arms_quant3": VRH31TwoArmsQuant3Config(),
+    "vr_h31_two_arms_exclude_effort": VRH31TwoArmsExcludeEffortConfig(),
+    "vr_h31_two_arms_quant2_exclude_effort": VRH31TwoArmsQuant2ExcludeEffortConfig(),
+    "vr_h31_two_arms_quant3_exclude_effort": VRH31TwoArmsQuant3ExcludeEffortConfig(),
+    "vr_h31_two_arms_include_task_progress_exclude_velocity_effort": VRH31TwoArmsIncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h31_two_arms_hor50_include_task_progress_exclude_velocity_effort": VRH31TwoArmsHor50IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h31_two_arms_quant2_include_task_progress_exclude_velocity_effort": VRH31TwoArmsQuant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h31_two_arms_crop_include_task_progress_exclude_velocity_effort": VRH31TwoArmsCropIncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h31_two_arms_hor50_quant2_include_task_progress_exclude_velocity_effort": VRH31TwoArmsHor50Quant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h31_two_arms_hor50_crop_include_task_progress_exclude_velocity_effort": VRH31TwoArmsHor50CropIncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h31_two_arms_hor50_quant2_crop_include_task_progress_exclude_velocity_effort": VRH31TwoArmsHor50Quant2CropIncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h31_left_arm_include_task_progress_exclude_velocity_effort": VRH31LeftArmIncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h31_left_arm_quant2_include_task_progress_exclude_velocity_effort": VRH31LeftArmQuant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h31_left_arm_exclude_velocity_effort": VRH31LeftArmExcludeVelocityEffortConfig(),
+    "vr_h31_left_arm_quant2_exclude_velocity_effort": VRH31LeftArmQuant2ExcludeVelocityEffortConfig(),
+    "vr_h31_left_arm_chunk8_step3_hor50_quant2_include_task_progress_exclude_velocity_effort": VRH31LeftArm_Chunk8Step3_Hor50Quant2_IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h31_left_arm_include_task_progress_exclude_velocity": VRH31LeftArmIncludeTaskProgressExcludeVelocityConfig(),
+
+    "vr_h311_left_arm_stereo_quant2_include_task_progress_exclude_velocity_effort": VRH311LeftArmStereoQuant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h311_left_arm_stereo_quant3_include_task_progress_exclude_velocity_effort": VRH311LeftArmStereoQuant3IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h311_gripper_open_quant2_include_task_progress_exclude_velocity_effort": VRH311GripperOpenQuant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h311_gripper_open_stereo_quant2_include_task_progress_exclude_velocity_effort": VRH311GripperOpenStereoQuant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h311_gripper_open_stereo_quant3_include_task_progress_exclude_velocity_effort": VRH311GripperOpenStereoQuant3IncludeTaskProgressExcludeVelocityEffortConfig(),
+
+    "vr_h311__whole_body__left_arm_hor16_quant2__stereo_include_task_progress": VRH311_WholeBody_LeftArmHor16Quant2_StereoIncludeTaskProgressConfig(),
+    "vr_h311__whole_body_chunk9_step2__left_arm_hor16_quant2__stereo_include_task_progress": VRH311_WholeBodyChunk9Step2_LeftArmHor16Quant2_StereoIncludeTaskProgressConfig(),
+    "vr_h311__whole_body_chunk9_step2__left_arm_hor16_quant3__stereo_include_task_progress": VRH311_WholeBodyChunk9Step2_LeftArmHor16Quant3_StereoIncludeTaskProgressConfig(),
+
+    "vr_h311_left_arm_quant2_include_task_progress_exclude_velocity_effort": VRH311LeftArmQuant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h311_left_arm_quant2_exclude_velocity": VRH311LeftArmQuant2ExcludeVelocityConfig(),
+    "vr_h311_left_arm_quant2_include_dropout_exclude_velocity_effort": VRH311LeftArmQuant2IncludeDropoutExcludeVelocityEffortConfig(),
+    "vr_h311_left_arm_quant2_exclude_velocity_effort": VRH311LeftArmQuant2ExcludeVelocityEffortConfig(),
+    "vr_h311_left_arm_quant2_include_task_progress": VRH311LeftArmQuant2IncludeTaskProgressConfig(),
+    "vr_h311_left_arm_quant2_include_dropout_task_progress_exclude_velocity_effort": VRH311LeftArmQuant2IncludeDropoutTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h311_left_arm_aug_img_quant2_include_task_progress_exclude_velocity_effort": VRH311LeftArmAugImgQuant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+    # "vr_h311_left_arm_rand_dropout_quant2_include_task_progress_exclude_velocity_effort": VRH311LeftArmRandDropoutQuant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+
+    "vr_h311_left_arm_rvt_quant2_include_task_progress_exclude_velocity_effort": VRH311LeftArmRVTQuant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h311_left_arm_stereo4_rvt_quant2_include_task_progress_exclude_velocity_effort": VRH311LeftArmStereo4RVTQuant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+    "vr_h311_left_arm_stereo5_rvt_quant2_include_task_progress_exclude_velocity_effort": VRH311LeftArmStereo5RVTQuant2IncludeTaskProgressExcludeVelocityEffortConfig(),
+
     "aloha_right_arm_only": AlohaRightArmConfig(),
     "aloha_right_arm_30_only": AlohaRightArm30Config()
 }

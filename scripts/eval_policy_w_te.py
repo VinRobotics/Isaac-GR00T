@@ -127,6 +127,8 @@ def main(args: ArgsConfig):
     for k, v in obs.items():
         if isinstance(v, np.ndarray):
             print(k, v.shape)
+            if k == "video.cam_head":
+                print(v)
         else:
             print(k, v)
 
@@ -142,14 +144,16 @@ def main(args: ArgsConfig):
 
     all_mse = []
     for traj_id in range(args.trajs):
+        args.save_plot_path = f"plot{traj_id}.png"
         print("Running trajectory:", traj_id)
+        policy.reset()
         mse = calc_mse_for_single_trajectory(
             policy,
             dataset,
             traj_id,
             modality_keys=args.modality_keys,
             steps=args.steps,
-            action_horizon=16,
+            action_horizon=args.action_horizon,
             plot=args.plot,
             temp_agg=True,
             save_plot_path=args.save_plot_path,

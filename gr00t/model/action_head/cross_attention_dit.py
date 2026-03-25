@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from typing import Optional
 
 import torch
@@ -212,12 +213,16 @@ class DiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
+        state_dropout_prob: float = 0.0,
+        alt_cond_injection: bool = False
     ):
         super().__init__()
 
         self.attention_head_dim = attention_head_dim
         self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
         self.gradient_checkpointing = False
+        self.state_dropout_prob = state_dropout_prob
+        self.alt_cond_injection = alt_cond_injection
 
         # Timestep encoder
         self.timestep_encoder = TimestepEncoder(
@@ -265,6 +270,7 @@ class DiT(ModelMixin, ConfigMixin):
         encoder_hidden_states: torch.Tensor,  # Shape: (B, S, D)
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
+        encoder_visual_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
     ):
         # Encode timesteps
@@ -275,21 +281,39 @@ class DiT(ModelMixin, ConfigMixin):
         encoder_hidden_states = encoder_hidden_states.contiguous()
 
         all_hidden_states = [hidden_states]
+        B, T = hidden_states.shape[:2]
+        B, S = encoder_hidden_states.shape[:2]
+        state_dropout = self.state_dropout_prob > 1e-9 and random.random() < self.state_dropout_prob
 
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1 and self.config.interleave_self_attention:
+                attention_mask = None
+                if state_dropout:
+                    attention_mask = torch.ones(
+                        B, T, T,
+                        dtype=torch.bool, 
+                        device=hidden_states.device
+                    )
+                    attention_mask[:, -16:, :-16] = False
+
                 hidden_states = block(
                     hidden_states,
-                    attention_mask=None,
+                    attention_mask=attention_mask,
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
                 )
             else:
+                attention_mask = None
+                if self.alt_cond_injection and encoder_visual_mask is not None:
+                    attention_mask = encoder_visual_mask.unsqueeze(1).repeat(1, T, 1)
+                    if idx % 4 == 2:
+                        attention_mask = ~attention_mask
+                
                 hidden_states = block(
                     hidden_states,
-                    attention_mask=None,
+                    attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
                     temb=temb,

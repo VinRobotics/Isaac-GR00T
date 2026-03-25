@@ -163,6 +163,11 @@ class GR00T_N1_5(PreTrainedModel):
         self,
         inputs: dict,
     ) -> BatchFeature:
+        print("=" * 500)
+        print("inputs:", inputs.keys())
+        print("inputs:", inputs["eagle_pixel_values"].shape)
+        print("=" * 500)
+        
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
@@ -236,6 +241,8 @@ class GR00T_N1_5(PreTrainedModel):
         tune_llm = kwargs.pop("tune_llm", False)
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
+        state_dropout_prob = kwargs.pop("state_dropout_prob", 0.0)
+        alt_cond_injection = kwargs.pop("alt_cond_injection", False)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Tune backbone vision tower: {tune_visual}")
@@ -265,6 +272,13 @@ class GR00T_N1_5(PreTrainedModel):
         pretrained_model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
         )
+    
+        pretrained_model.action_head.config.state_dropout_prob = state_dropout_prob
+        pretrained_model.action_head.config.alt_cond_injection = alt_cond_injection
+
+        pretrained_model.action_head.model.state_dropout_prob = state_dropout_prob
+        pretrained_model.action_head.model.alt_cond_injection = alt_cond_injection
+
         return pretrained_model
 
 

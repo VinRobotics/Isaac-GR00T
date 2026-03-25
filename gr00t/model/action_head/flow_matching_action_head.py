@@ -184,6 +184,9 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=32, metadata={"help": "Number of target vision tokens."}
     )
 
+    state_dropout_prob: float = field(default=0.0, metadata={"help": "State dropout probability."})
+    alt_cond_injection: bool = field(default=False, metadata={"help": "Whether to alternate condition injection."})
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
@@ -202,7 +205,11 @@ class FlowmatchingActionHead(nn.Module):
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
-        self.model = DiT(**config.diffusion_model_cfg)
+        self.model = DiT(
+            **config.diffusion_model_cfg, 
+            state_dropout_prob=config.state_dropout_prob,
+            alt_cond_injection=config.alt_cond_injection,
+        )
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
@@ -357,11 +364,13 @@ class FlowmatchingActionHead(nn.Module):
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
         vl_attn_mask = backbone_output.backbone_attention_mask
+        vl_vis_mask = backbone_output.backbone_visual_mask
 
         model_output = self.model(
             hidden_states=sa_embs,
             encoder_hidden_states=vl_embs,
             encoder_attention_mask=vl_attn_mask,
+            encoder_visual_mask=vl_vis_mask,
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
         )

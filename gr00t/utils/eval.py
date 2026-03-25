@@ -64,9 +64,33 @@ def calc_mse_for_single_trajectory(
         if step_count % action_horizon == 0:
             if data_point is None:
                 data_point = dataset.get_step_data(traj_id, step_count)
+            
+            print("data_point:", data_point.keys())
+            for k, v in data_point.items():
+                if isinstance(v, np.ndarray):
+                    print("key:", k, " -", type(v))
+                else:
+                    print("key:", k, " -", v)
+            import os
+            if not os.path.isfile("/mnt/data/sftp/data/tannq3/workspace/scripts/test_input.npz"):
+                np.savez(
+                    "/mnt/data/sftp/data/tannq3/workspace/scripts/test_input.npz",
+                    video_cam_head=data_point["video.cam_head"],
+                    video_cam_left=data_point["video.cam_left"],
+                    video_cam_right=data_point["video.cam_right"],
+                    left_arm=data_point["state.left_arm"],
+                    left_hand=data_point["state.left_hand"],
+                )
 
             print("inferencing at step: ", step_count)
             action_chunk = policy.get_action(data_point)
+            if not os.path.isfile("/mnt/data/sftp/data/tannq3/workspace/scripts/test_output.npz"):
+                np.savez(
+                    "/mnt/data/sftp/data/tannq3/workspace/scripts/test_output.npz",
+                    action_left_arm=action_chunk["action.left_arm"],
+                    action_left_hand=action_chunk["action.left_hand"],
+                    task_progress=action_chunk["action.task_progress"]
+                )
             for j in range(action_horizon):
                 # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
                 # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned

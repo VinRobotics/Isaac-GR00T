@@ -25,9 +25,12 @@ from .state_action import (
     StateActionSinCosTransform,
     StateActionToTensor,
     StateActionTransform,
+    StateActionPerturbationVRH31,
 )
 from .video import (
     VideoColorJitter,
+    VideoCropCenter,
+    VideoCropTopLeft,
     VideoCrop,
     VideoGrayscale,
     VideoHorizontalFlip,
@@ -38,4 +41,8 @@ from .video import (
     VideoToNumpy,
     VideoToTensor,
     VideoTransform,
+    VideoRandomlyRandomAffine,
+    VideoRandomPerspective,
+    VideoRandomEqualize,
+    VideoRandomlyGaussianNoise,
 )
