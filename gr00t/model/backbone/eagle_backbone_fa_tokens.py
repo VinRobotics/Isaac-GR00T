@@ -80,20 +80,27 @@ class EquiAdapter(nn.Module):
 
     Architecture: num_layers × (SA + CA)
 
-      Input: cat([H'.reshape(B, n_equi*T, D), lang_embed(h_lang)], dim=1) → [B, n_equi*T + T_lang, D]
-        H'     — equivariant vision tokens (regular repr, group-major)
-        h_lang — invariant language tokens, projected to regular repr via trivial embedding:
-                 lang_embed: R^d_llm → R^blocks (invariant subspace)
-                 expand: [v,v,...,v] × n_group → R^D  (trivial element in regular repr)
-                 Cyclic shift of [v,v,...,v] = [v,v,...,v] → invariant ✓
+      Input: cat([H'.reshape(B, n_equi*T, D),
+                  noequi_embed(h_noequi),      ← VLM image positions (non-equivariant semantics)
+                  lang_embed(h_lang)],          ← VLM text positions (language context)
+                 dim=1)
+               → [B, n_equi*T + n_noequi*T + T_lang, D]
+
+        H'       — equivariant vision tokens (regular repr, group-major)
+        h_noequi — VLM image token hidden states (trivial repr from VLM), embedded as
+                   trivial-in-regular: noequi_embed: R^D → R^blocks → [v,v,...,v] × n_group.
+                   Carries non-equivariant semantics (object identity, texture, scene context)
+                   that h_prime alone cannot represent.
+        h_lang   — invariant language tokens, embedded the same way via lang_embed.
+                   Cyclic shift of [v,v,...,v] = [v,v,...,v] → invariant ✓
 
       SA block — equivariant self-attention on the combined sequence (regular → regular):
-        Vision tokens mix with each other AND with language tokens in one sequence.
+        Vision tokens mix with non-equi image semantics and language tokens in one sequence.
 
       CA block — cross-attention from combined sequence to vl_hidden (regular ← trivial):
         vl_hidden contains BOTH image and language tokens from the VLM — full context.
 
-    Output: [B, n_equi*T + T_lang, D]  (same layout as input, updated features)
+    Output: [B, n_equi*T + n_noequi*T + T_lang, D]
 
     Identity init: zero-init o_proj + ff.fc2 → SA output = 0 + residual = identity ✓
                    zero-init v_proj + o_proj on CA → CA output = 0 at init ✓
@@ -154,10 +161,15 @@ class EquiAdapter(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # lang_embed: project h_lang (arbitrary R^d_llm) → invariant subspace (R^blocks),
+        # lang_embed: project h_lang (text positions, R^d_llm) → invariant subspace (R^blocks),
         # then expand to regular repr via trivial embedding: [v,v,...,v] × n_group.
-        # This ensures h_lang lives correctly in regular repr before concat with h_prime.
         self.lang_embed = nn.Linear(d_llm, blocks)
+
+        # noequi_embed: same trivial-in-regular trick for VLM image token positions.
+        # VLM image hidden states are invariant (VLM has no group structure) → trivial repr.
+        # Embedding them as [v,v,...,v] in regular repr lets equivariant tokens attend to
+        # non-equivariant semantics (object identity, texture) while keeping group structure.
+        self.noequi_embed = nn.Linear(d_llm, blocks)
 
         # Identity init
         for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
@@ -172,37 +184,43 @@ class EquiAdapter(nn.Module):
             for p in ca_blk.ff.fc2.parameters():
                 nn.init.zeros_(p)
 
+    def _trivial_to_regular(self, x: torch.Tensor, embed: nn.Linear, B: int) -> torch.Tensor:
+        """Project x [B, N, d_llm] → trivial-in-regular [B, N, D] via [v,v,...,v] embedding."""
+        x_inv = embed(x)                                   # [B, N, blocks]
+        return (x_inv
+                .unsqueeze(-2)
+                .expand(-1, -1, self.n_group, -1)
+                .reshape(B, -1, self.d_eq))                # [B, N, D]
+
     def forward(
         self,
         h_prime: torch.Tensor,
+        h_noequi: torch.Tensor,
         h_lang: torch.Tensor,
         vl_hidden: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
-            h_prime:   [B, n_equi, T_vis, D]   equivariant vision features (group-major)
-            h_lang:    [B, T_lang, D]           invariant language features (projected via lang_embed into regular repr)
-            vl_hidden: [B, T_total, D]          full VLM output (image + language, trivial repr)
+            h_prime:   [B, n_equi, T_vis, D]     equivariant vision features (group-major)
+            h_noequi:  [B, n_noequi*T_vis, D]    VLM image token hidden states (trivial repr)
+            h_lang:    [B, T_lang, D]             VLM text token hidden states (trivial repr)
+            vl_hidden: [B, T_total, D]            full VLM output (image + language, trivial repr)
         Returns:
-            [B, n_equi*T_vis + T_lang, D]
+            [B, n_equi*T_vis + n_noequi*T_vis + T_lang, D]
         """
         B, n_equi, T, D = h_prime.shape
         dt = next(self.sa_blocks[0].parameters()).dtype
 
-        # Embed h_lang as trivial element in regular repr space:
-        #   1. lang_embed: [B, T_lang, d_llm] → [B, T_lang, blocks]  (invariant subspace)
-        #   2. expand × n_group:               → [B, T_lang, n_group, blocks]
-        #   3. reshape:                        → [B, T_lang, D]       (group-major layout)
-        # Result: [v,v,...,v] per token — a proper trivial-in-regular element ✓
-        h_lang_inv = self.lang_embed(h_lang.to(dt))                    # [B, T_lang, blocks]
-        h_lang_reg = (h_lang_inv
-                      .unsqueeze(-2)
-                      .expand(-1, -1, self.n_group, -1)
-                      .reshape(B, -1, self.d_eq))                      # [B, T_lang, D]
+        # Embed h_noequi and h_lang as trivial elements in regular repr space:
+        #   project: R^D → R^blocks  (invariant subspace)
+        #   expand:  [v,v,...,v] × n_group → R^D  (group-major layout)
+        # Result: [v,v,...,v] per token — proper trivial-in-regular element ✓
+        h_noequi_reg = self._trivial_to_regular(h_noequi.to(dt), self.noequi_embed, B)  # [B, n_noequi*T, D]
+        h_lang_reg   = self._trivial_to_regular(h_lang.to(dt),   self.lang_embed,   B)  # [B, T_lang, D]
 
-        # Concat into combined sequence: [B, n_equi*T + T_lang, D]
+        # Concat into combined sequence: [B, n_equi*T + n_noequi*T + T_lang, D]
         h_flat = h_prime.to(dt).reshape(B, n_equi * T, D)
-        h = torch.cat([h_flat, h_lang_reg], dim=1)
+        h = torch.cat([h_flat, h_noequi_reg, h_lang_reg], dim=1)
 
         # vl_hidden as CA context: [B, T_total, D]
         vl = vl_hidden.to(dt)
@@ -1083,16 +1101,21 @@ class EagleBackboneFATokens(nn.Module):
         lang_dtype = self.eagle_linear.weight.dtype
         vl_features = self.eagle_linear(vl_hidden.to(lang_dtype))         # [B, T_total, project_to_dim]
 
-        # Extract text-only positions as h_lang (initial state of language tokens in adapter).
+        # Split vl_features into image and text positions.
         # text_mask is batch-consistent (fixed template), so first sample's mask suffices.
-        # These tokens have VLM cross-modal understanding (text attended to images inside LLM).
         text_pos = text_mask[0]                                            # [T_total] bool
-        h_lang = vl_features[:, text_pos, :]                              # [B, T_lang, project_to_dim]
+        h_lang      = vl_features[:, text_pos,  :]                        # [B, T_lang, project_to_dim]
+        # Image positions are filled equi-first in _forward_llm_with_injected_vision:
+        #   [0 : n_equi*T]          → equi camera tokens  (already captured in h_prime)
+        #   [n_equi*T : ...]        → non-equi camera tokens (new non-equivariant semantics)
+        h_img_all   = vl_features[:, ~text_pos, :]                        # [B, n_all_img*T, D]
+        n_equi_img  = n_equi * num_vision_tokens
+        h_noequi    = h_img_all[:, n_equi_img:, :]                        # [B, n_noequi*T, project_to_dim]
 
         # ── Phase 3: EquiAdapter ──────────────────────────────────────────────
-        # cat(h_prime_flat, h_lang) → SA on combined → CA ← vl_features (full image+lang context)
-        # Output: [B, n_equi*T_vis + T_lang, project_to_dim]
-        h_prime_llm = self.equi_adapter(h_prime, h_lang, vl_features)
+        # cat(h_prime_flat, h_noequi_reg, h_lang_reg) → SA → CA ← vl_features
+        # Output: [B, n_equi*T_vis + n_noequi*T_vis + T_lang, project_to_dim]
+        h_prime_llm = self.equi_adapter(h_prime, h_noequi, h_lang, vl_features)
 
         return h_prime_llm, eagle_input["attention_mask"]
 
@@ -1105,10 +1128,12 @@ class EagleBackboneFATokens(nn.Module):
 
         Returns:
             BatchFeature with:
-                - backbone_equi_vision_features: [B, n_equi*T_vision + T_lang, D]
-                    First n_equi*T_vision tokens: equivariant vision features (group-major).
-                    Last T_lang tokens: invariant language features (vision-conditioned via
-                    Reynolds cross-attention). Use directly as DiT cross-attention context.
+                - backbone_equi_vision_features: [B, n_equi*T + n_noequi*T + T_lang, D]
+                    First n_equi*T tokens:   equivariant vision features (regular repr, group-major).
+                    Next  n_noequi*T tokens: VLM image hidden states as trivial-in-regular
+                                             (non-equivariant semantics: object identity, texture).
+                    Last  T_lang tokens:     VLM text hidden states as trivial-in-regular.
+                    Use directly as DiT cross-attention context.
                 - backbone_attention_mask: attention mask from Eagle tokeniser
         """
         self.set_frozen_modules_to_eval_mode()
