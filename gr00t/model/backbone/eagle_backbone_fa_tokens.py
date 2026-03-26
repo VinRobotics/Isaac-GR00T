@@ -249,9 +249,9 @@ class EagleBackboneFATokens(nn.Module):
         output_type: str = 'reg',  # 'reg' for regular representation
         # Phase 2/3: equivariant adapter
         use_inv_projector_for_vlm: bool = True,  # Phase 2: inject inv-proj tokens into LLM
-        equi_adapter_num_heads: int = 32,        # heads in SA/CA; matches N1.5 vl_self_attention num_attention_heads=32
-        equi_adapter_attention_head_dim: int = 64, # head dim; matches N1.5 vl_self_attention attention_head_dim=64
-        equi_adapter_num_layers: int = 4,        # SA+CA blocks; matches N1.5 vl_self_attention_cfg.num_layers=4
+        equi_adapter_num_heads: int = 32,         # heads in SA/CA (reduced for data efficiency)
+        equi_adapter_attention_head_dim: int = 64, # head dim; scalar_dim = num_heads * head_dim
+        equi_adapter_num_layers: int = 2,        # SA+CA blocks (reduced for data efficiency)
     ):
         """
         Args:
@@ -699,7 +699,7 @@ class EagleBackboneFATokens(nn.Module):
             img_batch_expanded,
             grid,
             align_corners=True,
-            padding_mode='zeros'
+            padding_mode='border'
         )
         
         return rotated_imgs
