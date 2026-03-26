@@ -109,6 +109,9 @@ class ArgsConfig:
     use_advantage_conditioning: bool = False
     """"""
 
+    cfg_guidance_weight: float = 1.0
+    """"""
+
     denoising_steps: int = 4
     """The number of denoising steps to use."""
 
@@ -217,7 +220,10 @@ def main(args: ArgsConfig):
             policy.model.action_head.get_action = types.MethodType(FlowmatchingActionHead_CFG.get_action, policy.model.action_head)
 
         if args.use_advantage_conditioning:
-            policy.model.action_head.config = args.use_advantage_conditioning
+            policy.model.action_head.config.use_advantage_conditioning = args.use_advantage_conditioning
+            policy.model.action_head.config.cfg_guidance_weight = args.cfg_guidance_weight
+
+            print(f"Update guidance weight {policy.model.action_head.config.cfg_guidance_weight=}")
 
         # Setup TensorRT if requested
         if args.use_tensorrt:
