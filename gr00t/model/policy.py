@@ -394,7 +394,7 @@ class Gr00tPolicy(BasePolicy):
             )
 
             # Create new action head with updated config
-            new_action_head = FlowmatchingActionHead(new_action_head_config)
+            
 
             # Copy the weights from the old action head to the new one
             new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
@@ -406,6 +406,16 @@ class Gr00tPolicy(BasePolicy):
             model.config.action_horizon = expected_action_horizon
             model.action_horizon = expected_action_horizon
             model.config.action_head_cfg["action_horizon"] = expected_action_horizon
+
+        from gr00t.model.action_head.flow_matching_action_head import (
+            FlowmatchingActionHead,
+        )
+        new_action_head = FlowmatchingActionHead(model.action_head.config)
+        new_action_head.config.use_advantage_conditioning = True
+        new_action_head.init_advantage_conditioning()
+
+        new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
+        model.action_head = new_action_head
 
         model.to(device=self.device)  # type: ignore
 
