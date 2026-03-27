@@ -339,143 +339,211 @@ class EquivariantAttention(nn.Module):
 
         return out
 
-class DualStreamEquiCA(nn.Module):
+class EquiContextMixerAttention(nn.Module):
     """
-    Dual-stream equivariant cross-attention.
+    Mixed-type self-attention between trivial tokens (language + non-equi vision)
+    and regular tokens (equi vision). Preserves field types for both output streams.
 
-    Takes equivariant vision context (regular repr) AND invariant language context
-    (plain tensor, no group structure), computes shared attention weights over the
-    combined key space — allowing interaction between vision and language — while
-    using separate V projections to maintain equivariance throughout.
+    All Q, K → invariant scalars (trivial via standard linear, regular via Reynolds/Schur).
+    Trivial output: Σ attn * V_TT  +  Σ attn * Reynolds(V_R)   — trivial ✓
+    Regular output: Σ attn * lift(V_T)  +  Σ attn * V_RR       — regular ✓
 
-    Equivariance proof:
-        Q(g·x)          = Q(x)             [regular → trivial = invariant]
-        K_vis(g·x)      = K_vis(x)         [regular → trivial = invariant]
-        K_lang(g·x)     = K_lang(x)        [plain lang = invariant]
-        attn_w          = softmax(Q·K^T)   [invariant scalars ✓]
-
-        V_vis(g·x)      = ρ(g)·V_vis(x)   [regular → regular, equivariant]
-        V_lang_lift(g·x)= V_lang_lift(x)   [trivial-in-regular, invariant]
-
-        out(g·x) = Σ_vis w·ρ(g)·V_vis + Σ_lang w·V_lang_lift
-                 = ρ(g)·out(x)  ✓  (trivial is a subspace of regular: ρ(g)·trivial = trivial)
-
-    Identity init: zero-init v_vis + o_proj → output = 0 + residual at init ✓
+    Zero-init on output projections → residual passthrough at init.
     """
 
     def __init__(
         self,
-        in_type: enn.FieldType,
-        vis_type: enn.FieldType,
         lang_dim: int,
-        heads: int = 8,
+        regular_type: enn.FieldType,
+        num_heads: int = 8,
         dim_head: int = 64,
         dropout: float = 0.0,
-        bias: bool = True,
-        out_bias: bool = True,
     ):
         super().__init__()
-        self.in_type  = in_type
-        self.vis_type = vis_type
-        self.lang_dim = lang_dim
+        gspace = regular_type.gspace
+        G = gspace.fibergroup.order()
+        scalar_dim = num_heads * dim_head
 
-        gspace = in_type.gspace
-        assert gspace == vis_type.gspace, "in_type and vis_type must share gspace"
-        self.G = gspace.fibergroup.order()
-        self.H = heads
-        self.Dh = dim_head
-        self.scalar_dim = heads * dim_head
-        assert self.scalar_dim % self.G == 0, (
-            f"heads*dim_head ({self.scalar_dim}) must be divisible by G ({self.G})"
-        )
+        self.G          = G
+        self.H          = num_heads
+        self.Dh         = dim_head
+        self.scalar_dim = scalar_dim
+        self.lang_dim   = lang_dim
+        self.d_R        = regular_type.size
+        self.n_reg_v    = self.d_R // G
+        self.regular_type = regular_type
 
-        n_regular = self.scalar_dim // self.G
-        self.n_regular = n_regular
-        self.qkv_type    = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
-        self.inv_qk_type = enn.FieldType(gspace, [gspace.trivial_repr] * self.scalar_dim)
+        inv_qk_type = enn.FieldType(gspace, [gspace.trivial_repr] * scalar_dim)
+        inv_T_type  = enn.FieldType(gspace, [gspace.trivial_repr] * lang_dim)
 
-        # Q: equi query → invariant scalars
-        self.q_proj  = enn.Linear(in_type,        self.inv_qk_type, bias=bias)
-        # K_vis: equi vision → invariant scalars  (regular → trivial via Schur's lemma)
-        self.k_vis   = enn.Linear(vis_type,        self.inv_qk_type, bias=bias)
-        # K_lang: plain linear (language is invariant, no group structure)
-        self.k_lang  = nn.Linear(lang_dim, self.scalar_dim, bias=True)
-        # V_vis: equi vision → equi  (regular → regular, circulant)
-        self.v_vis   = enn.Linear(vis_type,        self.qkv_type,    bias=bias)
-        # V_lang: plain linear → blocks, then lifted to regular by repeat(G)
-        # lift: [B, Tl, n_regular] → [B, Tl, G, n_regular] → [B, Tl, G*n_regular=scalar_dim]
-        # Under ρ(g): cyclic_shift([v,…,v]) = [v,…,v]  →  trivial-in-regular ✓
-        self.v_lang  = nn.Linear(lang_dim, n_regular, bias=True)
-        # Output projection: equi → equi
-        self.o_proj  = enn.Linear(self.qkv_type, in_type, bias=out_bias)
+        # Q, K → invariant scalars
+        self.Q_T = nn.Linear(lang_dim, scalar_dim)
+        self.Q_R = enn.Linear(regular_type, inv_qk_type)   # Reynolds via Schur
+        self.K_T = nn.Linear(lang_dim, scalar_dim)
+        self.K_R = enn.Linear(regular_type, inv_qk_type)
+
+        # V for TRIVIAL output (both streams → lang_dim trivial)
+        self.V_TT = nn.Linear(lang_dim, lang_dim)
+        self.V_RT = enn.Linear(regular_type, inv_T_type)   # regular → trivial via Reynolds
+        self.out_T = nn.Linear(lang_dim, lang_dim)
+        nn.init.zeros_(self.out_T.weight)
+        nn.init.zeros_(self.out_T.bias)
+
+        # V for REGULAR output
+        #   V_TR: trivial → regular-subspace (lift: broadcast G times in group-major layout)
+        #   V_RR: regular → regular (equivariant / circulant)
+        self.V_TR_base = nn.Linear(lang_dim, self.n_reg_v)
+        self.V_RR      = enn.Linear(regular_type, regular_type)
+        self.out_R     = enn.Linear(regular_type, regular_type)
+        nn.init.zeros_(self.V_TR_base.weight)
+        nn.init.zeros_(self.V_TR_base.bias)
+        for p in self.V_RR.parameters():  nn.init.zeros_(p)
+        for p in self.out_R.parameters(): nn.init.zeros_(p)
 
         self.dropout = nn.Dropout(dropout)
         self.scale   = dim_head ** -0.5
 
-        # Identity init: start as residual-passthrough
-        nn.init.zeros_(self.v_lang.weight);  nn.init.zeros_(self.v_lang.bias)
-        for p in self.v_vis.parameters():  nn.init.zeros_(p)
-        for p in self.o_proj.parameters(): nn.init.zeros_(p)
+    def forward(self, T: torch.Tensor, R: torch.Tensor):
+        """
+        T : [B, N_T, lang_dim]  trivial (language + non-equi vision)
+        R : [B, N_R, d_R]       regular, group-major (equi vision)
+        Returns (T_out, R_out) with same shapes.
+        """
+        B, N_T, _ = T.shape
+        B, N_R, _ = R.shape
+        H, Dh, G  = self.H, self.Dh, self.G
 
-    def forward(
+        R_flat = R.reshape(B * N_R, self.d_R)
+        R_geo  = enn.GeometricTensor(R_flat, self.regular_type)
+
+        # ── Q, K (all invariant) ──────────────────────────────────────────────
+        Q_T = self.Q_T(T)                                              # [B, N_T, scalar_dim]
+        Q_R = self.Q_R(R_geo).tensor.reshape(B, N_R, self.scalar_dim) # [B, N_R, scalar_dim]
+        K_T = self.K_T(T)
+        K_R = self.K_R(R_geo).tensor.reshape(B, N_R, self.scalar_dim)
+
+        Q_h = torch.cat([Q_T, Q_R], dim=1).reshape(B, N_T + N_R, H, Dh).transpose(1, 2)
+        K_h = torch.cat([K_T, K_R], dim=1).reshape(B, N_T + N_R, H, Dh).transpose(1, 2)
+        A   = torch.softmax(Q_h @ K_h.transpose(-1, -2) * self.scale, dim=-1)
+        A   = self.dropout(A)                                          # [B, H, N_T+N_R, N_T+N_R]
+
+        A_T = A[:, :, :N_T, :]    # [B, H, N_T, N_T+N_R]
+        A_R = A[:, :, N_T:, :]    # [B, H, N_R, N_T+N_R]
+
+        # ── Trivial output ────────────────────────────────────────────────────
+        V_TT    = self.V_TT(T)                                         # [B, N_T, lang_dim]
+        V_RT    = self.V_RT(R_geo).tensor.reshape(B, N_R, self.lang_dim)
+        V_T_all = torch.cat([V_TT, V_RT], dim=1)                      # [B, N_T+N_R, lang_dim]
+
+        n_val_T = self.lang_dim // H
+        V_T_h   = V_T_all.reshape(B, N_T + N_R, H, n_val_T).transpose(1, 2)
+        out_T   = (A_T @ V_T_h).transpose(1, 2).reshape(B, N_T, self.lang_dim)
+        out_T   = self.out_T(out_T)
+
+        # ── Regular output ────────────────────────────────────────────────────
+        # lift(V_T): broadcast each channel G times → trivial-in-regular (group-major) ✓
+        V_TR_base = self.V_TR_base(T)                                  # [B, N_T, n_reg_v]
+        V_TR      = (V_TR_base.unsqueeze(-1)
+                              .expand(-1, -1, -1, G)
+                              .reshape(B, N_T, self.d_R))              # [B, N_T, d_R]
+
+        V_RR    = self.V_RR(R_geo).tensor.reshape(B, N_R, self.d_R)
+        V_R_all = torch.cat([V_TR, V_RR], dim=1)                      # [B, N_T+N_R, d_R]
+
+        n_val_R = self.d_R // H
+        V_R_h   = V_R_all.reshape(B, N_T + N_R, H, n_val_R).transpose(1, 2)
+        out_R   = (A_R @ V_R_h).transpose(1, 2).reshape(B * N_R, self.d_R)
+
+        out_R   = self.out_R(enn.GeometricTensor(out_R, self.regular_type)).tensor.reshape(B, N_R, self.d_R)
+
+        return out_T, out_R
+
+
+class EquiContextMixerBlock(nn.Module):
+    """
+    EquiContextMixerAttention + LayerNorm + residual.
+
+    LayerNorm over the full channel dim is equivariant for regular repr:
+    mean/var are permutation-invariant, so LN(ρ(g)·x) = ρ(g)·LN(x) ✓
+    """
+
+    def __init__(
         self,
-        hidden_states: torch.Tensor,   # [B, Tq, D_eq]  equivariant query
-        vis_ctx: torch.Tensor,         # [B, Tv, D_eq]  equivariant vision context
-        lang_ctx: torch.Tensor,        # [B, Tl, D_lang] invariant language context
-    ) -> torch.Tensor:
-        B, Tq, _ = hidden_states.shape
-        Tv = vis_ctx.shape[1]
-        Tl = lang_ctx.shape[1]
-        dt = hidden_states.dtype
+        lang_dim: int,
+        regular_type: enn.FieldType,
+        num_heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.norm_T = nn.LayerNorm(lang_dim)
+        self.norm_R = nn.LayerNorm(regular_type.size)   # equivariant ✓
+        self.attn   = EquiContextMixerAttention(lang_dim, regular_type, num_heads, dim_head, dropout)
 
-        # ── Q: equi query → invariant scalars ────────────────────────────────
-        q_flat = einops.rearrange(hidden_states, "b t d -> (b t) d")
-        Q = self.q_proj(enn.GeometricTensor(q_flat, self.in_type)).tensor   # [B*Tq, scalar_dim]
-        Q = einops.rearrange(Q, "(b t) d -> b t d", b=B)
+    def forward(self, T: torch.Tensor, R: torch.Tensor):
+        dT, dR = self.attn(self.norm_T(T), self.norm_R(R))
+        return T + dT, R + dR
 
-        # ── K_vis: equi vision → invariant scalars ────────────────────────────
-        v_flat = einops.rearrange(vis_ctx, "b t d -> (b t) d")
-        v_geo  = enn.GeometricTensor(v_flat, self.vis_type)
-        K_vis  = self.k_vis(v_geo).tensor                                   # [B*Tv, scalar_dim]
-        K_vis  = einops.rearrange(K_vis, "(b t) d -> b t d", b=B)
 
-        # ── K_lang: plain linear (invariant by nature) ───────────────────────
-        K_lang = self.k_lang(lang_ctx.to(dt))                               # [B, Tl, scalar_dim]
+class ContextMixerPipeline(nn.Module):
+    """
+    N layers of EquiContextMixerBlock followed by lang→regular lift and concat.
 
-        # ── Shared key space → interaction between vis and lang ───────────────
-        K = torch.cat([K_vis, K_lang], dim=1)                               # [B, Tv+Tl, scalar_dim]
+    After mixing, trivial (lang) tokens are lifted to regular repr via an equivariant
+    enn.Linear(trivial→regular). The result is a unified regular-repr context:
+        [vis_updated (regular), lang_lifted (regular)] → [B, N_vis+N_lang, d_R]
 
-        # ── Attention weights (invariant scalars → equivariance preserved) ───
-        Q_h   = einops.rearrange(Q, "b t (h d) -> b t h d", h=self.H)
-        K_h   = einops.rearrange(K, "b t (h d) -> b t h d", h=self.H)
-        attn  = torch.einsum("b t h d, b k h d -> b h t k", Q_h, K_h) * self.scale
-        attn  = torch.softmax(attn, dim=-1)                                 # [B, H, Tq, Tv+Tl]
-        attn  = self.dropout(attn)
+    This allows downstream EDiT to use a single-stream EquivariantAttention
+    (BasicTransformerBlock, both_regular mode) instead of DualStreamEquiCA.
+    """
 
-        # ── V_vis: equi vision → equivariant values ───────────────────────────
-        V_vis = self.v_vis(v_geo).tensor                                    # [B*Tv, scalar_dim]
-        V_vis = einops.rearrange(V_vis, "(b t) d -> b t d", b=B)
+    def __init__(
+        self,
+        lang_dim: int,
+        regular_type: enn.FieldType,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        gspace = regular_type.gspace
+        G      = gspace.fibergroup.order()
 
-        # ── V_lang: plain → trivial-in-regular (lift: repeat G times) ────────
-        # layout: [g0_b0,…,g0_b(n-1), g1_b0,…] matches ESCNN group-major ✓
-        V_lang_b = self.v_lang(lang_ctx.to(dt))                            # [B, Tl, n_regular]
-        V_lang   = (V_lang_b
-                    .unsqueeze(2)
-                    .expand(-1, -1, self.G, -1)
-                    .reshape(B, Tl, self.G * self.n_regular))               # [B, Tl, scalar_dim]
+        self.regular_type = regular_type
+        self.lang_dim     = lang_dim
+        self.d_R          = regular_type.size
+        self.G            = G
 
-        # ── Combined V ────────────────────────────────────────────────────────
-        V   = torch.cat([V_vis, V_lang], dim=1)                            # [B, Tv+Tl, scalar_dim]
-        V_h = einops.rearrange(V, "b t (h d) -> b t h d", h=self.H)
+        self.blocks = nn.ModuleList([
+            EquiContextMixerBlock(lang_dim, regular_type, num_heads, dim_head, dropout)
+            for _ in range(num_layers)
+        ])
 
-        # ── Weighted sum ──────────────────────────────────────────────────────
-        out = torch.einsum("b h t k, b k h d -> b h t d", attn, V_h)
-        out = einops.rearrange(out, "b h t d -> (b t) (h d)")              # [B*Tq, scalar_dim]
+        # Lift trivial lang → regular.
+        # enn.Linear(trivial_type, regular_type) is equivariant: ESCNN enforces that each
+        # output regular-repr neuron gets the same value for all G group elements (Schur).
+        trivial_lang_type = enn.FieldType(gspace, [gspace.trivial_repr] * lang_dim)
+        self.lang_to_regular = enn.Linear(trivial_lang_type, regular_type)
 
-        # ── Output projection (equivariant) ───────────────────────────────────
-        out = self.o_proj(enn.GeometricTensor(out, self.qkv_type)).tensor   # [B*Tq, D_eq]
-        out = einops.rearrange(out, "(b t) d -> b t d", b=B)
-        return out.to(hidden_states.dtype)
+    def forward(self, lang: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
+        """
+        lang : [B, N_lang, lang_dim]  trivial (language + non-equi vision)
+        vis  : [B, N_vis,  d_R]       regular (equi vision)
+        Returns: [B, N_vis+N_lang, d_R]  unified regular context
+        """
+        B, N_lang, _ = lang.shape
+
+        for block in self.blocks:
+            lang, vis = block(lang, vis)
+
+        # Lift lang (trivial) → regular via equivariant linear
+        lang_flat    = lang.reshape(B * N_lang, self.lang_dim)
+        lang_geo     = enn.GeometricTensor(lang_flat, self.lang_to_regular.in_type)
+        lang_regular = self.lang_to_regular(lang_geo).tensor.reshape(B, N_lang, self.d_R)
+
+        # Unified context: vis tokens first (consistent with existing encoder_hidden_states)
+        return torch.cat([vis, lang_regular], dim=1)   # [B, N_vis+N_lang, d_R]  all regular ✓
 
 
 class EquivariantAttentionPool(nn.Module):
@@ -803,111 +871,6 @@ class BasicTransformerBlock(nn.Module):
         return hidden_states
 
 
-class DualStreamTransformerBlock(nn.Module):
-    """
-    Transformer block using DualStreamEquiCA for cross-attention.
-
-    Structure (mirrors BasicTransformerBlock):
-        norm1 → DualStreamEquiCA(query, vis_ctx, lang_ctx) → residual
-        norm3 → EquivariantFeedForward → residual
-
-    The single attention op is replaced by DualStreamEquiCA which jointly attends
-    to equivariant vision tokens AND invariant language tokens via shared keys,
-    preserving equivariance while enabling rich vision-language interaction.
-    """
-
-    def __init__(
-        self,
-        in_type: enn.FieldType,
-        vis_type: enn.FieldType,
-        lang_dim: int,
-        inner_type: enn.FieldType,
-        temb_type: Optional[enn.FieldType] = None,
-        num_attention_heads: int = 8,
-        attention_head_dim: int = 64,
-        dropout: float = 0.0,
-        activation_fn: str = "geglu",
-        attention_bias: bool = False,
-        norm_type: str = "ada_norm",
-        norm_eps: float = 1e-5,
-        final_dropout: bool = False,
-        attention_out_bias: bool = True,
-    ):
-        super().__init__()
-        self.in_type   = in_type
-        self.norm_type = norm_type
-
-        if norm_type == "ada_norm":
-            self.norm1 = EquivariantAdaLayerNorm(in_type, temb_type=temb_type)
-        else:
-            self.norm1 = EquivariantLayerNorm(in_type, affine=False, eps=norm_eps)
-
-        self.dual_ca = DualStreamEquiCA(
-            in_type=in_type,
-            vis_type=vis_type,
-            lang_dim=lang_dim,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,
-            dropout=dropout,
-            bias=attention_bias,
-            out_bias=attention_out_bias,
-        )
-
-        self.norm3 = EquivariantLayerNorm(in_type, affine=False, eps=norm_eps)
-        self.ff = EquivariantFeedForward(
-            in_type, inner_type,
-            dropout=dropout,
-            activation_fn=activation_fn,
-            final_dropout=final_dropout,
-        )
-        self.final_dropout = (
-            enn.PointwiseDropout(in_type, p=dropout) if final_dropout else None
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        vis_ctx: torch.Tensor,
-        lang_ctx: torch.Tensor,
-        temb: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        hidden_states : [B, Tq, D_eq]   equivariant query (state/action tokens)
-        vis_ctx       : [B, Tv, D_eq]   equivariant vision context
-        lang_ctx      : [B, Tl, D_lang] invariant language context
-        temb          : [B, D_temb]     optional timestep embedding
-        """
-        B, T, _ = hidden_states.shape
-
-        # 1. Norm + DualStreamEquiCA + residual
-        flat = einops.rearrange(hidden_states, "b t d -> (b t) d")
-        geo  = enn.GeometricTensor(flat, self.in_type)
-        if self.norm_type == "ada_norm" and temb is not None:
-            temb_flat = einops.repeat(temb, "b d -> (b t) d", t=T)
-            norm_h = self.norm1(geo, temb_flat)
-        else:
-            norm_h = self.norm1(geo)
-        norm_states = einops.rearrange(norm_h.tensor, "(b t) d -> b t d", b=B)
-
-        ca_out = self.dual_ca(norm_states, vis_ctx, lang_ctx)
-        hidden_states = ca_out + hidden_states
-
-        # 2. Norm + FF + residual
-        flat = einops.rearrange(hidden_states, "b t d -> (b t) d")
-        geo  = enn.GeometricTensor(flat, self.in_type)
-        norm_h3 = self.norm3(geo)
-        ff_out  = self.ff(norm_h3)
-        ff_out_t = einops.rearrange(ff_out.tensor, "(b t) d -> b t d", b=B)
-
-        if self.final_dropout is not None:
-            ff_flat = einops.rearrange(ff_out_t, "b t d -> (b t) d")
-            ff_geo  = enn.GeometricTensor(ff_flat, self.in_type)
-            ff_out_t = einops.rearrange(
-                self.final_dropout(ff_geo).tensor, "(b t) d -> b t d", b=B
-            )
-
-        return ff_out_t + hidden_states
-
 
 class EDiT(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = True
@@ -936,7 +899,6 @@ class EDiT(ModelMixin, ConfigMixin):
         cross_attention_dim: Optional[int] = None,
         use_relative_position_bias: bool = False,
         max_relative_position: int = 32,
-        lang_context_dim: Optional[int] = None,
     ):
         super().__init__()
 
@@ -974,7 +936,7 @@ class EDiT(ModelMixin, ConfigMixin):
         print(f"EDiT Equivariant Configuration:")
         print(f"  Group: C{n_group}")
         print(f"  in_type size: {self.in_type.size} (regular repr - equivariant)")
-        print(f"  cross_attention_type size: {self.cross_attention_type.size} (trivial repr - invariant VL features)")
+        print(f"  cross_attention_type size: {self.cross_attention_type.size} (regular repr - unified context)")
         print(f"  inner_type size: {self.ff_inner_type.size}")
 
         # Timestep encoder outputs TRIVIAL repr (time is scalar, not rotated)
@@ -989,54 +951,30 @@ class EDiT(ModelMixin, ConfigMixin):
         )
         
         # Build equivariant transformer blocks.
-        # When lang_context_dim is set, CA blocks become DualStreamTransformerBlock,
-        # which jointly attends to equivariant vision AND invariant language context.
-        self.use_dual_stream = lang_context_dim is not None
+        # All CA blocks use BasicTransformerBlock (both_regular mode): unified regular-repr
+        # context is provided by ContextMixerPipeline before entering EDiT.
         all_blocks = []
         for idx in range(self.config.num_layers):
             use_self_attn = idx % 2 == 1 and interleave_self_attention
-
-            if not use_self_attn and self.use_dual_stream:
-                # CA block → DualStreamTransformerBlock
-                assert lang_context_dim is not None
-                all_blocks += [
-                    DualStreamTransformerBlock(
-                        in_type=self.in_type,
-                        vis_type=self.cross_attention_type,
-                        lang_dim=lang_context_dim,
-                        inner_type=self.ff_inner_type,
-                        temb_type=self.time_out_type,
-                        num_attention_heads=self.config.num_attention_heads,
-                        attention_head_dim=self.config.attention_head_dim,
-                        dropout=self.config.dropout,
-                        activation_fn=self.config.activation_fn,
-                        attention_bias=self.config.attention_bias,
-                        norm_type=norm_type,
-                        norm_eps=self.config.norm_eps,
-                        final_dropout=final_dropout,
-                    )
-                ]
-            else:
-                # SA block (interleaved) or original CA block (no dual stream)
-                curr_cross_type = self.in_type if use_self_attn else self.cross_attention_type
-                all_blocks += [
-                    BasicTransformerBlock(
-                        in_type=self.in_type,
-                        cross_attention_type=curr_cross_type,
-                        inner_type=self.ff_inner_type,
-                        temb_type=self.time_out_type,
-                        num_attention_heads=self.config.num_attention_heads,
-                        attention_head_dim=self.config.attention_head_dim,
-                        dropout=self.config.dropout,
-                        activation_fn=self.config.activation_fn,
-                        attention_bias=self.config.attention_bias,
-                        norm_type=norm_type,
-                        norm_eps=self.config.norm_eps,
-                        final_dropout=final_dropout,
-                        use_relative_position_bias=use_relative_position_bias,
-                        max_relative_position=max_relative_position,
-                    )
-                ]
+            curr_cross_type = self.in_type if use_self_attn else self.cross_attention_type
+            all_blocks.append(
+                BasicTransformerBlock(
+                    in_type=self.in_type,
+                    cross_attention_type=curr_cross_type,
+                    inner_type=self.ff_inner_type,
+                    temb_type=self.time_out_type,
+                    num_attention_heads=self.config.num_attention_heads,
+                    attention_head_dim=self.config.attention_head_dim,
+                    dropout=self.config.dropout,
+                    activation_fn=self.config.activation_fn,
+                    attention_bias=self.config.attention_bias,
+                    norm_type=norm_type,
+                    norm_eps=self.config.norm_eps,
+                    final_dropout=final_dropout,
+                    use_relative_position_bias=use_relative_position_bias,
+                    max_relative_position=max_relative_position,
+                )
+            )
         self.transformer_blocks = nn.ModuleList(all_blocks)
 
         # Output blocks (operating on equivariant features)
@@ -1064,17 +1002,15 @@ class EDiT(ModelMixin, ConfigMixin):
     def forward(
         self,
         hidden_states: torch.Tensor,          # (B, T, in_type.size)
-        encoder_hidden_states: torch.Tensor,  # (B, Sv, cross_attention_type.size) — equi vision
+        encoder_hidden_states: torch.Tensor,  # (B, Sv, cross_attention_type.size) — unified regular context
         timestep: Optional[torch.LongTensor] = None,
-        encoder_lang_states: Optional[torch.Tensor] = None,  # (B, Sl, lang_context_dim) — invariant lang
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
     ):
         """
         Args:
             hidden_states:         (B, T, D)   equivariant state/action tokens
-            encoder_hidden_states: (B, Sv, D)  equivariant vision context (regular repr)
-            encoder_lang_states:   (B, Sl, DL) invariant language context (optional, for dual-stream)
+            encoder_hidden_states: (B, Sv, D)  unified regular-repr context (vis + lifted lang)
             timestep:              timestep for AdaLN conditioning
             return_all_hidden_states: return list of per-layer hidden states
         """
@@ -1088,15 +1024,7 @@ class EDiT(ModelMixin, ConfigMixin):
         all_hidden_states = [hidden_states]
 
         for idx, block in enumerate(self.transformer_blocks):
-            if isinstance(block, DualStreamTransformerBlock):
-                # Dual-stream CA block: attends to equivariant vision + invariant language
-                hidden_states = block(
-                    hidden_states,
-                    vis_ctx=encoder_hidden_states,
-                    lang_ctx=encoder_lang_states,
-                    temb=temb,
-                )
-            elif idx % 2 == 1 and self.config.interleave_self_attention:
+            if idx % 2 == 1 and self.config.interleave_self_attention:
                 # Self-attention layer
                 hidden_states = block(
                     hidden_states,

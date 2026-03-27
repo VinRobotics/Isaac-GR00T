@@ -40,7 +40,7 @@ from gr00t.model.action_head.action_encoder import (
     swish,
 )
 
-from .equivariant_cross_attention_dit import EDiT, EquiVisionTransformer
+from .equivariant_cross_attention_dit import EDiT, EquiVisionTransformer, ContextMixerPipeline
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -414,11 +414,13 @@ class FlowmatchingActionHead(nn.Module):
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
-        # Inject n_group into diffusion model config
+        # Inject n_group into diffusion model config.
+        # lang_context_dim=None: ContextMixerPipeline fuses trivial+regular context before EDiT,
+        # so EDiT uses single-stream BasicTransformerBlock (both_regular mode) throughout.
         diffusion_cfg = {
             **config.diffusion_model_cfg,
             "n_group": self.n_group,
-            "lang_context_dim": self.config.backbone_embedding_dim
+            "lang_context_dim": None,
         }
         self.model = EDiT(**diffusion_cfg)
         self.action_dim = config.action_dim
@@ -479,6 +481,19 @@ class FlowmatchingActionHead(nn.Module):
             **vis_attn_cfg,
         )
 
+        # 4-layer context mixer: bidirectional trivial↔regular attention before EDiT.
+        # Mixes backbone_invariant_context (lang+non-equi vision, trivial) with
+        # backbone_equi_vision_features (equi vision, regular), then lifts trivial→regular
+        # and concatenates → unified regular context for single-stream EDiT cross-attention.
+        _vl_cfg = config.vl_self_attention_cfg
+        self.context_mixer = ContextMixerPipeline(
+            lang_dim=config.backbone_embedding_dim,
+            regular_type=self.model.cross_attention_type,
+            num_layers=_vl_cfg.get("num_layers", 4),
+            num_heads=_vl_cfg.get("num_attention_heads", 8),
+            dim_head=_vl_cfg.get("attention_head_dim", 64),
+            dropout=_vl_cfg.get("dropout", 0.0),
+        )
 
         if config.add_pos_embed:
             # Equivariant temporal position embeddings for state and action tokens.
@@ -745,9 +760,9 @@ class FlowmatchingActionHead(nn.Module):
 
         Dual-path backbone (EagleBackboneFATokens):
           backbone_equi_vision_features [B, n_equi*T, D]  — equivariant (regular repr)
-            → vl_features  (encoder_hidden_states for DualStreamEquiCA)
+            → vl_features  (equi-vision stream for ContextMixerPipeline)
           backbone_invariant_context    [B, T_lang + n_noequi*T, D]  — invariant (trivial repr)
-            → lang_features (encoder_lang_states for DualStreamEquiCA)
+            → lang_features (language stream for ContextMixerPipeline)
 
         Legacy backbone:
           backbone_equi_vision_features [B, n_equi, T, D] or [B, T_total, D]
@@ -772,8 +787,7 @@ class FlowmatchingActionHead(nn.Module):
 
         # Invariant context: language features + non-equi camera features (trivial repr).
         # Present when using the dual-path backbone (EagleBackboneFATokens).
-        # Passed as encoder_lang_states to EDiT's DualStreamTransformerBlock so the
-        # denoising DiT can jointly attend to equivariant vision AND invariant language.
+        # Fused with equi-vision via ContextMixerPipeline before entering EDiT.
         inv_ctx = backbone_output.get("backbone_invariant_context", None)
         backbone_output.data["lang_features"] = inv_ctx    # None for legacy backbones
 
@@ -816,6 +830,12 @@ class FlowmatchingActionHead(nn.Module):
         vl_embs    = backbone_output.vl_features                  # [B, n_equi*T, cross_attn_dim]
         lang_embs  = backbone_output.get("lang_features", None)   # [B, T_lang+n_noequi*T, D] or None
         encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*T], all-ones
+
+        # Context mixer: mix trivial (lang) ↔ regular (equi-vis), then unify to all-regular.
+        # Output: [B, N_vis+N_lang, cross_attn_dim] — single regular-repr context for EDiT.
+        if lang_embs is not None:
+            vl_embs   = self.context_mixer(lang_embs, vl_embs)
+            lang_embs = None
 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
@@ -867,7 +887,6 @@ class FlowmatchingActionHead(nn.Module):
         model_output = self.model(
             hidden_states=sa_embs,
             encoder_hidden_states=vl_embs,
-            encoder_lang_states=lang_embs,
             encoder_attention_mask=encoder_mask,
             timestep=t_discretized,
             return_all_hidden_states=False
@@ -925,6 +944,10 @@ class FlowmatchingActionHead(nn.Module):
         lang_embs  = backbone_output.get("lang_features", None)   # [B, T_lang+n_noequi*T, D] or None
         encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*T], all-ones
 
+        if lang_embs is not None:
+            vl_embs   = self.context_mixer(lang_embs, vl_embs)
+            lang_embs = None
+
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
@@ -981,7 +1004,6 @@ class FlowmatchingActionHead(nn.Module):
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
-                encoder_lang_states=lang_embs,
                 encoder_attention_mask=encoder_mask,
                 timestep=timesteps_tensor,
             )
@@ -1035,6 +1057,11 @@ class FlowmatchingActionHead(nn.Module):
         vl_embeds       = backbone_output.vl_features               # [B, n_equi*T, cross_attn_dim]
         lang_embeds_rt  = backbone_output.get("lang_features", None) # [B, T_lang+n_noequi*T, D] or None
         encoder_mask_rt = backbone_output.backbone_attention_mask   # [B, n_equi*T]
+
+        if lang_embeds_rt is not None:
+            vl_embeds      = self.context_mixer(lang_embeds_rt, vl_embeds)
+            lang_embeds_rt = None
+
         embodiment_id  = action_input.embodiment_id
 
         # Embed state.
@@ -1083,7 +1110,6 @@ class FlowmatchingActionHead(nn.Module):
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
-                    encoder_lang_states=lang_embeds_rt,
                     encoder_attention_mask=encoder_mask_rt,
                     timestep=timesteps_tensor,
                 )

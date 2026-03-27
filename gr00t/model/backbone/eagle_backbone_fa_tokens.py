@@ -18,23 +18,26 @@ Eagle Backbone: N-pass Frame Averaging after VLM.
 
 Runs the full VLM (SigLIP + LLM) once per group rotation so the language model
 sees each rotated view and produces rotation-conditioned hidden states.
-Frame averaging is then applied AFTER the VLM on the resulting features.
+Frame averaging is applied AFTER the VLM on the equi vision features only.
+Language and non-equi vision features are taken from the canonical frame (r=0),
+i.e., the pass where equi cameras are NOT rotated.
 
 Pipeline:
   1. Pre-rotate the n_equi cameras by each g ∈ C_N (N = n_group).
   2. For each rotation r: build pixel_values_r = [rotated_equi(r), non_equi_original]
      and run VLM([pixel_values_r, text]) → hidden_r [B, T_total, d_eagle].
   3. Extract three streams from hidden_r:
-       equi_vis_r  [B, n_equi, T_vis, d_eagle]  — equi camera VLM features
-       lang_r      [B, T_lang, d_eagle]          — language + cross-modal features
-       noequi_vis  [B, n_noequi, T_vis, d_eagle] — non-equi camera features (r=0 only,
-                                                    same for all r since pixels unchanged)
+       equi_vis_r  [B, n_equi, T_vis, d_eagle]  — equi camera VLM features (all N passes)
+       lang        [B, T_lang, d_eagle]          — language features  (canonical r=0 only)
+       noequi_vis  [B, n_noequi, T_vis, d_eagle] — non-equi features  (canonical r=0 only)
   4. FA_equi on {equi_vis_r}:
        H'[p] = (1/N) Σ_r ρ(r⁻¹) π(r⁻¹) equi_vis_r[p]   → [B, n_equi, T_vis, d_eagle]
        Equivariant: H'(g·x) = ρ(g) H'(x)  ✓
-  5. FA_inv on {lang_r}:
-       h_lang = (1/N) Σ_r lang_r                           → [B, T_lang, d_eagle]
-       Invariant: plain average over same-sum relabelling   ✓
+  5. Canonical frame for language + non-equi:
+       h_lang   = hidden_0[:, text_mask,       :]          → [B, T_lang, d_eagle]
+       h_noequi = hidden_0[:, noequi_seq_pos,  :]          → [B, n_noequi*T_vis, d_eagle]
+       Invariant: from unrotated canonical frame ✓
+       Cleaner than FA_inv average: no cross-attention noise from rotated equi tokens.
   6. Project:
        H'       → vision_proj  (group-major equivariant linear)   → [B, n_equi, T_vis, D]
        h_lang   → eagle_linear (plain linear, invariant)          → [B, T_lang, D]
@@ -422,12 +425,12 @@ class EagleBackboneFATokens(nn.Module):
         by expanding the batch dimension: effective batch = B × N.
 
         Correctness:
-          - equi vision: FA_equi  (ρ(r⁻¹) π(r⁻¹) before averaging) → equivariant H'
-          - language:    FA_inv   (plain average)                     → invariant
-          - non-equi:    FA_inv   (plain average over all N passes)   → invariant
-            Note: non-equi pixels are the same for all r, but their LLM hidden states
-            differ because the LLM attends globally to the changing equi tokens.
-            Averaging them over N passes (FA_inv) gives the correct invariant feature.
+          - equi vision: FA_equi (ρ(r⁻¹) π(r⁻¹) before averaging) → equivariant H'
+          - language:    canonical frame r=0 (unrotated equi images) → invariant ✓
+          - non-equi:    canonical frame r=0                         → invariant ✓
+            Using r=0 is cleaner than FA_inv average: language and non-equi features
+            are derived from the natural unrotated scene, avoiding cross-attention noise
+            from the N-1 artificially rotated equi-camera passes.
 
         Returns:
             h_prime_flat : [B, n_equi*T_vis, project_to_dim]  equivariant
@@ -531,15 +534,13 @@ class EagleBackboneFATokens(nn.Module):
             # Fallback: treat all tokens as equi (no image index knowledge)
             equi_vis_all = hidden_all[:, :, :, :].reshape(B, N, 1, T_total, d_eagle)
 
-        # lang_all: [B, N, T_lang, d_eagle]
-        lang_all = hidden_all[:, :, text_mask, :]
+        # Canonical frame (r=0): language + non-equi features from the unrotated pass.
+        # hidden_all[:, 0] is the pass where equi cameras are NOT rotated → natural scene.
+        hidden_canonical = hidden_all[:, 0]                            # [B, T_total, d_eagle]
 
-        # noequi_all: [B, N, n_noequi*T_vis, d_eagle] — average over N (FA_inv)
-        # Non-equi pixels are the same for every rotation but the LLM hidden states
-        # differ (global attention sees different equi tokens each pass).
-        # FA_inv (plain average) gives the correct invariant representation.
-        noequi_all = (
-            hidden_all[:, :, noequi_seq_pos, :]
+        h_lang_raw   = hidden_canonical[:, text_mask, :]              # [B, T_lang,        d_eagle]
+        h_noequi_raw = (
+            hidden_canonical[:, noequi_seq_pos, :]                    # [B, n_noequi*T_vis, d_eagle]
             if noequi_seq_pos is not None else None
         )
 
@@ -566,11 +567,7 @@ class EagleBackboneFATokens(nn.Module):
 
         h_prime_raw = transformed.mean(dim=0).reshape(B, n_equi, T_vis, d_eagle)
 
-        # ── Step 7: FA_inv on language + non-equi (plain average) ────────────
-        h_lang_raw   = lang_all.mean(dim=1)                           # [B, T_lang, d_eagle]
-        h_noequi_raw = noequi_all.mean(dim=1) if noequi_all is not None else None
-
-        # ── Step 8: project to project_to_dim ────────────────────────────────
+        # ── Step 7: project to project_to_dim ────────────────────────────────
         proj_dt   = self.vision_proj.weight.dtype
         blocks_in = d_eagle // N
         # Equivariant projection: same linear on each of the N group-slices
