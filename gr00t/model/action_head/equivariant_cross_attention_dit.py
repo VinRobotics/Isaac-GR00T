@@ -936,7 +936,7 @@ class EDiT(ModelMixin, ConfigMixin):
         cross_attention_dim: Optional[int] = None,
         use_relative_position_bias: bool = False,
         max_relative_position: int = 32,
-        lang_context_dim: Optional[int] = 1536,
+        lang_context_dim: Optional[int] = None,
     ):
         super().__init__()
 

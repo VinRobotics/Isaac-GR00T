@@ -507,11 +507,11 @@ class EagleBackboneFATokens(nn.Module):
         lm_out = self.eagle_model.language_model(
             inputs_embeds=input_embeds,
             attention_mask=attn_mask_all,
-            output_hidden_states=False,   # only last layer — saves memory vs storing all layers
+            output_hidden_states=True,
             return_dict=True,
         )
-        # last_hidden_state = output of the truncated LLM's final layer = hidden_states[select_layer]
-        hidden_all = lm_out.last_hidden_state.reshape(B, N, T_total, d_eagle)
+        # last_hidden_state = output of the truncated LLM's final layer = hidden_states[-1]
+        hidden_all = lm_out.hidden_states[-1].reshape(B, N, T_total, d_eagle)
 
         # ── Step 5: extract token streams ────────────────────────────────────
         if img_tok_idx is not None:
