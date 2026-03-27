@@ -1599,9 +1599,12 @@ class VRH3TwotHandTaskCompletionConfig(BaseDataConfig):
     def transform(self):
         transforms = [
             # video transforms
-            VideoToTensor(apply_to=self.video_keys),
-            VideoCrop(apply_to=self.video_keys, scale=0.95),
-            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
             VideoColorJitter(
                 apply_to=self.video_keys,
                 brightness=0.3,
@@ -4402,18 +4405,21 @@ class VRH311LeftArmQuant2IncludeTaskProgressConfig(BaseDataConfig):
 ###########################################################################################
 
 class VRH31TwoHand3CamConfig(BaseDataConfig):
-    video_keys = ["video.cam_front", "video.cam_left", "video.cam_right"]
+    video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
     state_keys = [
-        "state.arm",
+        "state.left_arm",
+        "state.right_arm",
         "state.left_hand",
         "state.right_hand",
     ]
     action_keys = [
-        "action.arm",
+        "action.left_arm",
+        "action.right_arm",
         "action.left_hand",
         "action.right_hand",
-        "action.task_progress"
     ]
+    task_completion_keys = ["observation.tasks.done"]
+    
     language_keys = ["annotation.human.task_description"]
     observation_indices = [0]
     state_indices = [0]
@@ -4421,7 +4427,7 @@ class VRH31TwoHand3CamConfig(BaseDataConfig):
 
     def modality_config(self):
         video_modality = ModalityConfig(
-            delta_indices=self.observation_indices,
+            delta_indices=[-20, -15, -10, -5, 0],
             modality_keys=self.video_keys,
         )
         state_modality = ModalityConfig(
@@ -4442,14 +4448,26 @@ class VRH31TwoHand3CamConfig(BaseDataConfig):
             "action": action_modality,
             "language": language_modality,
         }
+                # Add task completion modality if enabled
+        if self.task_completion_keys:
+            task_completion_modality = ModalityConfig(
+                delta_indices=[0],  # Same indices as action to get future completion status
+                modality_keys=self.task_completion_keys,
+            )
+            modality_configs["task_completion"] = task_completion_modality
+        
+        return modality_configs
         return modality_configs
 
     def transform(self):
         transforms = [
             # video transforms
-            VideoToTensor(apply_to=self.video_keys),
-            VideoCrop(apply_to=self.video_keys, scale=0.95),
-            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[:1]),
+            VideoCrop(apply_to=self.video_keys[:1], scale=0.95),
+            VideoResize(apply_to=self.video_keys[:1], height=224, width=224, interpolation="linear"),
+            VideoToTensor(apply_to=self.video_keys[1:]),
+            VideoCrop(apply_to=self.video_keys[1:], scale=0.95),
+            VideoResize(apply_to=self.video_keys[1:], height=224, width=224, interpolation="linear"),
             VideoColorJitter(
                 apply_to=self.video_keys,
                 brightness=0.3,
@@ -4468,6 +4486,7 @@ class VRH31TwoHand3CamConfig(BaseDataConfig):
                 #     "state.base_rotation": "rotation_6d",
                 # },
             ),
+            StateActionToTensor(apply_to=self.task_completion_keys),
             # action transforms
             StateActionToTensor(apply_to=self.action_keys),
             StateActionTransform(
@@ -4485,6 +4504,7 @@ class VRH31TwoHand3CamConfig(BaseDataConfig):
                 action_horizon=len(self.action_indices),
                 max_state_dim=64,
                 max_action_dim=32,
+                use_task_completion=True,
             ),
         ]
 

@@ -32,6 +32,8 @@ class RobotInferenceServer(BaseInferenceServer):
             "get_modality_config", model.get_modality_config, requires_input=False
         )
         self.register_endpoint("reset", model.reset, requires_input=False)
+        if hasattr(model, "get_task_completion"):
+            self.register_endpoint("get_task_completion", model.get_task_completion)
 
     @staticmethod
     def start_server(policy: BasePolicy, port: int, api_token: str = None):
@@ -49,6 +51,21 @@ class RobotInferenceClient(BaseInferenceClient, BasePolicy):
 
     def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         return self.call_endpoint("get_action", observations)
+
+    def get_task_completion(self, observations: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Call the task-completion endpoint on the server.
+
+        Pass window frames stacked along the time axis, e.g.:
+
+            obs = {"video.cam_head": np.stack([frame_t_minus_2,
+                                               frame_t_minus_1,
+                                               frame_t], axis=0)}  # (W, H, W, C)
+
+        Returns:
+            {"task_completion_pred": np.ndarray}  — sigmoid probability in [0, 1]
+        """
+        return self.call_endpoint("get_task_completion", observations)
 
     def get_modality_config(self) -> Dict[str, ModalityConfig]:
         return self.call_endpoint("get_modality_config", requires_input=False)

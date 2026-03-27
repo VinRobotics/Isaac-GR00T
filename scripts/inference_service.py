@@ -135,6 +135,7 @@ class ArgsConfig:
     If provided, the model's task_completion_detection weights are replaced with these."""
 
 
+
 #####################################################################################
 
 
@@ -208,9 +209,14 @@ def main(args: ArgsConfig):
 
         if args.task_completion_detection_path is not None:
             import torch as _torch
-            tcd_state = _torch.load(args.task_completion_detection_path, map_location="cpu")
+            tcd_state = _torch.load(
+                args.task_completion_detection_path,
+                map_location="cpu",
+                weights_only=True,
+            )
             policy.model.task_completion_detection.load_state_dict(tcd_state)
             print(f"Loaded task_completion_detection weights from: {args.task_completion_detection_path}")
+
 
         if args.guidance_option == "acg":
             policy.get_action = types.MethodType(Gr00tPolicy_ACG.get_action, policy)

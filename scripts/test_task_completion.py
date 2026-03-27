@@ -2,6 +2,8 @@ from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.experiment.data_config import load_data_config
 from gr00t.eval.robot import RobotInferenceClient, RobotInferenceServer
 import numpy as np
+from gr00t.task_completion.config import WindowTaskCompletionConfig
+from gr00t.task_completion.dataset import WindowFrameTaskCompletionDataset
 import torch
 from copy import deepcopy
 from tqdm import tqdm
@@ -9,12 +11,12 @@ from torch.utils.data.dataloader import DataLoader
 import os
 from PIL import Image
 
-data_config = load_data_config("vrh3_two_hand_task_completion")
+data_config = load_data_config("vr_h31_two_hand_3cam")
 modality_config = data_config.modality_config()
 modality_transform = data_config.transform()
 
 dataset = LeRobotSingleDataset(
-    "/home/locht1/Documents/locht1/code_convert/output/20251213_VR_H3_pickpart_speedup1_done_completion_test",
+    "/home/locht1/Documents/locht1/code_convert/output/vr_h31_place_completion_test",
     embodiment_tag="new_embodiment",
     video_backend="torchvision_av",
     modality_configs=modality_config,
@@ -31,8 +33,9 @@ i=0
 for data in tqdm(dataset):
     obs = data
     # print(obs)
-    action = client.get_action(obs)
-    task_completion = action["task_completion"] >= 0.5
+    action = client.get_task_completion(obs)
+    print(action)
+    task_completion = action["task_completion_pred"] >= 0.5
     
     correct = task_completion == obs["observation.tasks.done"][0][0]
     results += correct
@@ -42,7 +45,7 @@ for data in tqdm(dataset):
     label = int(obs["observation.tasks.done"][0][0])
     
     # Get the image from observation (video.cam_front)
-    img_tensor = obs["video.cam_front"][0]  # Get first frame
+    img_tensor = obs["video.cam_head"][0]  # Get first frame
     if isinstance(img_tensor, torch.Tensor):
         img_array = img_tensor.cpu().numpy()
     else:

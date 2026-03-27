@@ -294,6 +294,43 @@ class Gr00tPolicy(BasePolicy):
             
         return unnormalized_action
 
+    def get_task_completion(self, observations: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        """
+        Run the task-completion detector on a window of frames.
+
+        Args:
+            observations: same format as get_action().
+                For window-frame prediction pass video with shape
+                (window_size, H, W, C) — all W frames already stacked.
+                The standard modality transform handles variable T lengths;
+                Eagle attends across all frames in one forward pass.
+
+        Returns:
+            {"task_completion_pred": np.ndarray}  shape (B,) or scalar float
+                Sigmoid probability in [0, 1]; values near 1 → task done.
+        """
+        obs_copy = observations.copy()
+
+        is_batch = self._check_state_is_batched(obs_copy)
+        if not is_batch:
+            obs_copy = unsqueeze_dict_values(obs_copy)
+
+        for k, v in obs_copy.items():
+            if not isinstance(v, np.ndarray):
+                obs_copy[k] = np.array(v)
+
+        print(obs_copy)
+        normalized_input = self.apply_transforms(obs_copy)
+
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+            tc_pred = self.model.get_task_completion(normalized_input)  # (B,) float
+
+        result = tc_pred.float().cpu().numpy()
+        if not is_batch:
+            result = result.squeeze()
+
+        return {"task_completion_pred": result}
+
     def _get_action_from_normalized_input(self, normalized_input: Dict[str, Any]) -> torch.Tensor:
         # Set up autocast context if needed
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):

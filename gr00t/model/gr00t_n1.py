@@ -90,9 +90,6 @@ class GR00T_N1_5(PreTrainedModel):
             seq_dim=action_head_cfg.backbone_embedding_dim,
             hidden_dim=action_head_cfg.hidden_size,
         )
-        self.task_completion_detection_loss = nn.BCEWithLogitsLoss()
-        self.task_completion_only = False  # set True to skip diffusion forward pass
-        self.task_completion_loss_weight = 1.0  # scale factor for task completion loss
 
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
@@ -193,19 +190,6 @@ class GR00T_N1_5(PreTrainedModel):
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
-
-        if "task_completion" in action_inputs:
-            task_completion = action_inputs.task_completion.squeeze().float()
-            vl_embs = backbone_outputs.backbone_features.detach()
-            tc_logits = self.task_completion_detection(vl_embs).squeeze()
-            tc_loss = self.task_completion_detection_loss(tc_logits, task_completion)
-
-            if self.task_completion_only:
-                return BatchFeature(data={
-                    "loss": self.task_completion_loss_weight * tc_loss,
-                    "loss_vl_task_completion": tc_loss.detach(),
-                })
-
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=True)
         return action_head_outputs
@@ -217,12 +201,45 @@ class GR00T_N1_5(PreTrainedModel):
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
         backbone_outputs = self.backbone(backbone_inputs)
-        tc_logits = self.task_completion_detection(backbone_outputs.backbone_features.detach()).squeeze()
-        tc_pred = F.sigmoid(tc_logits)
         action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
-        action_head_outputs["action.task_completion"] = tc_pred
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
+
+    def get_task_completion(self, inputs: dict) -> torch.Tensor:
+        """
+        Run the backbone and task-completion detector on the given inputs.
+
+        Skips action-head validation so it works with window-frame inputs
+        where the video tensor has T=window_size frames (not T=1).
+
+        Args:
+            inputs: observation dict after apply_transforms().
+                    For window-frame prediction pass all W frames stacked
+                    along the time axis before calling this method, e.g.:
+                        obs["video.cam_head"] = np.stack([frame_{t-2},
+                                                          frame_{t-1},
+                                                          frame_t])  # (W, H, W, C)
+
+        Returns:
+            tc_pred : (B,) float tensor of sigmoid probabilities in [0, 1].
+                      Values close to 1 indicate task completion.
+        """
+        # Use backbone.prepare_input directly to skip validate_inputs, which
+        # asserts action-head shapes incompatible with window-frame inputs.
+        backbone_inputs = self.backbone.prepare_input(inputs)
+        
+        def to_device(x):
+            if torch.is_floating_point(x):
+                return x.to(self.device, dtype=self.action_head.dtype)
+            return x.to(self.device)
+
+        backbone_inputs = tree.map_structure(to_device, backbone_inputs)
+
+        backbone_outputs = self.backbone(backbone_inputs)
+        tc_logits = self.task_completion_detection(
+            backbone_outputs.backbone_features.detach()
+        ).squeeze(-1)
+        return F.sigmoid(tc_logits)
     
     def get_realtime_action(
         self,
@@ -238,11 +255,8 @@ class GR00T_N1_5(PreTrainedModel):
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
         backbone_outputs = self.backbone(backbone_inputs)
-        tc_logits = self.task_completion_detection(backbone_outputs.backbone_features.detach()).squeeze()
-        tc_pred = F.sigmoid(tc_logits)
         if prev_action_chunk is None:
             action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
-
         else:
             action_head_outputs = self.action_head.get_realtime_action(
                 action_inputs,
@@ -255,8 +269,6 @@ class GR00T_N1_5(PreTrainedModel):
                 sigma_d_o=sigma_d_o,
                 actual_action_dim=actual_action_dim
             )
-            # print("action_head_outputs: ", action_head_outputs)
-        action_head_outputs["action.task_completion"] = tc_pred
         _real_action_head_outputs = copy.deepcopy(action_head_outputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
 
