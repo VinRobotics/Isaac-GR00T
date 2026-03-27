@@ -1801,6 +1801,11 @@ class VRH31EffortGripperBothExcludeTaskProgress(BaseDataConfig):
     observation_indices = [0]
     state_indices = [0]
     action_indices = [x * 2 for x in range(16)]
+    effort_history_len = 16  # equals future effort len (len(action_indices))
+    effort_indices = list(range(-15, 1)) + [x * 2 for x in range(16)]  # 16 history + 16 future
+
+    effort_dims=15
+
 
     def modality_config(self):
         video_modality = ModalityConfig(
@@ -1815,6 +1820,10 @@ class VRH31EffortGripperBothExcludeTaskProgress(BaseDataConfig):
             delta_indices=self.action_indices,
             modality_keys=self.action_keys,
         )
+        effort_modality = ModalityConfig(
+            delta_indices=self.effort_indices,
+            modality_keys=self.effort_keys,
+        )
         language_modality = ModalityConfig(
             delta_indices=self.observation_indices,
             modality_keys=self.language_keys,
@@ -1823,6 +1832,7 @@ class VRH31EffortGripperBothExcludeTaskProgress(BaseDataConfig):
             "video": video_modality,
             "state": state_modality,
             "action": action_modality,
+            "effort": effort_modality,
             "language": language_modality,
         }
         return modality_configs
@@ -1860,17 +1870,26 @@ class VRH31EffortGripperBothExcludeTaskProgress(BaseDataConfig):
                 apply_to=self.action_keys,
                 normalization_modes={key: "min_max" for key in self.action_keys},
             ),
+            StateActionToTensor(apply_to=self.effort_keys),
+            StateActionTransform(
+                apply_to=self.effort_keys,
+                normalization_modes={key: "min_max" for key in self.effort_keys},
+            ),
             # concat transforms
             ConcatTransform(
                 video_concat_order=self.video_keys,
                 state_concat_order=self.state_keys,
+                effort_concat_order=self.effort_keys,
                 action_concat_order=self.action_keys,
             ),
             GR00TTransform(
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
+                effort_horizon=len(self.effort_indices),  # history + future
+                effort_history_len=self.effort_history_len,
                 max_state_dim=64,
                 max_action_dim=32,
+                max_effort_dim=15,
             ),
         ]
 
