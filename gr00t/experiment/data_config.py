@@ -1793,7 +1793,9 @@ class VRH31EffortGripperBothExcludeTaskProgress(BaseDataConfig):
         "action.gripper_open",
     ]
     effort_keys = [
-        "effort.left_arm",
+        "effort.left_shoulder",
+        "effort.left_elbow",
+        "effort.left_wrist",
         "effort.gripper_open",
     ]
     
