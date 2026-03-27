@@ -420,7 +420,6 @@ class FlowmatchingActionHead(nn.Module):
         diffusion_cfg = {
             **config.diffusion_model_cfg,
             "n_group": self.n_group,
-            "lang_context_dim": None,
         }
         self.model = EDiT(**diffusion_cfg)
         self.action_dim = config.action_dim
