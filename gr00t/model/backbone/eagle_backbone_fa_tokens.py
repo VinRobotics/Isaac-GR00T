@@ -14,57 +14,47 @@
 # limitations under the License.
 
 """
-Eagle Backbone with Late Frame Averaging on Full Vision Tokens.
+Eagle Backbone: N-pass Frame Averaging after VLM.
 
-This version preserves all vision transformer tokens instead of using pooled features,
-giving vision features equal importance to state and action tokens.
-Frame averaging is applied on the full token sequence with proper spatial alignment.
+Runs the full VLM (SigLIP + LLM) once per group rotation so the language model
+sees each rotated view and produces rotation-conditioned hidden states.
+Frame averaging is then applied AFTER the VLM on the resulting features.
 
-Key differences from EagleBackboneFA (pooled):
-- Output: [B, num_imgs, T_vision, D_vision] instead of [B, num_imgs, D_pool]
-- Preserves spatial/token information (256 tokens vs 1 pooled vector)
-- Better balance with state/action tokens in downstream processing
-- Each token is a regular representation of the CN group
+Pipeline:
+  1. Pre-rotate the n_equi cameras by each g ∈ C_N (N = n_group).
+  2. For each rotation r: build pixel_values_r = [rotated_equi(r), non_equi_original]
+     and run VLM([pixel_values_r, text]) → hidden_r [B, T_total, d_eagle].
+  3. Extract three streams from hidden_r:
+       equi_vis_r  [B, n_equi, T_vis, d_eagle]  — equi camera VLM features
+       lang_r      [B, T_lang, d_eagle]          — language + cross-modal features
+       noequi_vis  [B, n_noequi, T_vis, d_eagle] — non-equi camera features (r=0 only,
+                                                    same for all r since pixels unchanged)
+  4. FA_equi on {equi_vis_r}:
+       H'[p] = (1/N) Σ_r ρ(r⁻¹) π(r⁻¹) equi_vis_r[p]   → [B, n_equi, T_vis, d_eagle]
+       Equivariant: H'(g·x) = ρ(g) H'(x)  ✓
+  5. FA_inv on {lang_r}:
+       h_lang = (1/N) Σ_r lang_r                           → [B, T_lang, d_eagle]
+       Invariant: plain average over same-sum relabelling   ✓
+  6. Project:
+       H'       → vision_proj  (group-major equivariant linear)   → [B, n_equi, T_vis, D]
+       h_lang   → eagle_linear (plain linear, invariant)          → [B, T_lang, D]
+       noequi   → noequi_proj  (plain linear, invariant)          → [B, n_noequi*T_vis, D]
 
-Frame Averaging Formula:
-    FA(x) = (1/|G|) * Σ_g ρ(g) · π(g⁻¹) · f(g·x)
-
-Where:
-- g is a rotation from the cyclic group CN
-- f(g·x) = features from rotated image (tokens at rotated positions)
-- π(g⁻¹) = inverse spatial permutation (revert tokens to original positions)
-- ρ(g) = feature-space transformation (regular representation)
-
-This ensures proper per-token equivariance: f(g·x)[p] = ρ(g) · f(x)[π(g)·p]
-After spatial alignment, tokens across all rotations represent the same spatial content.
-
-Pipeline (EquiLLM-style adapter):
-    1. FA (Phase 1): Rotate images N times, extract features, apply FA → H' (equivariant)
-    2. Invariant FA + Eagle LLM (Phase 2): FA_inv(H') injected into LLM → vl_hidden.
-       FA_inv = (1/|G|) Σ_g π(g⁻¹)·f(g·x)  — spatial align only, no feature roll → invariant.
-       vl_hidden has both image and language token hidden states (full cross-modal context).
-       Text-only positions of vl_hidden projected to project_to_dim → h_lang.
-    3. EquiAdapter (Phase 3): EquiLLM-style skip-connection adapter.
-       Skip: H' bypasses LLM → adapter directly (same as EquiLLM H' skip connection).
-       cat(H'_flat, h_lang) → SA on combined sequence → CA ← vl_hidden (full image+lang)
-    4. Output: [B, n_equi*T_vis + T_lang, D]
-       [:n_equi*T_vis] equivariant vision tokens; [n_equi*T_vis:] language tokens
+Output (BatchFeature):
+  backbone_equi_vision_features : [B, n_equi*T_vis, D]            equivariant
+  backbone_invariant_context    : [B, T_lang + n_noequi*T_vis, D]  invariant
+  backbone_attention_mask       : Eagle tokeniser attention mask
 """
 
 import os
 import math
-from typing import Optional, List
+from typing import List
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel
 from transformers.feature_extraction_utils import BatchFeature
-
-import escnn
-import escnn.nn as enn
-from escnn.group import CyclicGroup
-from gr00t.model.action_head.equivariant_cross_attention_dit import BasicTransformerBlock
 
 import gr00t
 
@@ -73,163 +63,14 @@ DEFAULT_EAGLE_PATH = os.path.join(
 )
 
 
-
-class EquiAdapter(nn.Module):
-    """
-    Phase 3: EquiLLM-style adapter.
-
-    Architecture: num_layers × (SA + CA)
-
-      Input: cat([H'.reshape(B, n_equi*T, D), lang_embed(h_lang)], dim=1) → [B, n_equi*T + T_lang, D]
-        H'     — equivariant vision tokens (regular repr, group-major)
-        h_lang — invariant language tokens, projected to regular repr via trivial embedding:
-                 lang_embed: R^d_llm → R^blocks (invariant subspace)
-                 expand: [v,v,...,v] × n_group → R^D  (trivial element in regular repr)
-                 Cyclic shift of [v,v,...,v] = [v,v,...,v] → invariant ✓
-
-      SA block — equivariant self-attention on the combined sequence (regular → regular):
-        Vision tokens mix with each other AND with language tokens in one sequence.
-
-      CA block — cross-attention from combined sequence to vl_hidden (regular ← trivial):
-        vl_hidden contains BOTH image and language tokens from the VLM — full context.
-
-    Output: [B, n_equi*T + T_lang, D]  (same layout as input, updated features)
-
-    Identity init: zero-init o_proj + ff.fc2 → SA output = 0 + residual = identity ✓
-                   zero-init v_proj + o_proj on CA → CA output = 0 at init ✓
-    """
-
-    def __init__(
-        self,
-        d_eq: int,
-        d_llm: int,
-        n_group: int,
-        num_heads: int = 32,
-        attention_head_dim: int = 64,
-        num_layers: int = 4,
-    ):
-        super().__init__()
-        self.n_group = n_group
-        self.d_llm = d_llm
-        self.d_eq = d_eq
-        blocks = d_eq // n_group
-        self.blocks = blocks
-        scalar_dim = num_heads * attention_head_dim
-        assert scalar_dim % n_group == 0, (
-            f"num_heads*attention_head_dim ({scalar_dim}) must be divisible by n_group ({n_group})"
-        )
-
-        G = CyclicGroup(n_group)
-        gs = escnn.gspaces.no_base_space(G)
-
-        # Combined sequence type: all tokens live in regular repr space
-        equi_type     = enn.FieldType(gs, [gs.regular_repr] * blocks)
-        # vl_hidden context type: LLM output is invariant (trivial repr)
-        vl_type       = enn.FieldType(gs, [gs.trivial_repr] * d_llm)
-        ff_inner_type = enn.FieldType(gs, [gs.regular_repr] * blocks)
-
-        # SA: equivariant SA on combined [h_prime, h_lang] sequence
-        self.sa_blocks = nn.ModuleList([
-            BasicTransformerBlock(
-                in_type=equi_type,
-                cross_attention_type=equi_type,
-                inner_type=ff_inner_type,
-                num_attention_heads=num_heads,
-                attention_head_dim=attention_head_dim,
-                norm_type="layer_norm",
-            )
-            for _ in range(num_layers)
-        ])
-
-        # CA: combined sequence ← vl_hidden (both image + language, trivial repr)
-        self.ca_blocks = nn.ModuleList([
-            BasicTransformerBlock(
-                in_type=equi_type,
-                cross_attention_type=vl_type,
-                inner_type=ff_inner_type,
-                num_attention_heads=num_heads,
-                attention_head_dim=attention_head_dim,
-                norm_type="layer_norm",
-            )
-            for _ in range(num_layers)
-        ])
-
-        # lang_embed: project h_lang (arbitrary R^d_llm) → invariant subspace (R^blocks),
-        # then expand to regular repr via trivial embedding: [v,v,...,v] × n_group.
-        # This ensures h_lang lives correctly in regular repr before concat with h_prime.
-        self.lang_embed = nn.Linear(d_llm, blocks)
-
-        # Identity init
-        for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
-            for p in sa_blk.attn1.o_proj.parameters():
-                nn.init.zeros_(p)
-            for p in sa_blk.ff.fc2.parameters():
-                nn.init.zeros_(p)
-            for p in ca_blk.attn1.v_proj.parameters():
-                nn.init.zeros_(p)
-            for p in ca_blk.attn1.o_proj.parameters():
-                nn.init.zeros_(p)
-            for p in ca_blk.ff.fc2.parameters():
-                nn.init.zeros_(p)
-
-    def forward(
-        self,
-        h_prime: torch.Tensor,
-        h_lang: torch.Tensor,
-        vl_hidden: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            h_prime:   [B, n_equi, T_vis, D]   equivariant vision features (group-major)
-            h_lang:    [B, T_lang, D]           invariant language features (projected via lang_embed into regular repr)
-            vl_hidden: [B, T_total, D]          full VLM output (image + language, trivial repr)
-        Returns:
-            [B, n_equi*T_vis + T_lang, D]
-        """
-        B, n_equi, T, D = h_prime.shape
-        dt = next(self.sa_blocks[0].parameters()).dtype
-
-        # Embed h_lang as trivial element in regular repr space:
-        #   1. lang_embed: [B, T_lang, d_llm] → [B, T_lang, blocks]  (invariant subspace)
-        #   2. expand × n_group:               → [B, T_lang, n_group, blocks]
-        #   3. reshape:                        → [B, T_lang, D]       (group-major layout)
-        # Result: [v,v,...,v] per token — a proper trivial-in-regular element ✓
-        h_lang_inv = self.lang_embed(h_lang.to(dt))                    # [B, T_lang, blocks]
-        h_lang_reg = (h_lang_inv
-                      .unsqueeze(-2)
-                      .expand(-1, -1, self.n_group, -1)
-                      .reshape(B, -1, self.d_eq))                      # [B, T_lang, D]
-
-        # Concat into combined sequence: [B, n_equi*T + T_lang, D]
-        h_flat = h_prime.to(dt).reshape(B, n_equi * T, D)
-        h = torch.cat([h_flat, h_lang_reg], dim=1)
-
-        # vl_hidden as CA context: [B, T_total, D]
-        vl = vl_hidden.to(dt)
-
-        for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
-            h = sa_blk(h)                              # SA: combined sequence self-attends
-            h = ca_blk(h, encoder_hidden_states=vl)   # CA: combined ← full VLM context
-
-        return h.to(h_prime.dtype)
-
-
 class EagleBackboneFATokens(nn.Module):
     """
-    Eagle Backbone with Late Frame Averaging on Full Vision Tokens.
-    
-    Unlike EagleBackboneFA which uses pooled vision features, this version
-    preserves all vision transformer tokens to maintain richer visual information.
-    Frame averaging is applied on the full sequence of vision tokens.
-    
-    Pipeline:
-    1. Input: [B, n_img, C, H, W] images + text
-    2. Rotate each image N times -> [B*N, n_img, C, H, W]
-    3. Extract vision features -> [B*N*n_img, T_vision, D_vision]
-    4. Apply Frame Averaging on vision tokens -> [B*n_img, T_vision, D_vision]
-    5. Extract language features -> [B, T_text, D_text]
-    
-    Output provides full vision token sequences for richer visual representation.
+    Eagle Backbone with N-pass Frame Averaging (FA applied after VLM).
+
+    Each group rotation gets its own full VLM forward pass so language features
+    are conditioned on the actual rotated visual input.  FA is then applied to
+    the VLM outputs to produce equivariant vision features and invariant language
+    features.
     """
 
     def __init__(
@@ -242,43 +83,25 @@ class EagleBackboneFATokens(nn.Module):
         load_bf16: bool = False,
         eagle_path: str | None = None,
         project_to_dim: int = 1536,
-        # Late FA specific parameters
-        n_group: int = 8,  # Number of rotations (C4 = 4, C8 = 8)
+        # FA parameters
+        n_group: int = 8,
         num_images_per_sample: int = 1,
-        rotate_image_indices: List[int] | None = None,  # Which images to rotate (None = all)
-        output_type: str = 'reg',  # 'reg' for regular representation
-        # Phase 2/3: equivariant adapter
-        use_inv_projector_for_vlm: bool = True,  # Phase 2: inject inv-proj tokens into LLM
-        equi_adapter_num_heads: int = 32,        # heads in SA/CA; matches N1.5 vl_self_attention num_attention_heads=32
-        equi_adapter_attention_head_dim: int = 64, # head dim; matches N1.5 vl_self_attention attention_head_dim=64
-        equi_adapter_num_layers: int = 4,        # SA+CA blocks; matches N1.5 vl_self_attention_cfg.num_layers=4
+        rotate_image_indices: List[int] | None = None,
     ):
         """
         Args:
-            tune_llm: whether to tune the LLM model
-            tune_visual: whether to tune the visual model
-            select_layer: which LLM layer to extract features from
-            project_to_dim: project features to this dimension (must be divisible by n_group for reg repr)
-            n_group: number of rotations for CN group (4 for C4, 8 for C8)
-            num_images_per_sample: number of images per sample
-            rotate_image_indices: which image indices to rotate (None = all)
-            output_type: 'reg' for regular representation output
-            use_inv_projector_for_vlm: if True (Phase 2), replace SigLIP tokens in the
-                Eagle LLM with InvariantProjector(H') tokens instead of running SigLIP again.
+            project_to_dim: output feature dimension (must be divisible by n_group)
+            n_group: CN group order (4 → C4, 8 → C8)
+            num_images_per_sample: total number of camera views per sample
+            rotate_image_indices: which image indices to apply rotations to
+                                  (None = all); remaining images are non-equivariant
         """
         super().__init__()
-        assert not reproject_vision, "Reproject vision is not implemented here"
-        assert output_type == 'reg', "Only regular representation is supported"
+        assert not reproject_vision, "reproject_vision not implemented"
 
-        # Store config
         self.n_group = n_group
         self.num_images_per_sample = num_images_per_sample
-        self.output_type = output_type
         self.project_to_dim = project_to_dim if project_to_dim else 2048
-        self.use_inv_projector_for_vlm = use_inv_projector_for_vlm
-        self.equi_adapter_num_heads = equi_adapter_num_heads
-        self.equi_adapter_attention_head_dim = equi_adapter_attention_head_dim
-        self.equi_adapter_num_layers = equi_adapter_num_layers
 
         if rotate_image_indices is None:
             self.rotate_image_indices = list(range(num_images_per_sample))
@@ -290,200 +113,134 @@ class EagleBackboneFATokens(nn.Module):
             if i not in self.rotate_image_indices
         ]
 
-        # Ensure project_to_dim is divisible by n_group for regular representation
-        assert self.project_to_dim % n_group == 0, \
+        assert self.project_to_dim % n_group == 0, (
             f"project_to_dim ({self.project_to_dim}) must be divisible by n_group ({n_group})"
+        )
 
-        # Initialize Eagle model
+        # ── Eagle VLM ────────────────────────────────────────────────────────
         config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
-        # Projection layers: Eagle vision/LLM dim → project_to_dim
-        # Eagle mlp1 output dim matches LLM hidden size (e.g. 2048 for InternLM2-1.8B)
         d_eagle = self.eagle_model.language_model.config.hidden_size
 
-        # Vision projection: equivariant in group-major format.
-        # FA output uses group-major layout (D = n_group * blocks).
-        # Applying the same linear to each group-slice commutes with the group cyclic shift.
-        assert d_eagle % n_group == 0, \
-            f"d_eagle ({d_eagle}) must be divisible by n_group ({n_group}) for equivariant projection"
-        blocks_in  = d_eagle // n_group
+        assert d_eagle % n_group == 0, (
+            f"d_eagle ({d_eagle}) must be divisible by n_group ({n_group})"
+        )
+
+        # ── Projection layers ─────────────────────────────────────────────────
+        # Equivariant vision projection: applied per group-slice (group-major layout).
+        # D = n_group * blocks; the same linear maps each block independently
+        # so it commutes with the cyclic-shift action → equivariant.
+        blocks_in  = d_eagle       // n_group
         blocks_out = self.project_to_dim // n_group
         self.vision_proj = nn.Linear(blocks_in, blocks_out)
 
-        # Language projection: language hidden states are invariant — plain linear is fine.
+        # Invariant language projection (trivial repr → trivial repr).
         self.eagle_linear = nn.Linear(d_eagle, self.project_to_dim)
 
-        # Remove unused LLM layers (only if layers exist and select_layer is positive)
-        # select_layer=-1 means keep all layers, select_layer=N means keep first N layers
+        # Invariant non-equi camera projection (plain linear).
+        # Created even when non_equi_image_indices is empty so checkpoint loading
+        # is consistent; unused in forward when there are no non-equi cameras.
+        self.noequi_proj = nn.Linear(d_eagle, self.project_to_dim)
+
+        # Truncate LLM to select_layer layers for efficiency
         while len(self.eagle_model.language_model.model.layers) > select_layer:
             self.eagle_model.language_model.model.layers.pop(-1)
-
         self.select_layer = select_layer
 
-        # ── Phase 2: Invariant FA projector ─────────────────────────────────
-        # FA_inv(x) = (1/|G|) Σ_g f(g·x)  — plain average, no transformation.
-        # Proof: FA_inv(r·x)[p] = (1/|G|) Σ_g f(g·r·x)[p]
-        #        = (1/|G|) Σ_h f(h·x)[p]   [h=g·r, same sum over G]  = FA_inv(x) ✓
-        # Output lives in vision_dim (= d_eagle) space; project to d_eagle for VLM injection.
-        self.inv_fa_proj = nn.Linear(d_eagle, d_eagle)
-
-        # ── Phase 3: EquiAdapter (num_layers × SA+CA blocks) ────────────────
-        # Each block: equivariant SA (spatial token mixing) + CA (language conditioning).
-        # SA block: regular self-attention, tokens communicate across spatial positions.
-        # CA block: cross-attention to invariant language (trivial repr) via task descriptor.
-        self.equi_adapter = EquiAdapter(
-            d_eq=self.project_to_dim,
-            d_llm=self.project_to_dim,
-            n_group=n_group,
-            num_heads=equi_adapter_num_heads,
-            attention_head_dim=equi_adapter_attention_head_dim,
-            num_layers=equi_adapter_num_layers,
-        )
-
-        # Initialize rotation and frame averaging components
+        # ── Spatial helpers ───────────────────────────────────────────────────
         self._init_rotation_matrices()
         self._init_permutation_matrices()
-        # Token grid size: 16x16 = 256 tokens (typical for Eagle after pixel shuffle)
         self._init_token_permutation_indices(grid_size=16)
 
         self.set_trainable_parameters(tune_llm, tune_visual)
 
-        print(f"EagleBackboneFATokens initialized:")
+        n_equi   = len(self.rotate_image_indices)
+        n_noequi = len(self.non_equi_image_indices)
+        print(f"EagleBackboneFATokens (N-pass FA after VLM):")
         print(f"  n_group (CN): {self.n_group}")
-        print(f"  d_eagle (LLM hidden): {d_eagle}")
+        print(f"  d_eagle:      {d_eagle}")
         print(f"  project_to_dim: {self.project_to_dim}")
-        print(f"  rotate_image_indices: {self.rotate_image_indices}")
-        print(f"  non_equi_image_indices: {self.non_equi_image_indices}")
-        print(f"  output_type: {self.output_type}")
-        print(f"  use_inv_projector_for_vlm: {self.use_inv_projector_for_vlm}")
-        print(f"  equi_adapter_num_layers:       {self.equi_adapter_num_layers} (SA+CA blocks)")
-        print(f"  equi_adapter_num_heads:        {self.equi_adapter_num_heads}")
-        print(f"  equi_adapter_attention_head_dim: {self.equi_adapter_attention_head_dim}  (scalar_dim={self.equi_adapter_num_heads * self.equi_adapter_attention_head_dim})")
-        print(f"  Using FULL vision tokens (not pooled)")
-        print(f"  Token grid size: {self.token_grid_size}x{self.token_grid_size}")
+        print(f"  equi cameras:   {self.rotate_image_indices} ({n_equi} views)")
+        print(f"  non-equi cameras: {self.non_equi_image_indices} ({n_noequi} views)")
+        print(f"  VLM passes per sample: {self.n_group}")
+        print(f"  Token grid: {self.token_grid_size}x{self.token_grid_size}")
+
+    # ── Spatial initialisation ────────────────────────────────────────────────
 
     def _init_rotation_matrices(self):
-        """Initialize rotation matrices for image rotation via grid_sample."""
+        """Affine matrices for image rotation via grid_sample (CW by angle = r*2π/N)."""
         angles = torch.linspace(0, 2 * math.pi, self.n_group + 1)[:-1]
-        rotation_matrices = torch.zeros(self.n_group, 2, 3)
-
+        mats = torch.zeros(self.n_group, 2, 3)
         for i, angle in enumerate(angles):
-            cos_val = math.cos(-angle.item())
-            sin_val = math.sin(-angle.item())
-            
-            rotation_matrices[i, 0, 0] = cos_val
-            rotation_matrices[i, 0, 1] = -sin_val
-            rotation_matrices[i, 1, 0] = sin_val
-            rotation_matrices[i, 1, 1] = cos_val
-            
-        self.register_buffer("rotation_matrices_buffer", rotation_matrices)
-        
-        # Store angles for potential use
+            c = math.cos(-angle.item())
+            s = math.sin(-angle.item())
+            mats[i, 0, 0] =  c;  mats[i, 0, 1] = -s
+            mats[i, 1, 0] =  s;  mats[i, 1, 1] =  c
+        self.register_buffer("rotation_matrices_buffer", mats)
         self.register_buffer("angles", angles)
 
     def _init_permutation_matrices(self):
-        """Initialize permutation matrices for frame averaging."""
-        # Permutation matrices for regular representation
-        # P_r[i, j] = 1 if j = (i + r) mod N
-        permutation_matrices = torch.zeros(self.n_group, self.n_group, self.n_group)
+        """Cyclic permutation matrices for the regular representation."""
+        P = torch.zeros(self.n_group, self.n_group, self.n_group)
         for r in range(self.n_group):
             for i in range(self.n_group):
-                j = (i + r) % self.n_group
-                permutation_matrices[r, i, j] = 1.0
-        
-        self.register_buffer("permutation_matrices", permutation_matrices)
-        
-        # Pre-compute flattened version for batch operations
-        perm_matrices_flat = permutation_matrices.reshape(self.n_group, -1)
-        self.register_buffer("perm_matrices_flat", perm_matrices_flat)
-        
-        # Template for selecting permutation matrices
-        indices_template = torch.arange(self.n_group)
-        self.register_buffer("indices_template", indices_template)
-        
-        selected_perm_matrices_template = perm_matrices_flat[indices_template].reshape(
-            self.n_group, self.n_group, self.n_group
+                P[r, i, (i + r) % self.n_group] = 1.0
+        self.register_buffer("permutation_matrices", P)
+        self.register_buffer("perm_matrices_flat", P.reshape(self.n_group, -1))
+        idx = torch.arange(self.n_group)
+        self.register_buffer("indices_template", idx)
+        self.register_buffer(
+            "selected_perm_matrices_template",
+            P.reshape(self.n_group, -1)[idx].reshape(self.n_group, self.n_group, self.n_group),
         )
-        self.register_buffer("selected_perm_matrices_template", selected_perm_matrices_template)
-    
+
     def _init_token_permutation_indices(self, grid_size: int = 16):
         """
-        Initialize token permutation indices for different rotations.
+        Token permutation indices for spatial realignment after rotation.
 
-        Vision tokens are arranged in a grid (e.g., 16x16 = 256 tokens).
-        When the image is rotated by g, token at spatial position q moves to
-        position p where perm[r][p] = q  ("position p gets content from q").
+        perm[r][dest] = source  means: after rotating image by r steps CW,
+        the token at 'dest' in the rotated grid came from 'source' in the
+        original grid.  Applying the inverse (perm[n-r]) un-rotates the tokens.
 
-        Convention matches _apply_rotations_to_images / F.affine_grid with
-        matrix [[cos(a), sin(a)], [-sin(a), cos(a)]], i.e. CW rotation by
-        angle a = r * 2π/N.  For dest pixel (i, j) the source pixel is:
-
-            src_col = center + cos(a)*(j-center) + sin(a)*(i-center)
-            src_row = center - sin(a)*(j-center) + cos(a)*(i-center)
-
-        For exact 90° multiples nearest-neighbor is lossless (no two dest
-        positions round to the same source).  For non-90° angles (C8 odd
-        steps) naive rounding creates collisions; those are resolved with a
-        greedy bijective assignment that minimises total displacement.
-
-        perm[r][dest] = source index  (dest gets content from source)
-
-        Args:
-            grid_size: size of the token grid (sqrt of num_tokens)
+        Uses greedy bijective assignment for non-90° angles (C8 odd steps).
         """
         self.token_grid_size = grid_size
-        num_tokens = grid_size * grid_size
         N = grid_size
+        num_tokens = N * N
         center = (N - 1) / 2
-
-        token_perm_indices = torch.zeros(self.n_group, num_tokens, dtype=torch.long)
+        perm = torch.zeros(self.n_group, num_tokens, dtype=torch.long)
 
         for r in range(self.n_group):
-            # CW rotation angle matching affine_grid convention
             angle = r * 2 * math.pi / self.n_group
-            cos_a = math.cos(angle)
-            sin_a = math.sin(angle)
+            cos_a, sin_a = math.cos(angle), math.sin(angle)
 
-            # Compute continuous source position for each destination
-            float_src_row = []
-            float_src_col = []
+            float_src_row, float_src_col = [], []
             for i in range(N):
                 for j in range(N):
-                    ci = j - center   # col offset
-                    ri = i - center   # row offset
+                    ci, ri = j - center, i - center
                     float_src_col.append(center + cos_a * ci + sin_a * ri)
                     float_src_row.append(center - sin_a * ci + cos_a * ri)
 
-            # For exact 90° multiples, nearest-neighbor is a lossless bijection
             is_exact_90 = abs(math.sin(angle) ** 2 - round(math.sin(angle) ** 2)) < 1e-9
 
             if is_exact_90:
                 for dest in range(num_tokens):
-                    si = int(round(float_src_row[dest]))
-                    sj = int(round(float_src_col[dest]))
-                    si = max(0, min(N - 1, si))
-                    sj = max(0, min(N - 1, sj))
-                    token_perm_indices[r, dest] = si * N + sj
+                    si = max(0, min(N - 1, int(round(float_src_row[dest]))))
+                    sj = max(0, min(N - 1, int(round(float_src_col[dest]))))
+                    perm[r, dest] = si * N + sj
             else:
-                # Greedy bijective assignment: process destinations in order of
-                # increasing rounding error so best-fitting assignments go first.
-                rounding_err = [
+                err = [
                     (float_src_row[d] - round(float_src_row[d])) ** 2
                     + (float_src_col[d] - round(float_src_col[d])) ** 2
                     for d in range(num_tokens)
                 ]
-                dests_sorted = sorted(range(num_tokens), key=lambda d: rounding_err[d])
-
-                assigned_src = [0] * num_tokens
-                used_srcs: set = set()
-
+                dests_sorted = sorted(range(num_tokens), key=lambda d: err[d])
+                assigned = [0] * num_tokens
+                used: set = set()
                 for dest in dests_sorted:
-                    sr = float_src_row[dest]
-                    sc = float_src_col[dest]
-                    best_idx = None
-                    best_dist = float("inf")
-                    # Expand search radius until an unused source is found
+                    sr, sc = float_src_row[dest], float_src_col[dest]
+                    best_idx, best_dist = None, float("inf")
                     for radius in range(N):
                         for di in range(-radius, radius + 1):
                             for dj in range(-radius, radius + 1):
@@ -494,71 +251,48 @@ class EagleBackboneFATokens(nn.Module):
                                 if not (0 <= si < N and 0 <= sj < N):
                                     continue
                                 idx = si * N + sj
-                                if idx in used_srcs:
+                                if idx in used:
                                     continue
-                                dist = (sr - si) ** 2 + (sc - sj) ** 2
-                                if dist < best_dist:
-                                    best_dist = dist
-                                    best_idx = idx
+                                d = (sr - si) ** 2 + (sc - sj) ** 2
+                                if d < best_dist:
+                                    best_dist, best_idx = d, idx
                         if best_idx is not None:
                             break
                     if best_idx is None:
-                        # Fallback: first unused source (should not happen)
-                        best_idx = next(i for i in range(num_tokens) if i not in used_srcs)
-                    assigned_src[dest] = best_idx
-                    used_srcs.add(best_idx)
-
+                        best_idx = next(i for i in range(num_tokens) if i not in used)
+                    assigned[dest] = best_idx
+                    used.add(best_idx)
                 for dest in range(num_tokens):
-                    token_perm_indices[r, dest] = assigned_src[dest]
+                    perm[r, dest] = assigned[dest]
 
-        # Enforce inverse property for non-exact rotations:
-        # _permute_tokens_for_rotation(·, r, inverse=True) uses perm[(n-r)%n].
-        # For exact 90° steps the group structure already guarantees this; for
-        # approximate (greedy) rotations we must set perm[(n-r)%n] = perm[r]⁻¹
-        # explicitly so that forward ∘ inverse == identity.
+        # Enforce exact inverse property for greedy (non-90°) steps
         arange = torch.arange(num_tokens, dtype=torch.long)
         for r in range(1, self.n_group):
             angle = r * 2 * math.pi / self.n_group
-            is_exact_90 = abs(math.sin(angle) ** 2 - round(math.sin(angle) ** 2)) < 1e-9
-            if not is_exact_90:
+            if not (abs(math.sin(angle) ** 2 - round(math.sin(angle) ** 2)) < 1e-9):
                 r_inv = (self.n_group - r) % self.n_group
-                if r_inv > r:  # process each pair once
+                if r_inv > r:
                     inv_perm = torch.zeros(num_tokens, dtype=torch.long)
-                    inv_perm[token_perm_indices[r]] = arange
-                    token_perm_indices[r_inv] = inv_perm
+                    inv_perm[perm[r]] = arange
+                    perm[r_inv] = inv_perm
 
-        self.register_buffer("token_perm_indices", token_perm_indices)
+        self.register_buffer("token_perm_indices", perm)
 
-    # ── New layers added on top of the pretrained VLM ────────────────────────
-    # These are the only parameters that should be trained / saved / loaded.
+    # ── Trainable parameter management ────────────────────────────────────────
+
     _NEW_LAYER_PREFIXES = (
         "vision_proj.",
         "eagle_linear.",
-        "inv_fa_proj.",
-        "equi_adapter.",
+        "noequi_proj.",
     )
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
-        """
-        Freeze the entire eagle_model (VLM) and train only the new equivariant layers.
-
-        tune_llm / tune_visual are kept as arguments for API compatibility but
-        the VLM is always frozen here — only vision_proj, eagle_linear,
-        inv_projector and equi_adapter are trained.
-        """
+        """Freeze VLM; train only the new projection layers."""
         self.tune_llm = False
         self.tune_visual = False
-
-        # Freeze entire VLM
         self.eagle_model.requires_grad_(False)
-
-        # Unfreeze new equivariant layers only
         for name, p in self.named_parameters():
-            if name.startswith(self._NEW_LAYER_PREFIXES):
-                p.requires_grad_(True)
-            else:
-                p.requires_grad_(False)
-
+            p.requires_grad_(any(name.startswith(pfx) for pfx in self._NEW_LAYER_PREFIXES))
         trainable = [n for n, p in self.named_parameters() if p.requires_grad]
         print(f"Backbone trainable parameters ({len(trainable)}):")
         for n in trainable:
@@ -567,93 +301,54 @@ class EagleBackboneFATokens(nn.Module):
             print("  Warning: no trainable parameters found.")
 
     def load_pretrained_vlm(self, checkpoint_path: str) -> None:
-        """
-        Load eagle_model weights from a GR00T N1.5 checkpoint.
-
-        Handles sharded safetensors (model.safetensors.index.json),
-        single safetensors, and pytorch_model.bin formats.
-        Keys are expected to be prefixed with "backbone." in the checkpoint.
-        New layers (vision_proj, equi_adapter, etc.) that are absent from the
-        checkpoint are left with their random initialisation.
-        """
+        """Load eagle_model weights from a GR00T N1.5 checkpoint (sharded or single)."""
         import json
 
-        def _load_shard(path: str) -> dict:
+        def _load_shard(path):
             if path.endswith(".safetensors"):
-                from safetensors.torch import load_file
+                from safetensors.torch import load_file  # type: ignore[import-untyped]
                 return load_file(path)
             return torch.load(path, map_location="cpu")
 
-        # Collect full state dict from checkpoint
-        ckpt_path = checkpoint_path
-        index_file = os.path.join(ckpt_path, "model.safetensors.index.json")
-        single_sf  = os.path.join(ckpt_path, "model.safetensors")
-        single_bin = os.path.join(ckpt_path, "pytorch_model.bin")
+        ckpt = checkpoint_path
+        index_file = os.path.join(ckpt, "model.safetensors.index.json")
+        single_sf  = os.path.join(ckpt, "model.safetensors")
+        single_bin = os.path.join(ckpt, "pytorch_model.bin")
 
         raw: dict = {}
         if os.path.exists(index_file):
             with open(index_file) as f:
                 index = json.load(f)
-            shards = set(index["weight_map"].values())
-            for shard in shards:
-                raw.update(_load_shard(os.path.join(ckpt_path, shard)))
+            for shard in set(index["weight_map"].values()):
+                raw.update(_load_shard(os.path.join(ckpt, shard)))
         elif os.path.exists(single_sf):
             raw = _load_shard(single_sf)
         elif os.path.exists(single_bin):
             raw = _load_shard(single_bin)
         else:
-            raise FileNotFoundError(f"No checkpoint weights found in {ckpt_path}")
+            raise FileNotFoundError(f"No checkpoint weights found in {ckpt}")
 
-        # Strip "backbone." prefix → keys match self.state_dict()
-        backbone_sd = {
-            k.removeprefix("backbone."): v
-            for k, v in raw.items()
-            if k.startswith("backbone.")
-        }
-
-        # Load into backbone; strict=False so new layers are skipped
+        backbone_sd = {k.removeprefix("backbone."): v for k, v in raw.items() if k.startswith("backbone.")}
         missing, unexpected = self.load_state_dict(backbone_sd, strict=False)
-
-        # New-layer keys are expected to be missing — report only truly missing VLM keys
-        new_prefixes = self._NEW_LAYER_PREFIXES
-        unexpected_vlm = [k for k in missing if not k.startswith(new_prefixes)]
-        print(f"Loaded backbone weights from {ckpt_path}")
-        print(f"  New layers (random init): "
-              f"{[k for k in missing if k.startswith(new_prefixes)][:5]}"
-              f"{'...' if sum(k.startswith(new_prefixes) for k in missing) > 5 else ''}")
-        if unexpected_vlm:
-            print(f"  WARNING — unexpected missing VLM keys ({len(unexpected_vlm)}): "
-                  f"{unexpected_vlm[:5]}")
-        if unexpected:
-            print(f"  Unexpected keys in checkpoint (ignored): {unexpected[:5]}")
+        new_missing = [k for k in missing if k.startswith(self._NEW_LAYER_PREFIXES)]
+        vlm_missing  = [k for k in missing if not k.startswith(self._NEW_LAYER_PREFIXES)]
+        print(f"Loaded backbone from {ckpt}")
+        print(f"  New layers (random init): {new_missing[:5]}{'...' if len(new_missing) > 5 else ''}")
+        if vlm_missing:
+            print(f"  WARNING — unexpected missing VLM keys ({len(vlm_missing)}): {vlm_missing[:5]}")
 
     def new_layers_state_dict(self) -> dict:
-        """
-        Return state dict of only the new equivariant layers (vision_proj,
-        eagle_linear, inv_projector, equi_adapter).  Use this to save a
-        lightweight checkpoint after fine-tuning.
-        """
-        return {
-            k: v for k, v in self.state_dict().items()
-            if k.startswith(self._NEW_LAYER_PREFIXES)
-        }
+        return {k: v for k, v in self.state_dict().items() if k.startswith(self._NEW_LAYER_PREFIXES)}
 
     def load_new_layers_state_dict(self, state_dict: dict, strict: bool = True) -> None:
-        """
-        Load back a checkpoint saved by new_layers_state_dict().
-        Passes strict=False to the full load so VLM keys are not required.
-        """
-        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        missing, _ = self.load_state_dict(state_dict, strict=False)
         truly_missing = [k for k in missing if k.startswith(self._NEW_LAYER_PREFIXES)]
         if truly_missing and strict:
             raise RuntimeError(f"Missing new-layer keys: {truly_missing}")
-        if truly_missing:
-            print(f"  Warning — missing new-layer keys: {truly_missing}")
-        if unexpected:
-            print(f"  Unexpected keys (ignored): {unexpected[:5]}")
+
+    # ── Utility methods ───────────────────────────────────────────────────────
 
     def set_frozen_modules_to_eval_mode(self):
-        """Set frozen modules to eval mode for proper dropout/batchnorm behavior."""
         if self.training:
             if self.eagle_model.language_model and not self.tune_llm:
                 self.eagle_model.language_model.eval()
@@ -661,340 +356,86 @@ class EagleBackboneFATokens(nn.Module):
                 self.eagle_model.vision_model.eval()
 
     def prepare_input(self, batch: dict) -> BatchFeature:
-        """Prepare input batch."""
         return BatchFeature(data=batch)
 
     def _apply_rotations_to_images(self, img_batch: torch.Tensor) -> torch.Tensor:
         """
-        Apply all N rotations to a batch of images.
-        
+        Apply all N rotations to a batch of images in one grid_sample call.
+
         Args:
-            img_batch: [B, C, H, W] tensor
-            
+            img_batch: [B, C, H, W]
         Returns:
-            [B*N, C, H, W] tensor with all rotations
+            [B*N, C, H, W]  — layout: (b=0,r=0), (b=0,r=1), …, (b=B-1,r=N-1)
         """
         B, C, H, W = img_batch.shape
-        device = img_batch.device
-        
-        # Expand: [B, C, H, W] -> [B, N, C, H, W] -> [B*N, C, H, W]
-        expanded = img_batch.unsqueeze(1).expand(-1, self.n_group, -1, -1, -1)
-        img_batch_expanded = expanded.reshape(B * self.n_group, C, H, W)
-        
-        # Create rotation indices: [0,1,2,3, 0,1,2,3, ...] for each image
-        rotation_indices = torch.arange(self.n_group, device=device).repeat(B)
-        
-        # Get rotation matrices for each image
-        rotation_matrices = self.rotation_matrices_buffer[rotation_indices]
-        
-        # Generate sampling grid
-        grid = F.affine_grid(
-            rotation_matrices.to(img_batch.dtype),
-            size=(B * self.n_group, C, H, W),
-            align_corners=True
-        )
-        
-        # Apply rotations
-        rotated_imgs = F.grid_sample(
-            img_batch_expanded,
-            grid,
-            align_corners=True,
-            padding_mode='zeros'
-        )
-        
-        return rotated_imgs
+        N = self.n_group
+        flat = img_batch.unsqueeze(1).expand(-1, N, -1, -1, -1).reshape(B * N, C, H, W)
+        rot_idx = torch.arange(N, device=img_batch.device).repeat(B)
+        mats = self.rotation_matrices_buffer[rot_idx]
+        grid = F.affine_grid(mats.to(img_batch.dtype), size=(B * N, C, H, W), align_corners=True)
+        return F.grid_sample(flat, grid, align_corners=True, padding_mode="zeros")
 
-    def rotate_vl_batch(self, vl_input: dict) -> tuple:
-        """
-        Rotate only the equivariant images (rotate_image_indices) for FA.
-        Non-equivariant images (non_equi_image_indices) are returned unrotated.
+    # ── Main forward pass ─────────────────────────────────────────────────────
 
-        Returns:
-            equi_pixels  : [B * N * n_equi, C, H, W]
-            noequi_pixels: [B * n_noequi, C, H, W]   or None if no non-equi cameras
-            img_batch    : [B, num_images_per_sample, C, H, W]
-            B            : original batch size
-        """
-        eagle_prefix = "eagle_"
-        pixel_values = vl_input[f"{eagle_prefix}pixel_values"]
-        B = vl_input[f"{eagle_prefix}input_ids"].shape[0]
-        _, C, H, W = pixel_values.shape
-
-        img_batch = pixel_values.reshape(B, self.num_images_per_sample, C, H, W)
-        n_equi = len(self.rotate_image_indices)
-
-        equi_imgs = [
-            self._apply_rotations_to_images(img_batch[:, idx]).reshape(B, self.n_group, C, H, W)
-            for idx in self.rotate_image_indices
-        ]
-        # [n_equi, B, N, C, H, W] → [B, N, n_equi, C, H, W] → [B*N*n_equi, C, H, W]
-        equi_pixels = (
-            torch.stack(equi_imgs, dim=0)
-            .permute(1, 2, 0, 3, 4, 5)
-            .reshape(B * self.n_group * n_equi, C, H, W)
-        )
-
-        # Non-equi cameras: no rotation, just stack and flatten
-        if self.non_equi_image_indices:
-            n_noequi = len(self.non_equi_image_indices)
-            noequi_pixels = torch.stack(
-                [img_batch[:, idx] for idx in self.non_equi_image_indices], dim=1
-            ).reshape(B * n_noequi, C, H, W)  # [B*n_noequi, C, H, W]
-        else:
-            noequi_pixels = None
-
-        return equi_pixels, noequi_pixels, img_batch, B
-
-    def _apply_frame_averaging(
-        self, 
-        features: torch.Tensor, 
-        batch_size: int
-    ) -> torch.Tensor:
-        """
-        Apply frame averaging to features using permutation matrices.
-        
-        Args:
-            features: Tensor of shape [B, N, feature_dim]
-            batch_size: Batch size
-            
-        Returns:
-            Tensor of shape [B, feature_dim] with frame averaging applied
-        """
-        # Regular representation - use permutation matrices
-        feature_dim = features.shape[2]
-        blocks = feature_dim // self.n_group
-        features = features.reshape(batch_size, self.n_group, blocks, self.n_group)
-        
-        all_features_flat = features.reshape(-1, blocks, self.n_group)
-        selected_perm_matrices = self.selected_perm_matrices_template.repeat(batch_size, 1, 1).to(features.dtype)
-        aligned_features_flat = torch.bmm(all_features_flat, selected_perm_matrices)
-        aligned_features = aligned_features_flat.reshape(batch_size, self.n_group, blocks, self.n_group)
-        avg_features = torch.mean(aligned_features, dim=1)  # [B, blocks, N]
-        return avg_features.reshape(batch_size, blocks * self.n_group)
-
-    def _apply_frame_averaging_tokens(
-        self, 
-        features: torch.Tensor, 
-        batch_size: int,
-        num_tokens: int
-    ) -> torch.Tensor:
-        """
-        Apply frame averaging to a sequence of tokens.
-        
-        Each token is treated independently for frame averaging.
-        
-        Args:
-            features: Tensor of shape [B*N, T, D] where:
-                      - B is original batch size
-                      - N is number of rotations
-                      - T is number of tokens
-                      - D is feature dimension (must be divisible by N for reg repr)
-            batch_size: Original batch size (B)
-            num_tokens: Number of tokens (T)
-            
-        Returns:
-            Tensor of shape [B, T, D] with frame averaging applied per token
-        """
-        # Reshape to [B, N, T, D]
-        D = features.shape[-1]
-        features_reshaped = features.reshape(batch_size, self.n_group, num_tokens, D)
-        
-        # Permute to process each token independently: [B, T, N, D]
-        features_permuted = features_reshaped.permute(0, 2, 1, 3)
-        
-        # Flatten B and T for batch processing: [B*T, N, D]
-        features_flat = features_permuted.reshape(batch_size * num_tokens, self.n_group, D)
-        
-        # Apply frame averaging to each token
-        # Regular representation - split D into blocks of size N
-        blocks = D // self.n_group
-        features_blocks = features_flat.reshape(batch_size * num_tokens, self.n_group, blocks, self.n_group)
-        
-        # Flatten for batch matrix multiplication
-        all_features_flat = features_blocks.reshape(-1, blocks, self.n_group)
-        
-        # Get permutation matrices
-        selected_perm_matrices = self.selected_perm_matrices_template.repeat(
-            batch_size * num_tokens, 1, 1
-        ).to(features.dtype)
-        
-        # Apply permutation
-        aligned_features_flat = torch.bmm(all_features_flat, selected_perm_matrices)
-        
-        # Reshape back
-        aligned_features = aligned_features_flat.reshape(
-            batch_size * num_tokens, self.n_group, blocks, self.n_group
-        )
-        
-        # Average over rotations
-        avg_features = torch.mean(aligned_features, dim=1)  # [B*T, blocks, N]
-        avg_features = avg_features.reshape(batch_size * num_tokens, blocks * self.n_group)
-        
-        # Reshape to [B, T, D]
-        return avg_features.reshape(batch_size, num_tokens, D)
-
-    def _permute_tokens_for_rotation(
-        self, 
-        tokens: torch.Tensor, 
-        rotation_idx: int,
-        inverse: bool = False
-    ) -> torch.Tensor:
-        """
-        Permute token positions according to rotation.
-        
-        When image is rotated by rotation_idx, token at spatial position (i,j)
-        moves to a new position. This function permutes tokens to align them.
-        
-        Args:
-            tokens: [B, T, D] tensor of tokens
-            rotation_idx: index of rotation (0 to n_group-1)
-            inverse: if True, apply inverse permutation
-            
-        Returns:
-            Permuted tokens [B, T, D]
-        """
-        if rotation_idx == 0:
-            return tokens
-            
-        B, T, D = tokens.shape
-        
-        # Get permutation indices for this rotation
-        if inverse:
-            # For inverse, we need the inverse permutation
-            # Find where each token came from
-            perm = self.token_perm_indices[(self.n_group - rotation_idx) % self.n_group]
-        else:
-            perm = self.token_perm_indices[rotation_idx]
-        
-        # Apply permutation
-        # perm[i] tells us which token should go to position i
-        permuted = tokens[:, perm, :]
-        
-        return permuted
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Phase 2 helper: inject InvariantProjector tokens into Eagle LLM
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _forward_llm_with_injected_vision(
+    def _build_image_seq_positions(
         self,
-        eagle_input: dict,
-        inv_vision_tokens: torch.Tensor,
-        noequi_pixels: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_ids: torch.Tensor,
+        T_vis: int,
+        img_tok_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """
-        Run Eagle's LLM with injected vision tokens.
+        Compute sequence positions for equi tokens, non-equi tokens, and text tokens.
 
-          - Equi cameras: inv_projector(H') tokens fill the first n_equi*T image positions.
-          - Non-equi cameras (e.g. wrist): SigLIP features fill the remaining positions.
-            These are extracted here (single pass, no rotation) and also returned so
-            forward_eagle can project and pass them to EquiAdapter + action head.
-
-        Steps:
-          1. Embed text tokens.
-          2. If noequi_pixels provided, run extract_feature on them → noequi_raw [B*n_noequi, T, D].
-          3. Fill image placeholders: equi tokens first, noequi tokens after.
-          4. Run LLM layers on combined embeddings.
-
-        Args:
-            eagle_input:       dict with 'input_ids' [B, T_total] and 'attention_mask'
-            inv_vision_tokens: [B, n_equi*T, d_eagle]  invariant equi tokens (inv_projector output)
-            noequi_pixels:     [B*n_noequi, C, H, W]   raw non-equi camera pixels (optional)
+        All positions are computed from the first sample (input_ids[0]); the template
+        is assumed identical across the batch (same prompt structure).
 
         Returns:
-            hidden_states: [B, T_total, d_eagle]
+            equi_seq_pos  : [n_equi * T_vis]  — LLM sequence indices of equi image tokens
+            noequi_seq_pos: [n_noequi * T_vis] or None
+            text_mask     : [T_total] bool — True at language/text token positions
         """
-        input_ids = eagle_input["input_ids"]          # [B, T_total]
-        attn_mask = eagle_input["attention_mask"]     # [B, T_total]
-        B = input_ids.shape[0]
+        ids0 = input_ids[0]
+        is_img = ids0 == img_tok_idx                                  # [T_total] bool
+        all_img_pos = is_img.nonzero(as_tuple=True)[0]                # [n_imgs * T_vis]
+        text_mask = ~is_img                                           # [T_total] bool
 
-        # Text embeddings
-        embed_layer = self.eagle_model.get_input_embeddings()
-        input_embeds = embed_layer(input_ids).clone()  # [B, T_total, d_eagle]
+        equi_seq_pos = torch.cat([
+            all_img_pos[idx * T_vis : (idx + 1) * T_vis]
+            for idx in self.rotate_image_indices
+        ])
 
-        # Extract non-equi camera features (SigLIP + mlp1 → d_eagle dim, no rotation)
-        noequi_raw = None
-        noequi_tokens_flat = None
-        if noequi_pixels is not None:
-            noequi_raw, _ = self.eagle_model.extract_feature(noequi_pixels)  # [B*n_noequi, T, d_eagle]
-            n_noequi = len(self.non_equi_image_indices)
-            T_vis = noequi_raw.shape[1]
-            noequi_tokens_flat = noequi_raw.reshape(B, n_noequi * T_vis, -1)  # [B, n_noequi*T, d_eagle]
-
-        # Inject into image-token placeholder positions
-        img_tok_idx = getattr(self.eagle_model, "image_token_index", None)
-        if img_tok_idx is not None:
-            n_equi_tokens = inv_vision_tokens.shape[1]
-            for b in range(B):
-                positions = (input_ids[b] == img_tok_idx).nonzero(as_tuple=True)[0]
-                # Fill equi positions first
-                n_equi_fill = min(positions.shape[0], n_equi_tokens)
-                if n_equi_fill > 0:
-                    input_embeds[b, positions[:n_equi_fill]] = inv_vision_tokens[b, :n_equi_fill]
-                # Fill non-equi positions after equi
-                if noequi_tokens_flat is not None:
-                    n_noequi_fill = min(positions.shape[0] - n_equi_fill, noequi_tokens_flat.shape[1])
-                    if n_noequi_fill > 0:
-                        input_embeds[b, positions[n_equi_fill:n_equi_fill + n_noequi_fill]] = \
-                            noequi_tokens_flat[b, :n_noequi_fill]
-
-        # Run through the LLM
-        lm_output = self.eagle_model.language_model(
-            inputs_embeds=input_embeds,
-            attention_mask=attn_mask,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        hidden = lm_output.hidden_states[self.select_layer]  # [B, T_total, d_eagle]
-
-        # text_mask: True at positions that are NOT image-token placeholders
-        # Used by forward_eagle to extract language-only hidden states for EquiAdapter.
-        if img_tok_idx is not None:
-            text_mask = (input_ids != img_tok_idx)           # [B, T_total]
+        if self.non_equi_image_indices:
+            noequi_seq_pos = torch.cat([
+                all_img_pos[idx * T_vis : (idx + 1) * T_vis]
+                for idx in self.non_equi_image_indices
+            ])
         else:
-            text_mask = torch.ones(B, input_ids.shape[1], dtype=torch.bool, device=input_ids.device)
+            noequi_seq_pos = None
 
-        return hidden, text_mask
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Main forward through Eagle + FA + EquiAdapter
-    # ──────────────────────────────────────────────────────────────────────────
+        return equi_seq_pos, noequi_seq_pos, text_mask
 
     def forward_eagle(self, vl_input: BatchFeature) -> tuple:
         """
-        Forward through Eagle model with frame averaging on full vision tokens,
-        followed by Invariant FA projection (Phase 2) and EquiAdapter (Phase 3).
+        Batched N-pass VLM forward + FA.
 
-        Frame Averaging for COVARIANT equivariance:
+        All N rotations are processed in a single SigLIP call and a single LLM call
+        by expanding the batch dimension: effective batch = B × N.
 
-            FA(x) = (1/|G|) * Σ_h ρ(h⁻¹) · f(h·x)
-
-        Using ρ(h⁻¹) gives:  FA(g·x) = ρ(g) · FA(x)
-
-        After FA:
-          H'    = avg_vision_features  [B, n_equi, T, project_to_dim]  (equivariant)
-          H_llm = vl_features          [B, T_total, project_to_dim]     (invariant, image+lang)
-          H_out = equi_adapter(H', H_llm)                               (equivariant, language-conditioned)
-
-        H_out is returned as BOTH:
-          - backbone_equi_vision_features [B, n_equi, T, D] for DiT self-attention prefix
-          - backbone_vision_language_features [B, n_equi*T, D] for DiT cross-attention context
-
-        The cross-attention context is the equi_adapter output (not raw H_llm), so it
-        already encodes vision equivariance AND language conditioning and can be used
-        directly in DiT cross-attention without further processing.
-
-        Args:
-            vl_input: Input batch with eagle_ prefixed keys
+        Correctness:
+          - equi vision: FA_equi  (ρ(r⁻¹) π(r⁻¹) before averaging) → equivariant H'
+          - language:    FA_inv   (plain average)                     → invariant
+          - non-equi:    FA_inv   (plain average over all N passes)   → invariant
+            Note: non-equi pixels are the same for all r, but their LLM hidden states
+            differ because the LLM attends globally to the changing equi tokens.
+            Averaging them over N passes (FA_inv) gives the correct invariant feature.
 
         Returns:
-            (h_prime, h_prime_flat, attention_mask) tuple
-              h_prime:      [B, n_equi, T, project_to_dim] — equivariant adapted features
-              h_prime_flat: [B, n_equi*T, project_to_dim]  — same, flattened for cross-attention
+            h_prime_flat : [B, n_equi*T_vis, project_to_dim]  equivariant
+            h_lang       : [B, T_lang, project_to_dim]         invariant
+            h_noequi     : [B, n_noequi*T_vis, project_to_dim] or None  invariant
+            attn_mask    : Eagle tokeniser attention mask
         """
         eagle_prefix = "eagle_"
-
-        # Prepare eagle input dict (strip prefix, drop image_sizes)
         eagle_input = {
             k.removeprefix(eagle_prefix): v
             for k, v in vl_input.items()
@@ -1002,130 +443,189 @@ class EagleBackboneFATokens(nn.Module):
         }
         eagle_input.pop("image_sizes", None)
 
-        # ── Phase 1: FA on equivariant cameras ──────────────────────────────
-        equi_pixels, noequi_pixels, img_batch, B = self.rotate_vl_batch(dict(vl_input))
+        pixel_values = eagle_input.pop("pixel_values")  # [B*n_imgs, C, H, W]
+        input_ids    = eagle_input["input_ids"]          # [B, T_total]
+        B            = input_ids.shape[0]
+        N            = self.n_group
+        n_imgs       = self.num_images_per_sample
+        T_total      = input_ids.shape[1]
+        _, C, H, W   = pixel_values.shape
+        img_batch    = pixel_values.reshape(B, n_imgs, C, H, W)
+
+        d_eagle: int = self.eagle_model.language_model.config.hidden_size
         n_equi = len(self.rotate_image_indices)
+        img_tok_idx = getattr(self.eagle_model, "image_token_index", None)
 
-        # [B*N*n_equi, T, vision_dim]
-        equi_raw, _ = self.eagle_model.extract_feature(equi_pixels)
-        num_vision_tokens = equi_raw.shape[1]
-        vision_dim        = equi_raw.shape[2]
+        # ── Step 1: build pixel_values for all N rotations at once ────────────
+        # pv_all: [B, N, n_imgs, C, H, W] — equi cameras replaced per rotation,
+        # non-equi cameras are identical across the N dimension.
+        pv_all = img_batch.unsqueeze(1).expand(-1, N, -1, -1, -1, -1).clone()
+        for idx in self.rotate_image_indices:
+            # _apply_rotations_to_images returns [B*N, C, H, W] in (b,r) layout
+            all_rots = self._apply_rotations_to_images(img_batch[:, idx])     # [B*N, C, H, W]
+            pv_all[:, :, idx] = all_rots.reshape(B, N, C, H, W)
+        # Flatten to [B*N*n_imgs, C, H, W] for SigLIP
+        pv_all_flat = pv_all.reshape(B * N * n_imgs, C, H, W)
 
-        # Reshape to [B*n_equi, N, T, vision_dim]
-        equi_grouped = (
-            equi_raw
-            .reshape(B, self.n_group, n_equi, num_vision_tokens, vision_dim)
-            .permute(0, 2, 1, 3, 4)                           # [B, n_equi, N, T, D]
-            .reshape(B * n_equi, self.n_group, num_vision_tokens, vision_dim)
+        # ── Step 2: one SigLIP + mlp1 call for all B×N×n_imgs images ─────────
+        raw_all, _ = self.eagle_model.extract_feature(pv_all_flat)  # [B*N*n_imgs, T_vis, d_eagle]
+        T_vis = raw_all.shape[1]
+        assert T_vis == self.token_grid_size * self.token_grid_size, (
+            f"SigLIP returned {T_vis} tokens but token_perm_indices was built for "
+            f"{self.token_grid_size}×{self.token_grid_size}={self.token_grid_size**2}. "
+            f"Pass the correct grid_size to _init_token_permutation_indices."
+        )
+        raw_all = raw_all.reshape(B * N, n_imgs, T_vis, d_eagle)     # [B*N, n_imgs, T_vis, d_eagle]
+
+        # ── Step 3: build input_embeds for all B×N LLM passes ────────────────
+        # Text embeddings are identical across all N rotations — compute once.
+        embed_layer  = self.eagle_model.get_input_embeddings()
+        text_embeds  = embed_layer(input_ids)                         # [B, T_total, d_eagle]
+        # Expand to [B*N, T_total, d_eagle] — each of the N copies gets the same text
+        input_embeds = (
+            text_embeds.unsqueeze(1)
+            .expand(-1, N, -1, -1)
+            .reshape(B * N, T_total, d_eagle)
+            .clone()                                                   # clone: we'll overwrite img positions
         )
 
-        # Two FA streams computed from the same rotated features in one loop:
-        #
-        #   Equivariant:  ρ(h⁻¹) ⊗ π(h⁻¹) applied before averaging → FA_equi(r·x) = ρ(r)·FA_equi(x)
-        #   Invariant:    no transformation before averaging          → FA_inv(r·x)  = FA_inv(x)
-        #
-        # Invariance proof for plain average:
-        #   FA_inv(r·x)[p] = (1/|G|) Σ_g f(g·r·x)[p]
-        #                  = (1/|G|) Σ_h f(h·x)[p]   [h = g·r, same sum over G]
-        #                  = FA_inv(x)[p]  ✓
-        blocks = vision_dim // self.n_group
-        transformed_equi = []
-        transformed_inv  = []
-        for h in range(self.n_group):
-            feat_h = equi_grouped[:, h]                        # [B*n_equi, T, D]
-            # Invariant stream: no transformation, just collect raw features
-            transformed_inv.append(feat_h)
-            if h == 0:
-                transformed_equi.append(feat_h)
-            else:
-                h_inv = (self.n_group - h) % self.n_group
-                # Equivariant stream: π(h⁻¹) + ρ(h⁻¹)
-                feat_equi = torch.roll(
-                    feat_h[:, self.token_perm_indices[h_inv]]
-                    .reshape(B * n_equi, num_vision_tokens, self.n_group, blocks),
-                    shifts=h_inv, dims=2,
-                ).reshape(B * n_equi, num_vision_tokens, vision_dim)
-                transformed_equi.append(feat_equi)
+        # Inject vision tokens. Positions are the same across the batch (fixed template).
+        if img_tok_idx is not None:
+            positions = (input_ids[0] == img_tok_idx).nonzero(as_tuple=True)[0]  # [n_imgs * T_vis]
+            for img_idx in range(n_imgs):
+                pos_slice = positions[img_idx * T_vis : (img_idx + 1) * T_vis]   # [T_vis]
+                # raw_all[:, img_idx]: [B*N, T_vis, d_eagle] — vectorized over whole batch
+                input_embeds[:, pos_slice, :] = raw_all[:, img_idx, :, :]
 
-        # H' equivariant = [B, n_equi, T, vision_dim]
-        h_prime_raw = (
-            torch.stack(transformed_equi, dim=1)
-            .mean(dim=1)
-            .reshape(B, n_equi, num_vision_tokens, vision_dim)
+        # ── Step 4: one LLM call for all B×N passes ───────────────────────────
+        attn_mask_all = (
+            eagle_input["attention_mask"]
+            .unsqueeze(1)
+            .expand(-1, N, -1)
+            .reshape(B * N, T_total)
         )
-        # H' invariant = [B, n_equi, T, vision_dim]  (plain average — truly invariant)
-        h_inv_raw = (
-            torch.stack(transformed_inv, dim=1)
-            .mean(dim=1)
-            .reshape(B, n_equi, num_vision_tokens, vision_dim)
+        lm_out = self.eagle_model.language_model(
+            inputs_embeds=input_embeds,
+            attention_mask=attn_mask_all,
+            output_hidden_states=False,   # only last layer — saves memory vs storing all layers
+            return_dict=True,
+        )
+        # last_hidden_state = output of the truncated LLM's final layer = hidden_states[select_layer]
+        hidden_all = lm_out.last_hidden_state.reshape(B, N, T_total, d_eagle)
+
+        # ── Step 5: extract token streams ────────────────────────────────────
+        if img_tok_idx is not None:
+            equi_seq_pos, noequi_seq_pos, text_mask = self._build_image_seq_positions(
+                input_ids, T_vis, img_tok_idx
+            )
+        else:
+            text_mask    = torch.ones(T_total, dtype=torch.bool, device=input_ids.device)
+            equi_seq_pos = noequi_seq_pos = None
+
+        # equi_vis_all:  [B, N, n_equi, T_vis, d_eagle]
+        if equi_seq_pos is not None:
+            equi_vis_all = (
+                hidden_all[:, :, equi_seq_pos, :]
+                .reshape(B, N, n_equi, T_vis, d_eagle)
+            )
+        else:
+            # Fallback: treat all tokens as equi (no image index knowledge)
+            equi_vis_all = hidden_all[:, :, :, :].reshape(B, N, 1, T_total, d_eagle)
+
+        # lang_all: [B, N, T_lang, d_eagle]
+        lang_all = hidden_all[:, :, text_mask, :]
+
+        # noequi_all: [B, N, n_noequi*T_vis, d_eagle] — average over N (FA_inv)
+        # Non-equi pixels are the same for every rotation but the LLM hidden states
+        # differ (global attention sees different equi tokens each pass).
+        # FA_inv (plain average) gives the correct invariant representation.
+        noequi_all = (
+            hidden_all[:, :, noequi_seq_pos, :]
+            if noequi_seq_pos is not None else None
         )
 
-        # Project H' to project_to_dim via equivariant group-major projection:
-        # apply vision_proj to each of the n_group group-slices independently.
-        proj_dtype = self.vision_proj.weight.dtype
-        blocks_in = vision_dim // self.n_group
+        # ── Step 6: FA_equi on equivariant VLM vision features ───────────────
+        # H'[p] = (1/N) Σ_r  ρ(r⁻¹) · π(r⁻¹) · equi_vis_all[:,r,:,p,:]
+        # ρ(r⁻¹): roll group-blocks by r⁻¹  (regular repr cyclic shift)
+        # π(r⁻¹): inverse token spatial permutation (undoes image rotation in token grid)
+        blocks = d_eagle // N
+        BN_eq  = B * n_equi
+        # [B, N, n_equi, T_vis, D] → process rotation axis explicitly
+        feats = equi_vis_all.permute(1, 0, 2, 3, 4)  # [N, B, n_equi, T_vis, D]
+        transformed = torch.empty_like(feats)
+        transformed[0] = feats[0]
+        for h in range(1, N):
+            h_inv    = (N - h) % N
+            feat_h   = feats[h].reshape(BN_eq, T_vis, d_eagle)
+            # π(h⁻¹): gather tokens from inverse-permuted positions
+            feat_perm  = feat_h[:, self.token_perm_indices[h_inv], :]       # [BN_eq, T, D]
+            # ρ(h⁻¹): cyclic roll on the n_group block dimension
+            transformed[h] = torch.roll(
+                feat_perm.reshape(BN_eq, T_vis, N, blocks),
+                shifts=h_inv, dims=2,
+            ).reshape(B, n_equi, T_vis, d_eagle)
+
+        h_prime_raw = transformed.mean(dim=0).reshape(B, n_equi, T_vis, d_eagle)
+
+        # ── Step 7: FA_inv on language + non-equi (plain average) ────────────
+        h_lang_raw   = lang_all.mean(dim=1)                           # [B, T_lang, d_eagle]
+        h_noequi_raw = noequi_all.mean(dim=1) if noequi_all is not None else None
+
+        # ── Step 8: project to project_to_dim ────────────────────────────────
+        proj_dt   = self.vision_proj.weight.dtype
+        blocks_in = d_eagle // N
+        # Equivariant projection: same linear on each of the N group-slices
         h_prime = self.vision_proj(
-            h_prime_raw.reshape(-1, self.n_group, blocks_in).to(proj_dtype)
-        ).reshape(B, n_equi, num_vision_tokens, self.project_to_dim)
+            h_prime_raw.reshape(-1, N, blocks_in).to(proj_dt)
+        ).reshape(B, n_equi, T_vis, self.project_to_dim)
+        h_prime_flat = h_prime.reshape(B, n_equi * T_vis, self.project_to_dim)
 
-        # ── Phase 2: VLM pass ──────
-        # Invariant FA tokens (no feature roll) projected to d_eagle for VLM injection.
-        # h_inv_raw is invariant by construction: spatial-aligned average without ρ(h⁻¹).
-        inv_dtype = self.inv_fa_proj.weight.dtype
-        inv_tokens_flat = self.inv_fa_proj(
-            h_inv_raw.reshape(B, n_equi * num_vision_tokens, vision_dim).to(inv_dtype)
-        )                                                              # [B, n_equi*T, d_eagle]
-        vl_hidden, text_mask = self._forward_llm_with_injected_vision(
-            eagle_input, inv_tokens_flat, noequi_pixels
-        )
+        lang_dt = self.eagle_linear.weight.dtype
+        h_lang  = self.eagle_linear(h_lang_raw.to(lang_dt))           # [B, T_lang, D]
 
-        # Project full vl_hidden → project_to_dim (used both as CA context and h_lang source)
-        lang_dtype = self.eagle_linear.weight.dtype
-        vl_features = self.eagle_linear(vl_hidden.to(lang_dtype))         # [B, T_total, project_to_dim]
+        h_noequi = None
+        if h_noequi_raw is not None:
+            h_noequi = self.noequi_proj(h_noequi_raw.to(lang_dt))     # [B, n_noequi*T_vis, D]
 
-        # Extract text-only positions as h_lang (initial state of language tokens in adapter).
-        # text_mask is batch-consistent (fixed template), so first sample's mask suffices.
-        # These tokens have VLM cross-modal understanding (text attended to images inside LLM).
-        text_pos = text_mask[0]                                            # [T_total] bool
-        h_lang = vl_features[:, text_pos, :]                              # [B, T_lang, project_to_dim]
-
-        # ── Phase 3: EquiAdapter ──────────────────────────────────────────────
-        # cat(h_prime_flat, h_lang) → SA on combined → CA ← vl_features (full image+lang context)
-        # Output: [B, n_equi*T_vis + T_lang, project_to_dim]
-        h_prime_llm = self.equi_adapter(h_prime, h_lang, vl_features)
-
-        return h_prime_llm, eagle_input["attention_mask"]
+        return h_prime_flat, h_lang, h_noequi, eagle_input["attention_mask"]
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         """
-        Forward pass with Late Frame Averaging on full vision tokens.
+        Forward pass.
 
-        Args:
-            vl_input: Input batch
+        Returns BatchFeature with:
+          backbone_equi_vision_features : [B, n_equi*T_vis, D]
+              Equivariant vision tokens (regular representation, group-major).
+              Use as equivariant prefix in DiT self-attention.
 
-        Returns:
-            BatchFeature with:
-                - backbone_equi_vision_features: [B, n_equi*T_vision + T_lang, D]
-                    First n_equi*T_vision tokens: equivariant vision features (group-major).
-                    Last T_lang tokens: invariant language features (vision-conditioned via
-                    Reynolds cross-attention). Use directly as DiT cross-attention context.
-                - backbone_attention_mask: attention mask from Eagle tokeniser
+          backbone_invariant_context    : [B, T_lang + n_noequi*T_vis, D]
+              Concatenation of invariant language features and non-equi camera features.
+              Use as cross-attention context in DiT (language and non-equi are both trivial repr).
+
+          backbone_attention_mask       : Eagle tokeniser attention mask.
         """
         self.set_frozen_modules_to_eval_mode()
 
-        h_prime_llm, eagle_mask = self.forward_eagle(vl_input)
+        h_prime_flat, h_lang, h_noequi, attn_mask = self.forward_eagle(vl_input)
 
-        # DDP compatibility: ensure all trainable parameters participate in loss
+        # Invariant context: cat language + non-equi along the sequence dimension
+        if h_noequi is not None:
+            invariant_ctx = torch.cat([h_lang, h_noequi], dim=1)  # [B, T_lang + n_noequi*T, D]
+        else:
+            invariant_ctx = h_lang                                  # [B, T_lang, D]
+
+        # DDP: ensure all trainable parameters participate in loss
         if self.training and self.tune_visual:
-            dummy_term = torch.tensor(
-                0.0, device=h_prime_llm.device, dtype=h_prime_llm.dtype, requires_grad=True
-            )
-            for param in self.parameters():
-                if param.requires_grad:
-                    dummy_term = dummy_term + 0.0 * param.sum()
-            h_prime_llm = h_prime_llm + dummy_term
+            dummy = torch.tensor(0.0, device=h_prime_flat.device, dtype=h_prime_flat.dtype,
+                                 requires_grad=True)
+            for p in self.parameters():
+                if p.requires_grad:
+                    dummy = dummy + 0.0 * p.sum()
+            h_prime_flat = h_prime_flat + dummy
+            invariant_ctx = invariant_ctx + dummy
 
         return BatchFeature(data={
-            "backbone_equi_vision_features": h_prime_llm,  # [B, n_equi*T_vision + T_lang, D]
-            "backbone_attention_mask": eagle_mask,
+            "backbone_equi_vision_features": h_prime_flat,   # [B, n_equi*T_vis, D]
+            "backbone_invariant_context":    invariant_ctx,  # [B, T_lang + n_noequi*T, D]
+            "backbone_attention_mask":       attn_mask,
         })

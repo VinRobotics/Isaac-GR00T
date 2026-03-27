@@ -742,35 +742,40 @@ class FlowmatchingActionHead(nn.Module):
         """
         Process backbone features into DiT cross-attention context.
 
-        Equivariant cameras (e.g. top-down):
-          backbone_equi_vision_features [B, n_equi, T, D]
-            → + 2-D pos embed
-            → equi_vis_self_attn         equivariant self-attn → [B*n_equi, T, cross_attn_dim]
-            → reshape                    [B, n_equi*T, cross_attn_dim]
+        Dual-path backbone (EagleBackboneFATokens):
+          backbone_equi_vision_features [B, n_equi*T, D]  — equivariant (regular repr)
+            → vl_features  (encoder_hidden_states for DualStreamEquiCA)
+          backbone_invariant_context    [B, T_lang + n_noequi*T, D]  — invariant (trivial repr)
+            → lang_features (encoder_lang_states for DualStreamEquiCA)
 
-        Non-equivariant cameras (e.g. wrist), optional:
-          backbone_noequi_vision_features [B, n_noequi, T, D]
-            → noequi_vis_proj            plain nn.Linear → [B, n_noequi*T, cross_attn_dim]
-
-        Both concatenated → vl_features [B, (n_equi+n_noequi)*T, cross_attn_dim]
+        Legacy backbone:
+          backbone_equi_vision_features [B, n_equi, T, D] or [B, T_total, D]
+            → vl_features (plain cross-attention context)
         """
         equi_vis = backbone_output.backbone_equi_vision_features
+        B = equi_vis.shape[0] if equi_vis.dim() >= 2 else equi_vis.shape[0]
+
         if equi_vis.dim() == 3:
-            # Backbone returns flat [B, n_equi*T_vis + T_lang, D] — use as-is
-            B = equi_vis.shape[0]
-            vl_features = equi_vis
-            if "backbone_attention_mask" not in backbone_output:
-                attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
-                backbone_output.data["backbone_attention_mask"] = attn_mask
+            vl_features = equi_vis                          # [B, n_equi*T, D]
         else:
             # Legacy 4D path: [B, n_equi, T, D]
-            B, n_equi, T, D = equi_vis.shape
-            equi_proj = equi_vis.reshape(B * n_equi, T, D)
-            vl_features = equi_proj.reshape(B, n_equi * T, -1)
-            attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
-            backbone_output.data["backbone_attention_mask"] = attn_mask
+            _, n_equi, T, D = equi_vis.shape
+            vl_features = equi_vis.reshape(B, n_equi * T, D)
+
+        if "backbone_attention_mask" not in backbone_output:
+            backbone_output.data["backbone_attention_mask"] = torch.ones(
+                B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device
+            )
 
         backbone_output.data["vl_features"] = vl_features
+
+        # Invariant context: language features + non-equi camera features (trivial repr).
+        # Present when using the dual-path backbone (EagleBackboneFATokens).
+        # Passed as encoder_lang_states to EDiT's DualStreamTransformerBlock so the
+        # denoising DiT can jointly attend to equivariant vision AND invariant language.
+        inv_ctx = backbone_output.get("backbone_invariant_context", None)
+        backbone_output.data["lang_features"] = inv_ctx    # None for legacy backbones
+
         return backbone_output
 
     def process_backbone_output_vl_features(self, backbone_output: BatchFeature) -> BatchFeature:
@@ -806,9 +811,10 @@ class FlowmatchingActionHead(nn.Module):
                 expanded = v.repeat(*factors)
                 action_input[k] = expanded
 
-        # Equi cross-attention context from process_backbone_output.
-        vl_embs = backbone_output.vl_features                     # [B, n_equi*K, cross_attn_dim]
-        encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*K], all-ones
+        # Equivariant vision context + invariant language/non-equi context.
+        vl_embs    = backbone_output.vl_features                  # [B, n_equi*T, cross_attn_dim]
+        lang_embs  = backbone_output.get("lang_features", None)   # [B, T_lang+n_noequi*T, D] or None
+        encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*T], all-ones
 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
@@ -860,6 +866,7 @@ class FlowmatchingActionHead(nn.Module):
         model_output = self.model(
             hidden_states=sa_embs,
             encoder_hidden_states=vl_embs,
+            encoder_lang_states=lang_embs,
             encoder_attention_mask=encoder_mask,
             timestep=t_discretized,
             return_all_hidden_states=False
@@ -912,9 +919,10 @@ class FlowmatchingActionHead(nn.Module):
         
         backbone_output = self.process_backbone_output(backbone_output)
 
-        # Equi cross-attention context from process_backbone_output.
-        vl_embs = backbone_output.vl_features                     # [B, n_equi*K, cross_attn_dim]
-        encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*K], all-ones
+        # Equivariant vision context + invariant language/non-equi context.
+        vl_embs    = backbone_output.vl_features                  # [B, n_equi*T, cross_attn_dim]
+        lang_embs  = backbone_output.get("lang_features", None)   # [B, T_lang+n_noequi*T, D] or None
+        encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*T], all-ones
 
         embodiment_id = action_input.embodiment_id
 
@@ -972,6 +980,7 @@ class FlowmatchingActionHead(nn.Module):
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
+                encoder_lang_states=lang_embs,
                 encoder_attention_mask=encoder_mask,
                 timestep=timesteps_tensor,
             )
@@ -1020,10 +1029,11 @@ class FlowmatchingActionHead(nn.Module):
 
         backbone_output = self.process_backbone_output(backbone_output)
 
-        # Two-stream context from process_backbone_output.
+        # Equivariant vision context + invariant language/non-equi context.
         equi_vis_embeds = backbone_output.get("equi_vis_features")  # [B, n_img*T_vis, D_cross] or None
-        vl_embeds       = backbone_output.vl_features               # [B, T_text, vl_cross_dim]
-        encoder_mask_rt = backbone_output.backbone_attention_mask   # [B, T_text]
+        vl_embeds       = backbone_output.vl_features               # [B, n_equi*T, cross_attn_dim]
+        lang_embeds_rt  = backbone_output.get("lang_features", None) # [B, T_lang+n_noequi*T, D] or None
+        encoder_mask_rt = backbone_output.backbone_attention_mask   # [B, n_equi*T]
         embodiment_id  = action_input.embodiment_id
 
         # Embed state.
@@ -1072,6 +1082,7 @@ class FlowmatchingActionHead(nn.Module):
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
+                    encoder_lang_states=lang_embeds_rt,
                     encoder_attention_mask=encoder_mask_rt,
                     timestep=timesteps_tensor,
                 )
