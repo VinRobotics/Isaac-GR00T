@@ -510,8 +510,7 @@ class EagleBackboneFATokens(nn.Module):
             output_hidden_states=True,
             return_dict=True,
         )
-        # last_hidden_state = output of the truncated LLM's final layer = hidden_states[-1]
-        hidden_all = lm_out.hidden_states[-1].reshape(B, N, T_total, d_eagle)
+        hidden_all = lm_out.hidden_states[self.select_layer].reshape(B, N, T_total, d_eagle)
 
         # ── Step 5: extract token streams ────────────────────────────────────
         if img_tok_idx is not None:
