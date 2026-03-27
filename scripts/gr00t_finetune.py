@@ -152,6 +152,18 @@ class ArgsConfig:
     cfg_guidance_weight: float = 1.0
     """"""
 
+    use_value_head: bool = False
+    """"""
+
+    hidden_dim: int = 512
+    """"""
+
+    num_bins: int = 201 # B = 201 as in pi*0.6
+    """"""
+
+    value_loss_coeff: float = 1.0
+    """"""
+
 
 #####################################################################################
 # Helper functions
@@ -377,6 +389,14 @@ def main(config: ArgsConfig):
         model.action_head.config.advantage_cfg_dropout_prob = config.advantage_cfg_dropout_prob
         model.action_head.config.cfg_guidance_weight = config.cfg_guidance_weight
         model.action_head.init_advantage_conditioning()
+
+    if config.use_value_head:
+        print("Using Value Head!!!")
+        model.action_head.config.use_value_head = config.use_value_head
+        model.action_head.config.hidden_dim = config.hidden_dim
+        model.action_head.config.num_bins = config.num_bins
+        model.action_head.config.value_loss_coeff = config.value_loss_coeff
+        model.action_head.init_value_head()
 
     # Set the model's compute_dtype to bfloat16
     model.compute_dtype = "bfloat16"

@@ -166,6 +166,271 @@ class AdvantageEmbedding(nn.Module):
         return self.embedding(labels).unsqueeze(1)
 
 
+@dataclass
+class DistributionalValueHeadConfig(PretrainedConfig):
+    """
+    Config for the distributional value function pϕ(V | o_t, ℓ) from RECAP §IV-A.
+ 
+    The value function is kept intentionally SEPARATE from the policy network
+    (same design as π*0.6, which uses a smaller 670M VLM backbone for the VF
+    and a larger one for the policy). Here we attach it as a lightweight MLP
+    head that reads the same backbone_features the policy already computes,
+    so we pay zero extra backbone cost.
+ 
+    Architecture:
+        backbone_features  (B, S, backbone_dim)
+            → mean-pool over sequence          (B, backbone_dim)
+            → LayerNorm
+            → MLP  (backbone_dim → hidden_dim → num_bins)
+            → softmax  →  pϕ(V | o_t, ℓ)      (B, num_bins)
+ 
+    Return bins:
+        Normalised to (-1, 0) following π*0.6 §V-C.
+        bin 0  →  value  -1.0   (worst / failed episode)
+        bin B-1 → value   0.0   (successful completion, 0 steps remaining)
+    """
+    backbone_embedding_dim: int = field(default=1536)
+    hidden_dim: int = field(default=512)
+    num_bins: int = field(default=201)          # B = 201 as in π*0.6
+    value_min: float = field(default=-1.0)      # normalised lower bound
+    value_max: float = field(default=0.0)       # normalised upper bound
+    value_loss_coeff: float = field(default=1.0)
+ 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+ 
+ 
+class DistributionalValueHead(nn.Module):
+    """
+    Distributional value function  pϕ(V | o_t, ℓ)  from RECAP §IV-A.
+ 
+    Trains by minimising cross-entropy between the predicted bin distribution
+    and the discretised empirical return R_t(τ):
+ 
+        min_ϕ  E_{τ∈D} [ Σ_{o_t∈τ}  H( R^B_t(τ),  pϕ(V | o_t, ℓ) ) ]   (Eq. 1)
+ 
+    At inference, extracts a scalar value as:
+ 
+        V(o_t, ℓ) = Σ_b  pϕ(V=b | o_t) · v(b)
+ 
+    where v(b) is the real-valued centre of bin b.
+ 
+    Advantage estimation (n-step, App. F of π*0.6):
+ 
+        A(o_t, a_t) = Σ_{t'=t}^{t+N-1} r_{t'} + V(o_{t+N}) - V(o_t)
+ 
+    Usage
+    -----
+    # ── training ──
+    value_loss = value_head.compute_loss(backbone_output, returns)
+ 
+    # ── advantage labelling (offline, on whole dataset) ──
+    adv_labels = value_head.compute_advantage_labels(
+        backbone_features_t,      # (B, S, D) at step t
+        backbone_features_t_plus_N,  # (B, S, D) at step t+N
+        rewards_t_to_t_plus_N,    # (B, N)  per-step rewards
+        epsilon_ell,              # per-task threshold (30th–40th percentile)
+    )
+    """
+ 
+    def __init__(self, config: DistributionalValueHeadConfig):
+        super().__init__()
+        self.config = config
+        D = config.backbone_embedding_dim
+        H = config.hidden_dim
+        B = config.num_bins
+ 
+        self.norm = nn.LayerNorm(D)
+        self.mlp  = nn.Sequential(
+            nn.Linear(D, H),
+            nn.SiLU(),
+            nn.Linear(H, H),
+            nn.SiLU(),
+            nn.Linear(H, B),
+        )
+        # Fixed bin centres in [value_min, value_max]  shape (B,)
+        self.register_buffer(
+            "bin_centres",
+            torch.linspace(config.value_min, config.value_max, B),
+        )
+ 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+ 
+    def _pool_and_predict(self, backbone_features: torch.Tensor) -> torch.Tensor:
+        """
+        backbone_features : (B, S, D)
+        returns           : (B, num_bins)  raw logits
+        """
+        # Mean-pool over sequence tokens  → (B, D)
+        x = backbone_features.mean(dim=1)
+        x = self.norm(x)
+        return self.mlp(x)                         # (B, num_bins)
+ 
+    def _discretise_returns(self, returns: torch.Tensor) -> torch.Tensor:
+        """
+        Map scalar returns in [value_min, value_max] to integer bin indices.
+ 
+        returns : (B,) or (B, T)  normalised empirical returns R^B_t(τ)
+        output  : same shape, dtype=long, values in [0, num_bins-1]
+        """
+        v_min = self.config.value_min
+        v_max = self.config.value_max
+        B_bins = self.config.num_bins
+        # Clamp then scale to [0, num_bins-1]
+        r_clamped = returns.clamp(v_min, v_max)
+        bin_idx = ((r_clamped - v_min) / (v_max - v_min) * (B_bins - 1)).long()
+        return bin_idx
+ 
+    # ------------------------------------------------------------------
+    # Value prediction (scalar)
+    # ------------------------------------------------------------------
+ 
+    def predict_value(self, backbone_features: torch.Tensor) -> torch.Tensor:
+        """
+        Returns scalar value estimate  V(o_t, ℓ)  for each item in the batch.
+ 
+        V(o_t, ℓ) = Σ_b  pϕ(V=b | o_t) · v(b)         (RECAP §IV-A)
+ 
+        backbone_features : (B, S, D)
+        returns           : (B,)
+        """
+        logits = self._pool_and_predict(backbone_features)   # (B, num_bins)
+        probs  = torch.softmax(logits, dim=-1)                # (B, num_bins)
+        value  = (probs * self.bin_centres).sum(dim=-1)       # (B,)
+        return value
+ 
+    # ------------------------------------------------------------------
+    # Training loss  (RECAP Eq. 1)
+    # ------------------------------------------------------------------
+ 
+    def compute_loss(
+        self,
+        backbone_features: torch.Tensor,
+        empirical_returns: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Cross-entropy between predicted bin distribution and
+        discretised empirical return R^B_t(τ).
+ 
+        Implements RECAP Eq. 1:
+            min_ϕ  E_{τ∈D} [ Σ_{o_t∈τ}  H( R^B_t(τ),  pϕ(V | o_t, ℓ) ) ]
+ 
+        backbone_features : (B, S, D)   — pooled observation features
+        empirical_returns : (B,)        — normalised returns in [value_min, value_max]
+                                          computed OUTSIDE this module from episode data
+        returns           : scalar loss
+        """
+        logits   = self._pool_and_predict(backbone_features)  # (B, num_bins)
+        bin_idx  = self._discretise_returns(empirical_returns) # (B,)  long
+        loss     = F.cross_entropy(logits, bin_idx)
+        return loss * self.config.value_loss_coeff
+ 
+    # ------------------------------------------------------------------
+    # Advantage computation for labelling  (RECAP App. F)
+    # ------------------------------------------------------------------
+ 
+    @torch.no_grad()
+    def compute_advantage(
+        self,
+        features_t: torch.Tensor,
+        features_t_plus_N: torch.Tensor,
+        rewards: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        N-step advantage estimate (RECAP App. F):
+ 
+            A(o_t, a_t) = Σ_{t'=t}^{t+N-1} r_{t'}  +  V(o_{t+N})  −  V(o_t)
+ 
+        features_t        : (B, S, D)  backbone features at step t
+        features_t_plus_N : (B, S, D)  backbone features at step t+N
+        rewards           : (B, N)     per-step rewards between t and t+N
+        returns           : (B,)       advantage values
+        """
+        V_t       = self.predict_value(features_t)          # (B,)
+        V_t_plus_N = self.predict_value(features_t_plus_N)  # (B,)
+        sum_rewards = rewards.sum(dim=-1)                    # (B,)
+        return sum_rewards + V_t_plus_N - V_t               # (B,)
+ 
+    @torch.no_grad()
+    def compute_advantage_labels(
+        self,
+        features_t: torch.Tensor,
+        features_t_plus_N: torch.Tensor,
+        rewards: torch.Tensor,
+        epsilon_ell: float,
+    ) -> torch.Tensor:
+        """
+        Convert advantage values to binary labels for RECAP / CFGRL training.
+ 
+            I_t = 1  if  A(o_t, a_t, ℓ) > ε_ℓ   →  AdvantageEmbedding.POS_IDX
+            I_t = 0  otherwise                    →  AdvantageEmbedding.NEG_IDX
+ 
+        π*0.6 sets ε_ℓ at the 30th–40th percentile of predicted values
+        for task ℓ (App. F), so ~30-40 % of steps get positive advantage.
+ 
+        features_t        : (B, S, D)
+        features_t_plus_N : (B, S, D)
+        rewards           : (B, N)
+        epsilon_ell       : float  scalar threshold (per-task)
+        returns           : (B,)  long tensor of {POS_IDX=2, NEG_IDX=1}
+        """
+        A = self.compute_advantage(features_t, features_t_plus_N, rewards)
+        labels = torch.where(
+            A > epsilon_ell,
+            torch.full_like(A, AdvantageEmbedding.POS_IDX, dtype=torch.long),
+            torch.full_like(A, AdvantageEmbedding.NEG_IDX, dtype=torch.long),
+        )
+        return labels
+ 
+ 
+# ---------------------------------------------------------------------------
+# Utility: compute normalised per-step returns from episode data
+# ---------------------------------------------------------------------------
+ 
+def compute_normalised_returns(
+    success: torch.Tensor,
+    episode_lengths: torch.Tensor,
+    t: torch.Tensor,
+    max_episode_length: int,
+    c_fail: float = 100.0,
+) -> torch.Tensor:
+    """
+    Computes the normalised empirical return  R_t(τ)  used to train the
+    distributional value head (RECAP §IV-A, §V-C).
+ 
+    Reward definition (RECAP Eq. 5):
+        r_{t'}  =  0          if t' == T and success
+                   -C_fail    if t' == T and failure
+                   -1         otherwise
+ 
+    Return from step t:
+        R_t(τ)  =  Σ_{t'=t}^{T}  r_{t'}
+                =  -(T - t)          if success    (negative steps remaining)
+                   -(T - t) - C_fail if failure
+ 
+    Normalised to (-1, 0) per task using max_episode_length (π*0.6 §V-C):
+        R_t_norm  =  R_t(τ) / (max_episode_length + C_fail)
+ 
+    Args:
+        success          : (B,)  bool  — was the episode successful?
+        episode_lengths  : (B,)  long  — T for each episode
+        t                : (B,)  long  — current timestep index
+        max_episode_length: int        — normalisation constant per task
+        c_fail           : float       — large penalty for failure (default 100)
+ 
+    Returns:
+        normalised_returns : (B,)  float in [-1, 0]
+    """
+    steps_remaining = (episode_lengths - t).float()          # T - t
+    raw_return      = -steps_remaining                        # successful base
+    raw_return      = torch.where(success, raw_return, raw_return - c_fail)
+    norm_denom      = float(max_episode_length + c_fail)
+    return (raw_return / norm_denom).clamp(-1.0, 0.0)
+
 
 @dataclass
 class FlowmatchingActionHeadConfig(PretrainedConfig):
@@ -252,6 +517,29 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
             )
         },
     )
+    use_value_head: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Attach a distributional value head pϕ(V|o_t,ℓ) (RECAP §IV-A). "
+                "When enabled, forward() also returns `value_loss`. "
+                "The value head is trained jointly with the policy via a weighted "
+                "cross-entropy loss on discretised empirical returns."
+            )
+        },
+    )
+    hidden_dim: int = field(
+        default=512,
+        metadata={}
+    )
+    num_bins: int = field(
+        default=201,
+        metadata={}
+    )          # B = 201 as in pi*0.6
+    value_loss_coeff: float = field(
+        default=1.0,
+        metadata={}
+    )
 
 
     def __init__(self, **kwargs):
@@ -326,6 +614,24 @@ class FlowmatchingActionHead(nn.Module):
             )
         else:
             self.advantage_embedding = None
+
+    def init_value_head(self):
+        if self.config.use_value_head:
+            vh_kwargs = {
+                "backbone_embedding_dim": self.config.backbone_embedding_dim,
+                "hidden_dim": self.config.hidden_dim,
+                "num_bins": self.config.num_bins,
+                "value_loss_coeff": self.config.value_loss_coeff,
+            }
+            vh_config = DistributionalValueHeadConfig(**vh_kwargs)
+            self.value_head = DistributionalValueHead(vh_config)
+            print(
+                f"[RECAP] Distributional value head ENABLED  "
+                f"(num_bins={vh_config.num_bins}, "
+                f"value_loss_coeff={vh_config.value_loss_coeff})"
+            )
+        else:
+            self.value_head = None
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -506,7 +812,20 @@ class FlowmatchingActionHead(nn.Module):
         loss = loss.sum() / action_mask.sum()
         output_dict = {
             "loss": loss,
+            "action_loss": loss
         }
+
+        if self.value_head is not None:
+            empirical_return = action_input.get("empirical_return", None)
+            if empirical_return is not None:
+                # backbone_output.backbone_features is already vlln-processed
+                # but has NOT had the advantage token appended — correct input.
+                raw_backbone = backbone_output.backbone_features
+                value_loss = self.value_head.compute_loss(raw_backbone, empirical_return)
+                output_dict["value_loss"] = value_loss
+                action_loss = output_dict["action_loss"]
+                # Total loss = policy loss + value loss (both weighted by their coeffs)
+                output_dict["loss"] = action_loss + value_loss
         return BatchFeature(data=output_dict)
 
     @torch.no_grad()
