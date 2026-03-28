@@ -232,7 +232,7 @@ def main(config: ArgsConfig):
         from gr00t.model.gr00t_n1 import GR00T_N1_5_Config
         from transformers import AutoConfig
         _base_cfg = AutoConfig.from_pretrained(config.base_model_path)
-        _base_project_to_dim = _base_cfg.backbone_cfg.get("project_to_dim", 2048)
+        _base_project_to_dim = _base_cfg.backbone_cfg.get("project_to_dim") or 2048
         _n_group = backbone_cfg_overrides.get("n_group", _base_cfg.backbone_cfg.get("n_group", 8))
         _new_project_to_dim = _base_project_to_dim * config.equi_scale_factor
         assert _new_project_to_dim % _n_group == 0, (
