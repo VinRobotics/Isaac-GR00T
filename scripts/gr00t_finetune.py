@@ -128,6 +128,12 @@ class ArgsConfig:
     lora_full_model: bool = False
     """Whether to use the full model for LORA. If False, only the action head will be trained."""
 
+    equi_scale_factor: int = 1
+    """Scale factor for the equivariant representation capacity.
+    project_to_dim = pretrained_project_to_dim * equi_scale_factor.
+    scale_factor=1 (default) keeps the pretrained dimensions unchanged.
+    scale_factor=2 doubles project_to_dim (e.g. 2048 → 4096, blocks 256 → 512)."""
+
     dataloader_num_workers: int = 12
     """Number of workers for data loading per GPU."""
 
@@ -221,6 +227,20 @@ def main(config: ArgsConfig):
     # Build backbone_cfg overrides: rotation config + always persist n_group
     backbone_cfg_overrides = dict(rotation_config)
 
+    # Scale project_to_dim if equi_scale_factor != 1
+    if config.equi_scale_factor != 1:
+        from gr00t.model.gr00t_n1 import GR00T_N1_5_Config
+        from transformers import AutoConfig
+        _base_cfg = AutoConfig.from_pretrained(config.base_model_path)
+        _base_project_to_dim = _base_cfg.backbone_cfg.get("project_to_dim", 2048)
+        _n_group = backbone_cfg_overrides.get("n_group", _base_cfg.backbone_cfg.get("n_group", 8))
+        _new_project_to_dim = _base_project_to_dim * config.equi_scale_factor
+        assert _new_project_to_dim % _n_group == 0, (
+            f"project_to_dim ({_new_project_to_dim}) must be divisible by n_group ({_n_group})"
+        )
+        backbone_cfg_overrides["project_to_dim"] = _new_project_to_dim
+        print(f"equi_scale_factor={config.equi_scale_factor}: project_to_dim {_base_project_to_dim} → {_new_project_to_dim} (blocks {_base_project_to_dim//_n_group} → {_new_project_to_dim//_n_group})")
+
     # Load model — backbone_cfg_overrides are merged into backbone_cfg before construction
     model = GR00T_N1_5.from_pretrained(
         pretrained_model_name_or_path=config.base_model_path,
@@ -241,20 +261,28 @@ def main(config: ArgsConfig):
     action_horizon_changed = data_action_horizon != model.action_head.config.action_horizon
     num_hand_changed = data_num_hand != model.action_head.config.num_hand
     rot_type_changed = data_rot_type != model.action_head.config.num_hand
-    
-    if action_horizon_changed or num_hand_changed or rot_type_changed:
+    new_project_to_dim = backbone_cfg_overrides.get("project_to_dim", None)
+    cross_attn_dim_changed = (
+        new_project_to_dim is not None
+        and new_project_to_dim != model.action_head.config.diffusion_model_cfg.get("cross_attention_dim")
+    )
+
+    if action_horizon_changed or num_hand_changed or rot_type_changed or cross_attn_dim_changed:
         print(
             f"Recreating action head with action_horizon {data_action_horizon} (was {model.action_head.config.action_horizon}), "
             f"num_hand {data_num_hand} (was {model.action_head.config.num_hand}), "
             f"rot_type {data_rot_type} (was {model.action_head.config.rot_type}), "
         )
-        
 
         # Update the action head config
         new_action_head_config = model.action_head.config
         new_action_head_config.action_horizon = data_action_horizon
         new_action_head_config.num_hand = data_num_hand
         new_action_head_config.rot_type = data_rot_type
+        if cross_attn_dim_changed:
+            old_cross_attn = new_action_head_config.diffusion_model_cfg.get("cross_attention_dim")
+            new_action_head_config.diffusion_model_cfg["cross_attention_dim"] = new_project_to_dim
+            print(f"  cross_attention_dim {old_cross_attn} → {new_project_to_dim}")
 
         # Import the FlowmatchingActionHead class
         from gr00t.model.action_head.flow_matching_action_head import (
@@ -276,6 +304,8 @@ def main(config: ArgsConfig):
         model.config.action_head_cfg["num_hand"] = new_action_head_config.num_hand
         model.config.action_head_cfg["rot_type"] = new_action_head_config.rot_type
         model.config.action_head_cfg["action_horizon"] = data_action_horizon
+        if cross_attn_dim_changed:
+            model.config.action_head_cfg["diffusion_model_cfg"]["cross_attention_dim"] = new_project_to_dim
 
         # Set trainable parameters for the new action head
         model.action_head.set_trainable_parameters(
