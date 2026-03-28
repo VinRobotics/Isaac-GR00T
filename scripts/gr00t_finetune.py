@@ -292,8 +292,18 @@ def main(config: ArgsConfig):
         # Create new action head with updated config
         new_action_head = FlowmatchingActionHead(new_action_head_config)
 
-        # Copy the weights from the old action head to the new one
-        new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
+        # Copy weights from the old action head, skipping any size-mismatched params
+        # (e.g. equi_vis_self_attn layers change shape when cross_attention_dim changes)
+        old_sd = model.action_head.state_dict()
+        new_sd = new_action_head.state_dict()
+        compatible_sd = {
+            k: v for k, v in old_sd.items()
+            if k in new_sd and v.shape == new_sd[k].shape
+        }
+        skipped = [k for k in old_sd if k not in compatible_sd]
+        if skipped:
+            print(f"  Skipping {len(skipped)} mismatched weight(s) (shape changed): {skipped[:3]}{'...' if len(skipped) > 3 else ''}")
+        new_action_head.load_state_dict(compatible_sd, strict=False)
 
         # Replace the action head
         model.action_head = new_action_head
