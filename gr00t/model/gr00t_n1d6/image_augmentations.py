@@ -221,11 +221,18 @@ def build_image_transformations_albumentations(
         max_size = shortest_image_edge
 
     # Training transforms (using ReplayCompose for consistent augmentation across views)
-    # Use SmallestMaxSize to preserve aspect ratios, with INTER_AREA for antialiasing
+    # Final step letterboxes (LongestMaxSize + PadIfNeeded) so cameras with different
+    # aspect ratios all produce the same max_size x max_size output without any cropping.
     train_transform_list = [
         A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
         FractionalRandomCrop(crop_fraction=fraction_to_use),
-        A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+        A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+        A.PadIfNeeded(
+            min_height=max_size,
+            min_width=max_size,
+            border_mode=cv2.BORDER_CONSTANT,
+            value=0,
+        ),
     ]
 
     if random_rotation_angle is not None and random_rotation_angle != 0:
@@ -244,25 +251,14 @@ def build_image_transformations_albumentations(
             )
         )
 
-    # Pad to fixed square size so all cameras (with different aspect ratios) produce
-    # the same output dimensions and can be stacked across views.
-    train_transform_list.append(
-        A.PadIfNeeded(
-            min_height=max_size,
-            min_width=max_size,
-            border_mode=cv2.BORDER_CONSTANT,
-            value=0,
-        )
-    )
     train_transform = A.ReplayCompose(train_transform_list, p=1.0)
 
     # Evaluation transforms (deterministic)
-    # Use SmallestMaxSize to preserve aspect ratios, with INTER_AREA for antialiasing
     eval_transform = A.Compose(
         [
             A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
             FractionalCenterCrop(crop_fraction=fraction_to_use),
-            A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+            A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
             A.PadIfNeeded(
                 min_height=max_size,
                 min_width=max_size,

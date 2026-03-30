@@ -49,6 +49,14 @@ class FinetuneConfig:
     Dropout probability applied to state inputs for regularization during training.
     """
 
+    # --- Image Resolution ---
+    shortest_image_edge: int = 256
+    """
+    Resize images so their shortest edge equals this value before cropping.
+    Increase to train at higher resolution (e.g. 480 to avoid downscaling 480x640 cameras).
+    All cameras are letterboxed to a square of this size, so no content is cropped.
+    """
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""

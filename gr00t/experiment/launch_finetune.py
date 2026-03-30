@@ -61,6 +61,7 @@ if __name__ == "__main__":
     config.model.state_dropout_prob = ft_config.state_dropout_prob
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
+    config.model.shortest_image_edge = ft_config.shortest_image_edge
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False
