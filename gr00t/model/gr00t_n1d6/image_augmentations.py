@@ -244,6 +244,16 @@ def build_image_transformations_albumentations(
             )
         )
 
+    # Pad to fixed square size so all cameras (with different aspect ratios) produce
+    # the same output dimensions and can be stacked across views.
+    train_transform_list.append(
+        A.PadIfNeeded(
+            min_height=max_size,
+            min_width=max_size,
+            border_mode=cv2.BORDER_CONSTANT,
+            value=0,
+        )
+    )
     train_transform = A.ReplayCompose(train_transform_list, p=1.0)
 
     # Evaluation transforms (deterministic)
@@ -253,6 +263,12 @@ def build_image_transformations_albumentations(
             A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
             FractionalCenterCrop(crop_fraction=fraction_to_use),
             A.SmallestMaxSize(max_size=max_size, interpolation=cv2.INTER_AREA),
+            A.PadIfNeeded(
+                min_height=max_size,
+                min_width=max_size,
+                border_mode=cv2.BORDER_CONSTANT,
+                value=0,
+            ),
         ]
     )
 
