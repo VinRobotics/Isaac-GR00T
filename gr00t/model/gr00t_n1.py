@@ -29,7 +29,7 @@ from .action_head.flow_matching_action_head import (
     FlowmatchingActionHead,
     FlowmatchingActionHeadConfig,
 )
-from .backbone import EagleBackbone
+from .backbone import EagleBackboneEquiAdapt
 
 BACKBONE_FEATURE_KEY = "backbone_vision_language_features"
 ACTION_KEY = "action_pred"
@@ -50,6 +50,7 @@ class GR00T_N1_5_Config(PretrainedConfig):
 
     action_dim: int = field(init=False, metadata={"help": "Action dimension."})
     compute_dtype: str = field(default="float32", metadata={"help": "Compute dtype."})
+    canon_loss_weight: float = field(default=0.0, metadata={"help": "Weight for canonicalization orthogonality loss (equiAdapt). 0 = disabled."})
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -79,13 +80,14 @@ class GR00T_N1_5(PreTrainedModel):
         super().__init__(config)
         self.local_model_path = local_model_path
 
-        self.backbone = EagleBackbone(**config.backbone_cfg)
+        self.backbone = EagleBackboneEquiAdapt(**config.backbone_cfg)
         action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
         self.action_head = FlowmatchingActionHead(action_head_cfg)
 
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+        self.canon_loss_weight = getattr(config, "canon_loss_weight", 0.0)
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -167,6 +169,12 @@ class GR00T_N1_5(PreTrainedModel):
         backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=True)
+
+        # Add canonicalization orthogonality loss when enabled (equiAdapt training)
+        if self.training and self.canon_loss_weight > 0.0:
+            canon_loss = self.backbone.get_canonicalization_loss()
+            action_head_outputs["loss"] = action_head_outputs["loss"] + self.canon_loss_weight * canon_loss
+
         return action_head_outputs
 
     def get_backbone_output(

@@ -382,6 +382,9 @@ class EagleBackboneEquiAdapt(nn.Module):
         ref = self.reference_vector.expand(self.n_group * B, -1)
         scalar = F.cosine_similarity(ref, vec_out, dim=-1)  # [N*B]
 
+        # Cache for get_canonicalization_loss()
+        self._last_vector_out = vec_out  # [N*B, out_vector_size]
+
         # Reshape to [N, B] → [B, N]
         group_activations = scalar.reshape(self.n_group, B).T.contiguous()  # [B, N]
 
@@ -498,6 +501,59 @@ class EagleBackboneEquiAdapt(nn.Module):
         return tokens_shifted.reshape(B, T, D)
 
     # ---------------------------------------------------------------------- #
+    # Canonicalization auxiliary losses  (call after forward_eagle)
+    # ---------------------------------------------------------------------- #
+
+    def get_canonicalization_loss(self, artifact_err_wt: float = 0.0) -> torch.Tensor:
+        """
+        Auxiliary loss for training the canonicalization network.
+
+        Combines two terms from OptimizedGroupEquivariantImageCanonicalization:
+
+        1. **Orthogonality loss** (always active):
+           Forces the feature vectors for different group elements to be
+           orthogonal (cosine similarity ≈ 0 for distinct elements).
+           This prevents mode collapse where all rotations map to the same vector.
+
+        2. **Rotation artifact loss** (when artifact_err_wt > 0):
+           Randomly re-rotates already-group-augmented images and checks that
+           the canonicalization network gives consistent vectors.
+           Penalises inconsistency via MSE between the two sets of vectors.
+           This requires calling _compute_artifact_vectors() separately.
+
+        Args:
+            artifact_err_wt: weight for rotation artifact loss (0 = disabled).
+
+        Returns:
+            Scalar loss tensor. Add to the main task loss during training.
+        """
+        if not hasattr(self, "_last_vector_out"):
+            raise RuntimeError(
+                "get_canonicalization_loss() must be called after forward_eagle()."
+            )
+
+        vectors = self._last_vector_out  # [N*B, out_vector_size]
+
+        # Infer batch size from cached vector
+        NB = vectors.shape[0]
+        B = NB // self.n_group
+
+        # Orthogonality: shape [B, N, out_vector_size]
+        vectors_per_sample = vectors.reshape(self.n_group, B, self.out_vector_size)
+        vectors_per_sample = vectors_per_sample.permute(1, 0, 2)  # [B, N, D]
+
+        # Gram matrix [B, N, N]
+        distances = vectors_per_sample @ vectors_per_sample.permute(0, 2, 1)
+        mask = 1.0 - torch.eye(self.n_group, device=vectors.device)  # [N, N]
+        ortho_loss = torch.abs(distances * mask.unsqueeze(0)).mean()
+
+        if artifact_err_wt > 0.0 and hasattr(self, "_last_vector_out_artifact"):
+            artifact_loss = F.mse_loss(self._last_vector_out_artifact, vectors.detach())
+            return ortho_loss + artifact_err_wt * artifact_loss
+
+        return ortho_loss
+
+    # ---------------------------------------------------------------------- #
     # Main forward
     # ---------------------------------------------------------------------- #
 
@@ -506,54 +562,61 @@ class EagleBackboneEquiAdapt(nn.Module):
         Forward pass with equiAdapt canonicalization on equi cameras.
 
         Pipeline:
-          Equi cameras:
-            x_equi → canonicalize → eagle.extract_feature → invert_tokens → [B, n_equi, T, D]
-          Language (full VL model, unmodified):
-            vl_input → eagle(**) → hidden_states[select_layer] → [B, T_text, D]
+          Step 1: Canonicalize each equi camera, store rotation indices.
+                  Non-equi cameras are kept unchanged.
+
+          Step 2: Build mixed pixel_values:
+                  [canonical_equi_cam0, ..., original_non_equi_camK, ...]  [B*num_imgs, C, H, W]
+
+          Step 3: Run Eagle model ONCE with mixed pixel_values:
+                  a) extract_feature(pixel_values_mixed) → all-camera vision tokens [B*num_imgs, T, D]
+                  b) eagle(**) with pixel_values_mixed → LLM hidden_states [B, T_text, D]
+                  Both use the same canonicalized inputs, so the LLM context also
+                  benefits from the canonical view of equi cameras.
+
+          Step 4: Slice equi camera tokens from the all-camera batch,
+                  apply _invert_tokens (ρ(r)) to recover equivariant features.
 
         Returns:
-            (equi_vision_features, vl_features, attention_mask)
+            (equi_vision_features [B, n_equi, T, D],
+             vl_features [B, T_text, D],
+             attention_mask)
         """
         eagle_prefix = "eagle_"
 
-        pixel_values = vl_input[f"{eagle_prefix}pixel_values"]
+        pixel_values = vl_input[f"{eagle_prefix}pixel_values"]  # [B*num_imgs, C, H, W]
         B = vl_input[f"{eagle_prefix}input_ids"].shape[0]
         _, C, H, W = pixel_values.shape
-        n_equi = len(self.rotate_image_indices)
 
-        # Reshape pixel_values: [B * num_imgs, C, H, W] → [B, num_imgs, C, H, W]
+        # [B*num_imgs, C, H, W] → [B, num_imgs, C, H, W]
         img_batch = pixel_values.reshape(B, self.num_images_per_sample, C, H, W)
 
         # ------------------------------------------------------------------ #
-        # Equi cameras: canonicalize → backbone → invert
+        # Step 1: Canonicalize equi cameras
         # ------------------------------------------------------------------ #
-        equi_vision_features_list = []
+        rotation_indices_per_cam: dict = {}
+        img_batch_mixed = img_batch.clone()
+
         for cam_idx in self.rotate_image_indices:
             x_cam = img_batch[:, cam_idx]  # [B, C, H, W]
-
-            # Step 1: detect rotation
             group_activations, rotation_indices = self._get_rotation_indices(x_cam)
-
-            # Step 2: canonicalize image
-            x_canonical = self._canonicalize_images(x_cam, group_activations)  # [B, C, H, W]
-
-            # Step 3: run Eagle vision encoder on canonical images
-            raw_tokens, _ = self.eagle_model.extract_feature(x_canonical)
-            # raw_tokens: [B, T_vision, D_vision]
-
-            # Step 4: project features
-            raw_tokens = self.eagle_linear(raw_tokens)  # [B, T, project_to_dim]
-
-            # Step 5: invert tokens — apply ρ(r) to recover equivariant features
-            equi_tokens = self._invert_tokens(raw_tokens, rotation_indices)  # [B, T, D]
-
-            equi_vision_features_list.append(equi_tokens)
-
-        # Stack: [B, n_equi, T, D]
-        equi_vision_features = torch.stack(equi_vision_features_list, dim=1)
+            img_batch_mixed[:, cam_idx] = self._canonicalize_images(x_cam, group_activations)
+            rotation_indices_per_cam[cam_idx] = rotation_indices
 
         # ------------------------------------------------------------------ #
-        # Language features from full VL model (unmodified, no canonicalization)
+        # Step 2: Build mixed pixel_values
+        #         canonical for equi cams, original for non-equi cams
+        # ------------------------------------------------------------------ #
+        # [B, num_imgs, C, H, W] → [B*num_imgs, C, H, W]
+        pixel_values_mixed = img_batch_mixed.reshape(B * self.num_images_per_sample, C, H, W)
+
+        # ------------------------------------------------------------------ #
+        # Step 3: ONE full Eagle forward with mixed pixel_values
+        #
+        # Eagle internally calls extract_feature and inserts vision tokens at
+        # positions where input_ids == image_token_index before running the LLM.
+        # hidden_states[0]  = the input embeddings (pure vision tokens + text)
+        # hidden_states[select_layer] = LLM output for language features
         # ------------------------------------------------------------------ #
         eagle_input = {
             k.removeprefix(eagle_prefix): v
@@ -562,12 +625,63 @@ class EagleBackboneEquiAdapt(nn.Module):
         }
         if "image_sizes" in eagle_input:
             del eagle_input["image_sizes"]
+        eagle_input["pixel_values"] = pixel_values_mixed
 
         vl_out = self.eagle_model(
             **eagle_input, output_hidden_states=True, return_dict=True
         )
-        vl_features = vl_out.hidden_states[self.select_layer]
-        vl_features = self.eagle_linear(vl_features)
+
+        # ------------------------------------------------------------------ #
+        # Step 4: Project LLM output → vl_features, then apply ρ(r) to equi
+        #         camera positions in-place and extract as equi_vision_features.
+        #
+        # image_mask[b, p] = True  iff input_ids[b, p] == image_token_index.
+        # Image tokens are laid out contiguously per camera:
+        #   cam 0 → positions [0 : T_vis]
+        #   cam 1 → positions [T_vis : 2*T_vis]
+        #   ...  (within the set of True positions for sample b)
+        #
+        # We:
+        #   1. Project the full LLM hidden state with eagle_linear.
+        #   2. For each equi camera, gather its T_vis token rows from vl_features,
+        #      apply _invert_tokens, then scatter the result back into vl_features.
+        #   3. Also collect the inverted tokens as equi_vision_features.
+        # ------------------------------------------------------------------ #
+        input_ids = eagle_input["input_ids"]                             # [B, N_seq]
+        image_mask = (input_ids == self.eagle_model.image_token_index)  # [B, N_seq]
+
+        # Project: [B, N_seq, D_llm] → [B, N_seq, project_to_dim]
+        vl_features = self.eagle_linear(vl_out.hidden_states[self.select_layer])
+
+        # Infer T_vis from mask (uniform across batch in GR00T)
+        T_vis = image_mask[0].sum().item() // self.num_images_per_sample
+
+        # Sequence indices of all image tokens per sample: [B, num_imgs * T_vis]
+        _, col_idx = image_mask.nonzero(as_tuple=True)
+        col_idx_2d = col_idx.reshape(B, self.num_images_per_sample * T_vis)  # [B, NI]
+
+        b_idx = torch.arange(B, device=vl_features.device).unsqueeze(1)  # [B, 1]
+
+        equi_vision_features_list = []
+        for cam_idx in self.rotate_image_indices:
+            start = cam_idx * T_vis
+            end   = start + T_vis
+
+            # Sequence positions of this camera's tokens: [B, T_vis]
+            cam_col = col_idx_2d[:, start:end]
+
+            # Gather: [B, T_vis, D]
+            tokens_cam = vl_features[b_idx, cam_col]
+
+            # Apply ρ(r) → equivariant tokens: [B, T_vis, D]
+            equi_tokens = self._invert_tokens(tokens_cam, rotation_indices_per_cam[cam_idx])
+            equi_vision_features_list.append(equi_tokens)
+
+            # Write equivariant tokens back into vl_features at the same positions
+            vl_features[b_idx, cam_col] = equi_tokens
+
+        # [B, n_equi, T_vis, D]
+        equi_vision_features = torch.stack(equi_vision_features_list, dim=1)
 
         attention_mask = eagle_input["attention_mask"]
 

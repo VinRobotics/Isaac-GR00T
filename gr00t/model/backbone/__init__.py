@@ -15,3 +15,4 @@
 
 from .eagle_backbone import EagleBackbone  
 from .eagle_backbone_fa_tokens import EagleBackboneFATokens 
+from .eagle_backbone_equiadapt import EagleBackboneEquiAdapt
