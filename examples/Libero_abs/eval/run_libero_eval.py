@@ -59,6 +59,7 @@ class GenerateConfig:
     task_suite_name: str = "libero_spatial"          # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 5                    # Number of rollouts per task
+    rotation_randomization: bool = False                     # Whether to apply random SO(2) rotation to all objects in the initial state for diversity
     #################################################################################################################
     # fmt: on
     """Port to connect to."""
@@ -160,6 +161,52 @@ class GR00TPolicy:
         return action_array
 
 
+def _quat_multiply(q1, q2):
+    """Quaternion multiplication q1 * q2. MuJoCo format: [w, x, y, z]"""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ])
+
+
+def perturb_init_state(env, init_state, xy_noise_scale=0.02, seed=None):
+    """Add random XY noise and SO(2) yaw rotation to all objects in a LIBERO init state.
+
+    Args:
+        env: LIBERO ControlEnv (after env.reset())
+        init_state: 1D numpy array from get_task_init_states()
+        xy_noise_scale: std of Gaussian noise in meters
+        seed: optional random seed for reproducibility
+    """
+    rng = np.random.default_rng(seed)
+    state = init_state.copy()
+
+    model = env.env.sim.model
+    qpos_start = 1  # flattened state layout: [time(1), qpos(nq), qvel(nv)]
+
+    for joint_id in range(model.njnt):
+        if model.jnt_type[joint_id] == 0:  # free joint = object (not robot hinge)
+            addr = model.jnt_qposadr[joint_id]
+            flat_idx = qpos_start + addr
+
+            # XY position noise
+            state[flat_idx + 0] += rng.normal(0, xy_noise_scale)
+            state[flat_idx + 1] += rng.normal(0, xy_noise_scale)
+
+            # Random SO(2) rotation around Z axis
+            theta = rng.uniform(0, 2 * np.pi)
+            q_rot = np.array([np.cos(theta / 2), 0.0, 0.0, np.sin(theta / 2)])
+            q_orig = state[flat_idx + 3 : flat_idx + 7].copy()  # [w, x, y, z]
+            q_new = _quat_multiply(q_rot, q_orig)
+            state[flat_idx + 3 : flat_idx + 7] = q_new / np.linalg.norm(q_new)
+
+    return state
+
+
 def eval_libero(cfg: GenerateConfig) -> None:
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -192,9 +239,16 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Reset environment
             env.reset()
 
-            # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx])
-
+            # Set initial states with randomized object poses for diversity
+            if cfg.rotation_randomization:
+                perturbed_state = perturb_init_state(
+                    env, initial_states[episode_idx],
+                    xy_noise_scale=0.02, seed=task_id * 1000 + episode_idx
+                )
+                obs = env.set_init_state(perturbed_state)
+            else:
+                obs = env.set_init_state(initial_states[episode_idx])
+                
             # Start in delta mode for the wait phase; switch to absolute after
             for robot in env.env.robots:
                 robot.controller.use_delta = True
