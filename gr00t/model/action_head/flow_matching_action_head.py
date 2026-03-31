@@ -373,6 +373,17 @@ class FlowmatchingActionHead(nn.Module):
         
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+        
+        
+        # VL stream (invariant): backbone language features → vlln → vl_self_attention → vl_proj
+        self.vlln = (
+            nn.LayerNorm(config.backbone_language_embedding_dim) if config.use_vlln else nn.Identity()
+        )
+        self.vl_self_attention = (
+            SelfAttentionTransformer(**config.vl_self_attention_cfg)
+            if config.use_vlln
+            else nn.Identity()
+        )
 
         if config.add_pos_embed:
             # Equivariant temporal position embeddings for state and action tokens.
