@@ -39,7 +39,7 @@ Use the standard ``DefaultDataCollator`` from gr00t.model.transforms.
 """
 
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from gr00t.data.dataset import LeRobotSingleDataset, ModalityConfig
 from gr00t.data.transform.base import ComposedModalityTransform
@@ -76,7 +76,7 @@ class WindowFrameTaskCompletionDataset(LeRobotSingleDataset):
         language_key: str,
         task_completion_key: str,
         delta_indices: List[int],
-        transforms: ComposedModalityTransform=None,
+        transforms: Optional[ComposedModalityTransform] = None,
         embodiment_tag: str = "new_embodiment",
         video_backend: str = "torchvision_av",
     ):

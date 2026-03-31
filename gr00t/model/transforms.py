@@ -128,6 +128,17 @@ class GR00TTransform(InvertibleModalityTransform):
         default=False,
         description="Whether to include task completion in the transform output for training.",
     )
+    camera_major_order: bool = Field(
+        default=False,
+        description=(
+            "If True, images are sent to Eagle camera-major: all frames of camera 0 first, "
+            "then all frames of camera 1, etc. "
+            "(cam_head_t0…cam_head_tN, cam_left_t0…cam_left_tN, …). "
+            "The default (False) is time-major: cam_head_t0, cam_left_t0, …, cam_head_t1, …. "
+            "Set True for task completion window inference so each camera's temporal context "
+            "is contiguous in the Eagle sequence."
+        ),
+    )
 
     max_length: int = 512
     embodiment_tag: EmbodimentTag | None = None
@@ -186,7 +197,8 @@ class GR00TTransform(InvertibleModalityTransform):
         images = batch["images"]  # [V, T, C, H, W]
         images.shape[0]
 
-        np_images = rearrange(images, "v t c h w -> (t v) c h w")
+        pattern = "v t c h w -> (v t) c h w" if self.camera_major_order else "v t c h w -> (t v) c h w"
+        np_images = rearrange(images, pattern)
         text_content = []
 
         # handle language

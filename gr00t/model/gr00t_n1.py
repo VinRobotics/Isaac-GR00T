@@ -229,6 +229,8 @@ class GR00T_N1_5(PreTrainedModel):
         backbone_inputs = self.backbone.prepare_input(inputs)
         
         def to_device(x):
+            if not isinstance(x, torch.Tensor):
+                return x  # PIL Images, strings, etc. pass through unchanged
             if torch.is_floating_point(x):
                 return x.to(self.device, dtype=self.action_head.dtype)
             return x.to(self.device)

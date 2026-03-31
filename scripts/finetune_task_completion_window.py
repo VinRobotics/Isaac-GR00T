@@ -42,10 +42,11 @@ After training, load the detector weights at inference:
     )
 """
 
+import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Literal, Optional
 
@@ -74,7 +75,7 @@ class ArgsConfig:
     output_dir: str = "/tmp/tc_window"
     """Directory to save checkpoints and final detector weights."""
 
-    delta_indices: List[int] = field(default_factory=lambda: [0])
+    delta_indices: List[int] = field(default_factory=lambda: list(reversed([-i * 10 for i in range(10)])))
     """Temporal offsets (relative to current step) to sample per training example.
     All values should be <= 0 (past frames); the last entry should be 0.
 
@@ -245,11 +246,15 @@ def main(args: ArgsConfig):
     output_path = Path(args.output_dir) / "task_completion_detection.pt"
     model.save_detector_weights(output_path)
 
-    print("\nDone. To use at inference:")
-    print(f"  policy.model.set_task_completion_window_size({len(delta_indices)})")
-    print(f"  policy.model.task_completion_detection.load_state_dict(")
-    print(f'      torch.load("{output_path}")')
-    print(f"  )")
+    # --- Save task completion config (video_keys + delta_indices) ---
+    config_path = Path(args.output_dir) / "task_completion_config.json"
+    with open(config_path, "w") as f:
+        json.dump(asdict(data_cfg), f, indent=2)
+    print(f"Saved task completion config to: {config_path}")
+
+    print("\nDone. To use at inference pass --task_completion_detection_path to inference_service.py:")
+    print(f"  --task_completion_detection_path {output_path}")
+    print(f"  (task_completion_config.json is auto-detected from the same directory)")
 
 
 # ---------------------------------------------------------------------------

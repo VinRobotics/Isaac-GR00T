@@ -54,10 +54,12 @@ Note: TensorRT engines must be built before running with --use-tensorrt flag.
 See deployment_scripts/README.md for instructions on building TensorRT engines.
 """
 
+import json
 import time
 import types
 from dataclasses import dataclass
-from typing import Literal
+from pathlib import Path
+from typing import Literal, Optional
 
 import numpy as np
 import tyro
@@ -131,8 +133,13 @@ class ArgsConfig:
     """DiT model dtype (fp16, fp8). Only used when use_tensorrt is True."""
 
     task_completion_detection_path: str = None
-    """Path to a task_completion_detection.pt file saved by finetune_task_completion.py.
+    """Path to a task_completion_detection.pt file saved by finetune_task_completion_window.py.
     If provided, the model's task_completion_detection weights are replaced with these."""
+
+    task_completion_config_path: str = None
+    """Path to a task_completion_config.json file saved by finetune_task_completion_window.py.
+    If not set, auto-detected from the same directory as task_completion_detection_path.
+    Provides video_keys and delta_indices for get_task_completion()."""
 
 
 
@@ -198,13 +205,31 @@ def main(args: ArgsConfig):
         modality_config = data_config.modality_config()
         modality_transform = data_config.transform()
 
+        # --- Load task completion config (video_keys + delta_indices) ---
+        task_completion_config = None
+        tc_config_path = args.task_completion_config_path
+        if tc_config_path is None and args.task_completion_detection_path is not None:
+            # Auto-detect from the same directory as the detection weights.
+            tc_config_path = str(
+                Path(args.task_completion_detection_path).parent / "task_completion_config.json"
+            )
+        if tc_config_path is not None and Path(tc_config_path).exists():
+            from gr00t.task_completion.config import WindowTaskCompletionConfig
+            with open(tc_config_path) as f:
+                cfg_dict = json.load(f)
+            task_completion_config = WindowTaskCompletionConfig(**cfg_dict)
+            print(f"Loaded task completion config from: {tc_config_path}")
+            print(f"  video_keys:    {task_completion_config.video_keys}")
+            print(f"  delta_indices: {task_completion_config.delta_indices}")
+
         policy = Gr00tPolicy(
             model_path=args.model_path,
             modality_config=modality_config,
             modality_transform=modality_transform,
             embodiment_tag=args.embodiment_tag,
             denoising_steps=args.denoising_steps,
-            smooth_option=args.smooth_option
+            smooth_option=args.smooth_option,
+            task_completion_config=task_completion_config,
         )
 
         if args.task_completion_detection_path is not None:

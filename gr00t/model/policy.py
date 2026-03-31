@@ -76,6 +76,7 @@ class Gr00tPolicy(BasePolicy):
         denoising_steps: Optional[int] = None,
         smooth_option: Optional[str] = "",
         device: Union[int, str] = "cuda" if torch.cuda.is_available() else "cpu",
+        task_completion_config=None,
     ):
         """
         Initialize the Gr00tPolicy.
@@ -87,6 +88,11 @@ class Gr00tPolicy(BasePolicy):
             embodiment_tag (Union[str, EmbodimentTag]): The embodiment tag for the model.
             denoising_steps: Number of denoising steps to use for the action head.
             device (Union[int, str]): Device to run the model on.
+            task_completion_config: Optional WindowTaskCompletionConfig that defines
+                which video_keys and delta_indices to use for task completion inference.
+                When provided, get_task_completion() will validate observations against
+                these and apply the config's own inference transform instead of the
+                main policy transform.
         """
         try:
             # NOTE(YL) this returns the local path to the model which is normally
@@ -116,6 +122,17 @@ class Gr00tPolicy(BasePolicy):
         self._load_metadata(self.model_path / "experiment_cfg")
         # Load horizons
         self._load_horizons()
+
+        # Task-completion config: video_keys, delta_indices, and dedicated transform.
+        self._tc_video_keys: Optional[list] = None
+        self._tc_delta_indices: Optional[list] = None
+        self._tc_transform: Optional[ComposedModalityTransform] = None
+        if task_completion_config is not None:
+            self._tc_video_keys = task_completion_config.video_keys
+            self._tc_delta_indices = task_completion_config.delta_indices
+            self._tc_transform = task_completion_config.transform(training=False)
+            self._tc_transform.set_metadata(self.metadata)
+            self._tc_transform.eval()
 
         if denoising_steps is not None:
             if hasattr(self.model, "action_head") and hasattr(
@@ -298,11 +315,14 @@ class Gr00tPolicy(BasePolicy):
         """
         Run the task-completion detector on a window of frames.
 
+        Compatible with any GR00T data config: state keys are adapted to the
+        transform's configured state_horizon so that a window of W frames can be
+        passed regardless of what horizon the policy was initialised with.
+
         Args:
             observations: same format as get_action().
                 For window-frame prediction pass video with shape
                 (window_size, H, W, C) — all W frames already stacked.
-                The standard modality transform handles variable T lengths;
                 Eagle attends across all frames in one forward pass.
 
         Returns:
@@ -311,16 +331,37 @@ class Gr00tPolicy(BasePolicy):
         """
         obs_copy = observations.copy()
 
-        is_batch = self._check_state_is_batched(obs_copy)
-        if not is_batch:
-            obs_copy = unsqueeze_dict_values(obs_copy)
+        # Drop keys that are labels or actions — not needed at inference.
+        obs_copy = {
+            k: v for k, v in obs_copy.items()
+            if not any(tag in k for tag in ("action", "tasks.done", "task_completion"))
+        }
 
+        # Coerce to numpy first so validation always sees ndarray shapes.
         for k, v in obs_copy.items():
             if not isinstance(v, np.ndarray):
                 obs_copy[k] = np.array(v)
 
-        print(obs_copy)
-        normalized_input = self.apply_transforms(obs_copy)
+        # Validate video keys and window length against the task_completion_config.
+        self._validate_task_completion_obs(obs_copy)
+
+        # Use video keys to detect batching: individual video keys are
+        # [T, H, W, C] (4D) when unbatched, [B, T, H, W, C] (5D) when batched.
+        # _check_state_is_batched cannot be used here because state keys may be
+        # absent (task completion is vision-only), causing it to wrongly return True
+        # and skip unsqueeze — leaving video as 5-D after ConcatTransform and
+        # triggering the non-batched (PIL-Image) path in GR00TTransform.
+        is_batch = self._check_obs_is_batched(obs_copy)
+        if not is_batch:
+            obs_copy = unsqueeze_dict_values(obs_copy)
+
+        # Align state T-dimension to what GR00TTransform expects so that a
+        # window of W frames doesn't break the state_horizon assertion.
+        # Pass the active transform so the right GR00TTransform is inspected.
+        active_transform = self._tc_transform if self._tc_transform is not None else self._modality_transform
+        obs_copy = self._align_state_to_transform_horizon(obs_copy, active_transform)
+
+        normalized_input = active_transform(obs_copy)
 
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
             tc_pred = self.model.get_task_completion(normalized_input)  # (B,) float
@@ -330,6 +371,79 @@ class Gr00tPolicy(BasePolicy):
             result = result.squeeze()
 
         return {"task_completion_pred": result}
+
+    def _validate_task_completion_obs(self, obs: Dict[str, Any]) -> None:
+        """
+        When a task_completion_config was provided at init, verify that *obs*
+        contains the expected video keys and that each key has the right number
+        of window frames (len(delta_indices)).
+        """
+        if self._tc_video_keys is None:
+            return
+
+        missing = [k for k in self._tc_video_keys if k not in obs]
+        if missing:
+            raise ValueError(
+                f"get_task_completion: missing video keys {missing}. "
+                f"Expected: {self._tc_video_keys}"
+            )
+
+        if self._tc_delta_indices is not None:
+            expected_T = len(self._tc_delta_indices)
+            for k in self._tc_video_keys:
+                v = obs[k]  # already confirmed present above; already numpy
+                # Shape is [T, H, W, C] (unbatched) or [B, T, H, W, C] (batched).
+                T = v.shape[0] if v.ndim == 4 else v.shape[1]
+                if T != expected_T:
+                    raise ValueError(
+                        f"get_task_completion: '{k}' has T={T} frames but "
+                        f"task_completion_config expects T={expected_T} "
+                        f"(delta_indices={self._tc_delta_indices}). "
+                        f"Pass exactly {expected_T} stacked frames per camera."
+                    )
+
+    def _align_state_to_transform_horizon(
+        self, obs: Dict[str, Any], transform: Optional[ComposedModalityTransform] = None
+    ) -> Dict[str, Any]:
+        """
+        Ensure every ``state.*`` key in *obs* has exactly ``state_horizon``
+        timesteps along axis=1 (batch-first, already unsqueezed).
+
+        This makes ``get_task_completion`` compatible with any data config:
+        the caller may pass W window frames while the policy's GR00TTransform
+        was built with a different state_horizon.
+
+        Strategy:
+          - T > state_horizon  →  take the last state_horizon frames
+          - T < state_horizon  →  repeat the first frame to pad on the left
+          - T == state_horizon →  no-op
+        """
+        from gr00t.model.transforms import GR00TTransform
+
+        source = transform if transform is not None else self._modality_transform
+        state_horizon = None
+        for t in source.transforms:
+            if isinstance(t, GR00TTransform):
+                state_horizon = t.state_horizon
+                break
+
+        if state_horizon is None:
+            return obs  # No GR00TTransform found; nothing to adapt.
+
+        adapted = {}
+        for k, v in obs.items():
+            if k.startswith("state.") or k == "state":
+                T = v.shape[1]  # (B, T, D)
+                if T > state_horizon:
+                    adapted[k] = v[:, -state_horizon:]
+                elif T < state_horizon:
+                    pad = np.repeat(v[:, :1], state_horizon - T, axis=1)
+                    adapted[k] = np.concatenate([pad, v], axis=1)
+                else:
+                    adapted[k] = v
+            else:
+                adapted[k] = v
+        return adapted
 
     def _get_action_from_normalized_input(self, normalized_input: Dict[str, Any]) -> torch.Tensor:
         # Set up autocast context if needed
@@ -406,6 +520,19 @@ class Gr00tPolicy(BasePolicy):
             if "state" in k and len(v.shape) < 3:  # (B, Time, Dim)
                 return False
         return True
+
+    def _check_obs_is_batched(self, obs: Dict[str, Any]) -> bool:
+        """
+        Determine whether observations include a batch dimension.
+        Prefers video keys for detection (reliable even when state is absent):
+          - Unbatched video key: [T, H, W, C]  (4-D)
+          - Batched  video key: [B, T, H, W, C] (5-D)
+        Falls back to _check_state_is_batched when no video keys are found.
+        """
+        for k, v in obs.items():
+            if k.startswith("video.") and hasattr(v, "shape"):
+                return len(v.shape) >= 5
+        return self._check_state_is_batched(obs)
 
     def _load_model(self, model_path):
         model = GR00T_N1_5.from_pretrained(model_path, torch_dtype=COMPUTE_DTYPE)
