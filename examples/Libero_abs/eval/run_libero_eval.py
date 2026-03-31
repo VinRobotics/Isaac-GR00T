@@ -161,16 +161,16 @@ class GR00TPolicy:
         return action_array
 
 
-def perturb_init_state(env, init_state, rotation_radius=0.02, seed=None):
-    """Apply random SO(2) rotation to the XY position of all objects in a LIBERO init state.
+def perturb_init_state(env, init_state, displacement=0.02, seed=None):
+    """Displace each object's XY position by a small random SO(2) offset.
 
-    Each object's (x, y) position is rotated around the scene origin by a random angle,
-    displacing it by up to `rotation_radius` meters from its original location.
+    Picks a random direction uniformly in [0, 2π] and moves the object by
+    `displacement` meters in that direction, keeping it close to its original spot.
 
     Args:
         env: LIBERO ControlEnv (after env.reset())
         init_state: 1D numpy array from get_task_init_states()
-        rotation_radius: max displacement radius in meters (default 0.02 = 2cm)
+        displacement: displacement distance in meters (default 0.02 = 2cm)
         seed: optional random seed for reproducibility
     """
     rng = np.random.default_rng(seed)
@@ -184,12 +184,10 @@ def perturb_init_state(env, init_state, rotation_radius=0.02, seed=None):
             addr = model.jnt_qposadr[joint_id]
             flat_idx = qpos_start + addr
 
-            # Rotate XY position around origin by a random SO(2) angle
+            # Random direction in SO(2), fixed displacement magnitude
             theta = rng.uniform(0, 2 * np.pi)
-            x, y = state[flat_idx + 0], state[flat_idx + 1]
-            r = np.sqrt(x**2 + y**2) + rng.uniform(0, rotation_radius)
-            state[flat_idx + 0] = r * np.cos(np.arctan2(y, x) + theta)
-            state[flat_idx + 1] = r * np.sin(np.arctan2(y, x) + theta)
+            state[flat_idx + 0] += displacement * np.cos(theta)
+            state[flat_idx + 1] += displacement * np.sin(theta)
 
     return state
 
@@ -230,7 +228,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             if cfg.rotation_randomization:
                 perturbed_state = perturb_init_state(
                     env, initial_states[episode_idx],
-                    rotation_radius=0.02, seed=task_id * 1000 + episode_idx
+                    displacement=0.02, seed=task_id * 1000 + episode_idx
                 )
                 obs = env.set_init_state(perturbed_state)
             else:
