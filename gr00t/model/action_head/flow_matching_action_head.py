@@ -396,7 +396,7 @@ def compute_normalised_returns(
     episode_lengths: torch.Tensor,
     t: torch.Tensor,
     max_episode_length: int,
-    c_fail: float = 100.0,
+    c_fail: float = 2.0,
 ) -> torch.Tensor:
     """
     Computes the normalised empirical return  R_t(τ)  used to train the
@@ -816,7 +816,13 @@ class FlowmatchingActionHead(nn.Module):
         }
 
         if self.value_head is not None:
-            empirical_return = action_input.get("empirical_return", None)
+            assert self.config.use_advantage_conditioning, f"Reward only available when trigger use_advantage_conditioning, but found {self.config.use_advantage_conditioning=} "
+            empirical_return = compute_normalised_returns(
+                torch.where(reward < 0, False, True),
+                action_input[0],
+                1.0,
+                1
+            )
             if empirical_return is not None:
                 # backbone_output.backbone_features is already vlln-processed
                 # but has NOT had the advantage token appended — correct input.
