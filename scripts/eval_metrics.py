@@ -1,6 +1,7 @@
 """
 Calculate F1, Recall, Precision, Accuracy from filenames in a folder.
-Expected filename format: img_{idx}_pred_{pred}_label_{label}.png
+Expected filename format: img_{idx}_pred{pred}_{score}_label{label}.png
+  e.g. img_0000_pred0_0.00_label0.png
 """
 import re
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 
 def parse_folder(folder: str):
     preds, labels = [], []
-    pattern = re.compile(r"pred_(\d+)_label_(\d+)")
+    pattern = re.compile(r"pred(\d+)_[\d.]+_label(\d+)")
     for f in Path(folder).iterdir():
         m = pattern.search(f.name)
         if m:
@@ -36,15 +37,27 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--folder", default="/home/locht1/Documents/locht1/Isaac-GR00T/test_pick")
+    parser.add_argument("--folders", nargs="+", required=True)
     args = parser.parse_args()
 
-    preds, labels = parse_folder(args.folder)
-    print(f"Total samples: {len(preds)}")
+    all_preds, all_labels = [], []
+    for folder in args.folders:
+        preds, labels = parse_folder(folder)
+        print(f"[{folder}]  samples: {len(preds)}")
+        m = compute_metrics(preds, labels)
+        print(f"  TP={m['tp']}  TN={m['tn']}  FP={m['fp']}  FN={m['fn']}")
+        print(f"  Precision : {m['precision']:.4f}")
+        print(f"  Recall    : {m['recall']:.4f}")
+        print(f"  F1        : {m['f1']:.4f}")
+        print(f"  Accuracy  : {m['accuracy']:.4f}")
+        all_preds.extend(preds)
+        all_labels.extend(labels)
 
-    m = compute_metrics(preds, labels)
-    print(f"TP={m['tp']}  TN={m['tn']}  FP={m['fp']}  FN={m['fn']}")
-    print(f"Precision : {m['precision']:.4f}")
-    print(f"Recall    : {m['recall']:.4f}")
-    print(f"F1        : {m['f1']:.4f}")
-    print(f"Accuracy  : {m['accuracy']:.4f}")
+    if len(args.folders) > 1:
+        print(f"\n[All folders combined]  samples: {len(all_preds)}")
+        m = compute_metrics(all_preds, all_labels)
+        print(f"  TP={m['tp']}  TN={m['tn']}  FP={m['fp']}  FN={m['fn']}")
+        print(f"  Precision : {m['precision']:.4f}")
+        print(f"  Recall    : {m['recall']:.4f}")
+        print(f"  F1        : {m['f1']:.4f}")
+        print(f"  Accuracy  : {m['accuracy']:.4f}")
