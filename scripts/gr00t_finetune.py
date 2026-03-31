@@ -128,6 +128,9 @@ class ArgsConfig:
     lora_full_model: bool = False
     """Whether to use the full model for LORA. If False, only the action head will be trained."""
 
+    rot_aug: bool = False
+    """Whether to apply rotation augmentation during training."""
+
     dataloader_num_workers: int = 12
     """Number of workers for data loading per GPU."""
 
@@ -227,7 +230,7 @@ def main(config: ArgsConfig):
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
         load_backbone_only=True,  # load backbone only, not the action head
-        
+        rot_aug=config.rot_aug,
     )
     
     # Update backbone with rotation config if available (for frame averaging)

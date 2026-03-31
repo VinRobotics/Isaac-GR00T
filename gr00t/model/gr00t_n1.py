@@ -51,11 +51,14 @@ class GR00T_N1_5_Config(PretrainedConfig):
 
     action_dim: int = field(init=False, metadata={"help": "Action dimension."})
     compute_dtype: str = field(default="float32", metadata={"help": "Compute dtype."})
+    rot_aug: bool = field(default=False, metadata={"help": "Whether to apply rotation augmentation during training."})
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
             setattr(self, key, value)
+        if not hasattr(self, "rot_aug"):
+            self.rot_aug = False
 
 
 # real model
@@ -91,7 +94,7 @@ class GR00T_N1_5(PreTrainedModel):
         rot_type = config.action_head_cfg.get("rot_type", "quaternion")
         ee_dim = 7 if rot_type == "quaternion" else 6
         num_hand = config.action_head_cfg.get("num_hand", 1)
-        rot_aug = config.action_head_cfg.get("rot_aug", False)
+        rot_aug = config.rot_aug
         num_images_per_sample = config.backbone_cfg.get("num_images_per_sample", 1)
         rotate_image_indices = config.backbone_cfg.get("rotate_image_indices", None)
         self.rot_randomizer = (
@@ -258,6 +261,7 @@ class GR00T_N1_5(PreTrainedModel):
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
         load_backbone_only = kwargs.pop("load_backbone_only", False)
+        rot_aug = kwargs.pop("rot_aug", None)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Load backbone only: {load_backbone_only}")
@@ -281,6 +285,8 @@ class GR00T_N1_5(PreTrainedModel):
         if load_backbone_only:
             # Load only backbone weights during finetuning
             config = AutoConfig.from_pretrained(local_model_path)
+            if rot_aug is not None:
+                config.rot_aug = rot_aug
             pretrained_model = cls(config, local_model_path=local_model_path)
             
             # Load state dict and filter for backbone weights only
