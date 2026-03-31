@@ -30,6 +30,7 @@ from .action_head.flow_matching_action_head import (
     FlowmatchingActionHeadConfig,
 )
 from .backbone import EagleBackboneFATokens
+from .common import RotRandomizer
 
 BACKBONE_FEATURE_KEY = "backbone_equi_vision_features"
 ACTION_KEY = "action_pred"
@@ -86,6 +87,17 @@ class GR00T_N1_5(PreTrainedModel):
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+
+        rot_type = config.action_head_cfg.get("rot_type", "quaternion")
+        ee_dim = 7 if rot_type == "quaternion" else 6
+        num_hand = config.action_head_cfg.get("num_hand", 1)
+        rot_aug = config.action_head_cfg.get("rot_aug", False)
+        num_images_per_sample = config.backbone_cfg.get("num_images_per_sample", 1)
+        rotate_image_indices = config.backbone_cfg.get("rotate_image_indices", None)
+        self.rot_randomizer = (
+            RotRandomizer(rot_type, num_hand, ee_dim, rotate_image_indices, num_images_per_sample)
+            if rot_aug else None
+        )
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -164,6 +176,8 @@ class GR00T_N1_5(PreTrainedModel):
         inputs: dict,
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
+        if self.rot_randomizer is not None:
+            backbone_inputs, action_inputs = self.rot_randomizer(backbone_inputs, action_inputs)
         backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=True)

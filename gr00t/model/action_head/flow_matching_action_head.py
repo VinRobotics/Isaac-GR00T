@@ -39,6 +39,7 @@ from gr00t.model.action_head.action_encoder import (
     SinusoidalPositionalEncoding,
     swish,
 )
+from gr00t.model.common import RotationTransformer
 
 from .equivariant_cross_attention_dit import EDiT, EquiVisionTransformer
 
@@ -98,87 +99,6 @@ class CategorySpecificMLP(nn.Module):
     def forward(self, x, cat_ids):
         hidden = F.relu(self.layer1(x, cat_ids))
         return self.layer2(hidden, cat_ids)
-### equi
-
-
-class RotationTransformer:
-    valid_reps = [
-        'axis_angle',
-        'euler_angles',
-        'quaternion',
-        'rotation_6d',
-        'matrix'
-    ]
-
-    def __init__(self, 
-            from_rep='axis_angle', 
-            to_rep='rotation_6d', 
-            from_convention=None,
-            to_convention=None):
-        """
-        Valid representations
-
-        Always use matrix as intermediate representation.
-        """
-        assert from_rep != to_rep
-        assert from_rep in self.valid_reps
-        assert to_rep in self.valid_reps
-        if from_rep == 'euler_angles':
-            assert from_convention is not None
-        if to_rep == 'euler_angles':
-            assert to_convention is not None
-
-        forward_funcs = list()
-        inverse_funcs = list()
-
-        if from_rep != 'matrix':
-            funcs = [
-                getattr(pt, f'{from_rep}_to_matrix'),
-                getattr(pt, f'matrix_to_{from_rep}')
-            ]
-            if from_convention is not None:
-                funcs = [functools.partial(func, convention=from_convention) 
-                    for func in funcs]
-            forward_funcs.append(funcs[0])
-            inverse_funcs.append(funcs[1])
-
-        if to_rep != 'matrix':
-            funcs = [
-                getattr(pt, f'matrix_to_{to_rep}'),
-                getattr(pt, f'{to_rep}_to_matrix')
-            ]
-            if to_convention is not None:
-                funcs = [functools.partial(func, convention=to_convention) 
-                    for func in funcs]
-            forward_funcs.append(funcs[0])
-            inverse_funcs.append(funcs[1])
-        
-        inverse_funcs = inverse_funcs[::-1]
-        
-        self.forward_funcs = forward_funcs
-        self.inverse_funcs = inverse_funcs
-
-    @staticmethod
-    def _apply_funcs(x: Union[np.ndarray, torch.Tensor], funcs: list) -> Union[np.ndarray, torch.Tensor]:
-        x_ = x
-        if isinstance(x, np.ndarray):
-            x_ = torch.from_numpy(x)
-        x_: torch.Tensor
-        for func in funcs:
-            x_ = func(x_)
-        y = x_
-        if isinstance(x, np.ndarray):
-            y = x_.numpy()
-        return y
-        
-    def forward(self, x: Union[np.ndarray, torch.Tensor]
-        ) -> Union[np.ndarray, torch.Tensor]:
-        return self._apply_funcs(x, self.forward_funcs)
-    
-    def inverse(self, x: Union[np.ndarray, torch.Tensor]
-        ) -> Union[np.ndarray, torch.Tensor]:
-        return self._apply_funcs(x, self.inverse_funcs)
-
 
 class EquiCategorySpecificMLP(nn.Module):
     def __init__(self, num_categories, in_type, hidden_type, out_type):
@@ -432,7 +352,6 @@ class FlowmatchingActionHead(nn.Module):
         self.state_out_type = enn.FieldType(self.group, int(config.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
         self.eulerangle_to_sixd = RotationTransformer('euler_angles', 'rotation_6d', from_convention="ZYX")
-
         self.state_encoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
             in_type=self.state_in_type,
@@ -458,26 +377,6 @@ class FlowmatchingActionHead(nn.Module):
         
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
-
-        # Equivariant 2D positional embedding for vis tokens.
-        # (x, y) image coordinates are a 2D vector that transforms as irrep(1) under CN rotation.
-        self.equi_vis_pos_type = enn.FieldType(self.group, [self.group.irrep(1)])
-        self.equi_vis_pos_proj = enn.Linear(self.equi_vis_pos_type, self.model.in_type)
-
-        # 4-layer equivariant vision transformer: refine T_vis tokens per camera.
-        # h_prime stays in regular repr through all 4 SA+FFN blocks (equivariant throughout).
-        # EDiT cross_attention_type is also regular repr → vision output matches directly.
-        cross_attn_dim = diffusion_cfg.get("cross_attention_dim", 2048)
-        self.cross_attn_dim = cross_attn_dim
-        vis_attn_cfg = {
-            k: v for k, v in config.vl_self_attention_cfg.items()
-            if k != "positional_embeddings"  # handled externally via equi_vis_pos_proj
-        }
-        self.equi_vis_self_attn = EquiVisionTransformer(
-            in_type=self.model.cross_attention_type,
-            **vis_attn_cfg,
-        )
-
 
         if config.add_pos_embed:
             # Equivariant temporal position embeddings for state and action tokens.
@@ -720,23 +619,6 @@ class FlowmatchingActionHead(nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
-    def _get_vis_pos_emb(self, T: int, device: torch.device) -> torch.Tensor:
-        """
-        Compute equivariant 2-D positional embeddings for T = grid^2 vision tokens.
-
-        Positions (x, y) ∈ [-1, 1]^2 live in irrep(1) of C_N, so they transform
-        correctly under image rotations.  equi_vis_pos_proj lifts them to model.in_type.
-
-        Returns: [T, D_model]
-        """
-        grid = int(T ** 0.5)
-        assert grid * grid == T, f"T={T} must be a perfect square for 2-D pos embed"
-        ys = torch.linspace(-1, 1, grid, device=device)
-        xs = torch.linspace(-1, 1, grid, device=device)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        pos = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)  # [T, 2]
-        pos_geo = enn.GeometricTensor(pos, self.equi_vis_pos_type)
-        return self.equi_vis_pos_proj(pos_geo).tensor  # [T, D_model]
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         """
@@ -773,14 +655,6 @@ class FlowmatchingActionHead(nn.Module):
         backbone_output.data["vl_features"] = vl_features
         return backbone_output
 
-    def process_backbone_output_vl_features(self, backbone_output: BatchFeature) -> BatchFeature:
-        """Legacy path for non-FA backbone that provides backbone_features directly."""
-        backbone_features = backbone_output["backbone_features"]
-        backbone_features = self.vlln(backbone_features)
-        backbone_features = self.vl_self_attention(backbone_features)
-        backbone_output["backbone_features"] = backbone_features
-        return backbone_output
-
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
@@ -812,7 +686,7 @@ class FlowmatchingActionHead(nn.Module):
 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
-
+        
         # Embed state.
         B, T, _ = action_input.state.shape
         state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
