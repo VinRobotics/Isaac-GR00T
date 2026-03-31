@@ -425,7 +425,8 @@ def compute_normalised_returns(
     Returns:
         normalised_returns : (B,)  float in [-1, 0]
     """
-    steps_remaining = (episode_lengths - t).float()          # T - t
+    unnormalized_t = (t - (-1.0)) / (2)
+    steps_remaining = (episode_lengths - unnormalized_t).float()          # T - t
     raw_return      = -steps_remaining                        # successful base
     raw_return      = torch.where(success, raw_return, raw_return - c_fail)
     norm_denom      = float(max_episode_length + c_fail)
@@ -817,11 +818,15 @@ class FlowmatchingActionHead(nn.Module):
 
         if self.value_head is not None:
             assert self.config.use_advantage_conditioning, f"Reward only available when trigger use_advantage_conditioning, but found {self.config.use_advantage_conditioning=} "
+
+            task_progress_idx = action_input.action_mask.float().argmin() - 1
+            task_progress = action_input.action[:, :, task_progress_idx].mean(dim=1)
+
             empirical_return = compute_normalised_returns(
-                torch.where(reward < 0, False, True),
-                action_input[0],
-                1.0,
-                1
+                success=torch.where(reward < 0, False, True),
+                episode_lengths=torch.full_like(task_progress, 1.0),
+                t=task_progress,
+                max_episode_length=1,
             )
             if empirical_return is not None:
                 # backbone_output.backbone_features is already vlln-processed
