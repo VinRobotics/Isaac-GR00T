@@ -39,6 +39,7 @@ from gr00t.model.action_head.action_encoder import (
     SinusoidalPositionalEncoding,
     swish,
 )
+from gr00t.model.common import RotationTransformer
 
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
@@ -100,87 +101,6 @@ class CategorySpecificMLP(nn.Module):
     def forward(self, x, cat_ids):
         hidden = F.relu(self.layer1(x, cat_ids))
         return self.layer2(hidden, cat_ids)
-### equi
-
-
-class RotationTransformer:
-    valid_reps = [
-        'axis_angle',
-        'euler_angles',
-        'quaternion',
-        'rotation_6d',
-        'matrix'
-    ]
-
-    def __init__(self, 
-            from_rep='axis_angle', 
-            to_rep='rotation_6d', 
-            from_convention=None,
-            to_convention=None):
-        """
-        Valid representations
-
-        Always use matrix as intermediate representation.
-        """
-        assert from_rep != to_rep
-        assert from_rep in self.valid_reps
-        assert to_rep in self.valid_reps
-        if from_rep == 'euler_angles':
-            assert from_convention is not None
-        if to_rep == 'euler_angles':
-            assert to_convention is not None
-
-        forward_funcs = list()
-        inverse_funcs = list()
-
-        if from_rep != 'matrix':
-            funcs = [
-                getattr(pt, f'{from_rep}_to_matrix'),
-                getattr(pt, f'matrix_to_{from_rep}')
-            ]
-            if from_convention is not None:
-                funcs = [functools.partial(func, convention=from_convention) 
-                    for func in funcs]
-            forward_funcs.append(funcs[0])
-            inverse_funcs.append(funcs[1])
-
-        if to_rep != 'matrix':
-            funcs = [
-                getattr(pt, f'matrix_to_{to_rep}'),
-                getattr(pt, f'{to_rep}_to_matrix')
-            ]
-            if to_convention is not None:
-                funcs = [functools.partial(func, convention=to_convention) 
-                    for func in funcs]
-            forward_funcs.append(funcs[0])
-            inverse_funcs.append(funcs[1])
-        
-        inverse_funcs = inverse_funcs[::-1]
-        
-        self.forward_funcs = forward_funcs
-        self.inverse_funcs = inverse_funcs
-
-    @staticmethod
-    def _apply_funcs(x: Union[np.ndarray, torch.Tensor], funcs: list) -> Union[np.ndarray, torch.Tensor]:
-        x_ = x
-        if isinstance(x, np.ndarray):
-            x_ = torch.from_numpy(x)
-        x_: torch.Tensor
-        for func in funcs:
-            x_ = func(x_)
-        y = x_
-        if isinstance(x, np.ndarray):
-            y = x_.numpy()
-        return y
-        
-    def forward(self, x: Union[np.ndarray, torch.Tensor]
-        ) -> Union[np.ndarray, torch.Tensor]:
-        return self._apply_funcs(x, self.forward_funcs)
-    
-    def inverse(self, x: Union[np.ndarray, torch.Tensor]
-        ) -> Union[np.ndarray, torch.Tensor]:
-        return self._apply_funcs(x, self.inverse_funcs)
-
 
 class EquiCategorySpecificMLP(nn.Module):
     def __init__(self, num_categories, in_type, hidden_type, out_type):
@@ -428,7 +348,6 @@ class FlowmatchingActionHead(nn.Module):
         self.state_out_type = enn.FieldType(self.group, int(config.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
         self.eulerangle_to_sixd = RotationTransformer('euler_angles', 'rotation_6d', from_convention="ZYX")
-
         self.state_encoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
             in_type=self.state_in_type,
@@ -454,44 +373,6 @@ class FlowmatchingActionHead(nn.Module):
         
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
-
-        # VL stream (invariant): backbone language features → vlln → vl_self_attention → vl_proj
-        self.vlln = (
-            nn.LayerNorm(config.backbone_language_embedding_dim) if config.use_vlln else nn.Identity()
-        )
-        self.vl_self_attention = (
-            SelfAttentionTransformer(**config.vl_self_attention_cfg)
-            if config.use_vlln
-            else nn.Identity()
-        )
-        # Project VL features (after SA) to trivial VL cross-attention dim
-        _vl_cross_dim = diffusion_cfg.get("vl_cross_attention_dim") or diffusion_cfg.get("cross_attention_dim", 2048)
-        _vl_sa_inner_dim = config.vl_self_attention_cfg["num_attention_heads"] * config.vl_self_attention_cfg["attention_head_dim"]
-        self.vl_proj = nn.Linear(_vl_sa_inner_dim, _vl_cross_dim)
-
-        # Equi vision stream (equivariant): backbone vision features → equi_vis_proj
-        # backbone_vision_features has dim = backbone_embedding_dim (= project_to_dim, regular repr)
-        self.equi_vis_in_type = enn.FieldType(
-            self.group,
-            [self.group.regular_repr] * (config.backbone_embedding_dim // self.n_group),
-        )
-        self.equi_vis_to_hidden = enn.Linear(self.equi_vis_in_type, self.model.in_type)
-
-        # Equivariant 2D positional embedding for vis tokens.
-        # (x, y) image coordinates are a 2D vector that transforms as irrep(1) under CN rotation.
-        # This gives equi_vis_pool spatial awareness while preserving equivariance.
-        self.equi_vis_pos_type = enn.FieldType(self.group, [self.group.irrep(1)])
-        self.equi_vis_pos_proj = enn.Linear(self.equi_vis_pos_type, self.model.in_type)
-
-        # Learnable equivariant pooling: T_vis spatial tokens → num_vis_queries tokens per camera
-        # Q and K both in regular repr (equivariant projections); V raw equivariant; no v_proj
-        _pool_dim_head = self.model.in_type.size // 4  # H*Dh = in_type.size → divisible by G ✓
-        self.equi_vis_pool = EquivariantAttentionPool(
-            in_type=self.model.in_type,
-            num_queries=config.num_vis_queries,
-            heads=4,
-            dim_head=_pool_dim_head,
-        )
 
         if config.add_pos_embed:
             # Equivariant temporal position embeddings for state and action tokens.
@@ -795,14 +676,6 @@ class FlowmatchingActionHead(nn.Module):
         backbone_output.data["backbone_attention_mask"] = language_mask
         return backbone_output
 
-    def process_backbone_output_vl_features(self, backbone_output: BatchFeature) -> BatchFeature:
-        """Legacy path for non-FA backbone that provides backbone_features directly."""
-        backbone_features = backbone_output["backbone_features"]
-        backbone_features = self.vlln(backbone_features)
-        backbone_features = self.vl_self_attention(backbone_features)
-        backbone_output["backbone_features"] = backbone_features
-        return backbone_output
-
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
@@ -836,7 +709,7 @@ class FlowmatchingActionHead(nn.Module):
 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
-
+        
         # Embed state.
         B, T, _ = action_input.state.shape
         state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
