@@ -134,6 +134,9 @@ class ArgsConfig:
     scale_factor=1 (default) keeps the pretrained dimensions unchanged.
     scale_factor=2 doubles project_to_dim (e.g. 2048 → 4096, blocks 256 → 512)."""
 
+    rot_aug: bool = False
+    """Whether to apply rotation augmentation during training."""
+
     dataloader_num_workers: int = 12
     """Number of workers for data loading per GPU."""
 
@@ -250,6 +253,7 @@ def main(config: ArgsConfig):
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
         load_backbone_only=True,  # load backbone only, not the action head
         backbone_cfg_overrides=backbone_cfg_overrides,
+        rot_aug=config.rot_aug,
     )
 
     # Persist rotation config + n_group in saved config so inference reconstructs correctly
