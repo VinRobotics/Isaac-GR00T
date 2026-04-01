@@ -42,6 +42,7 @@ from gr00t.model.action_head.action_encoder import (
 from gr00t.model.common import RotationTransformer
 
 from .equivariant_cross_attention_dit import EDiT, EquiVisionTransformer
+from .geomformer_block import GeoMFormerBlock
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -232,6 +233,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default_factory=lambda: {
             "attention_head_dim": 48,
             "cross_attention_dim": 2048,
+            "cross_attention_inv_dim": None,  # set to blocks_bb at runtime when use_vlln=True
             "dropout": 0.2,
             "final_dropout": True,
             "interleave_self_attention": True,
@@ -334,10 +336,14 @@ class FlowmatchingActionHead(nn.Module):
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
-        # Inject n_group into diffusion model config
+        # Inject n_group and cross_attention_inv_dim into diffusion model config.
+        # cross_attention_inv_dim = blocks_bb = backbone_embedding_dim / n_group (trivial scalars).
+        D_bb = config.backbone_embedding_dim
+        blocks_bb = D_bb // self.n_group
         diffusion_cfg = {
             **config.diffusion_model_cfg,
             "n_group": self.n_group,
+            "cross_attention_inv_dim": blocks_bb if config.use_vlln else None,
         }
         self.model = EDiT(**diffusion_cfg)
         self.action_dim = config.action_dim
@@ -389,6 +395,27 @@ class FlowmatchingActionHead(nn.Module):
             self.temporal_pos_embed = nn.Embedding(config.max_seq_len, _D)
             self.temporal_pos_proj = enn.Linear(self.temporal_pos_trivial_type, self.model.in_type)
             nn.init.normal_(self.temporal_pos_embed.weight, mean=0.0, std=0.02)
+
+        # GeoMFormer-style dual-stream refiner over the EquiAdapter output [h_vis | z_inv].
+        # Z^E (h_vis): equivariant vision tokens in regular repr.
+        # Z^I (z_inv): invariant context (text + noequi) in trivial-in-regular format.
+        # Split point is provided by backbone as backbone_n_equi_tokens.
+        if config.use_vlln:
+            sa_cfg = config.vl_self_attention_cfg
+            assert D_bb % self.n_group == 0, (
+                f"backbone_embedding_dim ({D_bb}) must be divisible by n_group ({self.n_group})"
+            )
+            vl_sa_type = enn.FieldType(self.group, [self.group.regular_repr] * blocks_bb)
+            self.vl_self_attention = GeoMFormerBlock(
+                equi_type=vl_sa_type,
+                inv_dim=blocks_bb,
+                num_layers=sa_cfg["num_layers"],
+                num_attention_heads_eq=sa_cfg["num_attention_heads"],
+                attention_head_dim_eq=sa_cfg["attention_head_dim"],
+                num_attention_heads_inv=sa_cfg.get("num_attention_heads_inv", 8),
+                dropout=sa_cfg["dropout"],
+                final_dropout=sa_cfg["final_dropout"],
+            )
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
@@ -575,7 +602,7 @@ class FlowmatchingActionHead(nn.Module):
         filtered_state_dict = {}
         for key, value in state_dict.items():
             # Skip old-style state_encoder weights
-            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key or "vlln" in key or "vl_self_attention" in key or "language_proj" in key or "language_lift" in key or "equi_vis_proj" in key:
+            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key or "vlln" in key or "language_proj" in key or "language_lift" in key or "equi_vis_proj" in key:
                 print(f"Skipping incompatible state_encoder weight: {key}")
                 continue
             filtered_state_dict[key] = value
@@ -612,6 +639,23 @@ class FlowmatchingActionHead(nn.Module):
         ).tensor  # [T, D]
         return features + pos_emb.unsqueeze(0)
 
+    def _split_vl(self, backbone_output):
+        """
+        Read the pre-split equivariant and invariant vl streams from backbone_output.
+
+        Returns:
+            vl_equi : [B, T_eq,  D]     regular repr  → encoder_hidden_states
+            vl_inv  : [B, T_inv, D_inv] trivial repr  → encoder_hidden_states_inv (or None)
+        """
+        vl_equi = backbone_output.backbone_regular_features   # [B, T_eq, D]
+        vl_inv  = backbone_output.get("backbone_trivial_features", None)
+        if vl_inv is not None and (
+            not hasattr(self.model, "cross_attention_inv_type")
+            or self.model.cross_attention_inv_type is None
+        ):
+            vl_inv = None
+        return vl_equi, vl_inv
+
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         return (self.config.noise_s - sample) / self.config.noise_s
@@ -624,35 +668,26 @@ class FlowmatchingActionHead(nn.Module):
         """
         Process backbone features into DiT cross-attention context.
 
-        Equivariant cameras (e.g. top-down):
-          backbone_equi_vision_features [B, n_equi, T, D]
-            → + 2-D pos embed
-            → equi_vis_self_attn         equivariant self-attn → [B*n_equi, T, cross_attn_dim]
-            → reshape                    [B, n_equi*T, cross_attn_dim]
+        Backbone returns two separate streams:
+          backbone_regular_features : [B, T_eq,  D]  equivariant tokens (regular repr)
+          backbone_trivial_features : [B, T_inv, D]  invariant tokens   (trivial repr)
 
-        Non-equivariant cameras (e.g. wrist), optional:
-          backbone_noequi_vision_features [B, n_noequi, T, D]
-            → noequi_vis_proj            plain nn.Linear → [B, n_noequi*T, cross_attn_dim]
-
-        Both concatenated → vl_features [B, (n_equi+n_noequi)*T, cross_attn_dim]
+        GeoMFormerBlock refines both streams jointly, then stores them back.
         """
-        equi_vis = backbone_output.backbone_equi_vision_features
-        if equi_vis.dim() == 3:
-            # Backbone returns flat [B, n_equi*T_vis + T_lang, D] — use as-is
-            B = equi_vis.shape[0]
-            vl_features = equi_vis
-            if "backbone_attention_mask" not in backbone_output:
-                attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
-                backbone_output.data["backbone_attention_mask"] = attn_mask
-        else:
-            # Legacy 4D path: [B, n_equi, T, D]
-            B, n_equi, T, D = equi_vis.shape
-            equi_proj = equi_vis.reshape(B * n_equi, T, D)
-            vl_features = equi_proj.reshape(B, n_equi * T, -1)
-            attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
+        h_vis = backbone_output.backbone_regular_features   # [B, T_eq,  D]
+        z_inv = backbone_output.backbone_trivial_features   # [B, T_inv, D_llm]
+        B = h_vis.shape[0]
+
+        if "backbone_attention_mask" not in backbone_output:
+            T_total = h_vis.shape[1] + z_inv.shape[1]
+            attn_mask = torch.ones(B, T_total, dtype=torch.long, device=h_vis.device)
             backbone_output.data["backbone_attention_mask"] = attn_mask
 
-        backbone_output.data["vl_features"] = vl_features
+        if self.config.use_vlln and hasattr(self, "vl_self_attention"):
+            h_vis, z_inv = self.vl_self_attention(h_vis, z_inv)
+
+        backbone_output.data["backbone_regular_features"] = h_vis
+        backbone_output.data["backbone_trivial_features"] = z_inv
         return backbone_output
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
@@ -680,9 +715,7 @@ class FlowmatchingActionHead(nn.Module):
                 expanded = v.repeat(*factors)
                 action_input[k] = expanded
 
-        # Equi cross-attention context from process_backbone_output.
-        vl_embs = backbone_output.vl_features                     # [B, n_equi*K, cross_attn_dim]
-        encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*K], all-ones
+        encoder_mask = backbone_output.backbone_attention_mask
 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
@@ -731,9 +764,14 @@ class FlowmatchingActionHead(nn.Module):
         # State + action only — vision is cross-attention context, not a prefix
         sa_embs = torch.cat((state_features, action_features), dim=1)
 
+        # Split vl into equivariant (regular) and invariant (trivial) streams.
+        # Each DiT block attends to both via attn1 (equi) + attn_inv (inv) summed in-place.
+        vl_equi, vl_inv = self._split_vl(backbone_output)
+
         model_output = self.model(
             hidden_states=sa_embs,
-            encoder_hidden_states=vl_embs,
+            encoder_hidden_states=vl_equi,
+            encoder_hidden_states_inv=vl_inv,
             encoder_attention_mask=encoder_mask,
             timestep=t_discretized,
             return_all_hidden_states=False
@@ -786,9 +824,7 @@ class FlowmatchingActionHead(nn.Module):
         
         backbone_output = self.process_backbone_output(backbone_output)
 
-        # Equi cross-attention context from process_backbone_output.
-        vl_embs = backbone_output.vl_features                     # [B, n_equi*K, cross_attn_dim]
-        encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*K], all-ones
+        encoder_mask = backbone_output.backbone_attention_mask
 
         embodiment_id = action_input.embodiment_id
 
@@ -803,11 +839,12 @@ class FlowmatchingActionHead(nn.Module):
             state_features = self._add_temporal_pos_embed(state_features)
 
         # Set initial actions as the sampled noise.
-        batch_size = vl_embs.shape[0]
-        device = vl_embs.device
+        vl_equi, vl_inv = self._split_vl(backbone_output)
+        batch_size = vl_equi.shape[0]
+        device = vl_equi.device
         actions = torch.randn(
                     size=(batch_size, self.config.action_horizon, self.action_type.size),
-                    dtype=vl_embs.dtype,
+                    dtype=vl_equi.dtype,
                     device=device,
                 )
         num_steps = self.num_inference_timesteps
@@ -845,7 +882,8 @@ class FlowmatchingActionHead(nn.Module):
             # Run model forward.
             model_output = self.model(
                 hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
+                encoder_hidden_states=vl_equi,
+                encoder_hidden_states_inv=vl_inv,
                 encoder_attention_mask=encoder_mask,
                 timestep=timesteps_tensor,
             )

@@ -173,12 +173,6 @@ class EquiAdapter(nn.Module):
         # h_r = lang_proj(vl_equi) + h_inv  ←→  H^r = proj(H^llm) + H'
         self.lang_proj = nn.Linear(d_llm, d_eq)
 
-        # lang_embed / noequi_embed: reformat VLM output tokens as trivial-in-regular repr.
-        # trivial-in-regular: R^blocks expanded as [v,v,...,v]×G → invariant subspace of regular repr.
-        # VLM already cross-attended text ↔ noequi ↔ inv(equi vision); no extra attention needed.
-        self.lang_embed   = nn.Linear(d_eq, blocks)
-        self.noequi_embed = nn.Linear(d_eq, blocks)
-
         # Identity init
         for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
             for p in sa_blk.attn1.o_proj.parameters():
@@ -197,18 +191,14 @@ class EquiAdapter(nn.Module):
         h_equi: torch.Tensor,
         h_inv_skip: torch.Tensor,
         vlm_img: torch.Tensor,
-        vlm_text: torch.Tensor,
-        noequi_vlm: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             h_equi:     [B, n_equi, T_vis, D]   equivariant FA features (X̃' analog, skip)
             h_inv_skip: [B, n_equi*T_vis, D]    invariant FA features projected to D (H' analog, skip)
             vlm_img:    [B, n_equi*T_vis, D]    VLM output at equi-image positions (H^llm analog)
-            vlm_text:   [B, T_lang, D]           VLM output at text positions
-            noequi_vlm: [B, n_noequi*T_vis, D]  VLM output at non-equi camera positions (optional)
         Returns:
-            [B, n_equi*T_vis + n_noequi*T_vis + T_lang, D]
+            [B, n_equi*T_vis, D]
 
         Pipeline:
           SA+CA loop: equivariant SA+CA on h_vis; CA context = pure EquiLLM H^r.
@@ -227,19 +217,8 @@ class EquiAdapter(nn.Module):
         for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
             h_vis = sa_blk(h_vis)
             h_vis = ca_blk(h_vis, encoder_hidden_states=h_cond)
-
-        # Reformat noequi/text as trivial-in-regular: project to R^blocks → [v,v,...,v]×G.
-        def to_trivial_reg(x, embed):
-            scalar = embed(x)                                           # [B, T, blocks]
-            return (scalar.unsqueeze(-2)
-                    .expand(-1, -1, self.n_group, -1)
-                    .reshape(x.shape[0], -1, D))                       # [B, T, D]
-
-        text_out = to_trivial_reg(vlm_text.to(dt), self.lang_embed)
-        if noequi_vlm is not None:
-            noequi_out = to_trivial_reg(noequi_vlm.to(dt), self.noequi_embed)
-            return torch.cat([h_vis, noequi_out, text_out], dim=1).to(h_equi.dtype)
-        return torch.cat([h_vis, text_out], dim=1).to(h_equi.dtype)
+        
+        return h_vis
 
 
 class EagleBackboneFATokens(nn.Module):
@@ -1150,9 +1129,9 @@ class EagleBackboneFATokens(nn.Module):
         # ── Phase 3: EquiAdapter (EquiLLM-faithful) ───────────────────────────
         # SA+CA on h_equi; mix_sa_block joints all tokens in regular repr.
         # Output: [B, n_equi*T_vis + n_noequi*T + T_lang, project_to_dim]
-        h_adapted = self.equi_adapter(h_equi, h_inv_skip, vlm_img, vlm_text, noequi_vlm=noequi_vlm)
-
-        return h_adapted, eagle_input["attention_mask"]
+        regular_features = self.equi_adapter(h_equi, h_inv_skip, vlm_img)
+        trivial_features = torch.cat([noequi_vlm, vlm_text], dim=1) if noequi_vlm is not None else vlm_text
+        return regular_features, trivial_features, eagle_input["attention_mask"]
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         """
@@ -1172,19 +1151,20 @@ class EagleBackboneFATokens(nn.Module):
         """
         self.set_frozen_modules_to_eval_mode()
 
-        h_adapted, eagle_mask = self.forward_eagle(vl_input)
+        regular_features, trivial_features, eagle_mask = self.forward_eagle(vl_input)
 
         # DDP compatibility: ensure all trainable parameters participate in loss
         if self.training and self.tune_visual:
             dummy_term = torch.tensor(
-                0.0, device=h_adapted.device, dtype=h_adapted.dtype, requires_grad=True
+                0.0, device=regular_features.device, dtype=regular_features.dtype, requires_grad=True
             )
             for param in self.parameters():
                 if param.requires_grad:
                     dummy_term = dummy_term + 0.0 * param.sum()
-            h_adapted = h_adapted + dummy_term
+            regular_features = regular_features + dummy_term
 
         return BatchFeature(data={
-            "backbone_equi_vision_features": h_adapted,  # [B, n_equi*T_vision + T_lang, D]
+            "backbone_regular_features": regular_features,  # [B, n_equi*T_vision, D]
+            "backbone_trivial_features": trivial_features,  # [B, no_equi*T_vision + T_lang, D]
             "backbone_attention_mask": eagle_mask,
         })
