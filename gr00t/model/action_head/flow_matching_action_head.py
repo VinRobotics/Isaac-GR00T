@@ -343,7 +343,7 @@ class FlowmatchingActionHead(nn.Module):
         diffusion_cfg = {
             **config.diffusion_model_cfg,
             "n_group": self.n_group,
-            "cross_attention_inv_dim": blocks_bb if config.use_vlln else None,
+            "cross_attention_inv_dim": config.backbone_embedding_dim if config.use_vlln else None,
         }
         self.model = EDiT(**diffusion_cfg)
         self.action_dim = config.action_dim
@@ -408,11 +408,11 @@ class FlowmatchingActionHead(nn.Module):
             vl_sa_type = enn.FieldType(self.group, [self.group.regular_repr] * blocks_bb)
             self.vl_self_attention = GeoMFormerBlock(
                 equi_type=vl_sa_type,
-                inv_dim=blocks_bb,
+                inv_dim=config.backbone_embedding_dim,
                 num_layers=sa_cfg["num_layers"],
                 num_attention_heads_eq=sa_cfg["num_attention_heads"],
                 attention_head_dim_eq=sa_cfg["attention_head_dim"],
-                num_attention_heads_inv=sa_cfg.get("num_attention_heads_inv", 8),
+                num_attention_heads_inv=sa_cfg["num_attention_heads"],
                 dropout=sa_cfg["dropout"],
                 final_dropout=sa_cfg["final_dropout"],
             )
