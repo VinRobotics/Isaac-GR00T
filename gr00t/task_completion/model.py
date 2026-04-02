@@ -9,7 +9,8 @@ Architecture (Option B — single Eagle call)
         ↓  (B, N_all_tokens, D)  — Eagle attends across all frames jointly
   TaskCompletionDetector  (trainable)
         ↓
-  logit (B, 1)  ──  BCEWithLogitsLoss
+  logits (B, 3)  ──  CrossEntropyLoss
+  classes: 0=doing, 1=success, 2=failure
 
 All W frames defined by delta_indices are concatenated into a single image
 sequence and processed by Eagle in one forward pass, giving the model
@@ -39,8 +40,9 @@ class WindowTaskCompletionModel(nn.Module):
         Hidden dim for the TaskCompletionDetector MLP.
     freeze_backbone : bool
         If True (default) backbone parameters are frozen.
-    pos_weight : float | None
-        Optional positive-class weight for BCEWithLogitsLoss.
+    class_weight : list[float] | None
+        Optional per-class weights for CrossEntropyLoss (length 3).
+        Order: [doing, success, failure].
     """
 
     def __init__(
@@ -49,7 +51,7 @@ class WindowTaskCompletionModel(nn.Module):
         seq_dim: int,
         hidden_dim: int,
         freeze_backbone: bool = True,
-        pos_weight: Optional[float] = None,
+        class_weight: Optional[list] = None,
     ):
         super().__init__()
 
@@ -61,10 +63,11 @@ class WindowTaskCompletionModel(nn.Module):
         self.task_completion_detection = TaskCompletionDetector(
             seq_dim=seq_dim,
             hidden_dim=hidden_dim,
+            num_classes=3,
         )
 
-        pw = torch.tensor([pos_weight]) if pos_weight is not None else None
-        self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
+        cw = torch.tensor(class_weight) if class_weight is not None else None
+        self.loss_fn = nn.CrossEntropyLoss(weight=cw)
 
     # ------------------------------------------------------------------
     # Forward
@@ -83,9 +86,9 @@ class WindowTaskCompletionModel(nn.Module):
         Returns
         -------
         dict with keys:
-            "loss"                 : scalar BCE loss (only when labels present)
-            "logits"               : (B, 1)
-            "task_completion_pred" : (B,) sigmoid probability
+            "loss"                 : scalar CrossEntropy loss (only when labels present)
+            "logits"               : (B, 3)
+            "task_completion_pred" : (B, 3) softmax probabilities (0=doing, 1=success, 2=failure)
         """
         backbone_frozen = all(not p.requires_grad for p in self.backbone.parameters())
         ctx = torch.no_grad() if backbone_frozen else torch.enable_grad()
@@ -97,16 +100,16 @@ class WindowTaskCompletionModel(nn.Module):
         # (B, N_tokens, D) — Eagle attended over all W frames' tokens jointly
         features = backbone_out.backbone_features.float()
 
-        logits = self.task_completion_detection(features)  # (B, 1)
+        logits = self.task_completion_detection(features)  # (B, 3)
 
         out = {
             "logits": logits,
-            "task_completion_pred": F.sigmoid(logits.squeeze(-1)),
+            "task_completion_pred": F.softmax(logits, dim=-1),
         }
 
         if "task_completion" in batch:
-            labels = batch["task_completion"].float().to(logits.device)
-            out["loss"] = self.loss_fn(logits, labels.squeeze(-1))
+            labels = batch["task_completion"].long().to(logits.device).squeeze(-1)
+            out["loss"] = self.loss_fn(logits, labels)
 
         return out
 
@@ -121,7 +124,7 @@ class WindowTaskCompletionModel(nn.Module):
         seq_dim: int = 1536,
         hidden_dim: int = 1024,
         freeze_backbone: bool = True,
-        pos_weight: Optional[float] = None,
+        class_weight: Optional[list] = None,
     ) -> "WindowTaskCompletionModel":
         """
         Load only the EagleBackbone from a GR00T-N1.5 checkpoint.
@@ -145,7 +148,7 @@ class WindowTaskCompletionModel(nn.Module):
             seq_dim=seq_dim,
             hidden_dim=hidden_dim,
             freeze_backbone=freeze_backbone,
-            pos_weight=pos_weight,
+            class_weight=class_weight,
         )
 
     def load_detector_weights(self, path: str | Path):

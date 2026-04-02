@@ -326,8 +326,8 @@ class Gr00tPolicy(BasePolicy):
                 Eagle attends across all frames in one forward pass.
 
         Returns:
-            {"task_completion_pred": np.ndarray}  shape (B,) or scalar float
-                Sigmoid probability in [0, 1]; values near 1 → task done.
+            {"task_completion_pred": np.ndarray}  shape (B, 3) or (3,) when not batched.
+                Softmax probabilities for [doing, success, failure].
         """
         obs_copy = observations.copy()
 

@@ -43,7 +43,8 @@ class WindowTaskCompletionConfig:
         Camera keys, e.g. ["video.cam_head", "video.cam_left", "video.cam_right"]
     language_key : str
     task_completion_key : str
-        Parquet column name for the binary done label.
+        Parquet column name for the multi-class label.
+        Values: 0 = doing, 1 = success, 2 = failure.
     max_state_dim / max_action_dim : int
         Must match the GR00T model's dimensions.
     """
@@ -54,7 +55,7 @@ class WindowTaskCompletionConfig:
         default_factory=lambda: ["video.cam_head", "video.cam_left", "video.cam_right"]
     )
     language_key: str = "annotation.human.task_description"
-    task_completion_key: str = "observation.tasks.done"
+    task_completion_key: str = "observation.tasks.label"
 
     max_state_dim: int = 64
     max_action_dim: int = 32

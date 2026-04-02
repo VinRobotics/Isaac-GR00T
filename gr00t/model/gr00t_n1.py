@@ -221,8 +221,8 @@ class GR00T_N1_5(PreTrainedModel):
                                                           frame_t])  # (W, H, W, C)
 
         Returns:
-            tc_pred : (B,) float tensor of sigmoid probabilities in [0, 1].
-                      Values close to 1 indicate task completion.
+            tc_pred : (B, 3) float tensor of softmax probabilities.
+                      Columns: [doing, success, failure].
         """
         # Use backbone.prepare_input directly to skip validate_inputs, which
         # asserts action-head shapes incompatible with window-frame inputs.
@@ -240,8 +240,8 @@ class GR00T_N1_5(PreTrainedModel):
         backbone_outputs = self.backbone(backbone_inputs)
         tc_logits = self.task_completion_detection(
             backbone_outputs.backbone_features.detach()
-        ).squeeze(-1)
-        return F.sigmoid(tc_logits)
+        )  # (B, 3)
+        return F.softmax(tc_logits, dim=-1)
     
     def get_realtime_action(
         self,

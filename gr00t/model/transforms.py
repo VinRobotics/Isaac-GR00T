@@ -319,13 +319,13 @@ class GR00TTransform(InvertibleModalityTransform):
     def _prepare_task_completion(self, data: dict):
         """
         Prepare task completion labels for training.
-        Task completion is a binary label (0 or 1) for each timestep in the action horizon.
-        Returns task_completion tensor.
-        
+        Task completion is a multi-class label (0=doing, 1=success, 2=failure).
+        Returns task_completion tensor of shape (1,) with dtype int64.
+
         The data may contain the task completion key as:
         - "task_completion" (already renamed)
-        - "observation.tasks.done" (original parquet column name)
-        - Any key containing "tasks.done" or "task_completion"
+        - "observation.tasks.label" (original parquet column name)
+        - Any key containing "tasks.label" or "task_completion"
         """
         # Try to find the task completion key
         task_completion_key = None
@@ -334,26 +334,26 @@ class GR00TTransform(InvertibleModalityTransform):
         else:
             # Search for task completion key patterns
             for key in data.keys():
-                if "tasks.done" in key or "task_completion" in key:
+                if "tasks.label" in key or "task_completion" in key:
                     task_completion_key = key
                     break
-        
+
         if task_completion_key is None:
             # Return zeros with no mask if task completion data not available
-            task_completion = np.zeros((1), dtype=np.uint8)
+            task_completion = np.zeros((1,), dtype=np.int64)
             return task_completion
 
         task_completion = data[task_completion_key]
-        
+
         # Convert tensor to numpy if needed
         if hasattr(task_completion, 'numpy'):
             task_completion = task_completion.numpy()
-        
+
         # Take only the last value (for current step prediction)
         # task_completion shape is [action_horizon, 1], we want just the last step
-        task_completion = task_completion[-1:]  # [1, 1]
-        
-        task_completion = task_completion.astype(np.uint8)
+        task_completion = task_completion[-1:]  # [1, ...]
+
+        task_completion = task_completion.astype(np.int64)
 
         return task_completion
 

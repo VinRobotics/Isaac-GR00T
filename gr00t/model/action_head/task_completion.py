@@ -16,8 +16,16 @@ class TaskCompletionDetector(nn.Module):
     so no buffer is needed here.
     """
 
-    def __init__(self, seq_dim: int, hidden_dim: int, num_heads: int = 8, dropout: float = 0.1):
+    def __init__(
+        self,
+        seq_dim: int,
+        hidden_dim: int,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        num_classes: int = 3,
+    ):
         super().__init__()
+        self.num_classes = num_classes
         while seq_dim % num_heads != 0 and num_heads > 1:
             num_heads //= 2
 
@@ -40,7 +48,7 @@ class TaskCompletionDetector(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(hidden_dim // 2, num_classes),
         )
 
         self._init_weights()
@@ -71,7 +79,7 @@ class TaskCompletionDetector(nn.Module):
         Args:
             x: (B, T, seq_dim) — VL token sequence (all frames already packed)
         Returns:
-            logits: (B, 1)
+            logits: (B, num_classes)  — 0=doing, 1=success, 2=failure
         """
         # Upcast to float32: long sequences (1000+ tokens) overflow bfloat16 softmax
         x = x.float()

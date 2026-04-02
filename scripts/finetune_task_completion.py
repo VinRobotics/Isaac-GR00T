@@ -4,7 +4,7 @@ Finetune only the task_completion_detection head of GR00T.
 This script:
   1. Loads the full GR00T model.
   2. Freezes all parameters except `action_head.task_completion_detection`.
-  3. Trains the detector using BCEWithLogitsLoss on datasets with task-completion labels.
+  3. Trains the detector using CrossEntropyLoss on datasets with task-completion labels (0=doing, 1=success, 2=failure).
   4. After training, saves ONLY the task_completion_detection state dict to
      `<output_dir>/task_completion_detection.pt`.
 
@@ -26,7 +26,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 import torch
 import tyro
@@ -96,12 +96,12 @@ class ArgsConfig:
     """Whether to resume from a checkpoint."""
 
     task_completion_loss_weight: float = 1.0
-    """Scale factor applied to the task completion BCE loss."""
+    """Scale factor applied to the task completion CrossEntropy loss."""
 
-    success_pos_weight: float = 1.0
-    """Weight for the positive (success/done=1) class in BCEWithLogitsLoss.
-    Set > 1.0 to upweight success labels when failures dominate the dataset.
-    e.g. if 90% failure / 10% success, try success_pos_weight=9.0."""
+    class_weight: Optional[list] = None
+    """Per-class weights for CrossEntropyLoss, length 3: [doing, success, failure].
+    Set higher to upweight underrepresented classes.
+    e.g. if doing dominates, try class_weight=[0.1, 1.0, 1.0]."""
 
 
 #####################################################################################
@@ -158,11 +158,11 @@ def main(config: ArgsConfig):
     model.task_completion_only = True
     model.task_completion_loss_weight = config.task_completion_loss_weight
 
-    # Replace loss with class-weighted version to handle failure/success imbalance
-    if config.success_pos_weight != 1.0:
-        pos_weight = torch.tensor([config.success_pos_weight])
-        model.task_completion_detection_loss = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        print(f"Using pos_weight={config.success_pos_weight} for success labels")
+    # Replace loss with class-weighted version to handle class imbalance
+    if config.class_weight is not None:
+        cw = torch.tensor(config.class_weight)
+        model.task_completion_detection_loss = torch.nn.CrossEntropyLoss(weight=cw)
+        print(f"Using class_weight={config.class_weight} for [doing, success, failure]")
 
     # Freeze everything, then unfreeze only task_completion_detection
     for p in model.parameters():
