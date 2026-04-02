@@ -110,8 +110,9 @@ class ArgsConfig:
     resume: bool = False
     num_gpus: int = 1
 
-    success_pos_weight: float = 9.0
-    """Upweight success (done=1) labels. Set > 1 when failures dominate."""
+    class_weight: Optional[float] = None
+    """Upweight success (done=1) labels. If None, computed automatically from the dataset
+    as n_negative / n_positive. Set explicitly to override (e.g. 9.0)."""
 
     seq_dim: int = 2048
     """Backbone output projection dim (must match model_path's project_to_dim)."""
@@ -184,14 +185,36 @@ def main(args: ArgsConfig):
 
     collate_fn = DefaultDataCollator()
 
+    # --- Class weight ---
+    if args.class_weight is not None:
+        # Scalar override: upweight success (class 1) relative to doing (class 0).
+        # Use [1.0, class_weight, 1.0] — failure weight kept at 1.0.
+        class_weight = [1.0, args.class_weight, 1.0]
+    else:
+        # Auto-compute balanced weights by aggregating label counts across all datasets.
+        import numpy as _np
+        counts = _np.zeros(3, dtype=_np.int64)
+        for ds in datasets:
+            c = ds.count_labels()
+            if c is not None:
+                counts += c
+        n_total = counts.sum()
+        if n_total == 0:
+            class_weight = None
+        else:
+            class_weight = [
+                float(n_total / (3 * counts[c])) if counts[c] > 0 else 1.0
+                for c in range(3)
+            ]
+        print(f"Auto class_weight: {class_weight}  (counts per class: {counts.tolist()})")
+
     # --- Model ---
-    pos_weight = args.success_pos_weight if args.success_pos_weight != 1.0 else None
     model = WindowTaskCompletionModel.from_groot_pretrained(
         model_path=args.model_path,
         seq_dim=args.seq_dim,
         hidden_dim=args.hidden_dim,
         freeze_backbone=True,
-        pos_weight=pos_weight,
+        class_weight=class_weight,
     )
 
     if args.detector_init_path is not None:

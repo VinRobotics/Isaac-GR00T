@@ -41,8 +41,21 @@ Use the standard ``DefaultDataCollator`` from gr00t.model.transforms.
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
+import pandas as pd
+
 from gr00t.data.dataset import LeRobotSingleDataset, ModalityConfig
 from gr00t.data.transform.base import ComposedModalityTransform
+
+
+def _balanced_weights(counts: np.ndarray) -> list:
+    """Balanced class weights: weight[c] = n_total / (n_classes * n_c)."""
+    n_total = counts.sum()
+    n_classes = len(counts)
+    return [
+        float(n_total / (n_classes * counts[c])) if counts[c] > 0 else 1.0
+        for c in range(n_classes)
+    ]
 
 
 class WindowFrameTaskCompletionDataset(LeRobotSingleDataset):
@@ -82,6 +95,7 @@ class WindowFrameTaskCompletionDataset(LeRobotSingleDataset):
     ):
         assert len(delta_indices) >= 1, "delta_indices must have at least one entry"
         self._window_delta_indices = list(delta_indices)
+        self._task_completion_key = task_completion_key
 
         modality_configs = {
             # Video: all W frames defined by delta_indices
@@ -111,3 +125,40 @@ class WindowFrameTaskCompletionDataset(LeRobotSingleDataset):
     @property
     def window_size(self) -> int:
         return len(self._window_delta_indices)
+
+    def count_labels(self) -> Optional[np.ndarray]:
+        """Count label occurrences across all parquet files.
+
+        Returns an int64 array of shape (3,) with counts for
+        [doing=0, success=1, failure=2], or None if the column is absent.
+        """
+        parquet_files = sorted(self.dataset_path.glob("data/*/*.parquet"))
+        if not parquet_files:
+            return None
+
+        counts = np.zeros(3, dtype=np.int64)
+        found_column = False
+        for pf in parquet_files:
+            df = pd.read_parquet(pf)
+            if self._task_completion_key not in df.columns:
+                continue
+            found_column = True
+            labels = np.array(df[self._task_completion_key].tolist()).ravel().astype(int)
+            for c in range(3):
+                counts[c] += int((labels == c).sum())
+
+        return counts if found_column else None
+
+    def compute_class_weight(self) -> Optional[list]:
+        """Compute balanced per-class weights from all parquet files.
+
+        Classes: 0=doing, 1=success, 2=failure.
+        Uses the balanced formula: weight[c] = n_total / (n_classes * n_c).
+
+        Returns None if the task_completion column is absent, or a list of
+        three floats [w_doing, w_success, w_failure].
+        """
+        counts = self.count_labels()
+        if counts is None or counts.sum() == 0:
+            return None
+        return _balanced_weights(counts)
