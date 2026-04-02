@@ -18,7 +18,6 @@ vrh3_two_hands_config = {
             "left_shoulder",
             "left_elbow",
             "left_wrist",
-            "gripper_open",
         ],
     ),
     "action": ModalityConfig(
