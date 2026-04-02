@@ -89,7 +89,7 @@ class ArgsConfig:
     """Camera keys. If not set, defaults to VRH3 three-camera setup."""
 
     language_key: str = "annotation.human.task_description"
-    task_completion_key: str = "observation.tasks.done"
+    task_completion_key: str = "observation.tasks.label"
 
     embodiment_tag: Literal[tuple(EMBODIMENT_TAG_MAPPING.keys())] = "new_embodiment"
     video_backend: Literal["torchcodec", "decord", "torchvision_av"] = "torchvision_av"

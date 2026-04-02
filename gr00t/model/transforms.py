@@ -350,8 +350,8 @@ class GR00TTransform(InvertibleModalityTransform):
             task_completion = task_completion.numpy()
 
         # Take only the last value (for current step prediction)
-        # task_completion shape is [action_horizon, 1], we want just the last step
-        task_completion = task_completion[-1:]  # [1, ...]
+        # task_completion shape is [action_horizon, 1], we want just the last step as (1,)
+        task_completion = np.array([task_completion.ravel()[-1]])  # always (1,)
 
         task_completion = task_completion.astype(np.int64)
 
