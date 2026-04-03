@@ -367,9 +367,7 @@ def check_equivariance_tokens(
     n_vis_tokens = n_equi * T_vision
 
     # Create base input and save visualization
-    base_input = create_test_input(batch_size, num_images, device=device,
-                                   save_visualization=True,
-                                   save_path="test_tokens_input_image.png")
+    base_input = create_test_input(batch_size, num_images, device=device,)
 
     errors = []
     all_passed = True
