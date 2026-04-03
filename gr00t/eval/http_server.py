@@ -42,8 +42,49 @@ class HTTPInferenceServer:
         self.app = FastAPI(title="GR00T Inference Server", version="1.0.0")
 
         # Register endpoints
+        self.app.post("/task_completion")(self.predict_task_completion)
+        self.app.post("/reset")(self.reset)
         self.app.post("/act")(self.predict_action)
         self.app.get("/health")(self.health_check)
+        
+    def reset(self) -> JSONResponse:
+        """Reset the model's internal state, if applicable."""
+        if hasattr(self.policy, "reset"):
+            self.policy.reset()
+            return JSONResponse(content={"status": "reset successful"})
+        else:
+            raise HTTPException(status_code=400, detail="Model does not support reset")
+    
+    def predict_task_completion(self, payload: Dict[str, Any]) -> JSONResponse:
+        """Predict task completion from observation."""
+        try:
+            if "observation" not in payload:
+                raise HTTPException(
+                    status_code=400, detail="Missing 'observation' field in payload"
+                )
+
+            obs = payload["observation"]
+
+            if not hasattr(self.policy, "get_task_completion"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Model does not support task completion prediction",
+                )
+
+            # Run inference
+            task_completion = self.policy.get_task_completion(obs)
+
+            # Return prediction as JSON with numpy arrays
+            return JSONResponse(content=task_completion)
+
+        except Exception as e:
+            logging.error(traceback.format_exc())
+            logging.warning(
+                "Your request threw an error; make sure your request complies with the expected format:\n"
+                "{'observation': dict} where observation contains the required modalities.\n"
+                "Example observation keys: video.ego_view, state.left_arm, state.right_arm, etc."
+            )
+            raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
     def predict_action(self, payload: Dict[str, Any]) -> JSONResponse:
         """Predict action from observation."""
