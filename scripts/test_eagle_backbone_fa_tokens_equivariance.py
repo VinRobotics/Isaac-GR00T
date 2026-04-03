@@ -134,11 +134,13 @@ def transform_regular_repr(features: torch.Tensor, group_element: int, n_group: 
     return features_transformed
 
 
-def create_test_input(batch_size: int, num_images: int, img_size: int = 224, 
+def create_test_input(batch_size: int, num_images: int, img_size: int = 224,
                       seq_len: int = 64, device: torch.device = None,
                       dtype: torch.dtype = torch.bfloat16,
                       save_visualization: bool = False,
-                      save_path: str = "test_input_image.png") -> dict:
+                      save_path: str = "test_input_image.png",
+                      image_token_index: Optional[int] = None,
+                      num_image_tokens: int = 0) -> dict:
     """
     Create test vision-language input with structured (non-symmetric) pattern.
     Each batch sample and each image within a sample has a unique pattern.
@@ -231,9 +233,12 @@ def create_test_input(batch_size: int, num_images: int, img_size: int = 224,
     if save_visualization:
         save_test_image(pixel_values, save_path)
     
-    # Create dummy text tokens
-    input_ids = torch.randint(0, 32000, (batch_size, seq_len), device=device)
-    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
+    # Create dummy text tokens, with image token placeholders at the front if requested
+    total_len = seq_len + num_image_tokens
+    input_ids = torch.randint(0, 32000, (batch_size, total_len), device=device)
+    if image_token_index is not None and num_image_tokens > 0:
+        input_ids[:, :num_image_tokens] = image_token_index
+    attention_mask = torch.ones(batch_size, total_len, dtype=torch.long, device=device)
     
     return {
         "eagle_pixel_values": pixel_values,
@@ -366,8 +371,18 @@ def check_equivariance_tokens(
     T_vision = grid_size * grid_size   # e.g. 16*16 = 256
     n_vis_tokens = n_equi * T_vision
 
+    # Gather image token info from model so input_ids contain the right placeholders
+    img_tok_idx = getattr(model.eagle_model, "image_token_index", None)
+    # n_vis_tokens covers equi cameras; also account for any non-equi cameras
+    n_noequi = len(model.non_equi_image_indices) if hasattr(model, "non_equi_image_indices") else 0
+    total_img_tokens = n_vis_tokens + n_noequi * T_vision
+
     # Create base input and save visualization
-    base_input = create_test_input(batch_size, num_images, device=device,)
+    base_input = create_test_input(
+        batch_size, num_images, device=device,
+        image_token_index=img_tok_idx,
+        num_image_tokens=total_img_tokens,
+    )
 
     errors = []
     all_passed = True
