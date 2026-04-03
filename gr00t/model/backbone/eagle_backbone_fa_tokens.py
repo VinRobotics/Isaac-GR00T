@@ -965,13 +965,13 @@ class EagleBackboneFATokens(nn.Module):
                 # Fill equi positions first
                 n_equi_fill = min(positions.shape[0], n_equi_tokens)
                 if n_equi_fill > 0:
-                    input_embeds[b, positions[:n_equi_fill]] = inv_vision_tokens[b, :n_equi_fill]
+                    input_embeds[b, positions[:n_equi_fill]] = inv_vision_tokens[b, :n_equi_fill].to(input_embeds.dtype)
                 # Fill non-equi positions after equi
                 if noequi_tokens_flat is not None:
                     n_noequi_fill = min(positions.shape[0] - n_equi_fill, noequi_tokens_flat.shape[1])
                     if n_noequi_fill > 0:
                         input_embeds[b, positions[n_equi_fill:n_equi_fill + n_noequi_fill]] = \
-                            noequi_tokens_flat[b, :n_noequi_fill]
+                            noequi_tokens_flat[b, :n_noequi_fill].to(input_embeds.dtype)
 
         # Run through the LLM
         lm_output = self.eagle_model.language_model(
