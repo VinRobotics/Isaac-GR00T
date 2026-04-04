@@ -35,6 +35,19 @@ COMPUTE_DTYPE = torch.bfloat16
 
 class BasePolicy(ABC):
     @abstractmethod
+    def get_value(self, observations: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Abstract method to get the value for a given state.
+
+        Args:
+            observations: The observations from the environment.
+
+        Returns:
+            The value to take in the environment in dictionary format.
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
     def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """
         Abstract method to get the action for a given state.
@@ -204,6 +217,31 @@ class Gr00tPolicy(BasePolicy):
         )
         print("PROCESS OUTPUT", action.shape)
         return action
+    
+    def get_value(self, observations: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Make a prediction with the value model.
+        """
+        # Create a copy to avoid mutating input
+        obs_copy = observations.copy()
+
+        is_batch = self._check_state_is_batched(obs_copy)
+        if not is_batch:
+            obs_copy = unsqueeze_dict_values(obs_copy)
+
+        # Convert to numpy arrays
+        for k, v in obs_copy.items():
+            if not isinstance(v, np.ndarray):
+                obs_copy[k] = np.array(v)
+
+        normalized_input = self.apply_transforms(obs_copy)
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+            model_pred = self.model.get_value(normalized_input)
+
+        if not is_batch:
+            model_pred = squeeze_dict_values(model_pred)
+        return model_pred
+
 
     def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -412,7 +450,9 @@ class Gr00tPolicy(BasePolicy):
         )
         new_action_head = FlowmatchingActionHead(model.action_head.config)
         new_action_head.config.use_advantage_conditioning = True
+        new_action_head.config.use_value_head = True
         new_action_head.init_advantage_conditioning()
+        new_action_head.init_value_head()
 
         new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
         model.action_head = new_action_head

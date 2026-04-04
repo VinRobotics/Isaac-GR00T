@@ -169,6 +169,16 @@ class GR00T_N1_5(PreTrainedModel):
         self.validate_data(action_head_outputs, backbone_outputs, is_training=True)
         return action_head_outputs
 
+    def get_value(
+            self,
+            inputs: dict,
+    ) -> BatchFeature:
+        backbone_inputs, action_inputs = self.prepare_input(inputs)
+        # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
+        backbone_outputs = self.backbone(backbone_inputs)
+        value_head_outputs = self.action_head.get_value(backbone_outputs)
+        return value_head_outputs
+
     def get_action(
         self,
         inputs: dict,
@@ -176,8 +186,7 @@ class GR00T_N1_5(PreTrainedModel):
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
         backbone_outputs = self.backbone(backbone_inputs)
-        action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
-        self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
+        action_head_outputs = self.action_head.get_value(backbone_outputs, action_inputs)
         return action_head_outputs
     
     def get_realtime_action(

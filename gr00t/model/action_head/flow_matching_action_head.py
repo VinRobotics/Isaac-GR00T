@@ -840,6 +840,18 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=output_dict)
 
     @torch.no_grad()
+    def get_value(self, backbone_output: BatchFeature) -> BatchFeature:
+
+        backbone_output = self.process_backbone_output(backbone_output)
+
+        # Get vision and language embeddings.
+        vl_embs = backbone_output.backbone_features
+
+        value = self.value_head.predict_value(backbone_features=vl_embs)
+
+        return BatchFeature(data=value)
+
+    @torch.no_grad()
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
 
         backbone_output = self.process_backbone_output(backbone_output)
