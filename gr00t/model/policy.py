@@ -238,6 +238,8 @@ class Gr00tPolicy(BasePolicy):
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
             model_pred = self.model.get_value(normalized_input)
 
+        model_pred["value_pred"] = model_pred["value_pred"].float().cpu()
+
         if not is_batch:
             model_pred = squeeze_dict_values(model_pred)
         return model_pred

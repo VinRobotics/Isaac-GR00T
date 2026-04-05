@@ -849,7 +849,7 @@ class FlowmatchingActionHead(nn.Module):
 
         value = self.value_head.predict_value(backbone_features=vl_embs)
 
-        return BatchFeature(data=value)
+        return BatchFeature(data={"value_pred": value})
 
     @torch.no_grad()
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:

@@ -56,10 +56,11 @@ def calc_mse_for_single_trajectory(
             print("inferencing at step: ", step_count)
             value = policy.get_value(data_point)
             for _ in range(action_horizon):
-                pred_value_across_time.append(value)
+                pred_value_across_time.append(np.atleast_1d(value["value_pred"]))
 
     # plot the joints
     pred_value_across_time = np.array(pred_value_across_time)[:steps]
+    print(f"{pred_value_across_time=} {pred_value_across_time.shape=}")
 
     print("pred_value_joints vs time", pred_value_across_time.shape)
 
@@ -89,16 +90,13 @@ def plot_trajectory(
     if save_plot_path is not None:
         matplotlib.use("Agg")
 
-    action_dim = info["action_dim"]
     pred_value_across_time = info["pred_value_across_time"]
-    modality_keys = info["modality_keys"]
     traj_id = info["traj_id"]
-    mse = info["mse"]
     action_horizon = info["action_horizon"]
     steps = info["steps"]
 
     # Adjust figure size and spacing to accommodate titles
-    fig, axes = plt.subplots(nrows=action_dim, ncols=1, figsize=(10, 4 * action_dim + 2))
+    fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(10, 4 * 1 + 2))
 
     # Leave plenty of space at the top for titles
     plt.subplots_adjust(top=0.92, left=0.1, right=0.96, hspace=0.4)
@@ -108,25 +106,18 @@ def plot_trajectory(
     # Combine all modality keys into a single string
     # add new line if total length is more than 60 chars
     modality_string = ""
-    for key in modality_keys:
-        modality_string += key + "\n " if len(modality_string) > 40 else key + ", "
-    title_text = f"Trajectory Analysis - ID: {traj_id}\nModalities: {modality_string[:-2]}\nUnnormalized MSE: {mse:.6f}"
+    title_text = f"Trajectory Analysis - ID: {traj_id}"
 
     fig.suptitle(title_text, fontsize=14, fontweight="bold", color="#2E86AB", y=0.95)
 
-    # Loop through each action dim
-    for i, ax in enumerate(axes):
-        # The dimensions of state_joints and action are the same only when the robot uses actions directly as joint commands.
-        # Therefore, do not plot them if this is not the case.
-        ax.plot(pred_value_across_time[:, i], label="pred action", linewidth=2)
+    axes.plot(pred_value_across_time, label="pred value", linewidth=2)
 
-        ax.set_title(f"Action Dimension {i}", fontsize=12, fontweight="bold", pad=10)
-        ax.legend(loc="upper right", framealpha=0.9)
-        ax.grid(True, alpha=0.3)
+    axes.legend(loc="upper right", framealpha=0.9)
+    axes.grid(True, alpha=0.3)
 
-        # Set better axis labels
-        ax.set_xlabel("Time Step", fontsize=10)
-        ax.set_ylabel("Value", fontsize=10)
+    # Set better axis labels
+    axes.set_xlabel("Time Step", fontsize=10)
+    axes.set_ylabel("Value", fontsize=10)
 
     if save_plot_path:
         print("saving plot to", save_plot_path)
