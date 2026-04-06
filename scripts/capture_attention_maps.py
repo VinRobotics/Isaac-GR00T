@@ -185,9 +185,11 @@ def main(args):
 
     # --- Data config & dataset ---
     data_config = load_data_config(args.data_config)
-    modality_config = data_config.modality_config()
+    if hasattr(data_config, "inference_modality_config"):
+        modality_config = data_config.inference_modality_config()
+    else:
+        modality_config = data_config.modality_config()
     modality_transform = data_config.transform()
-
     dataset = LeRobotSingleDataset(
         dataset_path=args.dataset_path,
         modality_configs=modality_config,
