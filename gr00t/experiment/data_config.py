@@ -2027,7 +2027,11 @@ class VRH31GripperBothForRL(BaseDataConfig):
         "action.task_progress",
     ]
     language_keys = ["annotation.human.task_description"]
-    reward_keys = ["reward.current"]
+    reward_keys = [
+        "reward.current",
+        "reward.current_frame_idx",
+        "reward.episode_lengths"
+    ]
     observation_indices = [0]
     state_indices = [0]
     action_indices = [x * 2 for x in range(16)]

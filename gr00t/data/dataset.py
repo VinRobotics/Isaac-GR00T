@@ -496,6 +496,8 @@ class LeRobotSingleDataset(Dataset):
                 # Check if the key is valid
                 if key == "action.task_progress":
                     continue
+                if key in ["reward.current_frame_idx", "reward.episode_lengths"]:
+                    continue
 
                 try:
                     self.lerobot_modality_meta.get_key_meta(key)
@@ -839,7 +841,7 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id: int,
         key: str,
         base_index: int,
-    ) -> list[float]:
+    ) -> np.ndarray:
         """Get the reward data for a trajectory by step indices.
 
         Args:
@@ -858,6 +860,23 @@ class LeRobotSingleDataset(Dataset):
         trajectory_index = self.get_trajectory_index(trajectory_id)
         # Get the maximum length of the trajectory
         max_length = self.trajectory_lengths[trajectory_index]
+
+        # this handles reward.current_frame_idx if specified
+        if key == "reward.current_frame_idx":
+            # Get frame_index array and apply proper bounds checking and padding
+            frame_index_array = self.curr_traj_data["frame_index"].to_numpy()
+            # Use retrieve_data_and_pad to handle out-of-bounds indices
+            frame_index = self.retrieve_data_and_pad(
+                array=frame_index_array,
+                step_indices=step_indices,
+                max_length=max_length,
+                padding_strategy="first_last",  # Use first/last for task progress
+            )
+            # get the task progress by using "frame index / trajectory length"
+            frame_index = frame_index
+            return frame_index
+        elif key == "reward.episode_lengths":
+            return np.array([max_length])
         # Get the end times corresponding to the closest indices
         step_indices = np.maximum(step_indices, 0)
         step_indices = np.minimum(step_indices, max_length - 1)
@@ -882,7 +901,7 @@ class LeRobotSingleDataset(Dataset):
             else:
                 rewards.append(self.curr_traj_data[original_key][step_indices[i]].item())
         # return self.tasks.loc[task_indices]["task"].tolist()
-        return rewards
+        return np.array(rewards)
 
     def get_data_by_modality(
         self,

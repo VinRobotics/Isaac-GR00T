@@ -190,6 +190,7 @@ class DistributionalValueHeadConfig(PretrainedConfig):
         bin B-1 → value   0.0   (successful completion, 0 steps remaining)
     """
     backbone_embedding_dim: int = field(default=1536)
+    state_dim: int = field(default=64)
     hidden_dim: int = field(default=512)
     num_bins: int = field(default=201)          # B = 201 as in π*0.6
     value_min: float = field(default=-1.0)      # normalised lower bound
@@ -239,12 +240,18 @@ class DistributionalValueHead(nn.Module):
         super().__init__()
         self.config = config
         D = config.backbone_embedding_dim
+        S = config.state_dim
         H = config.hidden_dim
         B = config.num_bins
  
         self.norm = nn.LayerNorm(D)
+        self.state_proj = nn.Sequential(
+            nn.Linear(S, H),
+            nn.SiLU(),
+            nn.Linear(H, D),   # project to backbone dim for clean addition
+        )
         self.mlp  = nn.Sequential(
-            nn.Linear(D, H),
+            nn.Linear(D + D, H),
             nn.SiLU(),
             nn.Linear(H, H),
             nn.SiLU(),
@@ -259,132 +266,46 @@ class DistributionalValueHead(nn.Module):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
- 
-    def _pool_and_predict(self, backbone_features: torch.Tensor) -> torch.Tensor:
+
+    def _encode(
+        self,
+        backbone_features: torch.Tensor,   # (B, S_seq, D)
+        state:             torch.Tensor,   # (B, state_dim)
+    ) -> torch.Tensor:
         """
-        backbone_features : (B, S, D)
-        returns           : (B, num_bins)  raw logits
+        Fuse vision-language and proprioceptive state, then predict bins.
+
+        backbone_features: mean-pooled VL tokens  → (B, D)
+        state:             raw proprioception      → projected to (B, D)
+        concatenated                               → (B, 2D)  → MLP  → (B, num_bins)
         """
-        # Mean-pool over sequence tokens  → (B, D)
-        x = backbone_features.mean(dim=1)
-        x = self.norm(x)
-        return self.mlp(x)                         # (B, num_bins)
- 
-    def _discretise_returns(self, returns: torch.Tensor) -> torch.Tensor:
-        """
-        Map scalar returns in [value_min, value_max] to integer bin indices.
- 
-        returns : (B,) or (B, T)  normalised empirical returns R^B_t(τ)
-        output  : same shape, dtype=long, values in [0, num_bins-1]
-        """
-        v_min = self.config.value_min
-        v_max = self.config.value_max
-        B_bins = self.config.num_bins
-        # Clamp then scale to [0, num_bins-1]
-        r_clamped = returns.clamp(v_min, v_max)
-        bin_idx = ((r_clamped - v_min) / (v_max - v_min) * (B_bins - 1)).long()
-        return bin_idx
- 
-    # ------------------------------------------------------------------
-    # Value prediction (scalar)
-    # ------------------------------------------------------------------
- 
-    def predict_value(self, backbone_features: torch.Tensor) -> torch.Tensor:
-        """
-        Returns scalar value estimate  V(o_t, ℓ)  for each item in the batch.
- 
-        V(o_t, ℓ) = Σ_b  pϕ(V=b | o_t) · v(b)         (RECAP §IV-A)
- 
-        backbone_features : (B, S, D)
-        returns           : (B,)
-        """
-        logits = self._pool_and_predict(backbone_features)   # (B, num_bins)
-        probs  = torch.softmax(logits, dim=-1)                # (B, num_bins)
-        value  = (probs * self.bin_centres).sum(dim=-1)       # (B,)
-        return value
- 
-    # ------------------------------------------------------------------
-    # Training loss  (RECAP Eq. 1)
-    # ------------------------------------------------------------------
- 
+        vl  = self.norm(backbone_features.mean(dim=1))    # (B, D)
+        s   = self.state_proj(state).squeeze(dim=1)       # (B, D)
+        x   = torch.cat([vl, s], dim=-1)                  # (B, 2D)
+        return self.mlp(x)                                # (B, num_bins)
+
+    def predict_value(
+        self,
+        backbone_features: torch.Tensor,   # (B, S_seq, D)
+        state:             torch.Tensor,   # (B, state_dim)
+    ) -> torch.Tensor:
+        probs = torch.softmax(self._encode(backbone_features, state), dim=-1)
+        return (probs * self.bin_centres).sum(dim=-1)      # (B,)
+
     def compute_loss(
         self,
-        backbone_features: torch.Tensor,
-        empirical_returns: torch.Tensor,
+        backbone_features:  torch.Tensor,   # (B, S_seq, D)
+        state:              torch.Tensor,   # (B, state_dim)
+        empirical_returns:  torch.Tensor,   # (B,) in [value_min, value_max]
     ) -> torch.Tensor:
-        """
-        Cross-entropy between predicted bin distribution and
-        discretised empirical return R^B_t(τ).
- 
-        Implements RECAP Eq. 1:
-            min_ϕ  E_{τ∈D} [ Σ_{o_t∈τ}  H( R^B_t(τ),  pϕ(V | o_t, ℓ) ) ]
- 
-        backbone_features : (B, S, D)   — pooled observation features
-        empirical_returns : (B,)        — normalised returns in [value_min, value_max]
-                                          computed OUTSIDE this module from episode data
-        returns           : scalar loss
-        """
-        logits   = self._pool_and_predict(backbone_features)  # (B, num_bins)
-        bin_idx  = self._discretise_returns(empirical_returns) # (B,)  long
-        loss     = F.cross_entropy(logits, bin_idx)
-        return loss * self.config.value_loss_coeff
- 
-    # ------------------------------------------------------------------
-    # Advantage computation for labelling  (RECAP App. F)
-    # ------------------------------------------------------------------
- 
-    @torch.no_grad()
-    def compute_advantage(
-        self,
-        features_t: torch.Tensor,
-        features_t_plus_N: torch.Tensor,
-        rewards: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        N-step advantage estimate (RECAP App. F):
- 
-            A(o_t, a_t) = Σ_{t'=t}^{t+N-1} r_{t'}  +  V(o_{t+N})  −  V(o_t)
- 
-        features_t        : (B, S, D)  backbone features at step t
-        features_t_plus_N : (B, S, D)  backbone features at step t+N
-        rewards           : (B, N)     per-step rewards between t and t+N
-        returns           : (B,)       advantage values
-        """
-        V_t       = self.predict_value(features_t)          # (B,)
-        V_t_plus_N = self.predict_value(features_t_plus_N)  # (B,)
-        sum_rewards = rewards.sum(dim=-1)                    # (B,)
-        return sum_rewards + V_t_plus_N - V_t               # (B,)
- 
-    @torch.no_grad()
-    def compute_advantage_labels(
-        self,
-        features_t: torch.Tensor,
-        features_t_plus_N: torch.Tensor,
-        rewards: torch.Tensor,
-        epsilon_ell: float,
-    ) -> torch.Tensor:
-        """
-        Convert advantage values to binary labels for RECAP / CFGRL training.
- 
-            I_t = 1  if  A(o_t, a_t, ℓ) > ε_ℓ   →  AdvantageEmbedding.POS_IDX
-            I_t = 0  otherwise                    →  AdvantageEmbedding.NEG_IDX
- 
-        π*0.6 sets ε_ℓ at the 30th–40th percentile of predicted values
-        for task ℓ (App. F), so ~30-40 % of steps get positive advantage.
- 
-        features_t        : (B, S, D)
-        features_t_plus_N : (B, S, D)
-        rewards           : (B, N)
-        epsilon_ell       : float  scalar threshold (per-task)
-        returns           : (B,)  long tensor of {POS_IDX=2, NEG_IDX=1}
-        """
-        A = self.compute_advantage(features_t, features_t_plus_N, rewards)
-        labels = torch.where(
-            A > epsilon_ell,
-            torch.full_like(A, AdvantageEmbedding.POS_IDX, dtype=torch.long),
-            torch.full_like(A, AdvantageEmbedding.NEG_IDX, dtype=torch.long),
-        )
-        return labels
+        logits  = self._encode(backbone_features, state)
+        bin_idx = self._discretise(empirical_returns)
+        return F.cross_entropy(logits, bin_idx) * self.config.value_loss_coeff
+
+    def _discretise(self, returns: torch.Tensor) -> torch.Tensor:
+        v_min, v_max = self.config.value_min, self.config.value_max
+        r = returns.clamp(v_min, v_max)
+        return ((r - v_min) / (v_max - v_min) * (self.config.num_bins - 1)).long()
  
  
 # ---------------------------------------------------------------------------
@@ -395,8 +316,8 @@ def compute_normalised_returns(
     success: torch.Tensor,
     episode_lengths: torch.Tensor,
     t: torch.Tensor,
-    max_episode_length: int,
-    c_fail: float = 2.0,
+    max_episode_length: int = 1040,
+    c_fail: float = 100.0,
 ) -> torch.Tensor:
     """
     Computes the normalised empirical return  R_t(τ)  used to train the
@@ -425,8 +346,7 @@ def compute_normalised_returns(
     Returns:
         normalised_returns : (B,)  float in [-1, 0]
     """
-    unnormalized_t = (t - (-1.0)) / (2)
-    steps_remaining = (episode_lengths - unnormalized_t).float()          # T - t
+    steps_remaining = (episode_lengths - t).float()          # T - t
     raw_return      = -steps_remaining                        # successful base
     raw_return      = torch.where(success, raw_return, raw_return - c_fail)
     norm_denom      = float(max_episode_length + c_fail)
@@ -605,7 +525,6 @@ class FlowmatchingActionHead(nn.Module):
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
     def init_advantage_conditioning(self):
-        print("Action Config: ", self.config)
         if self.config.use_advantage_conditioning:
             self.advantage_embedding = AdvantageEmbedding(2048)
             print(
@@ -620,6 +539,7 @@ class FlowmatchingActionHead(nn.Module):
         if self.config.use_value_head:
             vh_kwargs = {
                 "backbone_embedding_dim": self.config.backbone_embedding_dim,
+                "state_dim": self.config.max_state_dim,
                 "hidden_dim": self.config.hidden_dim,
                 "num_bins": self.config.num_bins,
                 "value_loss_coeff": self.config.value_loss_coeff,
@@ -656,6 +576,10 @@ class FlowmatchingActionHead(nn.Module):
                     print(f"Action head trainable parameter: {name}")
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No action head trainable parameters found.")
+
+    def set_frozen_whole_action_head(self):
+        for name, p in self.named_parameters():
+            p.requires_grad = False
 
     def set_frozen_modules_to_eval_mode(self):
         """
@@ -819,20 +743,26 @@ class FlowmatchingActionHead(nn.Module):
         if self.value_head is not None:
             assert self.config.use_advantage_conditioning, f"Reward only available when trigger use_advantage_conditioning, but found {self.config.use_advantage_conditioning=} "
 
-            task_progress_idx = action_input.action_mask.float().argmin() - 1
-            task_progress = action_input.action[:, :, task_progress_idx].mean(dim=1)
+            t = action_input["reward.current_frame_idx"].squeeze(dim=-1)
+            episode_lengths = action_input["reward.episode_lengths"].squeeze(dim=-1)
+
+            output_dict = {}
 
             empirical_return = compute_normalised_returns(
                 success=torch.where(reward < 0, False, True),
-                episode_lengths=torch.full_like(task_progress, 1.0),
-                t=task_progress,
-                max_episode_length=1,
+                episode_lengths=episode_lengths,
+                t=t,
+                max_episode_length=1040,
+                c_fail=1040 / 2
             )
             if empirical_return is not None:
                 # backbone_output.backbone_features is already vlln-processed
                 # but has NOT had the advantage token appended — correct input.
-                raw_backbone = backbone_output.backbone_features
-                value_loss = self.value_head.compute_loss(raw_backbone, empirical_return)
+                value_loss = self.value_head.compute_loss(
+                    vl_embs,
+                    action_input.state.float(),              # ← add state
+                    empirical_return,
+                )
                 output_dict["value_loss"] = value_loss
                 action_loss = output_dict["action_loss"]
                 # Total loss = policy loss + value loss (both weighted by their coeffs)
@@ -840,14 +770,17 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=output_dict)
 
     @torch.no_grad()
-    def get_value(self, backbone_output: BatchFeature) -> BatchFeature:
+    def get_value(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
 
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
 
-        value = self.value_head.predict_value(backbone_features=vl_embs)
+        value = self.value_head.predict_value(
+            backbone_features=vl_embs,
+            state=action_input.state
+        )
 
         return BatchFeature(data={"value_pred": value})
 

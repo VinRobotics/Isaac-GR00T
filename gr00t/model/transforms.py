@@ -316,6 +316,9 @@ class GR00TTransform(InvertibleModalityTransform):
         # 2.1) Prepare reward
         reward = data.get("reward.current", None)
         transformed_data["reward"] = reward
+        
+        transformed_data["reward.current_frame_idx"] = data.get("reward.current_frame_idx", None)
+        transformed_data["reward.episode_lengths"] = data.get("reward.episode_lengths", None)
 
         if self.training:
             # 3) Prepare actions

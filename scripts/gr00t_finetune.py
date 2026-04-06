@@ -396,11 +396,17 @@ def main(config: ArgsConfig):
         model.action_head.config.hidden_dim = config.hidden_dim
         model.action_head.config.num_bins = config.num_bins
         model.action_head.config.value_loss_coeff = config.value_loss_coeff
+        if model.action_head.config.value_loss_coeff == 1.0:
+            model.action_head.set_frozen_whole_action_head()
         model.action_head.init_value_head()
 
     # Set the model's compute_dtype to bfloat16
     model.compute_dtype = "bfloat16"
     model.config.compute_dtype = "bfloat16"
+
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            print(f"Action head trainable parameter: {name}")
 
     if config.lora_rank > 0:
         model = get_lora_model(
