@@ -183,35 +183,45 @@ def main(args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Data config & dataset ---
+    # --- Data config ---
     data_config = load_data_config(args.data_config)
-    if hasattr(data_config, "inference_modality_config"):
-        modality_config = data_config.inference_modality_config()
-    else:
-        modality_config = data_config.modality_config()
     modality_transform = data_config.transform()
-    dataset = LeRobotSingleDataset(
-        dataset_path=args.dataset_path,
-        modality_configs=modality_config,
-        video_backend=args.video_backend,
-        transforms=modality_transform,
-        embodiment_tag=EmbodimentTag(args.embodiment_tag),
-    )
 
-    print(f"Dataset length: {len(dataset)}")
-    print(f"Trajectory lengths: {dataset.trajectory_lengths}")
+    # Training-time config: used to initialise the policy (sets action_horizon etc.)
+    train_modality_config = data_config.modality_config()
+
+    # Inference-time config: effort modality uses only history indices (no future labels).
+    # Data configs with torque/effort history expose infer_modality_config() for this.
+    if hasattr(data_config, "inference_modality_config"):
+        infer_modality_config = data_config.inference_modality_config()  # type: ignore[attr-defined]
+        print("Using inference_modality_config() for dataset loading.")
+    else:
+        infer_modality_config = train_modality_config
+        print("No inference_modality_config() found, using modality_config().")
 
     # --- Policy / model ---
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     policy = Gr00tPolicy(
         model_path=args.model_path,
-        modality_config=modality_config,
+        modality_config=train_modality_config,
         modality_transform=modality_transform,
         embodiment_tag=args.embodiment_tag,
         denoising_steps=args.denoising_steps,
         device=device,
     )
     policy.model.eval()
+
+    # --- Dataset: use inference modality config + no transforms (policy applies them) ---
+    dataset = LeRobotSingleDataset(
+        dataset_path=args.dataset_path,
+        modality_configs=infer_modality_config,
+        video_backend=args.video_backend,
+        transforms=None,
+        embodiment_tag=EmbodimentTag(args.embodiment_tag),
+    )
+
+    print(f"Dataset length: {len(dataset)}")
+    print(f"Trajectory lengths: {dataset.trajectory_lengths}")
 
     # --- Install attention capture processors ---
     dit = policy.model.action_head.model  # DiT instance
@@ -221,13 +231,13 @@ def main(args):
     token_info = get_token_counts(policy)
     print("Token layout in query (sa_embs):", token_info)
 
-    # --- Determine video keys from modality config ---
-    video_keys = modality_config.get("video", modality_config["video"]).modality_keys \
-        if "video" in modality_config else []
-    state_keys = modality_config.get("state", None)
-    state_keys = state_keys.modality_keys if state_keys else []
-    language_keys = modality_config.get("language", None)
-    language_keys = language_keys.modality_keys if language_keys else []
+    # --- Determine video keys from inference modality config ---
+    video_keys = infer_modality_config["video"].modality_keys \
+        if "video" in infer_modality_config else []
+    state_keys = infer_modality_config["state"].modality_keys \
+        if "state" in infer_modality_config else []
+    language_keys = infer_modality_config["language"].modality_keys \
+        if "language" in infer_modality_config else []
 
     num_steps = min(args.num_steps, len(dataset))
     all_metadata = {
@@ -249,16 +259,8 @@ def main(args):
     for step_idx in range(args.start_step, args.start_step + num_steps):
         print(f"  Step {step_idx} / {args.start_step + num_steps - 1}", end="\r")
 
-        # --- Get raw observation (pre-transform) for saving ---
+        # --- Get raw observation (transforms=None, policy handles them) ---
         raw_obs = dataset[step_idx]
-
-        # --- Prepare observation for policy (same as eval_policy.py) ---
-        obs_for_policy = {}
-        for k, v in raw_obs.items():
-            if isinstance(v, np.ndarray):
-                obs_for_policy[k] = v
-            else:
-                obs_for_policy[k] = v
 
         # --- Clear all processors before this step ---
         for p in processors:
@@ -266,7 +268,7 @@ def main(args):
 
         # --- Run inference (this triggers the denoising loop) ---
         with torch.inference_mode():
-            action_pred = policy.get_action(obs_for_policy)
+            action_pred = policy.get_action(raw_obs)
 
         # --- Collect attention maps ---
         # attn_maps: (num_denoising_steps, num_layers, num_heads, Q, K)
