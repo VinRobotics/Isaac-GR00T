@@ -194,7 +194,7 @@ def main(args):
         dataset_path=args.dataset_path,
         modality_configs=modality_config,
         video_backend=args.video_backend,
-        transforms=None,
+        transforms=modality_transform,
         embodiment_tag=EmbodimentTag(args.embodiment_tag),
     )
 
