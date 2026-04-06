@@ -100,6 +100,10 @@ class AttentionVisualizer:
         self.num_heads = self.meta["num_heads"]
         self.num_denoising_steps = self.meta["denoising_steps"]
         self.video_keys = self.meta.get("video_keys", [])
+        # layer_is_cross[i] == True means layer i does cross-attention (Q→VL tokens)
+        self.layer_is_cross = self.meta.get(
+            "layer_is_cross", [True] * self.num_layers
+        )
 
         # Current state
         self.cur_step_idx = args.start_step
@@ -124,13 +128,22 @@ class AttentionVisualizer:
     def _get_attn_map(self, step_data: dict) -> np.ndarray:
         """
         Extract attention map for current controls.
-        attention_maps shape: (T_denoise, L, H, Q, K)
-        Returns: (Q, K) 2-D array
+        Per-layer format: key "attn_layer_NN" → (T_denoise, H, Q, K_layer)
+        Returns: (Q, K) 2-D float32 array
         """
-        maps = step_data["attention_maps"]  # (T, L, H, Q, K)
-        t = min(self.cur_denoise_step, maps.shape[0] - 1)
-        l = min(self.cur_layer,        maps.shape[1] - 1)
-        layer_map = maps[t, l]  # (H, Q, K)
+        layer_key = f"attn_layer_{self.cur_layer:02d}"
+        if layer_key not in step_data:
+            # Fallback for old single-array format
+            maps = step_data.get("attention_maps")
+            if maps is None:
+                return np.zeros((1, 1))
+            t = min(self.cur_denoise_step, maps.shape[0] - 1)
+            l = min(self.cur_layer, maps.shape[1] - 1)
+            layer_map = maps[t, l].astype(np.float32)
+        else:
+            layer_maps = step_data[layer_key].astype(np.float32)  # (T, H, Q, K)
+            t = min(self.cur_denoise_step, layer_maps.shape[0] - 1)
+            layer_map = layer_maps[t]  # (H, Q, K)
 
         if self.cur_head == -1:
             return layer_map.mean(axis=0)  # (Q, K)
@@ -334,17 +347,21 @@ class AttentionVisualizer:
             ax.text(-0.5, y, label, ha="right", va="center",
                     fontsize=7, color=color, transform=ax.get_yaxis_transform())
 
-        ax.set_xlabel("VL token index (encoder)", fontsize=8, color="white")
         ax.set_ylabel("Query token (DiT input)", fontsize=8, color="white")
         ax.tick_params(colors="white", labelsize=6)
         ax.spines[:].set_color("#555")
 
+        is_cross = self.layer_is_cross[self.cur_layer] if self.cur_layer < len(self.layer_is_cross) else True
+        attn_type = "cross-attn (→VL)" if is_cross else "self-attn (→Q)"
         title_parts = [
-            f"Layer {self.cur_layer}",
+            f"Layer {self.cur_layer} [{attn_type}]",
             f"Denoise t={self.cur_denoise_step}",
             f"Head {'mean' if self.cur_head == -1 else self.cur_head}",
         ]
         ax.set_title("  |  ".join(title_parts), fontsize=8, color="white", pad=4)
+        # Update x-axis label based on attention type
+        xlabel = "VL token index (encoder)" if is_cross else "Query token index (self)"
+        ax.set_xlabel(xlabel, fontsize=8, color="white")
 
         # Colorbar
         try:

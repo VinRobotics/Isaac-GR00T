@@ -134,27 +134,25 @@ def collect_attention_maps(processors):
     """
     Collect captured attention maps from all processors.
 
-    Returns:
-        np.ndarray of shape (num_denoising_steps, num_layers, num_heads, Q, K)
-        is_cross: list[list[bool]] of shape (num_layers, num_denoising_steps)
-    """
-    num_layers = len(processors)
-    num_steps = len(processors[0].attention_history)
+    Cross-attention layers: K = num VL tokens
+    Self-attention layers:  K = num query tokens (Q)
+    These sizes differ, so we can NOT stack across layers into one array.
 
-    # All layers should have the same number of steps
+    Returns:
+        per_layer: list[np.ndarray] of length num_layers,
+                   each array has shape (num_denoising_steps, num_heads, Q, K_layer)
+        is_cross:  list[list[bool]] shape (num_layers, num_denoising_steps)
+    """
+    num_steps = len(processors[0].attention_history)
     for i, p in enumerate(processors):
         assert len(p.attention_history) == num_steps, (
             f"Layer {i} has {len(p.attention_history)} steps, expected {num_steps}"
         )
 
-    # Stack: (denoising_steps, layers, heads, Q, K)
-    stacked = np.stack(
-        [np.stack(p.attention_history, axis=0) for p in processors],
-        axis=1,
-    )  # (T, L, H, Q, K)
-
-    is_cross = [p.is_cross_attention_history for p in processors]  # (L, T)
-    return stacked, is_cross
+    # One array per layer: (T_denoise, H, Q, K)
+    per_layer = [np.stack(p.attention_history, axis=0) for p in processors]
+    is_cross = [p.is_cross_attention_history for p in processors]
+    return per_layer, is_cross
 
 
 def get_token_counts(policy: Gr00tPolicy):
@@ -277,11 +275,21 @@ def main(args):
         if "language" in infer_modality_config else []
 
     num_steps = min(args.num_steps, len(dataset))
+
+    # Detect which layers are cross-attention (need one forward pass to know for sure,
+    # but we can infer from the config: interleave_self_attention alternates odd layers).
+    interleave = getattr(dit.config, "interleave_self_attention", False)
+    layer_is_cross = [
+        not (interleave and (i % 2 == 1))
+        for i in range(len(dit.transformer_blocks))
+    ]
+
     all_metadata = {
         "num_layers": len(dit.transformer_blocks),
         "num_heads": dit.config.num_attention_heads,
         "denoising_steps": args.denoising_steps,
         "token_info": token_info,
+        "layer_is_cross": layer_is_cross,
         "video_keys": video_keys,
         "state_keys": state_keys,
         "language_keys": language_keys,
@@ -308,8 +316,9 @@ def main(args):
             action_pred = policy.get_action(raw_obs)
 
         # --- Collect attention maps ---
-        # attn_maps: (num_denoising_steps, num_layers, num_heads, Q, K)
-        attn_maps, is_cross = collect_attention_maps(processors)
+        # per_layer: list[np.ndarray], each (T_denoise, H, Q, K_layer)
+        # K differs between cross-attn and self-attn layers, so we save per-layer.
+        per_layer_maps, is_cross = collect_attention_maps(processors)
 
         # --- Extract images (first frame of each camera) ---
         images = {}
@@ -352,9 +361,14 @@ def main(args):
         # --- Save ---
         save_path = output_dir / f"step_{step_idx:05d}.npz"
         save_dict = {
-            "attention_maps": attn_maps,  # (T_denoise, L, H, Q, K)
             "annotation": np.array(annotation),
         }
+        # Save per-layer attention maps: attn_layer_0, attn_layer_1, ...
+        # Each array: (T_denoise, H, Q, K_layer) — K differs for self- vs cross-attn layers.
+        for layer_idx, layer_map in enumerate(per_layer_maps):
+            is_cross_layer = is_cross[layer_idx][0] if is_cross[layer_idx] else True
+            save_dict[f"attn_layer_{layer_idx:02d}"] = layer_map.astype(np.float16)
+            save_dict[f"attn_layer_{layer_idx:02d}_is_cross"] = np.array(is_cross_layer)
         # Add images
         for vk, img in images.items():
             clean_key = vk.replace(".", "_")
