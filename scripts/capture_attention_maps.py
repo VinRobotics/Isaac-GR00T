@@ -25,10 +25,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from gr00t.data.dataset import LeRobotSingleDataset
+from gr00t.data.dataset import LeRobotSingleDataset, ModalityConfig
 from gr00t.data.embodiment_tags import EMBODIMENT_TAG_MAPPING, EmbodimentTag
 from gr00t.experiment.data_config import load_data_config
 from gr00t.model.policy import Gr00tPolicy
+from gr00t.model.transforms import GR00TTransform
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +177,22 @@ def get_token_counts(policy: Gr00tPolicy):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _find_groot_transform(transform) -> "GR00TTransform | None":
+    """Recursively find the GR00TTransform inside a (composed) transform pipeline."""
+    if isinstance(transform, GR00TTransform):
+        return transform
+    if hasattr(transform, "transforms"):
+        for t in transform.transforms:
+            found = _find_groot_transform(t)
+            if found is not None:
+                return found
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -191,12 +208,12 @@ def main(args):
     train_modality_config = data_config.modality_config()
 
     # Inference-time config: effort modality uses only history indices (no future labels).
-    # Data configs with torque/effort history expose infer_modality_config() for this.
+    # Data configs with torque/effort history expose inference_modality_config() for this.
     if hasattr(data_config, "inference_modality_config"):
         infer_modality_config = data_config.inference_modality_config()  # type: ignore[attr-defined]
         print("Using inference_modality_config() for dataset loading.")
     else:
-        infer_modality_config = train_modality_config
+        infer_modality_config = dict(train_modality_config)  # mutable copy
         print("No inference_modality_config() found, using modality_config().")
 
     # --- Policy / model ---
@@ -210,6 +227,26 @@ def main(args):
         device=device,
     )
     policy.model.eval()
+
+    # --- Auto-trim effort delta_indices to match GR00TTransform.effort_history_len ---
+    # When inference_modality_config() is absent, the effort modality may still include
+    # future labels (history + future frames). Find effort_history_len from the transform
+    # and keep only the history portion so the transform assertion doesn't fail.
+    groot_t = _find_groot_transform(policy._modality_transform)
+    if groot_t is not None and groot_t.effort_history_len is not None:
+        for mod_key in list(infer_modality_config.keys()):
+            cfg = infer_modality_config[mod_key]
+            if len(cfg.delta_indices) > groot_t.effort_history_len and mod_key == "effort":
+                trimmed = cfg.delta_indices[:groot_t.effort_history_len]
+                infer_modality_config[mod_key] = ModalityConfig(
+                    delta_indices=trimmed,
+                    modality_keys=cfg.modality_keys,
+                )
+                print(
+                    f"Auto-trimmed '{mod_key}' delta_indices: "
+                    f"{len(cfg.delta_indices)} → {groot_t.effort_history_len} frames "
+                    f"(effort_history_len={groot_t.effort_history_len})"
+                )
 
     # --- Dataset: use inference modality config + no transforms (policy applies them) ---
     dataset = LeRobotSingleDataset(
