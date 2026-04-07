@@ -15,9 +15,11 @@
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
 from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.model.policy import BasePolicy
+from gr00t.model.action_head.flow_matching_action_head import compute_normalised_returns
 
 # numpy print precision settings 3, dont use exponential notation
 np.set_printoptions(precision=3, suppress=True)
@@ -45,6 +47,7 @@ def calc_mse_for_single_trajectory(
     save_plot_path=None,
 ):
     pred_value_across_time = []
+    gt_value_across_time = []
 
     for step_count in range(steps):
         data_point = None
@@ -56,7 +59,18 @@ def calc_mse_for_single_trajectory(
             print("inferencing at step: ", step_count)
             value = policy.get_value(data_point)
             for _ in range(action_horizon):
+                reward = torch.Tensor(data_point["reward.current"]).squeeze(dim=-1)
+                t = torch.Tensor(data_point["reward.current_frame_idx"]).squeeze(dim=-1)
+                episode_lengths = torch.Tensor(data_point["reward.episode_lengths"]).squeeze(dim=-1)
+
                 pred_value_across_time.append(np.atleast_1d(value["value_pred"]))
+                gt_value_across_time.append(np.atleast_1d(compute_normalised_returns(
+                    success=torch.where(reward < 0, False, True),
+                    episode_lengths=episode_lengths,
+                    t=t,
+                    max_episode_length=1040,
+                    c_fail=1040/2
+                )))
 
     # plot the joints
     pred_value_across_time = np.array(pred_value_across_time)[:steps]
@@ -71,6 +85,7 @@ def calc_mse_for_single_trajectory(
     if plot or save_plot_path is not None:
         info = {
             "pred_value_across_time": pred_value_across_time,
+            "gt_value_across_time": gt_value_across_time,
             "traj_id": traj_id,
             "action_horizon": action_horizon,
             "steps": steps,
@@ -91,6 +106,7 @@ def plot_trajectory(
         matplotlib.use("Agg")
 
     pred_value_across_time = info["pred_value_across_time"]
+    gt_value_across_time = info["gt_value_across_time"]
     traj_id = info["traj_id"]
     action_horizon = info["action_horizon"]
     steps = info["steps"]
@@ -111,6 +127,7 @@ def plot_trajectory(
     fig.suptitle(title_text, fontsize=14, fontweight="bold", color="#2E86AB", y=0.95)
 
     axes.plot(pred_value_across_time, label="pred value", linewidth=2)
+    axes.plot(gt_value_across_time, label="gt value", linewidth=2)
 
     axes.legend(loc="upper right", framealpha=0.9)
     axes.grid(True, alpha=0.3)

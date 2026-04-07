@@ -190,6 +190,11 @@ class DistributionalValueHeadConfig(PretrainedConfig):
         bin B-1 → value   0.0   (successful completion, 0 steps remaining)
     """
     backbone_embedding_dim: int = field(default=1536)
+
+    seq_dim: int = field(default=8)
+    num_heads: int = field(default=8)
+    dropout: float = field(default=0.1)
+
     state_dim: int = field(default=64)
     hidden_dim: int = field(default=512)
     num_bins: int = field(default=201)          # B = 201 as in π*0.6
@@ -235,33 +240,76 @@ class DistributionalValueHead(nn.Module):
         epsilon_ell,              # per-task threshold (30th–40th percentile)
     )
     """
- 
+
     def __init__(self, config: DistributionalValueHeadConfig):
         super().__init__()
-        self.config = config
-        D = config.backbone_embedding_dim
-        S = config.state_dim
-        H = config.hidden_dim
+        # Ensure seq_dim is divisible by num_heads
+        num_heads = config.num_heads
+        dropout = config.dropout
         B = config.num_bins
- 
-        self.norm = nn.LayerNorm(D)
-        self.state_proj = nn.Sequential(
-            nn.Linear(S, H),
-            nn.SiLU(),
-            nn.Linear(H, D),   # project to backbone dim for clean addition
+        
+        while config.seq_dim % num_heads != 0 and num_heads > 1:
+            num_heads //= 2
+
+        self.norm_in = nn.LayerNorm(config.seq_dim)
+
+        # Learnable CLS token — dedicated "task-completion query"
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.seq_dim))
+        nn.init.normal_(self.cls_token, std=0.02)
+
+        # Cross-attention: CLS attends over all sequence tokens
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=config.seq_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
         )
-        self.mlp  = nn.Sequential(
-            nn.Linear(D + D, H),
-            nn.SiLU(),
-            nn.Linear(H, H),
-            nn.SiLU(),
-            nn.Linear(H, B),
+        self.norm_attn = nn.LayerNorm(config.seq_dim)
+
+        # Classifier MLP with dropout
+        self.classifier = nn.Sequential(
+            nn.Linear(config.seq_dim, config.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim // 2, B),
         )
-        # Fixed bin centres in [value_min, value_max]  shape (B,)
+
         self.register_buffer(
             "bin_centres",
             torch.linspace(config.value_min, config.value_max, B),
         )
+
+        self.config = config
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Initialize ALL parameters in this module to safe values.
+        Called both from __init__ and from GR00T_N1_5.from_pretrained (since
+        HuggingFace replaces every parameter with uninitialized memory for keys
+        absent from the base checkpoint, discarding the __init__ values).
+        """
+        # CLS token
+        nn.init.normal_(self.cls_token, std=0.02)
+        # LayerNorms: standard init
+        nn.init.ones_(self.norm_in.weight)
+        nn.init.zeros_(self.norm_in.bias)
+        nn.init.ones_(self.norm_attn.weight)
+        nn.init.zeros_(self.norm_attn.bias)
+        # Cross-attention projection weights
+        for name, p in self.cross_attn.named_parameters():
+            if "weight" in name:
+                nn.init.normal_(p, mean=0.0, std=0.02)
+            elif "bias" in name:
+                nn.init.zeros_(p)
+        # Classifier MLP
+        for module in self.classifier.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                nn.init.zeros_(module.bias)
  
     # ------------------------------------------------------------------
     # Internal helpers
@@ -279,10 +327,12 @@ class DistributionalValueHead(nn.Module):
         state:             raw proprioception      → projected to (B, D)
         concatenated                               → (B, 2D)  → MLP  → (B, num_bins)
         """
-        vl  = self.norm(backbone_features.mean(dim=1))    # (B, D)
-        s   = self.state_proj(state).squeeze(dim=1)       # (B, D)
-        x   = torch.cat([vl, s], dim=-1)                  # (B, 2D)
-        return self.mlp(x)                                # (B, num_bins)
+        cls = self.cls_token.float().expand(backbone_features.shape[0], -1, -1)  # (B, 1, seq_dim)
+        backbone_features = self.norm_in(backbone_features)
+        attended, _ = self.cross_attn(query=cls, key=backbone_features, value=backbone_features)  # (B, 1, seq_dim)
+        attended = self.norm_attn(attended.squeeze(1))              # (B, seq_dim)
+        logits = self.classifier(attended)
+        return logits
 
     def predict_value(
         self,
@@ -454,7 +504,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         metadata={}
     )
     num_bins: int = field(
-        default=201,
+        default=51,
         metadata={}
     )          # B = 201 as in pi*0.6
     value_loss_coeff: float = field(
@@ -540,6 +590,7 @@ class FlowmatchingActionHead(nn.Module):
             vh_kwargs = {
                 "backbone_embedding_dim": self.config.backbone_embedding_dim,
                 "state_dim": self.config.max_state_dim,
+                "seq_dim": self.config.backbone_embedding_dim,
                 "hidden_dim": self.config.hidden_dim,
                 "num_bins": self.config.num_bins,
                 "value_loss_coeff": self.config.value_loss_coeff,
@@ -549,7 +600,8 @@ class FlowmatchingActionHead(nn.Module):
             print(
                 f"[RECAP] Distributional value head ENABLED  "
                 f"(num_bins={vh_config.num_bins}, "
-                f"value_loss_coeff={vh_config.value_loss_coeff})"
+                f"value_loss_coeff={vh_config.value_loss_coeff} "
+                f"hidden_dim={vh_config.hidden_dim}), "
             )
         else:
             self.value_head = None
@@ -746,8 +798,6 @@ class FlowmatchingActionHead(nn.Module):
             t = action_input["reward.current_frame_idx"].squeeze(dim=-1)
             episode_lengths = action_input["reward.episode_lengths"].squeeze(dim=-1)
 
-            output_dict = {}
-
             empirical_return = compute_normalised_returns(
                 success=torch.where(reward < 0, False, True),
                 episode_lengths=episode_lengths,
@@ -766,7 +816,8 @@ class FlowmatchingActionHead(nn.Module):
                 output_dict["value_loss"] = value_loss
                 action_loss = output_dict["action_loss"]
                 # Total loss = policy loss + value loss (both weighted by their coeffs)
-                output_dict["loss"] = action_loss + value_loss
+                # output_dict["loss"] = action_loss + value_loss
+                output_dict["loss"] = value_loss
         return BatchFeature(data=output_dict)
 
     @torch.no_grad()
