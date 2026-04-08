@@ -175,10 +175,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
-            # Use absolute actions to match training data
-            for robot in env.env.robots:
-                robot.controller.use_delta = False
-
             # Setup
             t = 0
             top_view = []
@@ -201,10 +197,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                     # and we need to wait for them to fall
                     if t < cfg.num_steps_wait:
-                        # Hold current pose (absolute) while objects settle
-                        current_ori = quat2axisangle(obs["robot0_eef_quat"])
-                        hold_action = np.concatenate([obs["robot0_eef_pos"], current_ori, [-1.0]])
-                        obs, reward, done, info = env.step(hold_action)
+                        obs, reward, done, info = env.step(get_libero_dummy_action())
                         t += 1
                         continue
 
