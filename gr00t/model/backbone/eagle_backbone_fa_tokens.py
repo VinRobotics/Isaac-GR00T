@@ -195,7 +195,6 @@ class EquiAdapter(nn.Module):
     def forward(
         self,
         h_equi: torch.Tensor,
-        h_inv_skip: torch.Tensor,
         vlm_img: torch.Tensor,
         vlm_text: torch.Tensor,
         noequi_vlm: Optional[torch.Tensor] = None,
@@ -203,7 +202,6 @@ class EquiAdapter(nn.Module):
         """
         Args:
             h_equi:     [B, n_equi, T_vis, D]   equivariant FA features (X̃' analog, skip)
-            h_inv_skip: [B, n_equi*T_vis, D]    invariant FA features projected to D (H' analog, skip)
             vlm_img:    [B, n_equi*T_vis, D]    VLM output at equi-image positions (H^llm analog)
             vlm_text:   [B, T_lang, D]           VLM output at text positions
             noequi_vlm: [B, n_noequi*T_vis, D]  VLM output at non-equi camera positions (optional)
@@ -211,18 +209,20 @@ class EquiAdapter(nn.Module):
             [B, n_equi*T_vis + n_noequi*T_vis + T_lang, D]
 
         Pipeline:
-          SA+CA loop: equivariant SA+CA on h_vis; CA context = pure EquiLLM H^r.
+          SA+CA loop: equivariant SA+CA on h_vis; CA context = VLM image tokens + text tokens.
           Output: [h_vis (equivariant) | noequi_trivial_reg | text_trivial_reg]
-            VLM already cross-attended text ↔ noequi ↔ inv(equi vision) — no extra attention needed.
             noequi/text reformatted as trivial-in-regular for downstream DiT compatibility.
         """
         B, n_equi, T, D = h_equi.shape
         dt = next(self.sa_blocks[0].parameters()).dtype
 
-        # EquiLLM Eq.6: H^r = proj(H^llm) + H'
-        h_cond = self.lang_proj(vlm_img.to(dt)) + h_inv_skip.to(dt)   # [B, n_equi*T, D] invariant
-
-        # Equivariant SA+CA on vision tokens only
+        # CA context: purely VLM-conditioned (vlm_img already cross-attended image+text in LLM)
+        # + raw text tokens for direct spatial word access.
+        # h_inv_skip (H') omitted: raw vision features dilute the language signal;
+        # geometric structure is carried by h_equi through SA instead.
+        h_cond = self.lang_proj(vlm_img.to(dt))                        # [B, n_equi*T, D]
+        # Equivariant SA+CA on vision tokens; CA context extended with text tokens.
+        # ca_blk zero-init (v/o proj) + text_to_cond zero-init → identity at start.
         h_vis = h_equi.to(dt).reshape(B, n_equi * T, D)
         for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
             h_vis = sa_blk(h_vis)
@@ -1140,17 +1140,10 @@ class EagleBackboneFATokens(nn.Module):
             if noequi_img_idx.numel() > 0 else None
         )
 
-        # h_inv_skip: H' skip connection — invariant FA projected to project_to_dim, bypasses VLM.
-        # Analogy: EquiLLM H' skip from Equivariant Encoder → Equivariant Adapter.
-        inv_adap_dtype = self.inv_adapter_proj.weight.dtype
-        h_inv_skip = self.inv_adapter_proj(
-            fa_inv_raw.reshape(B, n_equi * num_vision_tokens, vision_dim).to(inv_adap_dtype)
-        )                                                                  # [B, n_equi*T, project_to_dim]
-
         # ── Phase 3: EquiAdapter (EquiLLM-faithful) ───────────────────────────
         # SA+CA on h_equi; mix_sa_block joints all tokens in regular repr.
         # Output: [B, n_equi*T_vis + n_noequi*T + T_lang, project_to_dim]
-        h_adapted = self.equi_adapter(h_equi, h_inv_skip, vlm_img, vlm_text, noequi_vlm=noequi_vlm)
+        h_adapted = self.equi_adapter(h_equi, vlm_img, vlm_text, noequi_vlm=noequi_vlm)
 
         return h_adapted, eagle_input["attention_mask"]
 
