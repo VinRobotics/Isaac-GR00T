@@ -358,10 +358,10 @@ class FlowmatchingActionHead(nn.Module):
         self.state_hidden_type = enn.FieldType(self.group, int(config.hidden_size / self.n_group) * [self.group.regular_repr])
         self.state_out_type = enn.FieldType(self.group, int(config.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
-        self.axisangle_to_sixd = RotationTransformer('axis_angle', 'rotation_6d', from_convention="ZYX")
+        self.axisangle_to_sixd = RotationTransformer('axis_angle', 'rotation_6d')
         
         self.quaternion_to_matrix = RotationTransformer('quaternion', 'matrix')
-        self.axisangle_to_matrix = RotationTransformer('axis_angle', 'matrix', from_convention="ZYX")
+        self.axisangle_to_matrix = RotationTransformer('axis_angle', 'matrix')
         
         self.state_encoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
