@@ -1,7 +1,7 @@
 import os
 import pprint
 from dataclasses import dataclass
-
+from typing import Dict
 import cv2
 import numpy as np
 import torch
@@ -42,7 +42,6 @@ def show_obs_images_cv2(new_obs):
     # convert RGB -> BGR for OpenCV
     img_agent_bgr = cv2.cvtColor(img_agent, cv2.COLOR_RGB2BGR)
     img_wrist_bgr = cv2.cvtColor(img_wrist, cv2.COLOR_RGB2BGR)
-
     # show in separate windows
     cv2.imshow("Agent View", img_agent_bgr)
     cv2.imshow("Wrist View", img_wrist_bgr)
@@ -120,7 +119,7 @@ class GR00TPolicy:
         return new_obs
 
     def _convert_to_libero_action(
-        self, action_chunk: dict[str, np.array], idx: int = 0
+        self, action_chunk: Dict[str, np.array], idx: int = 0
     ) -> np.ndarray:
         """Convert GR00T action chunk to Libero format.
 
@@ -138,6 +137,7 @@ class GR00TPolicy:
         action_array = normalize_gripper_action(action_array, binarize=True)
         assert len(action_array) == 7, f"Expected 7-dim action, got {len(action_array)}"
         return action_array
+
 
 
 def eval_libero(cfg: GenerateConfig) -> None:
@@ -238,6 +238,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 success=done,
                 task_description=task_description,
                 log_file=log_file,
+                prefix_name=cfg.task_suite_name
             )
 
             # Log current results
