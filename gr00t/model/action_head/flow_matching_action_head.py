@@ -490,10 +490,10 @@ class FlowmatchingActionHead(nn.Module):
         def getActionGTRelEachHand(ee_state):
             ee_pos = ee_state[:, :, :3] # (bs, t, 3)
             ee_quat = ee_state[:, :, 3:self.ee_dim] # (bs, t, 4)
-            ee_rho = self.getMatrixRotation(ee_quat) # (bs, t, 9)
+            ee_rho = self.getMatrixRotation(ee_quat).reshape(*ee_quat.shape[:2], 9) # (bs, t, 9)
             pos_xy = ee_pos[:, :, 0:2] # 2
             pos_z = ee_pos[:, :, 2:3] # 1
-            
+
             ee_rho = torch.matmul(self.p.to(ee_state.device), ee_rho.transpose(-1, -2)).transpose(-1, -2) # (bs, t, 9)
             
             ee_rho01, ee_rho02, ee_rho03, ee_rho11, ee_rho12, ee_rho2 = ee_rho[:, :, 0:1], ee_rho[:, :, 1:2], ee_rho[:, :, 2:3], ee_rho[:, :, 3:5], ee_rho[:, :, 5:7], ee_rho[:, :, 7:9]
@@ -562,6 +562,7 @@ class FlowmatchingActionHead(nn.Module):
             ee_rho03 = ee_pred[:, :, 10:11]
             rho = torch.cat([ee_rho01, ee_rho02, ee_rho03, ee_rho11, ee_rho12, ee_rho2], dim=-1)
             m_rh0 = torch.matmul(self.p_inv.to(ee_pred.device), rho.transpose(-1, -2)).transpose(-1, -2)
+            m_rh0 = m_rh0.reshape(*m_rh0.shape[:2], 3, 3) # (bs, t, 3, 3)
             quat = self.getQuaternionFromMatrix(m_rh0)
             return pos_xy, quat
         
