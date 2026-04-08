@@ -87,6 +87,7 @@ class GR00TPolicy:
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.config = self.LIBERO_CONFIG
         self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
+        self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
         self.headless = headless
 
     def get_action(self, observation_dict, lang: str):
@@ -100,8 +101,7 @@ class GR00TPolicy:
         """Convert Libero observation to GR00T format."""
         xyz = obs["robot0_eef_pos"]
         rpy = quat2axisangle(obs["robot0_eef_quat"])
-        quat = obs["robot0_eef_quat"]
-        gripper = np.asarray(obs["robot0_gripper_qpos"]).mean()
+        gripper = obs["robot0_gripper_qpos"]
         img, wrist_img = get_libero_image(obs)
         new_obs = {
             "video.image": np.expand_dims(img, axis=0),
@@ -109,14 +109,10 @@ class GR00TPolicy:
             "state.x": np.array([[xyz[0]]]),
             "state.y": np.array([[xyz[1]]]),
             "state.z": np.array([[xyz[2]]]),
-            # "state.roll": np.array([[rpy[0]]]),
-            # "state.pitch": np.array([[rpy[1]]]),
-            # "state.yaw": np.array([[rpy[2]]]),
-            "state.rx": np.array([[quat[0]]]),
-            "state.ry": np.array([[quat[1]]]),
-            "state.rz": np.array([[quat[2]]]),
-            "state.rw": np.array([[quat[3]]]),
-            "state.gripper": np.array([[gripper]]),
+            "state.roll": np.array([[rpy[0]]]),
+            "state.pitch": np.array([[rpy[1]]]),
+            "state.yaw": np.array([[rpy[2]]]),
+            "state.gripper": np.expand_dims(gripper, axis=0),
             "annotation.human.action.task_description": [lang],
         }
         if not self.headless:
@@ -124,7 +120,7 @@ class GR00TPolicy:
         return new_obs
 
     def _convert_to_libero_action(
-        self, action_chunk: Dict[str, np.array], idx: int = 0
+        self, action_chunk: dict[str, np.array], idx: int = 0
     ) -> np.ndarray:
         """Convert GR00T action chunk to Libero format.
 
@@ -133,29 +129,15 @@ class GR00TPolicy:
             idx: Index of action to extract from chunk (default: 0 for first action)
 
         Returns:
-            7-dim numpy array: [x, y, z, ax, ay, az, gripper]  (absolute pos + axis-angle)
+            7-dim numpy array: [dx, dy, dz, droll, dpitch, dyaw, gripper]
         """
-        quat = np.asarray([
-            action_chunk[f"action.rx"][idx][0],
-            action_chunk[f"action.ry"][idx][0],
-            action_chunk[f"action.rz"][idx][0],
-            action_chunk[f"action.rw"][idx][0],
-        ])
-        # quat -> axis-angle via scipy (canonical, angle always in [0, π], no sign ambiguity)
-        rot = Rotation.from_quat(quat).as_rotvec()  # input: (x,y,z,w), output: axis*angle
-        action_chunk["action.roll"] = [rot[0]]
-        action_chunk["action.pitch"] = [rot[1]]
-        action_chunk["action.yaw"] = [rot[2]]
-        
         action_components = [
             np.atleast_1d(action_chunk[f"action.{key}"][idx])[0] for key in self.action_keys
         ]
-
         action_array = np.array(action_components, dtype=np.float32)
         action_array = normalize_gripper_action(action_array, binarize=True)
         assert len(action_array) == 7, f"Expected 7-dim action, got {len(action_array)}"
         return action_array
-
 
 def eval_libero(cfg: GenerateConfig) -> None:
     # Initialize LIBERO task suite
