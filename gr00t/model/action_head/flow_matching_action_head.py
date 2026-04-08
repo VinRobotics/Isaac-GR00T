@@ -299,6 +299,11 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     rot_type: str = field(
         default="quaternion", metadata={"help": "Define rot type: quaternion, euler_angles"}
     )
+    
+    rel_action: bool = field(
+        default=False, metadata={"help": "Whether to predict actions in relative (velocity) space instead of absolute state space."}
+    )
+    
     backbone_language_embedding_dim: int = field(
         default=2048, metadata={"help": "Language feature dim from backbone LLM (D_llm)."}
     )
@@ -345,13 +350,19 @@ class FlowmatchingActionHead(nn.Module):
         self.num_inference_timesteps = config.num_inference_timesteps
 
         # equi state
+        self.rel_action = self.config.rel_action
         self.ee_dim = 7 if self.config.rot_type == "quaternion" else 6
+        self.real_dim = 12 if self.rel_action else 9
         self.group = gspaces.no_base_space(CyclicGroup(self.n_group))
         self.state_in_type = self.getJointFieldType(is_action=False)
         self.state_hidden_type = enn.FieldType(self.group, int(config.hidden_size / self.n_group) * [self.group.regular_repr])
         self.state_out_type = enn.FieldType(self.group, int(config.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
-        self.eulerangle_to_sixd = RotationTransformer('euler_angles', 'rotation_6d', from_convention="ZYX")
+        self.axisangle_to_sixd = RotationTransformer('axis_angle', 'rotation_6d', from_convention="ZYX")
+        
+        self.quaternion_to_matrix = RotationTransformer('quaternion', 'matrix')
+        self.axisangle_to_matrix = RotationTransformer('axis_angle', 'matrix', from_convention="ZYX")
+        
         self.state_encoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
             in_type=self.state_in_type,
@@ -359,7 +370,7 @@ class FlowmatchingActionHead(nn.Module):
             out_type=self.state_out_type,
         )
         
-        self.action_type = self.getJointFieldType(is_action=True)
+        self.action_type = self.getJointFieldType(is_action=True) if not self.rel_action else self.getActionRelFieldType(is_action=True)
         self.action_out_type = enn.FieldType(self.group, int(self.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         
         self.action_encoder = MultiEmbodimentActionEncoder(
@@ -392,6 +403,20 @@ class FlowmatchingActionHead(nn.Module):
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
+        
+        self.p = torch.tensor([
+            [1, 0, 0, 0, 1, 0, 0, 0, 0],
+            [0, -1, 0, 1, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 1],
+            [0, 0, 1, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 1, 0],
+            [0, 1, 0, 1, 0, 0, 0, 0, 0],
+            [-1, 0, 0, 0, 1, 0, 0, 0, 0]
+        ]).float()
+        self.p_inv = torch.linalg.inv(self.p)
+        
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
     
     def getJointFieldType(self, is_action):
@@ -400,6 +425,26 @@ class FlowmatchingActionHead(nn.Module):
             self.group,
             self.num_hand * 4 * [self.group.irrep(1)] # pos xy, rot 6, left and right
             + (max_dim - ((self.ee_dim - 1) * self.num_hand)) * [self.group.trivial_repr], # gripper 1, z from both ee is 2
+        )
+        
+    def getActionRelFieldType(self, is_action):
+        max_dim = self.config.max_action_dim if is_action else self.config.max_state_dim
+
+        # Per-hand layout (matches getActionGTRelEachHand transform_features):
+        # [rho2(2), xy(2), rho12(2), rho11(2), rho01(1), rho02(1), rho03(1)] = 11 dims
+        # Equivariant: irrep(2) + 3*irrep(1) = 8 dims
+        # Trivial from rotation decomp: 3 trivials (rho01/02/03)
+        per_hand = (
+            1 * [self.group.irrep(2)]       # rho2: 2 dims
+            + 3 * [self.group.irrep(1)]     # xy, rho12, rho11: 6 dims
+            + 3 * [self.group.trivial_repr] # rho01, rho02, rho03: 3 dims
+        )
+
+        # Remaining trivials: z per hand + hand_state = max_dim - (ee_dim-1)*num_hand
+        return enn.FieldType(
+            self.group,
+            self.num_hand * per_hand
+            + (max_dim - (self.ee_dim - 1) * self.num_hand) * [self.group.trivial_repr]
         )
         
     def getJointGeometricTensor(self, state, is_action):
@@ -442,13 +487,39 @@ class FlowmatchingActionHead(nn.Module):
         return enn.GeometricTensor(state_features, self.getJointFieldType(is_action))
     
     def getActionGT(self, action):
+        def getActionGTRelEachHand(ee_state):
+            ee_pos = ee_state[:, :, :3] # (bs, t, 3)
+            ee_quat = ee_state[:, :, 3:self.ee_dim] # (bs, t, 4)
+            ee_rho = self.getMatrixRotation(ee_quat) # (bs, t, 9)
+            pos_xy = ee_pos[:, :, 0:2] # 2
+            pos_z = ee_pos[:, :, 2:3] # 1
+            
+            ee_rho = torch.matmul(self.p.to(ee_state.device), ee_rho.transpose(-1, -2)).transpose(-1, -2) # (bs, t, 9)
+            
+            ee_rho01, ee_rho02, ee_rho03, ee_rho11, ee_rho12, ee_rho2 = ee_rho[:, :, 0:1], ee_rho[:, :, 1:2], ee_rho[:, :, 2:3], ee_rho[:, :, 3:5], ee_rho[:, :, 5:7], ee_rho[:, :, 7:9]
+            
+            transform_features = torch.cat(
+                [
+                    ee_rho2, #2
+                    pos_xy, #2
+                    ee_rho12,
+                    ee_rho11,
+                    ee_rho01,
+                    ee_rho02,
+                    ee_rho03,
+                ],
+                dim=-1
+            ) 
+            
+            return transform_features, pos_z
+        
         def getActionGTEachHand(ee_state):
             ee_pos = ee_state[:, :, :3] # (bs, t, 3)
             ee_quat = ee_state[:, :, 3:self.ee_dim] # (bs, t, 4)
             ee_rot = self.get6DRotation(ee_quat)
             pos_xy = ee_pos[:, :, 0:2] # 2
             pos_z = ee_pos[:, :, 2:3] # 1
-            joint_features = torch.cat(
+            transform_features = torch.cat(
                 [
                     pos_xy,
                     ee_rot[:, :, 0:1], # 1
@@ -460,28 +531,42 @@ class FlowmatchingActionHead(nn.Module):
                 ],
                 dim=-1
             )
-            return joint_features, pos_z
+            return transform_features, pos_z
+        action_transform = getActionGTRelEachHand if self.rel_action else getActionGTEachHand
         if self.num_hand == 2:
             l_ee_state = action[:, :, :self.ee_dim] # bs, t, 7 
             r_ee_state = action[:, :, self.ee_dim:self.ee_dim*2] # bs, t, 7  
             hand_state = action[:, :, self.ee_dim*2:]
             
-            l_tf, l_pos_z = getActionGTEachHand(l_ee_state)
-            r_tf, r_pos_z = getActionGTEachHand(r_ee_state)
+            l_tf, l_pos_z = action_transform(l_ee_state)
+            r_tf, r_pos_z = action_transform(r_ee_state)
 
             state_features = torch.cat([l_tf, r_tf, l_pos_z, r_pos_z, hand_state], dim=-1)
         else:
             l_ee_state = action[:, :, :self.ee_dim] # bs, t, 7 
             hand_state = action[:, :, self.ee_dim:]
             
-            l_tf, l_pos_z = getActionGTEachHand(l_ee_state)
+            l_tf, l_pos_z = action_transform(l_ee_state)
             state_features = torch.cat([l_tf, l_pos_z, hand_state], dim=-1)
         return state_features
     
     
     def getActionOutput(self, pred):
+        def getActionRelOutputEachHand(ee_pred):
+            ee_rho2 = ee_pred[:, :, 0:2] # (bs, t, 2)
+            pos_xy = ee_pred[:, :, 2:4]
+            ee_rho12 = ee_pred[:, :, 4:6]
+            ee_rho11 = ee_pred[:, :, 6:8]
+            ee_rho01 = ee_pred[:, :, 8:9]
+            ee_rho02 = ee_pred[:, :, 9:10]
+            ee_rho03 = ee_pred[:, :, 10:11]
+            rho = torch.cat([ee_rho01, ee_rho02, ee_rho03, ee_rho11, ee_rho12, ee_rho2], dim=-1)
+            m_rh0 = torch.matmul(self.p_inv.to(ee_pred.device), rho.transpose(-1, -2)).transpose(-1, -2)
+            quat = self.getQuaternionFromMatrix(m_rh0)
+            return pos_xy, quat
+        
         def getActionOutputEachHand(ee_pred):
-            ee_xy = ee_pred[:, :, 0:2] # (bs, t, 3)
+            ee_xy = ee_pred[:, :, 0:2] # (bs, t, 2)
             ee_cos1 = ee_pred[:, :, 2:3]
             ee_sin1 = ee_pred[:, :, 3:4]
             ee_cos2 = ee_pred[:, :, 4:5]
@@ -492,23 +577,24 @@ class FlowmatchingActionHead(nn.Module):
             rot_6d = torch.cat([ee_cos1, ee_cos2, ee_cos3, ee_sin1, ee_sin2, ee_sin3], dim=-1)
             quat = self.getQuaternionFrom6D(rot_6d)
             return ee_xy, quat
-        
+        real_dim_wo_z = self.real_dim - 1
+        action_transform = getActionRelOutputEachHand if self.rel_action else getActionOutputEachHand
         if self.num_hand == 2:
-            l_xy, l_quat = getActionOutputEachHand(pred[:, :, :8]) # bs, t, 8
-            r_xy, r_quat = getActionOutputEachHand(pred[:, :, 8:16]) # bs, t, 8
-            
-            l_z, r_z = pred[:, :, 16:17], pred[:, :, 17:18] # bs, t, 1
-            hand_state = pred[:, :, 18:] # bs, t, rest
+            l_xy, l_quat = action_transform(pred[:, :, :real_dim_wo_z]) # bs, t, 8
+            r_xy, r_quat = action_transform(pred[:, :, real_dim_wo_z:real_dim_wo_z*2]) # bs, t, 8
+
+            l_z, r_z = pred[:, :, real_dim_wo_z*2:real_dim_wo_z*2+1], pred[:, :, real_dim_wo_z*2+1:real_dim_wo_z*2+2] # bs, t, 1
+            hand_state = pred[:, :, real_dim_wo_z*2+2:] # bs, t, rest
             
             action_output = torch.cat(
                 [l_xy, l_z, l_quat, r_xy, r_z, r_quat, hand_state],
                 dim=-1
             )
         else:
-            l_xy, l_quat = getActionOutputEachHand(pred[:, :, :8]) # bs, t, 8
+            l_xy, l_quat = action_transform(pred[:, :, :real_dim_wo_z]) # bs, t, 8
             
-            l_z = pred[:, :, 8:9] # bs, t, 1
-            hand_state = pred[:, :, 9:] # bs, t, rest
+            l_z = pred[:, :, real_dim_wo_z:real_dim_wo_z+1] # bs, t, 1
+            hand_state = pred[:, :, real_dim_wo_z+1:] # bs, t, rest
             
             action_output = torch.cat(
                 [l_xy, l_z, l_quat, hand_state],
@@ -516,23 +602,71 @@ class FlowmatchingActionHead(nn.Module):
             )
             
         return action_output
+    
+    def getMatrixRotation(self, quat):
+        if quat.shape[-1] == 4:
+            return self.quaternion_to_matrix.forward(quat[:, :, [3, 0, 1, 2]]) 
+        else:
+            return self.axisangle_to_matrix.forward(quat)
+    
+    def getQuaternionFromMatrix(self, matrix):
+        if self.ee_dim == 7:
+            quat = self.quaternion_to_matrix.inverse(matrix)
+            return quat[:, :, [1, 2, 3, 0]]  # xyzw
+        else:
+            return self.axisangle_to_matrix.inverse(matrix)
 
     def get6DRotation(self, quat):
         # data is in xyzw, but rotation transformer takes wxyz
         if quat.shape[-1] == 4:
             return self.quaternion_to_sixd.forward(quat[:, :, [3, 0, 1, 2]]) 
         else:
-            return self.eulerangle_to_sixd.forward(quat)
+            return self.axisangle_to_sixd.forward(quat)
     
     def getQuaternionFrom6D(self, rot_6d):
         if self.ee_dim == 7:
             quat = self.quaternion_to_sixd.inverse(rot_6d)
             return quat[:, :, [1, 2, 3, 0]]  # xyzw
         else:
-            return self.eulerangle_to_sixd.inverse(rot_6d)
+            return self.axisangle_to_sixd.inverse(rot_6d)
 
+    def transform_action_mask(self, action_mask: torch.Tensor, velocity_dim: int) -> torch.Tensor:
+        """
+        Transform action_mask from original (quat/axisangle) space to velocity (rot6d) space.
 
+        getActionGT reorganises each hand's EE dims:
+          original per hand : [x, y, z, rot...]  = ee_dim  (7 quat | 6 axisangle)
+          velocity per hand : [x, y, rot6d(6)]   = 8 dims  (placed first for all hands)
+                            + [z]                = 1 dim   (placed after all hands' 8-d blocks)
 
+        Total real dims in velocity space = num_hand * 9 + hand_state_dims
+
+        Mapping by input type:
+          quat   (ee_dim=7): per-hand  7 -> 9, 2 hands: n+4  (4 = 2*(9-7))
+          axisangle (ee_dim=6): per-hand  6 -> 9, 2 hands: n+6  (6 = 2*(9-6))
+
+        Args:
+            action_mask : [B, T, max_action_dim] — 1 = real feature dim, 0 = padding
+            velocity_dim: last dim of the velocity tensor (= self.action_type.size)
+        Returns:
+            new_mask    : [B, T, velocity_dim]  — same dtype / device as action_mask
+        """
+        B, T, _ = action_mask.shape
+        device = action_mask.device
+
+        # Number of real feature dims in original space (uniform across B, T)
+        n_real_dims = int(action_mask[0, 0].float().sum().item())
+
+        # Hand-state (gripper, etc.) dims = original real dims minus all EE dims
+        hand_state_dims = max(0, n_real_dims - self.ee_dim * self.num_hand)
+
+        # In velocity space each hand contributes 8 (xy + rot6d) + 1 (z) = 9 real dims
+        real_dims = 12 if self.rel_action else 9
+        n_real_trans = self.num_hand * real_dims + hand_state_dims
+
+        new_mask = torch.zeros(B, T, velocity_dim, device=device, dtype=action_mask.dtype)
+        new_mask[:, :, :n_real_trans] = 1
+        return new_mask
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -698,6 +832,7 @@ class FlowmatchingActionHead(nn.Module):
         actions = action_input.action
         
         actions_gt = self.getActionGT(actions)
+        
         noise = torch.randn(actions_gt.shape, device=actions_gt.device, dtype=actions_gt.dtype)
         t = self.sample_time(actions_gt.shape[0], device=actions_gt.device, dtype=actions_gt.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
@@ -712,7 +847,7 @@ class FlowmatchingActionHead(nn.Module):
             noisy_trajectory, "b t c -> (b t) c"
         )
         
-        noisy_trajectory = enn.GeometricTensor(noisy_trajectory, self.getJointFieldType(True))
+        noisy_trajectory = enn.GeometricTensor(noisy_trajectory, self.action_type)
 
         action_encoder_embodiment_id = embodiment_id.repeat((actions_gt.shape[1]))
         action_features = self.action_encoder(noisy_trajectory, t_discretized, action_encoder_embodiment_id)
@@ -762,14 +897,13 @@ class FlowmatchingActionHead(nn.Module):
         # pred_actions = self.getActionOutput(pred_actions)
         # Slice out only the action portion of pred and target.
         with torch.no_grad():
-            B, T, original_action_dim = action_input.action_mask.shape
             velocity_dim = velocity.shape[-1]
-            
-            # Create action mask that matches the velocity dimension
-            action_mask = torch.zeros((B, T, velocity_dim), device=velocity.device)
-            
-            # Copy original mask values
-            action_mask[:, :, :original_action_dim] = action_input.action_mask
+            # Transform mask from original rotation space (quat/axisangle) to rot6d velocity
+            # space, accounting for the dimension expansion done by getActionGT:
+            #   quat (7) -> 9 per hand (+2), axisangle (6) -> 9 per hand (+3)
+            action_mask = self.transform_action_mask(
+                action_input.action_mask.float(), velocity_dim
+            ).to(velocity.device)
         loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = loss.sum() / action_mask.sum()
         output_dict = {
@@ -826,7 +960,7 @@ class FlowmatchingActionHead(nn.Module):
             noisy_trajectory = einops.rearrange(
                 actions, "b t c -> (b t) c"
             )
-            noisy_trajectory = enn.GeometricTensor(noisy_trajectory, self.getJointFieldType(True))
+            noisy_trajectory = enn.GeometricTensor(noisy_trajectory, self.action_type)
             action_features = self.action_encoder(noisy_trajectory, timesteps_tensor, action_encoder_embodiment_id)
             action_features = action_features.tensor
             action_features = einops.rearrange(
