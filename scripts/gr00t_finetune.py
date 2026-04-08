@@ -217,6 +217,7 @@ def main(config: ArgsConfig):
     data_action_horizon = len(data_config_cls.action_indices)
     data_num_hand = getattr(data_config_cls, "num_hand", 2)
     data_rot_type = getattr(data_config_cls, "rot_type", "quaternion")
+    data_rel_action = getattr(data_config_cls, "rel_action", False)
     
     # Get rotation config for frame averaging backbone
     rotation_config = data_config_cls.get_rotation_config() if hasattr(data_config_cls, "get_rotation_config") else None
@@ -264,13 +265,15 @@ def main(config: ArgsConfig):
     # Need to recreate action head with correct config since it was initialized with old config
     action_horizon_changed = data_action_horizon != model.action_head.config.action_horizon
     num_hand_changed = data_num_hand != model.action_head.config.num_hand
-    rot_type_changed = data_rot_type != model.action_head.config.num_hand
-    
-    if action_horizon_changed or num_hand_changed or rot_type_changed:
+    rot_type_changed = data_rot_type != model.action_head.config.rot_type
+    rel_action_changed = data_rel_action != model.action_head.config.rel_action
+
+    if action_horizon_changed or num_hand_changed or rot_type_changed or rel_action_changed:
         print(
             f"Recreating action head with action_horizon {data_action_horizon} (was {model.action_head.config.action_horizon}), "
             f"num_hand {data_num_hand} (was {model.action_head.config.num_hand}), "
             f"rot_type {data_rot_type} (was {model.action_head.config.rot_type}), "
+            f"rel_action {data_rel_action} (was {model.action_head.config.rel_action}), "
         )
         
 
@@ -279,7 +282,7 @@ def main(config: ArgsConfig):
         new_action_head_config.action_horizon = data_action_horizon
         new_action_head_config.num_hand = data_num_hand
         new_action_head_config.rot_type = data_rot_type
-
+        new_action_head_config.rel_action = data_rel_action
         # Import the FlowmatchingActionHead class
         from gr00t.model.action_head.flow_matching_action_head import (
             FlowmatchingActionHead,
@@ -299,6 +302,7 @@ def main(config: ArgsConfig):
         model.action_horizon = data_action_horizon
         model.config.action_head_cfg["num_hand"] = new_action_head_config.num_hand
         model.config.action_head_cfg["rot_type"] = new_action_head_config.rot_type
+        model.config.action_head_cfg["rel_action"] = new_action_head_config.rel_action
         model.config.action_head_cfg["action_horizon"] = data_action_horizon
 
         # Set trainable parameters for the new action head
