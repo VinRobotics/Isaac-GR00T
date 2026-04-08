@@ -7,10 +7,10 @@ import numpy as np
 import torch
 import tqdm
 import tyro
-from scipy.spatial.transform import Rotation
 from libero.libero import benchmark
 
 from examples.Libero.eval.utils import (
+    get_libero_dummy_action,
     get_libero_env,
     get_libero_image,
     normalize_gripper_action,
@@ -87,7 +87,6 @@ class GR00TPolicy:
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.config = self.LIBERO_CONFIG
         self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
-        self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
         self.headless = headless
 
     def get_action(self, observation_dict, lang: str):
@@ -120,7 +119,7 @@ class GR00TPolicy:
         return new_obs
 
     def _convert_to_libero_action(
-        self, action_chunk: dict[str, np.array], idx: int = 0
+        self, action_chunk: Dict[str, np.array], idx: int = 0
     ) -> np.ndarray:
         """Convert GR00T action chunk to Libero format.
 
@@ -138,6 +137,8 @@ class GR00TPolicy:
         action_array = normalize_gripper_action(action_array, binarize=True)
         assert len(action_array) == 7, f"Expected 7-dim action, got {len(action_array)}"
         return action_array
+
+
 
 def eval_libero(cfg: GenerateConfig) -> None:
     # Initialize LIBERO task suite
@@ -174,10 +175,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
-            # Use absolute actions to match training data
-            for robot in env.env.robots:
-                robot.controller.use_delta = False
-
             # Setup
             t = 0
             top_view = []
@@ -200,10 +197,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                     # and we need to wait for them to fall
                     if t < cfg.num_steps_wait:
-                        # Hold current pose (absolute) while objects settle
-                        current_ori = Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec()
-                        hold_action = np.concatenate([obs["robot0_eef_pos"], current_ori, [-1.0]])
-                        obs, reward, done, info = env.step(hold_action)
+                        obs, reward, done, info = env.step(get_libero_dummy_action())
                         t += 1
                         continue
 
