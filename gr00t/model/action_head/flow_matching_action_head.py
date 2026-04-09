@@ -135,13 +135,13 @@ class MultiEmbodimentActionEncoder(nn.Module):
 
 class AdvantageEmbedding(nn.Module):
     """
-    Encodes the binary advantage indicator I_t from RECAP (π*0.6, §IV-B).
+    Encodes the binary advantage indicator I_t from RECAP (pi*0.6, §IV-B).
  
     Three indices:
         NULL_IDX (0)  – unconditional token used during CFG dropout and the
                         unconditional forward pass at inference.
-        NEG_IDX  (1)  – A(o, a) ≤ ε_ℓ  →  "Advantage: negative"
-        POS_IDX  (2)  – A(o, a)  > ε_ℓ  →  "Advantage: positive"
+        NEG_IDX  (1)  – A(o, a) ≤ eps_l  →  "Advantage: negative"
+        POS_IDX  (2)  – A(o, a)  > eps_l  →  "Advantage: positive"
  
     The embedding is appended to encoder_hidden_states so the cross-attention
     in DiT can condition the velocity field on optimality.
@@ -169,10 +169,10 @@ class AdvantageEmbedding(nn.Module):
 @dataclass
 class DistributionalValueHeadConfig(PretrainedConfig):
     """
-    Config for the distributional value function pϕ(V | o_t, ℓ) from RECAP §IV-A.
+    Config for the distributional value function pϕ(V | o_t, l) from RECAP §IV-A.
  
     The value function is kept intentionally SEPARATE from the policy network
-    (same design as π*0.6, which uses a smaller 670M VLM backbone for the VF
+    (same design as pi*0.6, which uses a smaller 670M VLM backbone for the VF
     and a larger one for the policy). Here we attach it as a lightweight MLP
     head that reads the same backbone_features the policy already computes,
     so we pay zero extra backbone cost.
@@ -182,10 +182,10 @@ class DistributionalValueHeadConfig(PretrainedConfig):
             → mean-pool over sequence          (B, backbone_dim)
             → LayerNorm
             → MLP  (backbone_dim → hidden_dim → num_bins)
-            → softmax  →  pϕ(V | o_t, ℓ)      (B, num_bins)
+            → softmax  →  pϕ(V | o_t, l)      (B, num_bins)
  
     Return bins:
-        Normalised to (-1, 0) following π*0.6 §V-C.
+        Normalised to (-1, 0) following pi*0.6 §V-C.
         bin 0  →  value  -1.0   (worst / failed episode)
         bin B-1 → value   0.0   (successful completion, 0 steps remaining)
     """
@@ -197,7 +197,7 @@ class DistributionalValueHeadConfig(PretrainedConfig):
 
     state_dim: int = field(default=64)
     hidden_dim: int = field(default=512)
-    num_bins: int = field(default=201)          # B = 201 as in π*0.6
+    num_bins: int = field(default=201)          # B = 201 as in pi*0.6
     value_min: float = field(default=-1.0)      # normalised lower bound
     value_max: float = field(default=0.0)       # normalised upper bound
     value_loss_coeff: float = field(default=1.0)
@@ -210,20 +210,20 @@ class DistributionalValueHeadConfig(PretrainedConfig):
  
 class DistributionalValueHead(nn.Module):
     """
-    Distributional value function  pϕ(V | o_t, ℓ)  from RECAP §IV-A.
+    Distributional value function  pϕ(V | o_t, l)  from RECAP §IV-A.
  
     Trains by minimising cross-entropy between the predicted bin distribution
     and the discretised empirical return R_t(τ):
  
-        min_ϕ  E_{τ∈D} [ Σ_{o_t∈τ}  H( R^B_t(τ),  pϕ(V | o_t, ℓ) ) ]   (Eq. 1)
+        min_ϕ  E_{τ∈D} [ Σ_{o_t∈τ}  H( R^B_t(τ),  pϕ(V | o_t, l) ) ]   (Eq. 1)
  
     At inference, extracts a scalar value as:
  
-        V(o_t, ℓ) = Σ_b  pϕ(V=b | o_t) · v(b)
+        V(o_t, l) = Σ_b  pϕ(V=b | o_t) · v(b)
  
     where v(b) is the real-valued centre of bin b.
  
-    Advantage estimation (n-step, App. F of π*0.6):
+    Advantage estimation (n-step, App. F of pi*0.6):
  
         A(o_t, a_t) = Σ_{t'=t}^{t+N-1} r_{t'} + V(o_{t+N}) - V(o_t)
  
@@ -266,13 +266,21 @@ class DistributionalValueHead(nn.Module):
         )
         self.norm_attn = nn.LayerNorm(config.seq_dim)
 
+        self.state_proj = nn.Sequential(
+            nn.Linear(config.state_dim, config.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(config.hidden_dim, config.seq_dim),   # project to backbone dim for clean addition
+        )
+
         # Classifier MLP with dropout
         self.classifier = nn.Sequential(
             nn.Linear(config.seq_dim, config.hidden_dim),
             nn.GELU(),
+            nn.LayerNorm(config.hidden_dim),
             nn.Dropout(dropout),
             nn.Linear(config.hidden_dim, config.hidden_dim // 2),
             nn.GELU(),
+            nn.LayerNorm(config.hidden_dim // 2),
             nn.Linear(config.hidden_dim // 2, B),
         )
 
@@ -331,6 +339,8 @@ class DistributionalValueHead(nn.Module):
         backbone_features = self.norm_in(backbone_features)
         attended, _ = self.cross_attn(query=cls, key=backbone_features, value=backbone_features)  # (B, 1, seq_dim)
         attended = self.norm_attn(attended.squeeze(1))              # (B, seq_dim)
+        state_proj = self.state_proj(state.float().squeeze(dim=1))
+        fused      = torch.cat([attended, state_proj], dim=-1)
         logits = self.classifier(attended)
         return logits
 
@@ -383,7 +393,7 @@ def compute_normalised_returns(
                 =  -(T - t)          if success    (negative steps remaining)
                    -(T - t) - C_fail if failure
  
-    Normalised to (-1, 0) per task using max_episode_length (π*0.6 §V-C):
+    Normalised to (-1, 0) per task using max_episode_length (pi*0.6 §V-C):
         R_t_norm  =  R_t(τ) / (max_episode_length + C_fail)
  
     Args:
@@ -457,7 +467,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     )
 
     use_advantage_conditioning: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": (
                 "Enable RECAP-style advantage conditioning. "
@@ -488,11 +498,12 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
             )
         },
     )
+
     use_value_head: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": (
-                "Attach a distributional value head pϕ(V|o_t,ℓ) (RECAP §IV-A). "
+                "Attach a distributional value head pϕ(V|o_t,l) (RECAP §IV-A). "
                 "When enabled, forward() also returns `value_loss`. "
                 "The value head is trained jointly with the policy via a weighted "
                 "cross-entropy loss on discretised empirical returns."
@@ -500,16 +511,40 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         },
     )
     hidden_dim: int = field(
-        default=512,
+        default=2048,
         metadata={}
     )
     num_bins: int = field(
-        default=51,
+        default=201,
         metadata={}
     )          # B = 201 as in pi*0.6
     value_loss_coeff: float = field(
         default=1.0,
         metadata={}
+    )
+
+    _phase: str = field(
+        default="value_head" #action_head
+    )
+
+    recap_alpha: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "alpha in RECAP Eq. 3: weight of conditional term relative to "
+                "unconditional term. pi*0.6 uses alpha=1.0 (equal weight). "
+                "Higher alpha → stronger push toward advantage-conditioned behavior."
+            )
+        },
+    )
+    advantage_threshold_percentile: float = field(
+        default=0.30,
+        metadata={
+            "help": (
+                "Percentile of V predictions used as eps_l threshold. "
+                "pi*0.6 App. F: 0.30 for pre-training, 0.40 for fine-tuning."
+            )
+        },
     )
 
 
@@ -572,6 +607,10 @@ class FlowmatchingActionHead(nn.Module):
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
+
+        self.init_advantage_conditioning()
+        self.init_value_head()
+
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
     def init_advantage_conditioning(self):
@@ -629,9 +668,48 @@ class FlowmatchingActionHead(nn.Module):
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No action head trainable parameters found.")
 
-    def set_frozen_whole_action_head(self):
-        for name, p in self.named_parameters():
+    def set_phase_value_head(self):
+        """
+        Phase 1 — RECAP Alg 1 lines 1, 4, 8:
+            Train V on D using Eq. 1.
+            Policy (DiT, encoders, decoders) frozen.
+            Value head trainable.
+        """
+        # Freeze everything
+        for _, p in self.parameters():
             p.requires_grad = False
+        # Unfreeze value head
+        for _, p in self.value_head.parameters():
+            p.requires_grad = True
+        # Unfreeze advantage embedding (learns alongside value head)
+        if self.advantage_embedding is not None:
+            for _, p in self.advantage_embedding.parameters():
+                p.requires_grad = True
+
+        self._phase = "value_head"
+        print("[RECAP] ── Phase 1: VALUE_HEAD ──")
+        print(f"  Trainable params: {sum(p.numel() for _, p in self.vl_self_attention.parameters() if p.requires_grad):,}")
+
+    def set_phase_policy(self):
+        """
+        Phase 2 — RECAP Alg 1 lines 2, 5, 9:
+            Train piθ on D using Eq. 3 and frozen V.
+            Value head frozen (used only for labelling).
+            Policy trainable (respects tune_projector / tune_diffusion_model).
+        """
+        # Restore policy trainability
+        self.set_trainable_parameters(self.config.tune_projector, self.config.tune_diffusion_model)
+        # Freeze value head
+        for _, p in self.value_head.parameters():
+            p.requires_grad = False
+        # Advantage embedding always trainable in policy phase
+        if self.advantage_embedding is not None:
+            for _, p in self.advantage_embedding.parameters():
+                p.requires_grad = True
+
+        self._phase = "policy"
+        print("[RECAP] ── Phase 2: POLICY ──")
+        print(f"  Trainable params: {sum(p.numel() for _, p in self.parameters() if p.requires_grad):,}")
 
     def set_frozen_modules_to_eval_mode(self):
         """
@@ -701,7 +779,103 @@ class FlowmatchingActionHead(nn.Module):
  
         return vl_embs_aug, vl_attn_mask_aug
 
-    def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+    @torch.no_grad()
+    def compute_advantage_labels_from_value_head(
+        self,
+        backbone_feats: torch.Tensor,   # (B, S, D)  VL features (pre-advantage-token)
+        state:          torch.Tensor,   # (B, state_dim)
+        reward:         torch.Tensor,   # (B,)  {-1=fail, 0=success}
+        percentile:     float = 0.30,   # eps_l threshold (30th pct pre-train, 40th fine-tune)
+    ) -> torch.Tensor:
+        """
+        Derive per-step advantage indicator I_t from the frozen value head.
+
+        RECAP App. F: eps_l is set at the 30th percentile of V values predicted
+        by the value function for the current task l, so ~30% of steps get
+        positive advantage (POS_IDX).
+
+        Hard rule: failure steps (reward=-1) are ALWAYS labelled NEG regardless
+        of their predicted value — failure is never positive advantage.
+
+        Returns (B,) long tensor ∈ {NEG_IDX=1, POS_IDX=2}
+        """
+        V       = self.value_head.predict_value(backbone_feats, state)       # (B,)
+        epsilon = torch.quantile(V, percentile)                          # scalar eps_l
+
+        is_failure      = reward < 0                                     # (B,) bool
+        above_threshold = V > epsilon                                    # (B,) bool
+
+        labels = torch.where(
+            above_threshold & ~is_failure,
+            torch.full_like(V, AdvantageEmbedding.POS_IDX, dtype=torch.long),
+            torch.full_like(V, AdvantageEmbedding.NEG_IDX, dtype=torch.long),
+        )
+        return labels                                                     # (B,)
+    
+    def forward_value_head(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+        # Set frozen modules to eval
+        self.set_frozen_modules_to_eval_mode()
+
+        backbone_output = self.process_backbone_output(backbone_output)
+
+        if self.config.expand_batch is not None:
+            for k, v in backbone_output.items():
+                ndim = len(v.shape)
+                factors = [self.config.expand_batch]
+                while len(factors) < ndim:
+                    factors.append(1)
+                factors = tuple(factors)
+                expanded = v.repeat(*factors)
+                backbone_output[k] = expanded
+
+            for k, v in action_input.items():
+                ndim = len(v.shape)
+                factors = [self.config.expand_batch]
+                while len(factors) < ndim:
+                    factors.append(1)
+                factors = tuple(factors)
+                expanded = v.repeat(*factors)
+                action_input[k] = expanded
+
+        # Get vision and language embeddings.
+        vl_embs = backbone_output.backbone_features
+        vl_attn_mask = backbone_output.backbone_attention_mask
+        device = vl_embs.device
+
+        # Get embodiment ID.
+        embodiment_id = action_input.embodiment_id
+
+        # Inject advantage token
+        if self.config.use_advantage_conditioning:
+            assert "reward" in action_input.keys(), f"No reward found in {action_input.keys()=}"
+            reward = torch.squeeze(action_input["reward"], dim=-1)
+
+        t = action_input["reward.current_frame_idx"].squeeze(dim=-1)
+        episode_lengths = action_input["reward.episode_lengths"].squeeze(dim=-1)
+
+        max_episode_length = 1040 / 2
+
+        empirical_return = compute_normalised_returns(
+            success=torch.where(reward < 0, False, True),
+            episode_lengths=episode_lengths,
+            t=t,
+            max_episode_length=max_episode_length,
+            c_fail=max_episode_length / 2
+        )
+        if empirical_return is not None:
+            # backbone_output.backbone_features is already vlln-processed
+            # but has NOT had the advantage token appended — correct input.
+            value_loss = self.value_head.compute_loss(
+                vl_embs,
+                action_input.state.float(),              # ← add state
+                empirical_return,
+            )
+            output_dict = {
+                "loss": value_loss,
+            }
+        return BatchFeature(data=output_dict)
+    
+    def forward_action_head(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
 
@@ -740,6 +914,14 @@ class FlowmatchingActionHead(nn.Module):
             reward = torch.squeeze(action_input["reward"], dim=-1)
 
             adv_label = torch.where(reward < 0, AdvantageEmbedding.NEG_IDX, AdvantageEmbedding.POS_IDX)
+            with torch.no_grad():
+                adv_labels = compute_advantage_labels_from_value_head(
+                    value_head=self.value_head,
+                    backbone_feats=vl_embs_raw,
+                    state=action_input.state.float(),
+                    reward=reward,
+                    percentile=getattr(self.config, "advantage_threshold_percentile", 0.30),
+                )
 
             vl_embs, vl_attn_mask = self._apply_advantage_conditioning(
                 vl_embs, vl_attn_mask, adv_label
@@ -789,36 +971,14 @@ class FlowmatchingActionHead(nn.Module):
         loss = loss.sum() / action_mask.sum()
         output_dict = {
             "loss": loss,
-            "action_loss": loss
         }
-
-        if self.value_head is not None:
-            assert self.config.use_advantage_conditioning, f"Reward only available when trigger use_advantage_conditioning, but found {self.config.use_advantage_conditioning=} "
-
-            t = action_input["reward.current_frame_idx"].squeeze(dim=-1)
-            episode_lengths = action_input["reward.episode_lengths"].squeeze(dim=-1)
-
-            empirical_return = compute_normalised_returns(
-                success=torch.where(reward < 0, False, True),
-                episode_lengths=episode_lengths,
-                t=t,
-                max_episode_length=1040,
-                c_fail=1040 / 2
-            )
-            if empirical_return is not None:
-                # backbone_output.backbone_features is already vlln-processed
-                # but has NOT had the advantage token appended — correct input.
-                value_loss = self.value_head.compute_loss(
-                    vl_embs,
-                    action_input.state.float(),              # ← add state
-                    empirical_return,
-                )
-                output_dict["value_loss"] = value_loss
-                action_loss = output_dict["action_loss"]
-                # Total loss = policy loss + value loss (both weighted by their coeffs)
-                # output_dict["loss"] = action_loss + value_loss
-                output_dict["loss"] = value_loss
         return BatchFeature(data=output_dict)
+
+    def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+
+        elif self.value_head is not None:
+            output_dict = self.forward_value_head(backbone_output, action_input)
+        return output_dict
 
     @torch.no_grad()
     def get_value(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
