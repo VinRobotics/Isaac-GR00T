@@ -111,7 +111,7 @@ class GR00TPolicy:
             "state.roll": np.array([[rpy[0]]]),
             "state.pitch": np.array([[rpy[1]]]),
             "state.yaw": np.array([[rpy[2]]]),
-            "state.gripper": np.array([[gripper]]),
+            "state.gripper": np.expand_dims(gripper, axis=0),
             "annotation.human.action.task_description": [lang],
         }
         if not self.headless:
