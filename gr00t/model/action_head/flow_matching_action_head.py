@@ -625,6 +625,7 @@ class FlowmatchingActionHead(nn.Module):
 
         # Get vision and language embeddings.
         vl_embs = backbone_output.backbone_features
+        vl_attn_mask = backbone_output.backbone_attention_mask
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
@@ -647,6 +648,28 @@ class FlowmatchingActionHead(nn.Module):
             inference_delay, prefix_attention_horizon, self.config.action_horizon, prefix_attention_schedule
         )
         weights = weights.to(device)
+
+        # Prepare advantage-conditioned and unconditional encoder contexts
+        use_adv = self.config.use_advantage_conditioning
+        w = self.config.cfg_guidance_weight
+        dual_pass = use_adv and (w != 1.0)
+ 
+        if use_adv:
+            # Conditional context: I_t = POS
+            vl_embs_cond, vl_attn_mask_cond = self._apply_advantage_conditioning(
+                vl_embs, vl_attn_mask,
+                advantage_label=torch.full(
+                    (batch_size,), AdvantageEmbedding.POS_IDX, dtype=torch.long, device=device
+                ),
+            )
+            if dual_pass:
+                # Unconditional context: I_t = NULL
+                vl_embs_null, vl_attn_mask_null = self._apply_advantage_conditioning(
+                    vl_embs, vl_attn_mask,
+                    advantage_label=None,   # → all NULL_IDX
+                )
+        else:
+            vl_embs_cond, vl_attn_mask_cond = vl_embs, vl_attn_mask
 
         for t in range(num_steps):
 
@@ -673,10 +696,21 @@ class FlowmatchingActionHead(nn.Module):
                 # Run model forward.
                 model_output = self.model(
                     hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embs,
+                    encoder_hidden_states=vl_embs_cond,
+                    encoder_attention_mask=vl_attn_mask_cond,
                     timestep=timesteps_tensor,
                 )
                 pred = self.action_decoder(model_output, embodiment_id)
+
+                if dual_pass:
+                    model_output_uncond = self.model(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embs_null,
+                        encoder_attention_mask=vl_attn_mask_null,
+                        timestep=timesteps_tensor,
+                    )
+                    pred_uncond = self.action_decoder(model_output_uncond, embodiment_id)
+                    pred = pred_uncond + w * (pred - pred_uncond)
 
                 pred_velocity = pred[:, -self.action_horizon :]
                 return x_t_ + pred_velocity * dt, pred_velocity
