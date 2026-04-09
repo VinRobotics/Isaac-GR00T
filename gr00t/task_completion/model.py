@@ -18,7 +18,7 @@ cross-frame attention for free.
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -161,3 +161,63 @@ class WindowTaskCompletionModel(nn.Module):
         """Save only the TaskCompletionDetector weights."""
         torch.save(self.task_completion_detection.state_dict(), path)
         print(f"Saved task_completion_detection weights to: {path}")
+
+    @staticmethod
+    def extract_detector_weights_from_checkpoint(
+        checkpoint_dir: str | Path,
+        output_path: Optional[Union[str, Path]] = None,
+    ) -> Path:
+        """Extract TaskCompletionDetector weights from a Trainer checkpoint.
+
+        The HuggingFace Trainer saves the full model as ``model.safetensors``
+        with keys prefixed by module name (e.g. ``task_completion_detection.fc1.weight``).
+        This function filters those keys, strips the prefix, and writes a
+        ``task_completion_detection.pt`` file that ``load_detector_weights`` can consume.
+
+        Parameters
+        ----------
+        checkpoint_dir:
+            Directory containing ``model.safetensors`` (a Trainer checkpoint or
+            the final output directory).
+        output_path:
+            Where to write the ``.pt`` file.  Defaults to
+            ``<checkpoint_dir>/task_completion_detection.pt``.
+
+        Returns
+        -------
+        Path
+            Absolute path of the written ``.pt`` file.
+        """
+        try:
+            from safetensors.torch import load_file
+        except ImportError as e:
+            raise ImportError(
+                "safetensors is required. Install with: pip install safetensors"
+            ) from e
+
+        checkpoint_dir = Path(checkpoint_dir)
+        safetensors_path = checkpoint_dir / "model.safetensors"
+        if not safetensors_path.exists():
+            raise FileNotFoundError(f"model.safetensors not found in: {checkpoint_dir}")
+
+        if output_path is None:
+            output_path = checkpoint_dir / "task_completion_detection.pt"
+        output_path = Path(output_path)
+
+        prefix = "task_completion_detection."
+        full_state = load_file(safetensors_path, device="cpu")
+        detector_state = {
+            k[len(prefix):]: v
+            for k, v in full_state.items()
+            if k.startswith(prefix)
+        }
+
+        if not detector_state:
+            raise ValueError(
+                f"No keys with prefix '{prefix}' found in {safetensors_path}. "
+                "Make sure the checkpoint was saved from WindowTaskCompletionModel."
+            )
+
+        torch.save(detector_state, output_path)
+        print(f"Extracted {len(detector_state)} tensors → {output_path}")
+        return output_path
