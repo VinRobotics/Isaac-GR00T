@@ -1,7 +1,20 @@
+import logging
 import os
 import pprint
 from dataclasses import dataclass
 from typing import Dict
+# Redirect robosuite's hardcoded /tmp/robosuite.log to user-owned log_dir
+_log_dir = "/mnt/data/sftp/data/locht1/logs"
+os.makedirs(_log_dir, exist_ok=True)
+_orig_file_handler_init = logging.FileHandler.__init__
+
+def _patched_file_handler_init(self, filename, *args, **kwargs):
+    if filename == "/tmp/robosuite.log":
+        filename = os.path.join(_log_dir, "robosuite.log")
+    _orig_file_handler_init(self, filename, *args, **kwargs)
+
+logging.FileHandler.__init__ = _patched_file_handler_init
+
 import cv2
 import numpy as np
 import torch
@@ -18,7 +31,7 @@ from examples.Libero.eval.utils import (
     save_rollout_video,
 )
 
-log_dir = "/tmp/logs"
+log_dir = "/mnt/data/sftp/data/locht1/logs"
 os.makedirs(log_dir, exist_ok=True)  # ensures directory exists
 
 
