@@ -46,10 +46,11 @@ Pipeline (EquiLLM-faithful, Section 3.2 of arXiv:2502.11149):
     2. Invariant FA + Eagle LLM (Phase 2): fa_inv_raw projected → injected into frozen VLM.
        VLM attends jointly over invariant vision + text tokens → vlm_hidden.
        Analogy: EquiLLM's Projector(H') + Prompt P → LLM → H^llm.
-    3. EquiAdapter (Phase 3): FiLM-based equivariant adapter.
-       film_proj(vlm_img) → token-aligned scale + shift (invariant, per block-channel)
-       h_equi = h_equi * (1 + scale) + shift   ← equivariant: scale/shift act on scalar dim,
-                                                   broadcast uniformly over group slots ✓
+    3. EquiAdapter (Phase 3): faithful EquiLLM adapter (Eq. 6).
+       h_cond     = lang_proj(vlm_img) + h_inv_skip  ← EquiLLM: H^r = proj(H^llm) + H'
+       SA+CA loop = SA(h_equi) → CA(h_equi ← h_cond) ← EquiLLM: EGNN(H^r, X̃')
+       text_ca    = standard CA: Q=[noequi|text], K=V=inv(h_vis)  ← text attends to vision,
+                    stays invariant (both Q and K/V invariant → output invariant ✓)
     4. Output: [B, n_equi*T_vis + n_noequi*T_vis + T_lang, D]
        [:n_equi*T]        equivariant vision tokens (regular repr)
        [n_equi*T:-T_lang] non-equi camera tokens (trivial-in-regular, invariant)
@@ -66,6 +67,11 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel
 from transformers.feature_extraction_utils import BatchFeature
 
+import escnn
+import escnn.nn as enn
+from escnn.group import CyclicGroup
+from gr00t.model.action_head.equivariant_cross_attention_dit import BasicTransformerBlock
+
 import gr00t
 
 DEFAULT_EAGLE_PATH = os.path.join(
@@ -76,30 +82,29 @@ DEFAULT_EAGLE_PATH = os.path.join(
 
 class EquiAdapter(nn.Module):
     """
-    Phase 3: FiLM-based equivariant adapter.
+    Phase 3: EquiLLM-faithful equivariant adapter (Section 3.2, Eq. 6).
 
-    Fuses equivariant h_equi (regular repr) with rich VLM context (vlm_img) via
-    token-aligned Feature-wise Linear Modulation (FiLM).
+    Single CA block: h_equi queries ← vlm_img keys/values (invariant context).
+    No SA — vlm_img already contains rich cross-modal context from the frozen VLM,
+    and h_equi has spatial structure from FA. One CA pass is sufficient to inject
+    language/visual context into the equivariant tokens.
 
-    Equivariance argument:
-      FiLM scale/shift are projected from vlm_img (invariant) and act only on the
-      scalar (block) dimension of the regular representation — they are broadcast
-      identically across all group slots.  Scaling/shifting the block dim uniformly
-      across the group is a G-equivariant operation:
-          ρ(g) · FiLM(h) = FiLM(ρ(g) · h)   ✓
-      because ρ(g) permutes group slots but leaves the block values unchanged.
+    Token-based adaptation:
+      h_cond    = lang_proj(vlm_img)          # project VLM output into equi space (invariant)
+      h_adapted = CA(h_equi, context=h_cond)  # equivariant queries attend to invariant context
 
-    FiLM formula (token-aligned, per block-channel):
-        film            = film_proj(vlm_img)              # [B, T, 2*blocks]
-        scale, shift    = film.chunk(2)                   # each [B, T, blocks]
-        h_vis           = h_vis * (1 + scale) + shift     # broadcast over n_group dim
+    Equivariance: CA queries come from h_equi (regular repr); K/V come from h_cond (invariant).
+    Attention weights are the same across all group slots → permutation of group slots
+    commutes with attention → output remains equivariant ✓
 
-    Zero-init on film_proj → scale=0, shift=0 at training start → identity (h_equi unchanged).
+    Language tokens (VLM output at text positions) are appended to output unchanged.
 
     Output: [B, n_equi*T_vis + n_noequi*T_vis + T_lang, D]
-      [:n_equi*T_vis]        equivariant vision tokens (FiLM-modulated, regular repr)
-      [n_equi*T:-T_lang]     non-equi camera tokens   (trivial-in-regular, invariant)
-      [-T_lang:]             language tokens           (trivial-in-regular, invariant)
+      [:n_equi*T_vis]    equivariant vision tokens (CA-modulated, regular repr)
+      [n_equi*T:-T_lang] non-equi camera tokens   (trivial-in-regular, invariant)
+      [-T_lang:]         language tokens           (trivial-in-regular, invariant)
+
+    Identity init: zero-init v_proj + o_proj + ff.fc2 → CA output = 0 at init ✓
     """
 
     def __init__(
@@ -107,6 +112,9 @@ class EquiAdapter(nn.Module):
         d_eq: int,
         d_llm: int,
         n_group: int,
+        num_heads: int = 32,
+        attention_head_dim: int = 64,
+        num_layers: int = 1,  # CA-only blocks (SA removed)
     ):
         super().__init__()
         self.n_group = n_group
@@ -114,21 +122,50 @@ class EquiAdapter(nn.Module):
         self.d_eq = d_eq
         blocks = d_eq // n_group
         self.blocks = blocks
+        scalar_dim = num_heads * attention_head_dim
+        assert scalar_dim % n_group == 0, (
+            f"num_heads*attention_head_dim ({scalar_dim}) must be divisible by n_group ({n_group})"
+        )
 
-        # film_proj: token-aligned FiLM scale+shift from vlm_img.
-        # Output 2*blocks: first half = scale, second half = shift.
-        # Both are invariant (projected from invariant vlm_img) and act on the
-        # scalar (block) dimension → equivariance preserved ✓
-        # Zero-init → identity at training start.
-        self.film_proj = nn.Linear(d_llm, 2 * blocks)
-        nn.init.zeros_(self.film_proj.weight)
-        nn.init.zeros_(self.film_proj.bias)
+        G = CyclicGroup(n_group)
+        gs = escnn.gspaces.no_base_space(G)
+
+        # h_prime type: equivariant vision tokens (regular repr)
+        equi_type     = enn.FieldType(gs, [gs.regular_repr] * blocks)
+        # h_cond type: invariant context (trivial repr)
+        inv_type      = enn.FieldType(gs, [gs.trivial_repr] * d_llm)
+        ff_inner_type = enn.FieldType(gs, [gs.regular_repr] * blocks)
+
+        # CA: h_equi queries ← lang_proj(vlm_img) keys/values (invariant context).
+        # No SA — downstream DiT handles token interaction; VLM already did cross-modal mixing.
+        self.ca_blocks = nn.ModuleList([
+            BasicTransformerBlock(
+                in_type=equi_type,
+                cross_attention_type=inv_type,
+                inner_type=ff_inner_type,
+                num_attention_heads=num_heads,
+                attention_head_dim=attention_head_dim,
+                norm_type="layer_norm",
+            )
+            for _ in range(num_layers)
+        ])
+
+        # lang_proj: project VLM output at image positions into equi space (invariant).
+        self.lang_proj = nn.Linear(d_llm, d_eq)
 
         # lang_embed / noequi_embed: reformat VLM output tokens as trivial-in-regular repr.
         # trivial-in-regular: R^blocks expanded as [v,v,...,v]×G → invariant subspace of regular repr.
-        # VLM already cross-attended text ↔ noequi ↔ inv(equi vision); no extra attention needed.
         self.lang_embed   = nn.Linear(d_eq, blocks)
         self.noequi_embed = nn.Linear(d_eq, blocks)
+
+        # Identity init: CA output = 0 at training start → h_equi passes through unchanged.
+        for ca_blk in self.ca_blocks:
+            for p in ca_blk.attn1.v_proj.parameters():
+                nn.init.zeros_(p)
+            for p in ca_blk.attn1.o_proj.parameters():
+                nn.init.zeros_(p)
+            for p in ca_blk.ff.fc2.parameters():
+                nn.init.zeros_(p)
 
     def forward(
         self,
@@ -139,37 +176,33 @@ class EquiAdapter(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            h_equi:     [B, n_equi, T_vis, D]   equivariant FA features (regular repr, skip)
-            vlm_img:    [B, n_equi*T_vis, D]    VLM output at equi-image positions (invariant)
+            h_equi:     [B, n_equi, T_vis, D]   equivariant FA features (X̃' analog, skip)
+            vlm_img:    [B, n_equi*T_vis, D]    VLM output at equi-image positions (H^llm analog)
             vlm_text:   [B, T_lang, D]           VLM output at text positions
             noequi_vlm: [B, n_noequi*T_vis, D]  VLM output at non-equi camera positions (optional)
         Returns:
             [B, n_equi*T_vis + n_noequi*T_vis + T_lang, D]
 
         Pipeline:
-          1. Token-aligned FiLM: modulate h_equi with scale/shift derived from vlm_img.
-          2. Reformat noequi/text as trivial-in-regular and concatenate.
+          CA: h_equi queries attend to lang_proj(vlm_img) context (invariant).
+          Output: [h_vis (equivariant) | noequi_trivial_reg | text_trivial_reg]
+            noequi/text reformatted as trivial-in-regular for downstream DiT compatibility.
         """
         B, n_equi, T, D = h_equi.shape
-        dt = self.film_proj.weight.dtype
+        dt = next(self.ca_blocks[0].parameters()).dtype
 
-        h_vis = h_equi.to(dt).reshape(B, n_equi * T, D)       # [B, n_equi*T, D]
-
-        # Token-aligned FiLM: vlm_img → scale + shift per block-channel.
-        # scale/shift shape: [B, n_equi*T, blocks] — broadcast over n_group slots.
-        film = self.film_proj(vlm_img.to(dt))                  # [B, n_equi*T, 2*blocks]
-        scale, shift = film.chunk(2, dim=-1)                   # each [B, n_equi*T, blocks]
-
-        h_vis_r = h_vis.reshape(B, n_equi * T, self.n_group, self.blocks)
-        h_vis_r = h_vis_r * (1 + scale.unsqueeze(-2)) + shift.unsqueeze(-2)
-        h_vis = h_vis_r.reshape(B, n_equi * T, D)
+        # CA context: project vlm_img into equi space (invariant).
+        h_cond = self.lang_proj(vlm_img.to(dt))                        # [B, n_equi*T, D]
+        h_vis = h_equi.to(dt).reshape(B, n_equi * T, D)
+        for ca_blk in self.ca_blocks:
+            h_vis = ca_blk(h_vis, encoder_hidden_states=h_cond)
 
         # Reformat noequi/text as trivial-in-regular: project to R^blocks → [v,v,...,v]×G.
         def to_trivial_reg(x, embed):
-            scalar = embed(x)                                  # [B, T, blocks]
+            scalar = embed(x)                                           # [B, T, blocks]
             return (scalar.unsqueeze(-2)
                     .expand(-1, -1, self.n_group, -1)
-                    .reshape(x.shape[0], -1, D))               # [B, T, D]
+                    .reshape(x.shape[0], -1, D))                       # [B, T, D]
 
         text_out = to_trivial_reg(vlm_text.to(dt), self.lang_embed)
         if noequi_vlm is not None:
@@ -213,6 +246,9 @@ class EagleBackboneFATokens(nn.Module):
         output_type: str = 'reg',  # 'reg' for regular representation
         # Phase 2/3: equivariant adapter
         use_inv_projector_for_vlm: bool = True,  # Phase 2: inject inv-proj tokens into LLM
+        equi_adapter_num_heads: int = 32,         # heads in SA/CA (reduced for data efficiency)
+        equi_adapter_attention_head_dim: int = 64, # head dim; scalar_dim = num_heads * head_dim
+        equi_adapter_num_layers: int = 1,        # CA-only blocks
     ):
         """
         Args:
@@ -237,6 +273,9 @@ class EagleBackboneFATokens(nn.Module):
         self.output_type = output_type
         self.project_to_dim = project_to_dim if project_to_dim else 2048
         self.use_inv_projector_for_vlm = use_inv_projector_for_vlm
+        self.equi_adapter_num_heads = equi_adapter_num_heads
+        self.equi_adapter_attention_head_dim = equi_adapter_attention_head_dim
+        self.equi_adapter_num_layers = equi_adapter_num_layers
 
         if rotate_image_indices is None:
             self.rotate_image_indices = list(range(num_images_per_sample))
@@ -292,13 +331,16 @@ class EagleBackboneFATokens(nn.Module):
         # Separate from inv_fa_proj (which projects to d_eagle for LLM injection, Phase 2).
         self.inv_adapter_proj = nn.Linear(d_eagle, self.project_to_dim)
 
-        # ── Phase 3: EquiAdapter (num_layers × SA+CA blocks) ────────────────
-        # EquiLLM-faithful: h_r = lang_proj(vl_equi) + h_inv (additive, not concat)
-        # SA on h_prime only; CA ← h_r.  Language tokens appended to output unchanged.
+        # ── Phase 3: EquiAdapter (num_layers × CA blocks, no SA) ────────────────
+        # CA: h_equi queries attend to lang_proj(vlm_img) context (invariant).
+        # Language tokens appended to output unchanged.
         self.equi_adapter = EquiAdapter(
             d_eq=self.project_to_dim,
             d_llm=self.project_to_dim,
             n_group=n_group,
+            num_heads=equi_adapter_num_heads,
+            attention_head_dim=equi_adapter_attention_head_dim,
+            num_layers=equi_adapter_num_layers,
         )
 
         # Initialize rotation and frame averaging components
@@ -317,7 +359,9 @@ class EagleBackboneFATokens(nn.Module):
         print(f"  non_equi_image_indices: {self.non_equi_image_indices}")
         print(f"  output_type: {self.output_type}")
         print(f"  use_inv_projector_for_vlm: {self.use_inv_projector_for_vlm}")
-        print(f"  equi_adapter: FiLM (token-aligned scale+shift, zero-init)")
+        print(f"  equi_adapter_num_layers:       {self.equi_adapter_num_layers} (CA-only blocks)")
+        print(f"  equi_adapter_num_heads:        {self.equi_adapter_num_heads}")
+        print(f"  equi_adapter_attention_head_dim: {self.equi_adapter_attention_head_dim}  (scalar_dim={self.equi_adapter_num_heads * self.equi_adapter_attention_head_dim})")
         print(f"  Using FULL vision tokens (not pooled)")
         print(f"  Token grid size: {self.token_grid_size}x{self.token_grid_size}")
 
