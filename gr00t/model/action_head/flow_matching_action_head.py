@@ -41,7 +41,9 @@ from gr00t.model.action_head.action_encoder import (
 )
 from gr00t.model.common import RotationTransformer
 
-from .equivariant_cross_attention_dit import EDiT, EquiVisionTransformer, EquivariantLayerNorm
+from .equivariant_cross_attention_dit import EquivariantLayerNorm
+from .cross_attention_dit import DiT
+from .fa_modules import FAEncoder, EquiResAdapter
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -312,6 +314,15 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         metadata={"help": "Apply EquivariantLayerNorm to backbone VL features before DiT cross-attention. "
                           "Stabilises scale of randomly-initialised backbone new layers vs frozen VLM output."}
     )
+    equi_adapter_num_layers: int = field(
+        default=2, metadata={"help": "Number of SA+CA blocks in EquiResAdapter."}
+    )
+    equi_adapter_warmup_steps: int = field(
+        default=500, metadata={"help": "Warm-up steps for EquiResAdapter scale 0→1."}
+    )
+    tune_inv_dit: bool = field(
+        default=False, metadata={"help": "Whether to fine-tune the frozen pretrained DiT (inv_dit)."}
+    )
     def __init__(self, **kwargs):
         import dataclasses
         super().__init__(**kwargs)
@@ -344,17 +355,11 @@ class FlowmatchingActionHead(nn.Module):
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
-        # Inject n_group into diffusion model config
-        diffusion_cfg = {
-            **config.diffusion_model_cfg,
-            "n_group": self.n_group,
-        }
-        self.model = EDiT(**diffusion_cfg)
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
 
-        # equi state
+        # Group / field type setup
         self.rel_action = self.config.rel_action
         self.ee_dim = 7 if self.config.rot_type == "quaternion" else 6
         self.real_dim = 12 if self.rel_action else 9
@@ -364,39 +369,75 @@ class FlowmatchingActionHead(nn.Module):
         self.state_out_type = enn.FieldType(self.group, int(config.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
         self.axisangle_to_sixd = RotationTransformer('axis_angle', 'rotation_6d')
-        
         self.quaternion_to_matrix = RotationTransformer('quaternion', 'matrix')
         self.axisangle_to_matrix = RotationTransformer('axis_angle', 'matrix')
-        
-        self.state_encoder = EquiCategorySpecificMLP(
-            num_categories=config.max_num_embodiments,
-            in_type=self.state_in_type,
-            hidden_type=self.state_hidden_type,
-            out_type=self.state_out_type,
-        )
-        
+
         self.action_type = self.getJointFieldType(is_action=True) if not self.rel_action else self.getActionRelFieldType(is_action=True)
         self.action_out_type = enn.FieldType(self.group, int(self.input_embedding_dim / self.n_group) * [self.group.regular_repr])
-        
-        self.action_encoder = MultiEmbodimentActionEncoder(
-            in_type=self.action_type,
-            out_type=self.action_out_type,
-            num_embodiments=config.max_num_embodiments,
+
+        # ── inv_dit: frozen pretrained plain DiT (loaded from baseline checkpoint) ──────────
+        # cross_attention_dim is set to backbone.project_to_dim by gr00t_finetune.py;
+        # n_group is excluded (DiT is not equivariant).
+        inv_dit_cfg = {k: v for k, v in config.diffusion_model_cfg.items() if k != "n_group"}
+        self.inv_dit = DiT(**inv_dit_cfg)
+
+        # ── FA encoders: FA wraps frozen pretrained encoders ──────────────────────────────
+        self.fa_state_encoder = FAEncoder(
+            pretrained_encoder=EquiCategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                in_type=self.state_in_type,
+                hidden_type=self.state_hidden_type,
+                out_type=self.state_out_type,
+            ),
+            in_type=self.state_in_type,
+            n_group=self.n_group,
+            output_dim=config.input_embedding_dim,
         )
-        
+        self.fa_action_encoder = FAEncoder(
+            pretrained_encoder=MultiEmbodimentActionEncoder(
+                in_type=self.action_type,
+                out_type=self.action_out_type,
+                num_embodiments=config.max_num_embodiments,
+            ),
+            in_type=self.action_type,
+            n_group=self.n_group,
+            output_dim=config.input_embedding_dim,
+        )
+
+        # ── Projections ──────────────────────────────────────────────────────────────────
+        # equi_proj: 1536 → 1024  (equivariant, projects FA equi features to DiT hidden dim)
+        self.equi_proj = enn.Linear(self.state_out_type, self.state_hidden_type)
+
+        # vl_inv_proj: D/N → cross_attn_dim  (invariant, for inv_dit cross-attention context)
+        _inv_scalar_dim = config.backbone_embedding_dim // self.n_group
+        _cross_attn_dim = config.diffusion_model_cfg.get("cross_attention_dim", config.backbone_embedding_dim)
+        self.vl_inv_proj = nn.Linear(_inv_scalar_dim, _cross_attn_dim)
+
+        # ── EquiResAdapter: lightweight equivariant corrections ───────────────────────────
+        _equi_blk = config.hidden_size // self.n_group
+        _equi_in_type = enn.FieldType(self.group, [self.group.regular_repr] * _equi_blk)
+        self.equi_res_adapter = EquiResAdapter(
+            in_type=_equi_in_type,
+            inv_dim=config.hidden_size,
+            num_layers=config.equi_adapter_num_layers,
+            num_attention_heads=config.diffusion_model_cfg["num_attention_heads"],
+            attention_head_dim=config.diffusion_model_cfg["attention_head_dim"],
+            dropout=config.diffusion_model_cfg.get("dropout", 0.2),
+            final_dropout=config.diffusion_model_cfg.get("final_dropout", True),
+        )
+
+        # ── Action decoder (fresh init — geometry-corrected output → action space) ────────
         self.action_decoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
             in_type=self.state_hidden_type,
             hidden_type=self.state_hidden_type,
             out_type=self.action_type,
         )
-        
+
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
-        # Equivariant LayerNorm applied to backbone VL features before DiT cross-attention.
-        # backbone_embedding_dim is project_to_dim from backbone (default 1536 = n_group * blocks).
-        # EquivariantLayerNorm normalises per block-slot across the group dimension, preserving equivariance.
+        # Equivariant LayerNorm on backbone equi vision features before EquiResAdapter CA.
         if config.use_vl_layer_norm:
             _vl_blocks = config.backbone_embedding_dim // self.n_group
             _vl_type = enn.FieldType(self.group, [self.group.regular_repr] * _vl_blocks)
@@ -405,15 +446,13 @@ class FlowmatchingActionHead(nn.Module):
             self.vl_layer_norm = None
 
         if config.add_pos_embed:
-            # Equivariant temporal position embeddings for state and action tokens.
-            # Embeddings are in trivial (invariant) repr, then projected to regular repr via
-            # enn.Linear — this is equivariant because trivial → regular is always equivariant.
-            _D = self.model.in_type.size
+            # Equivariant temporal position embeddings: trivial → state_out_type (regular).
+            _D = config.input_embedding_dim
             self.temporal_pos_trivial_type = enn.FieldType(
                 self.group, [self.group.trivial_repr] * _D
             )
             self.temporal_pos_embed = nn.Embedding(config.max_seq_len, _D)
-            self.temporal_pos_proj = enn.Linear(self.temporal_pos_trivial_type, self.model.in_type)
+            self.temporal_pos_proj = enn.Linear(self.temporal_pos_trivial_type, self.state_out_type)
             nn.init.normal_(self.temporal_pos_embed.weight, mean=0.0, std=0.02)
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
@@ -689,68 +728,73 @@ class FlowmatchingActionHead(nn.Module):
         self.tune_diffusion_model = tune_diffusion_model
         for p in self.parameters():
             p.requires_grad = True
+        # Always freeze pretrained encoders inside FA wrappers
+        self.fa_state_encoder.pretrained_encoder.requires_grad_(False)
+        self.fa_action_encoder.pretrained_encoder.requires_grad_(False)
+        # Always freeze inv_dit unless explicitly requested
+        if not getattr(self.config, "tune_inv_dit", False):
+            self.inv_dit.requires_grad_(False)
         if not tune_projector:
             print("set requires_grad false for tune projector")
-            self.state_encoder.requires_grad_(False)
-            self.action_encoder.requires_grad_(False)
-            self.action_decoder.requires_grad_(False)
+            self.equi_proj.requires_grad_(False)
+            self.vl_inv_proj.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.temporal_pos_embed.requires_grad_(False)
                 self.temporal_pos_proj.requires_grad_(False)
         if not tune_diffusion_model:
             print("set requires_grad false for tune diffusion model")
-            
-            self.model.requires_grad_(False)
+            self.equi_res_adapter.requires_grad_(False)
         print(f"Tune action head projector: {self.tune_projector}")
         print(f"Tune action head diffusion model: {self.tune_diffusion_model}")
-        # Check if any parameters are still trainable. If not, print a warning.
-        if not tune_projector and not tune_diffusion_model:
-            for name, p in self.named_parameters():
-                if p.requires_grad:
-                    print(f"Action head trainable parameter: {name}")
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No action head trainable parameters found.")
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         """
-        Custom load_state_dict that handles the transition from old state_encoder (simple linear)
-        to new state_encoder (ESCNN equivariant).
-        
-        Old checkpoint has: action_head.state_encoder.layer1.W, action_head.state_encoder.layer1.b
-        New model has: action_head.state_encoder.layer1.layers.*.* (ESCNN linear layers)
-        
-        This method filters out incompatible state_encoder keys to prevent weight mismatches.
+        Remaps baseline checkpoint keys to the new dual-stream architecture.
+
+        Baseline (gr00t_baseline_locht1) → new name:
+          model.*          → inv_dit.*
+          state_encoder.*  → fa_state_encoder.pretrained_encoder.*
+          action_encoder.* → fa_action_encoder.pretrained_encoder.*
+          action_decoder.* → skipped (fresh init)
+          equi_res_adapter.* → skipped (fresh init)
         """
-        # Filter out old state_encoder weights that don't match the new ESCNN architecture
-        filtered_state_dict = {}
+        remapped = {}
+        skip_prefixes = (
+            "action_decoder.",
+            "equi_res_adapter.",
+            "future_tokens_equi_proj.", "vl_equi_proj.", "vlln.",
+            "vl_self_attention.", "language_proj.", "language_lift.", "equi_vis_proj.",
+        )
         for key, value in state_dict.items():
-            # Skip old-style state_encoder weights
-            if 'state_encoder.layer' in key or 'action_encoder' in key or 'action_decoder' in key or "model" in key or "future_tokens_equi_proj" in key or "vl_equi_proj" in key or "vlln" in key or "vl_self_attention" in key or "language_proj" in key or "language_lift" in key or "equi_vis_proj" in key:
-                print(f"Skipping incompatible state_encoder weight: {key}")
-                continue
-            filtered_state_dict[key] = value
-        # print(filtered_state_dict)
-        # Call parent's load_state_dict with filtered state
-        return super().load_state_dict(filtered_state_dict, strict=False, assign=assign)
+            if key.startswith("model."):
+                remapped["inv_dit." + key[len("model."):]] = value
+            elif key.startswith("state_encoder."):
+                remapped["fa_state_encoder.pretrained_encoder." + key[len("state_encoder."):]] = value
+            elif key.startswith("action_encoder."):
+                remapped["fa_action_encoder.pretrained_encoder." + key[len("action_encoder."):]] = value
+            elif key.startswith(skip_prefixes):
+                print(f"Skipping (fresh init): {key}")
+            else:
+                remapped[key] = value
+        return super().load_state_dict(remapped, strict=False, assign=assign)
 
     def set_frozen_modules_to_eval_mode(self):
         """
-        Huggingface will call model.train() at each training_step. To ensure
-        the expected behaviors for modules like dropout, batchnorm, etc., we
-        need to call model.eval() for the frozen modules.
+        Huggingface calls model.train() each step — keep frozen modules in eval.
         """
         if self.training:
-            if not self.tune_projector:
-                print("not tune projector")
-                self.state_encoder.eval()
-                self.action_encoder.eval()
-                self.action_decoder.eval()
-                if self.config.add_pos_embed:
-                    self.temporal_pos_embed.eval()
-                    self.temporal_pos_proj.eval()
+            # Pretrained encoders inside FA wrappers are always frozen
+            self.fa_state_encoder.pretrained_encoder.eval()
+            self.fa_action_encoder.pretrained_encoder.eval()
+            if not getattr(self.config, "tune_inv_dit", False):
+                self.inv_dit.eval()
+            if not self.tune_projector and self.config.add_pos_embed:
+                self.temporal_pos_embed.eval()
+                self.temporal_pos_proj.eval()
             if not self.tune_diffusion_model:
-                print("not tune diffusion model")
-                self.model.eval()
+                self.equi_res_adapter.eval()
 
     def _add_temporal_pos_embed(self, features: torch.Tensor) -> torch.Tensor:
         """Add equivariant temporal position embeddings to a [B, T, D] feature tensor."""
@@ -812,7 +856,12 @@ class FlowmatchingActionHead(nn.Module):
             )
             vl_features = self.vl_layer_norm(vl_geo).tensor.reshape(Bv, Tv, Dv).to(dtype=equi_vis.dtype)
 
-        backbone_output.data["vl_features"] = vl_features
+        backbone_output.data["vl_features"] = vl_features  # equi vision [B, T_equi, D]
+
+        # Store invariant features for inv_dit cross-attention
+        if "backbone_inv_features" in backbone_output:
+            backbone_output.data["vl_inv_features"] = backbone_output.backbone_inv_features
+
         return backbone_output
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
@@ -840,198 +889,209 @@ class FlowmatchingActionHead(nn.Module):
                 expanded = v.repeat(*factors)
                 action_input[k] = expanded
 
-        # Equi cross-attention context from process_backbone_output.
-        vl_embs = backbone_output.vl_features                     # [B, n_equi*K, cross_attn_dim]
-        encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*K], all-ones
-
-        # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
-        
-        # Embed state.
-        B, T, _ = action_input.state.shape
-        state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
-        state_features = self.state_encoder(state_input, embodiment_id)
-        state_features = state_features.tensor
-        state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=B, t=T)
-        
-        # Embed noised action trajectory.
-        actions = action_input.action
-        
-        actions_gt = self.getActionGT(actions)
-        
-        noise = torch.randn(actions_gt.shape, device=actions_gt.device, dtype=actions_gt.dtype)
-        t = self.sample_time(actions_gt.shape[0], device=actions_gt.device, dtype=actions_gt.dtype)
-        t = t[:, None, None]  # shape (B,1,1) for broadcast
+        B, T_s, _ = action_input.state.shape
 
+        # ── FA State encoding ─────────────────────────────────────────────────
+        geo_state = self.getJointGeometricTensor(action_input.state, is_action=False)
+        equi_state, inv_state = self.fa_state_encoder.encode(geo_state, embodiment_id.repeat(T_s))
+        equi_state = einops.rearrange(equi_state, '(b t) c -> b t c', b=B, t=T_s)
+        inv_state  = einops.rearrange(inv_state,  '(b t) c -> b t c', b=B, t=T_s)
+
+        # ── Noise + FA Action encoding ────────────────────────────────────────
+        actions_gt = self.getActionGT(action_input.action)
+        noise = torch.randn(actions_gt.shape, device=actions_gt.device, dtype=actions_gt.dtype)
+        t = self.sample_time(B, device=actions_gt.device, dtype=actions_gt.dtype)
+        t = t[:, None, None]
         noisy_trajectory = (1 - t) * noise + t * actions_gt
         velocity = actions_gt - noise
-
-        # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
-        
-        noisy_trajectory = einops.rearrange(
-            noisy_trajectory, "b t c -> (b t) c"
-        )
-        
-        noisy_trajectory = enn.GeometricTensor(noisy_trajectory, self.action_type)
 
-        action_encoder_embodiment_id = embodiment_id.repeat((actions_gt.shape[1]))
-        action_features = self.action_encoder(noisy_trajectory, t_discretized, action_encoder_embodiment_id)
-        action_features = action_features.tensor
-        action_features = einops.rearrange(
-            action_features,
-            '(b t) c -> b t c',
-            b=actions_gt.shape[0],
-            t=actions_gt.shape[1]
+        T_a = actions_gt.shape[1]
+        geo_action = enn.GeometricTensor(
+            einops.rearrange(noisy_trajectory, 'b t c -> (b t) c'), self.action_type
         )
+        action_emb_id = embodiment_id.repeat(T_a)
+        equi_action, inv_action = self.fa_action_encoder.encode(geo_action, action_emb_id, t_discretized)
+        equi_action = einops.rearrange(equi_action, '(b t) c -> b t c', b=B, t=T_a)
+        inv_action  = einops.rearrange(inv_action,  '(b t) c -> b t c', b=B, t=T_a)
 
         if self.config.add_pos_embed:
-            state_features = self._add_temporal_pos_embed(state_features)
-            action_features = self._add_temporal_pos_embed(action_features)
+            equi_state  = self._add_temporal_pos_embed(equi_state)
+            inv_state   = self._add_temporal_pos_embed(inv_state)
+            equi_action = self._add_temporal_pos_embed(equi_action)
+            inv_action  = self._add_temporal_pos_embed(inv_action)
 
-        # State + action only — vision is cross-attention context, not a prefix
-        sa_embs = torch.cat((state_features, action_features), dim=1)
+        # ── Invariant branch: frozen pretrained DiT ───────────────────────────
+        # vl_inv: invariant backbone scalars [B, T_rest, D/N], projected up for inv_dit
+        encoder_mask = backbone_output.backbone_attention_mask
+        if "vl_inv_features" in backbone_output:
+            vl_inv = backbone_output.vl_inv_features                  # [B, T_rest, D/N]
+            vl_inv_proj = self.vl_inv_proj(vl_inv.to(self.vl_inv_proj.weight.dtype))
+        else:
+            # Fallback: extract invariant scalars from equi features via mean over group slots
+            vl_equi = backbone_output.vl_features
+            N = self.n_group
+            Bv, Tv, Dv = vl_equi.shape
+            vl_inv_proj = self.vl_inv_proj(
+                vl_equi.reshape(Bv, Tv, Dv // N, N).mean(-1).to(self.vl_inv_proj.weight.dtype)
+            )
 
-        model_output = self.model(
-            hidden_states=sa_embs,
-            encoder_hidden_states=vl_embs,
+        sa_embs_inv = torch.cat([inv_state, inv_action], dim=1)  # [B, T_sa, D]
+        inv_output  = self.inv_dit(
+            hidden_states=sa_embs_inv,
+            encoder_hidden_states=vl_inv_proj,
             encoder_attention_mask=encoder_mask,
             timestep=t_discretized,
-            return_all_hidden_states=False
+        )                                                          # [B, T_sa, hidden_size]
+
+        # ── Equivariant branch: lightweight EquiResAdapter ────────────────────
+        sa_embs_equi = torch.cat([equi_state, equi_action], dim=1)  # [B, T_sa, D]
+        # Project equi features 1536 → hidden_size (equivariant)
+        equi_sa_proj = self.equi_proj(
+            enn.GeometricTensor(
+                einops.rearrange(sa_embs_equi, 'b t c -> (b t) c'),
+                self.state_out_type,
+            )
+        ).tensor
+        equi_sa_proj = einops.rearrange(equi_sa_proj, '(b t) c -> b t c',
+                                        b=sa_embs_equi.shape[0], t=sa_embs_equi.shape[1])
+        equi_delta = self.equi_res_adapter(equi_sa_proj, context=inv_output)  # [B, T_sa, hidden_size]
+
+        # ── Residual fusion: lift inv_output to regular repr + add equi delta ─
+        N = self.n_group
+        T_sa = inv_output.shape[1]
+        D = inv_output.shape[2]
+        # Lift inv_output to trivial-in-regular repr:
+        # average each (D/N)-block over N group slots → scalar, then replicate N times.
+        inv_scalar = inv_output.view(B, T_sa, D // N, N).mean(-1)      # [B, T_sa, D//N]
+        inv_lifted = inv_scalar.unsqueeze(-1).expand(-1, -1, -1, N).reshape(B, T_sa, D)
+        output = inv_lifted + equi_delta                           # [B, T_sa, hidden_size]
+
+        # ── Equi action decoder ───────────────────────────────────────────────
+        action_decoder_emb_id = embodiment_id.repeat(T_sa)
+        output_flat = enn.GeometricTensor(
+            einops.rearrange(output, 'b t c -> (b t) c'), self.state_hidden_type
         )
+        pred = self.action_decoder(output_flat, action_decoder_emb_id)
+        pred = einops.rearrange(pred.tensor, '(b t) c -> b t c', b=B, t=T_sa)
 
-        N_sa = model_output.shape[1]
+        pred_actions = pred[:, -T_a:]
 
-        action_decoder_embodiment_id = embodiment_id.repeat(N_sa)
-
-        model_output = einops.rearrange(
-            model_output,
-            'b t c -> (b t) c',
-        )
-        model_output = enn.GeometricTensor(model_output, self.state_hidden_type)
-        pred = self.action_decoder(model_output, action_decoder_embodiment_id)
-
-        pred = einops.rearrange(
-            pred.tensor,
-            '(b t) c -> b t c',
-            b=sa_embs.shape[0],
-            t=N_sa,
-        )
-
-        pred_actions = pred[:, -actions_gt.shape[1] :, :]
-
-        # pred_actions = self.getActionOutput(pred_actions)
-        # Slice out only the action portion of pred and target.
         with torch.no_grad():
             velocity_dim = velocity.shape[-1]
-            # Transform mask from original rotation space (quat/axisangle) to rot6d velocity
-            # space, accounting for the dimension expansion done by getActionGT:
-            #   quat (7) -> 9 per hand (+2), axisangle (6) -> 9 per hand (+3)
             action_mask = self.transform_action_mask(
                 action_input.action_mask.float(), velocity_dim
             ).to(velocity.device)
         loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = loss.sum() / action_mask.sum()
-        output_dict = {
-            "loss": loss,
-        }
-        return BatchFeature(data=output_dict)
+        return BatchFeature(data={"loss": loss})
 
     @torch.no_grad()
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
-        self.model.eval()
+        self.inv_dit.eval()
         self.action_decoder.eval()
-        self.state_encoder.eval()
-        self.action_encoder.eval()
-        
+        self.fa_state_encoder.eval()
+        self.fa_action_encoder.eval()
+        self.equi_res_adapter.eval()
+
         backbone_output = self.process_backbone_output(backbone_output)
-
-        # Equi cross-attention context from process_backbone_output.
-        vl_embs = backbone_output.vl_features                     # [B, n_equi*K, cross_attn_dim]
-        encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*K], all-ones
-
+        encoder_mask = backbone_output.backbone_attention_mask
         embodiment_id = action_input.embodiment_id
+        B, T_s, _ = action_input.state.shape
 
-        # Embed state.
-        B, T, _ = action_input.state.shape
-        state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
-        state_features = self.state_encoder(state_input, embodiment_id)
-        state_features = state_features.tensor
-        state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=B, t=T)
-
+        # ── FA State encoding (once, outside denoising loop) ─────────────────
+        geo_state = self.getJointGeometricTensor(action_input.state, is_action=False)
+        equi_state, inv_state = self.fa_state_encoder.encode(geo_state, embodiment_id.repeat(T_s))
+        equi_state = einops.rearrange(equi_state, '(b t) c -> b t c', b=B, t=T_s)
+        inv_state  = einops.rearrange(inv_state,  '(b t) c -> b t c', b=B, t=T_s)
         if self.config.add_pos_embed:
-            state_features = self._add_temporal_pos_embed(state_features)
+            equi_state = self._add_temporal_pos_embed(equi_state)
+            inv_state  = self._add_temporal_pos_embed(inv_state)
 
-        # Set initial actions as the sampled noise.
-        batch_size = vl_embs.shape[0]
-        device = vl_embs.device
+        # ── Prepare vl_inv context for inv_dit ───────────────────────────────
+        if "vl_inv_features" in backbone_output:
+            vl_inv_proj = self.vl_inv_proj(
+                backbone_output.vl_inv_features.to(self.vl_inv_proj.weight.dtype)
+            )
+        else:
+            vl_equi = backbone_output.vl_features
+            N = self.n_group
+            Bv, Tv, Dv = vl_equi.shape
+            vl_inv_proj = self.vl_inv_proj(
+                vl_equi.reshape(Bv, Tv, Dv // N, N).mean(-1).to(self.vl_inv_proj.weight.dtype)
+            )
+
+        device = inv_state.device
+        batch_size = B
         actions = torch.randn(
-                    size=(batch_size, self.config.action_horizon, self.action_type.size),
-                    dtype=vl_embs.dtype,
-                    device=device,
-                )
+            size=(batch_size, self.config.action_horizon, self.action_type.size),
+            dtype=inv_state.dtype, device=device,
+        )
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
 
-        # Run denoising steps.
+        N = self.n_group
+
         for t in range(num_steps):
-            t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
+            t_cont = t / float(num_steps)
             t_discretized = int(t_cont * self.num_timestep_buckets)
+            timesteps_tensor = torch.full((batch_size,), fill_value=t_discretized, device=device)
 
-            # Embed noised action trajectory.
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
+            # FA Action encoding
+            T_a = actions.shape[1]
+            action_emb_id = embodiment_id.repeat(T_a)
+            geo_action = enn.GeometricTensor(
+                einops.rearrange(actions, 'b t c -> (b t) c'), self.action_type
             )
-            action_encoder_embodiment_id = embodiment_id.repeat((actions.shape[1]))
-            noisy_trajectory = einops.rearrange(
-                actions, "b t c -> (b t) c"
+            equi_action, inv_action = self.fa_action_encoder.encode(
+                geo_action, action_emb_id, timesteps_tensor
             )
-            noisy_trajectory = enn.GeometricTensor(noisy_trajectory, self.action_type)
-            action_features = self.action_encoder(noisy_trajectory, timesteps_tensor, action_encoder_embodiment_id)
-            action_features = action_features.tensor
-            action_features = einops.rearrange(
-                action_features,
-                '(b t) c -> b t c',
-                b=actions.shape[0],
-                t=actions.shape[1]
-            )
-
+            equi_action = einops.rearrange(equi_action, '(b t) c -> b t c', b=B, t=T_a)
+            inv_action  = einops.rearrange(inv_action,  '(b t) c -> b t c', b=B, t=T_a)
             if self.config.add_pos_embed:
-                action_features = self._add_temporal_pos_embed(action_features)
+                equi_action = self._add_temporal_pos_embed(equi_action)
+                inv_action  = self._add_temporal_pos_embed(inv_action)
 
-            # State + action only — vision is cross-attention context, not a prefix
-            sa_embs = torch.cat((state_features, action_features), dim=1)
-
-            # Run model forward.
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
+            # Invariant branch
+            sa_embs_inv = torch.cat([inv_state, inv_action], dim=1)
+            inv_output  = self.inv_dit(
+                hidden_states=sa_embs_inv,
+                encoder_hidden_states=vl_inv_proj,
                 encoder_attention_mask=encoder_mask,
                 timestep=timesteps_tensor,
             )
 
-            N_sa = model_output.shape[1]
-
-            action_decoder_embodiment_id = embodiment_id.repeat(N_sa)
-
-            model_output = einops.rearrange(
-                model_output,
-                'b t c -> (b t) c',
+            # Equivariant branch
+            sa_embs_equi = torch.cat([equi_state, equi_action], dim=1)
+            equi_sa_proj = self.equi_proj(
+                enn.GeometricTensor(
+                    einops.rearrange(sa_embs_equi, 'b t c -> (b t) c'), self.state_out_type
+                )
+            ).tensor
+            equi_sa_proj = einops.rearrange(
+                equi_sa_proj, '(b t) c -> b t c', b=B, t=sa_embs_equi.shape[1]
             )
-            model_output = enn.GeometricTensor(model_output, self.state_hidden_type)
-            pred = self.action_decoder(model_output, action_decoder_embodiment_id)
+            equi_delta = self.equi_res_adapter(equi_sa_proj, context=inv_output)
 
-            pred = einops.rearrange(
-                pred.tensor,
-                '(b t) c -> b t c',
-                b=sa_embs.shape[0],
-                t=N_sa,
+            # Residual fusion
+            T_sa = inv_output.shape[1]
+            D = inv_output.shape[2]
+            inv_lifted = (inv_output.view(B, T_sa, D // N, 1)
+                          .expand(-1, -1, -1, N).reshape(B, T_sa, D))
+            output = inv_lifted + equi_delta
+
+            # Decode
+            dec_emb_id = embodiment_id.repeat(T_sa)
+            output_flat = enn.GeometricTensor(
+                einops.rearrange(output, 'b t c -> (b t) c'), self.state_hidden_type
             )
+            pred = self.action_decoder(output_flat, dec_emb_id)
+            pred = einops.rearrange(pred.tensor, '(b t) c -> b t c', b=B, t=T_sa)
 
-            pred_velocity = pred[:, -self.action_horizon :]
-            # Update actions using euler integration.
+            pred_velocity = pred[:, -self.action_horizon:]
             actions = actions + dt * pred_velocity
-            
+
         actions = self.getActionOutput(actions)
         return BatchFeature(data={"action_pred": actions})
     
