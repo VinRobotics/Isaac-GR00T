@@ -159,7 +159,7 @@ def forward_policy_recap(
     action_mask = action_input.action_mask                     # (B, H, action_dim)
 
     # ── Step 3: UNCONDITIONAL term  −log πθ(at|ot,ℓ) ─────────────────────
-    # Inject NULL token (∅) — no optimality signal
+    # Inject NULL token — no optimality signal
     vl_embs_null, vl_attn_mask_null = action_head._apply_advantage_conditioning(
         vl_embs_raw, vl_attn_mask,
         advantage_label=None,    # → all NULL_IDX = ∅

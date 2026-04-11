@@ -140,8 +140,8 @@ class AdvantageEmbedding(nn.Module):
     Three indices:
         NULL_IDX (0)  – unconditional token used during CFG dropout and the
                         unconditional forward pass at inference.
-        NEG_IDX  (1)  – A(o, a) ≤ eps_l  →  "Advantage: negative"
-        POS_IDX  (2)  – A(o, a)  > eps_l  →  "Advantage: positive"
+        NEG_IDX  (1)  – A(o, a) ≤ eps_l  ->  "Advantage: negative"
+        POS_IDX  (2)  – A(o, a)  > eps_l  ->  "Advantage: positive"
  
     The embedding is appended to encoder_hidden_states so the cross-attention
     in DiT can condition the velocity field on optimality.
@@ -179,15 +179,15 @@ class DistributionalValueHeadConfig(PretrainedConfig):
  
     Architecture:
         backbone_features  (B, S, backbone_dim)
-            → mean-pool over sequence          (B, backbone_dim)
-            → LayerNorm
-            → MLP  (backbone_dim → hidden_dim → num_bins)
-            → softmax  →  pϕ(V | o_t, l)      (B, num_bins)
+            -> mean-pool over sequence          (B, backbone_dim)
+            -> LayerNorm
+            -> MLP  (backbone_dim -> hidden_dim -> num_bins)
+            -> softmax  ->  pϕ(V | o_t, l)      (B, num_bins)
  
     Return bins:
         Normalised to (-1, 0) following pi*0.6 §V-C.
-        bin 0  →  value  -1.0   (worst / failed episode)
-        bin B-1 → value   0.0   (successful completion, 0 steps remaining)
+        bin 0  ->  value  -1.0   (worst / failed episode)
+        bin B-1 -> value   0.0   (successful completion, 0 steps remaining)
     """
     backbone_embedding_dim: int = field(default=1536)
 
@@ -331,9 +331,9 @@ class DistributionalValueHead(nn.Module):
         """
         Fuse vision-language and proprioceptive state, then predict bins.
 
-        backbone_features: mean-pooled VL tokens  → (B, D)
-        state:             raw proprioception      → projected to (B, D)
-        concatenated                               → (B, 2D)  → MLP  → (B, num_bins)
+        backbone_features: mean-pooled VL tokens  -> (B, D)
+        state:             raw proprioception      -> projected to (B, D)
+        concatenated                               -> (B, 2D)  -> MLP  -> (B, num_bins)
         """
         cls = self.cls_token.float().expand(backbone_features.shape[0], -1, -1)  # (B, 1, seq_dim)
         backbone_features = self.norm_in(backbone_features)
@@ -533,7 +533,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
             "help": (
                 "alpha in RECAP Eq. 3: weight of conditional term relative to "
                 "unconditional term. pi*0.6 uses alpha=1.0 (equal weight). "
-                "Higher alpha → stronger push toward advantage-conditioned behavior."
+                "Higher alpha -> stronger push toward advantage-conditioned behavior."
             )
         },
     )
@@ -867,7 +867,7 @@ class FlowmatchingActionHead(nn.Module):
             # but has NOT had the advantage token appended — correct input.
             value_loss = self.value_head.compute_loss(
                 vl_embs,
-                action_input.state.float(),              # ← add state
+                action_input.state.float(),              # <- add state
                 empirical_return,
             )
             output_dict = {
@@ -909,23 +909,24 @@ class FlowmatchingActionHead(nn.Module):
         embodiment_id = action_input.embodiment_id
 
         # Inject advantage token
-        if self.config.use_advantage_conditioning:
-            assert "reward" in action_input.keys(), f"No reward found in {action_input.keys()=}"
-            reward = torch.squeeze(action_input["reward"], dim=-1)
+        assert "reward" in action_input.keys(), f"No reward found in {action_input.keys()=}"
+        reward = torch.squeeze(action_input["reward"], dim=-1)
 
-            adv_label = torch.where(reward < 0, AdvantageEmbedding.NEG_IDX, AdvantageEmbedding.POS_IDX)
-            with torch.no_grad():
-                adv_labels = compute_advantage_labels_from_value_head(
-                    value_head=self.value_head,
-                    backbone_feats=vl_embs_raw,
-                    state=action_input.state.float(),
-                    reward=reward,
-                    percentile=getattr(self.config, "advantage_threshold_percentile", 0.30),
-                )
-
-            vl_embs, vl_attn_mask = self._apply_advantage_conditioning(
-                vl_embs, vl_attn_mask, adv_label
+        adv_label = torch.where(reward < 0, AdvantageEmbedding.NEG_IDX, AdvantageEmbedding.POS_IDX)
+        with torch.no_grad():
+            adv_label = self.compute_advantage_labels_from_value_head(
+            backbone_feats=vl_embs,
+            state=action_input.state.float(),
+            reward=reward,
+            percentile=self.config.advantage_threshold_percentile
+            if hasattr(self.config, "advantage_threshold_percentile")
+            else 0.30,
             )
+
+        pos_frac = (adv_label == AdvantageEmbedding.POS_IDX).float().mean()
+
+        # --- Step 2: build noised trajectory (shared for both terms) ──────────
+        # CFGRL Alg 1
 
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
@@ -953,30 +954,65 @@ class FlowmatchingActionHead(nn.Module):
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
-        vl_attn_mask = backbone_output.backbone_attention_mask
+        # --- Step 3: UNCONDITIONAL term ──────────
+        # Inject NULL token — no optimality signal
 
-        model_output = self.model(
-            hidden_states=sa_embs,
-            encoder_hidden_states=vl_embs,
-            encoder_attention_mask=vl_attn_mask,
-            timestep=t_discretized,
-            return_all_hidden_states=False,  # NOTE (YL): not using flare now
+        vl_embs_null, vl_attn_mask_null = self._apply_advantage_conditioning(
+            vl_embs, vl_attn_mask,
+            advantage_label=None,    # -> all NULL_IDX
         )
-        pred = self.action_decoder(model_output, embodiment_id)
-        pred_actions = pred[:, -actions.shape[1] :]
 
-        # Slice out only the action portion of pred and target.
+        model_output_null = self.model(
+            hidden_states=sa_embs,
+            encoder_hidden_states=vl_embs_null,
+            encoder_attention_mask=vl_attn_mask_null,   # <- correct augmented mask
+            timestep=t_discretized,
+            return_all_hidden_states=False,
+        )
+        pred_null  = self.action_decoder(model_output_null, embodiment_id)
+        pred_null  = pred_null[:, -actions.shape[1]:]
+
         action_mask = action_input.action_mask
-        loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = loss.sum() / action_mask.sum()
+        loss_uncond = F.mse_loss(pred_null, velocity, reduction="none") * action_mask
+        loss_uncond = loss_uncond.sum() / action_mask.sum()
+
+        # --- Step 4: CONDITIONAL term ──────────
+        # Inject advantage token with CFG dropout
+
+        vl_embs_cond, vl_attn_mask_cond = self._apply_advantage_conditioning(
+            vl_embs, vl_attn_mask,
+            advantage_label=adv_label,   # It in {NEG, POS} from value head
+        )
+
+        model_output_cond = self.model(
+            hidden_states=sa_embs,
+            encoder_hidden_states=vl_embs_cond,
+            encoder_attention_mask=vl_attn_mask_cond,   # <- correct augmented mask
+            timestep=t_discretized,
+            return_all_hidden_states=False,
+        )
+        pred_cond  = self.action_decoder(model_output_cond, embodiment_id)
+        pred_cond  = pred_cond[:, -actions.shape[1]:]
+
+        loss_cond = F.mse_loss(pred_cond, velocity, reduction="none") * action_mask
+        loss_cond = loss_cond.sum() / action_mask.sum()
+
+        # ── Step 5: total loss (Eq. 3) ─────────────────────────────────────────
+        # L = loss_uncond + α * loss_cond
+        total_loss = loss_uncond + self.config.recap_alpha * loss_cond
+
         output_dict = {
-            "loss": loss,
+            "loss": total_loss,
+            "action_loss_uncond": loss_uncond.detach(),
+            "action_loss_cond":   loss_cond.detach(),
+            "advantage_pos_frac": pos_frac.detach(),
         }
         return BatchFeature(data=output_dict)
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
-
-        elif self.value_head is not None:
+        if self._phase == "action_head":
+            output_dict = self.forward_action_head(backbone_output, action_input)
+        elif self._phase == "value_head":
             output_dict = self.forward_value_head(backbone_output, action_input)
         return output_dict
 
@@ -1034,7 +1070,7 @@ class FlowmatchingActionHead(nn.Module):
                 # Unconditional context: I_t = NULL
                 vl_embs_null, vl_attn_mask_null = self._apply_advantage_conditioning(
                     vl_embs, vl_attn_mask,
-                    advantage_label=None,   # → all NULL_IDX
+                    advantage_label=None,   # -> all NULL_IDX
                 )
         else:
             vl_embs_cond, vl_attn_mask_cond = vl_embs, vl_attn_mask

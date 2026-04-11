@@ -164,6 +164,9 @@ class ArgsConfig:
     value_loss_coeff: float = 1.0
     """"""
 
+    _phase: str = "value_head" # action_head
+    """"""
+
 
 #####################################################################################
 # Helper functions
@@ -383,22 +386,22 @@ def main(config: ArgsConfig):
             tune_projector=config.tune_projector, tune_diffusion_model=config.tune_diffusion_model
         )
 
-    if config.use_advantage_conditioning:
-        print("Using Advantage Conditioning!!!")
+    model.action_head.config._phase = config._phase
+
+    if config._phase == "action_head":
+        print("Training Action Head!!!")
         model.action_head.config.use_advantage_conditioning = config.use_advantage_conditioning
         model.action_head.config.advantage_cfg_dropout_prob = config.advantage_cfg_dropout_prob
         model.action_head.config.cfg_guidance_weight = config.cfg_guidance_weight
-        model.action_head.init_advantage_conditioning()
+        model.action_head.set_phase_policy()
 
-    if config.use_value_head:
-        print("Using Value Head!!!")
+    if config._phase == "action_head":
+        print("Training Value Head!!!")
         model.action_head.config.use_value_head = config.use_value_head
         model.action_head.config.hidden_dim = config.hidden_dim
         model.action_head.config.num_bins = config.num_bins
         model.action_head.config.value_loss_coeff = config.value_loss_coeff
-        if model.action_head.config.value_loss_coeff == 1.0:
-            model.action_head.set_frozen_whole_action_head()
-        model.action_head.init_value_head()
+        model.action_head.set_phase_value_head()
 
     # Set the model's compute_dtype to bfloat16
     model.compute_dtype = "bfloat16"
