@@ -102,13 +102,18 @@ class FAEncoder(nn.Module):
             inv:  [(B*T), D_out]  invariant plain mean
         """
         BT = geo_input.tensor.shape[0]
+        orig_dtype = geo_input.tensor.dtype
+        # escnn.transform() converts to numpy internally — cast to float32 first.
+        geo_input_f32 = enn.GeometricTensor(geo_input.tensor.float(), self.in_type)
         h_list = []
         gspace = self.in_type.gspace
 
         for g_idx in range(self.n_group):
             g_elem = gspace.fibergroup.element(g_idx)
-            # h·x: rotate input using its own field type
-            h_x_geo = enn.GeometricTensor(geo_input.transform(g_elem).tensor, self.in_type)
+            # h·x: rotate input using its own field type (must be float32 for escnn)
+            h_x_geo = enn.GeometricTensor(geo_input_f32.transform(g_elem).tensor, self.in_type)
+            # Cast back to original dtype before running through the encoder
+            h_x_geo = enn.GeometricTensor(h_x_geo.tensor.to(orig_dtype), self.in_type)
             # f(h·x): forward through frozen pretrained encoder
             if timestep is not None:
                 out = self.pretrained_encoder(h_x_geo, timestep, cat_ids).tensor
@@ -123,8 +128,9 @@ class FAEncoder(nn.Module):
         for g_idx, h_out in enumerate(h_list):
             g_inv_idx = (self.n_group - g_idx) % self.n_group
             g_inv = gspace.fibergroup.element(g_inv_idx)
-            geo_h_out = enn.GeometricTensor(h_out, self.fa_output_type)
-            aligned_list.append(geo_h_out.transform(g_inv).tensor)
+            # escnn.transform() requires float32
+            geo_h_out = enn.GeometricTensor(h_out.float(), self.fa_output_type)
+            aligned_list.append(geo_h_out.transform(g_inv).tensor.to(orig_dtype))
 
         aligned_stack = torch.stack(aligned_list, dim=1)               # [BT, N, D_out]
         equi = self._apply_frame_averaging(aligned_stack, BT)          # [BT, D_out]
