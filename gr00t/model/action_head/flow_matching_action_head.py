@@ -42,7 +42,7 @@ from gr00t.model.action_head.action_encoder import (
 from gr00t.model.common import RotationTransformer
 
 from .equivariant_cross_attention_dit import EquivariantLayerNorm
-from .cross_attention_dit import DiT
+from .cross_attention_dit import DiT, SelfAttentionTransformer
 from .fa_modules import FAEncoder, EquiResAdapter
 
 
@@ -323,6 +323,9 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     tune_inv_dit: bool = field(
         default=False, metadata={"help": "Whether to fine-tune the frozen pretrained DiT (inv_dit)."}
     )
+    vl_self_attention_cfg: dict = field(
+        default_factory=lambda: None, metadata={"help": "Config for SelfAttentionTransformer on inv features. None disables it."}
+    )
     def __init__(self, **kwargs):
         import dataclasses
         super().__init__(**kwargs)
@@ -444,6 +447,15 @@ class FlowmatchingActionHead(nn.Module):
             self.vl_layer_norm = EquivariantLayerNorm(_vl_type, affine=False)
         else:
             self.vl_layer_norm = None
+
+        # ── Inv branch: LayerNorm + SelfAttention (mirrors baseline process_backbone_output) ─
+        _cross_attn_dim = config.diffusion_model_cfg.get("cross_attention_dim", config.backbone_embedding_dim)
+        if getattr(config, "vl_self_attention_cfg", None) is not None:
+            self.vlln_inv = nn.LayerNorm(_cross_attn_dim)
+            self.vl_inv_self_attention = SelfAttentionTransformer(**config.vl_self_attention_cfg)
+        else:
+            self.vlln_inv = None
+            self.vl_inv_self_attention = None
 
         if config.add_pos_embed:
             # Equivariant temporal position embeddings: trivial → state_out_type (regular).
@@ -796,6 +808,10 @@ class FlowmatchingActionHead(nn.Module):
             if not self.tune_diffusion_model:
                 self.equi_res_adapter.eval()
 
+    def set_adapter_warmup_scale(self, step: int, warmup_steps: int) -> None:
+        """Update the EquiResAdapter warm-up scale based on the current training step."""
+        self.equi_res_adapter.set_warmup_scale(step, warmup_steps)
+
     def _add_temporal_pos_embed(self, features: torch.Tensor) -> torch.Tensor:
         """Add equivariant temporal position embeddings to a [B, T, D] feature tensor."""
         T = features.shape[1]
@@ -860,7 +876,12 @@ class FlowmatchingActionHead(nn.Module):
 
         # Store invariant features for inv_dit cross-attention
         if "backbone_inv_features" in backbone_output:
-            backbone_output.data["vl_inv_features"] = backbone_output.backbone_inv_features
+            inv_features = self.vl_inv_proj(backbone_output.backbone_inv_features)
+            if self.vlln_inv is not None:
+                inv_features = self.vlln_inv(inv_features)
+            if self.vl_inv_self_attention is not None:
+                inv_features = self.vl_inv_self_attention(inv_features)
+            backbone_output.data["vl_inv_features"] = inv_features
 
         return backbone_output
 
@@ -923,11 +944,10 @@ class FlowmatchingActionHead(nn.Module):
             inv_action  = self._add_temporal_pos_embed(inv_action)
 
         # ── Invariant branch: frozen pretrained DiT ───────────────────────────
-        # vl_inv: invariant backbone scalars [B, T_rest, D/N], projected up for inv_dit
+        # vl_inv_features already projected + LN + SA by process_backbone_output
         encoder_mask = backbone_output.backbone_attention_mask
         if "vl_inv_features" in backbone_output:
-            vl_inv = backbone_output.vl_inv_features                  # [B, T_rest, D/N]
-            vl_inv_proj = self.vl_inv_proj(vl_inv.to(self.vl_inv_proj.weight.dtype))
+            vl_inv_proj = backbone_output.vl_inv_features
         else:
             # Fallback: extract invariant scalars from equi features via mean over group slots
             vl_equi = backbone_output.vl_features
@@ -1010,10 +1030,9 @@ class FlowmatchingActionHead(nn.Module):
             inv_state  = self._add_temporal_pos_embed(inv_state)
 
         # ── Prepare vl_inv context for inv_dit ───────────────────────────────
+        # vl_inv_features already projected + LN + SA by process_backbone_output
         if "vl_inv_features" in backbone_output:
-            vl_inv_proj = self.vl_inv_proj(
-                backbone_output.vl_inv_features.to(self.vl_inv_proj.weight.dtype)
-            )
+            vl_inv_proj = backbone_output.vl_inv_features
         else:
             vl_equi = backbone_output.vl_features
             N = self.n_group

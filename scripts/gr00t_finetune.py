@@ -137,7 +137,7 @@ class ArgsConfig:
     rot_aug: bool = False
     """Whether to apply rotation augmentation during training."""
 
-    adapter_warmup_steps: int = 2000
+    adapter_warmup_steps: int = 1000
     """Number of steps to linearly ramp the EquiAdapter output from 0→1.
     0 (default) disables warm-up (adapter is fully active from step 0)."""
 

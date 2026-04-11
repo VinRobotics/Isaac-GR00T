@@ -105,6 +105,8 @@ class DualBrainTrainer(transformers.Trainer):
                 raw_model = raw_model.module
             if hasattr(raw_model, "backbone") and hasattr(raw_model.backbone, "set_adapter_warmup_scale"):
                 raw_model.backbone.set_adapter_warmup_scale(self.state.global_step, warmup_steps)
+            if hasattr(raw_model, "action_head") and hasattr(raw_model.action_head, "set_adapter_warmup_scale"):
+                raw_model.action_head.set_adapter_warmup_scale(self.state.global_step, warmup_steps)
 
         return super().training_step(model, inputs, num_items_in_batch)
 
