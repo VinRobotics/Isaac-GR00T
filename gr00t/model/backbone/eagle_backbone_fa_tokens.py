@@ -209,17 +209,11 @@ class EquiAdapter(nn.Module):
         if self.adapter_scale.item() != 1.0:
             h_vis = h_vis_in + (h_vis - h_vis_in) * self.adapter_scale
 
-        # Extract invariant scalar tokens: project VLM output to R^blocks (no group expansion).
-        # to_inv_scalar: [B, T, D] → [B, T, blocks]  (invariant, no regular-repr lifting)
-        def to_inv_scalar(x, embed):
-            return embed(x)                                             # [B, T, blocks]
-
-        text_out = to_inv_scalar(vlm_text.to(dt), self.lang_embed)     # [B, T_lang, blocks]
+        # Concatenate invariant scalar tokens directly from VLM output.
         if noequi_vlm is not None:
-            noequi_out = to_inv_scalar(noequi_vlm.to(dt), self.noequi_embed)  # [B, T_noequi, blocks]
-            inv_tokens = torch.cat([noequi_out, text_out], dim=1)      # [B, T_noequi+T_lang, blocks]
+            inv_tokens = torch.cat([noequi_vlm.to(dt), vlm_text.to(dt)], dim=1)
         else:
-            inv_tokens = text_out                                       # [B, T_lang, blocks]
+            inv_tokens = vlm_text.to(dt)
 
         return h_vis.to(h_equi.dtype), inv_tokens.to(h_equi.dtype)
 
