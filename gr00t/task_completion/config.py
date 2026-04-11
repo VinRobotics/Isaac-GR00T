@@ -52,7 +52,7 @@ class WindowTaskCompletionConfig:
     delta_indices: List[int] = field(default_factory=lambda: [0])
 
     video_keys: List[str] = field(
-        default_factory=lambda: ["video.cam_head", "video.cam_left", "video.cam_right"]
+        default_factory=lambda: ["video.cam_head", "video.cam_left"]
     )
     language_key: str = "annotation.human.task_description"
     task_completion_key: str = "observation.tasks.label"

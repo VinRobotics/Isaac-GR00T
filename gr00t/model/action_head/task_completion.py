@@ -31,7 +31,7 @@ class TaskCompletionDetector(nn.Module):
 
         self.norm_in = nn.LayerNorm(seq_dim)
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, seq_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 8, seq_dim))
         nn.init.normal_(self.cls_token, std=0.02)
 
         self.cross_attn = nn.MultiheadAttention(
@@ -83,8 +83,8 @@ class TaskCompletionDetector(nn.Module):
         """
         # Upcast to float32: long sequences (1000+ tokens) overflow bfloat16 softmax
         x = x.float()
-        cls = self.cls_token.float().expand(x.shape[0], -1, -1)  # (B, 1, seq_dim)
+        cls = self.cls_token.float().expand(x.shape[0], -1, -1)  # (B, 8, seq_dim)
         x = self.norm_in(x)
-        attended, _ = self.cross_attn(query=cls, key=x, value=x)  # (B, 1, seq_dim)
-        attended = self.norm_attn(attended.squeeze(1))              # (B, seq_dim)
+        attended, _ = self.cross_attn(query=cls, key=x, value=x)  # (B, 8, seq_dim)
+        attended = self.norm_attn(attended.mean(dim=1))             # (B, seq_dim)
         return self.classifier(attended)

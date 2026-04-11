@@ -147,8 +147,7 @@ def main(args: ArgsConfig):
     delta_indices = args.delta_indices
     video_keys = args.video_keys or [
         "video.cam_head",
-        "video.cam_left",
-        "video.cam_right",
+        "video.cam_left"
     ]
 
     # --- Data config & transform ---
