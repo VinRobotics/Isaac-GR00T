@@ -815,7 +815,7 @@ class FlowmatchingActionHead(nn.Module):
         pos_emb = self.temporal_pos_proj(
             enn.GeometricTensor(self.temporal_pos_embed(pos_ids), self.temporal_pos_trivial_type)
         ).tensor  # [T, D]
-        return features + pos_emb.unsqueeze(0)
+        return features + pos_emb.unsqueeze(0).to(features.dtype)
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
@@ -943,10 +943,11 @@ class FlowmatchingActionHead(nn.Module):
         encoder_mask = backbone_output.backbone_attention_mask
         vl_inv_ctx = backbone_output.vl_inv_features if "vl_inv_features" in backbone_output else backbone_output.vl_features
 
+        ref_dtype = inv_state.dtype
         sa_embs_inv = torch.cat([inv_state, inv_action], dim=1)  # [B, T_sa, D]
         inv_output  = self.inv_dit(
             hidden_states=sa_embs_inv,
-            encoder_hidden_states=vl_inv_ctx,
+            encoder_hidden_states=vl_inv_ctx.to(ref_dtype),
             encoder_attention_mask=encoder_mask,
             timestep=t_discretized,
         )                                                          # [B, T_sa, hidden_size]
@@ -962,7 +963,7 @@ class FlowmatchingActionHead(nn.Module):
         ).tensor
         equi_sa_proj = einops.rearrange(equi_sa_proj, '(b t) c -> b t c',
                                         b=sa_embs_equi.shape[0], t=sa_embs_equi.shape[1])
-        equi_delta = self.equi_res_adapter(equi_sa_proj, context=inv_output)  # [B, T_sa, hidden_size]
+        equi_delta = self.equi_res_adapter(equi_sa_proj.to(ref_dtype), context=inv_output)  # [B, T_sa, hidden_size]
 
         # ── Residual fusion: lift inv_output to regular repr + add equi delta ─
         N = self.n_group
@@ -1051,10 +1052,11 @@ class FlowmatchingActionHead(nn.Module):
                 inv_action  = self._add_temporal_pos_embed(inv_action)
 
             # Invariant branch
+            ref_dtype = inv_state.dtype
             sa_embs_inv = torch.cat([inv_state, inv_action], dim=1)
             inv_output  = self.inv_dit(
                 hidden_states=sa_embs_inv,
-                encoder_hidden_states=vl_inv_proj,  # set above
+                encoder_hidden_states=vl_inv_proj.to(ref_dtype),
                 encoder_attention_mask=encoder_mask,
                 timestep=timesteps_tensor,
             )
@@ -1069,13 +1071,13 @@ class FlowmatchingActionHead(nn.Module):
             equi_sa_proj = einops.rearrange(
                 equi_sa_proj, '(b t) c -> b t c', b=B, t=sa_embs_equi.shape[1]
             )
-            equi_delta = self.equi_res_adapter(equi_sa_proj, context=inv_output)
+            equi_delta = self.equi_res_adapter(equi_sa_proj.to(ref_dtype), context=inv_output)
 
             # Residual fusion
             T_sa = inv_output.shape[1]
             D = inv_output.shape[2]
-            inv_lifted = (inv_output.view(B, T_sa, D // N, 1)
-                          .expand(-1, -1, -1, N).reshape(B, T_sa, D))
+            inv_scalar = inv_output.view(B, T_sa, D // N, N).mean(-1)      # [B, T_sa, D//N]
+            inv_lifted = inv_scalar.unsqueeze(-1).expand(-1, -1, -1, N).reshape(B, T_sa, D)
             output = inv_lifted + equi_delta
 
             # Decode

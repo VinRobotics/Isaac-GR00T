@@ -102,35 +102,39 @@ class FAEncoder(nn.Module):
             inv:  [(B*T), D_out]  invariant plain mean
         """
         BT = geo_input.tensor.shape[0]
-        orig_dtype = geo_input.tensor.dtype
-        # escnn.transform() calls .numpy() internally — requires float32 and no autocast.
         device_type = geo_input.tensor.device.type
-        h_list = []
         gspace = self.in_type.gspace
 
+        # Pre-compute all rotated inputs with autocast disabled (escnn.transform → .numpy() requires float32).
+        # Cast back to the encoder's weight dtype immediately after transform.
+        enc_dtype = next(self.pretrained_encoder.parameters()).dtype
+        rotated_inputs = []
         with torch.autocast(device_type=device_type, enabled=False):
             geo_input_f32 = enn.GeometricTensor(geo_input.tensor.float(), self.in_type)
             for g_idx in range(self.n_group):
                 g_elem = gspace.fibergroup.element(g_idx)
-                rotated = geo_input_f32.transform(g_elem).tensor  # float32, no autocast
-                h_x_geo = enn.GeometricTensor(rotated.to(orig_dtype), self.in_type)
-                # f(h·x): forward through frozen pretrained encoder
-                if timestep is not None:
-                    out = self.pretrained_encoder(h_x_geo, timestep, cat_ids).tensor
-                else:
-                    out = self.pretrained_encoder(h_x_geo, cat_ids).tensor
-                h_list.append(out)
+                rotated = geo_input_f32.transform(g_elem).tensor.to(enc_dtype)
+                rotated_inputs.append(enn.GeometricTensor(rotated, self.in_type))
+
+        # Run encoder in normal autocast context.
+        h_list = []
+        for g_idx, h_x_geo in enumerate(rotated_inputs):
+            if timestep is not None:
+                out = self.pretrained_encoder(h_x_geo, timestep, cat_ids).tensor
+            else:
+                out = self.pretrained_encoder(h_x_geo, cat_ids).tensor
+            h_list.append(out)
 
         h_stack = torch.stack(h_list, dim=0)  # [N, BT, D_out]
 
-        # Equivariant FA: ρ_out(h⁻¹) · f(h·x), then mean
+        # Equivariant FA: ρ_out(h⁻¹) · f(h·x) — only the transform needs autocast disabled.
         aligned_list = []
         with torch.autocast(device_type=device_type, enabled=False):
             for g_idx, h_out in enumerate(h_list):
                 g_inv_idx = (self.n_group - g_idx) % self.n_group
                 g_inv = gspace.fibergroup.element(g_inv_idx)
                 geo_h_out = enn.GeometricTensor(h_out.float(), self.fa_output_type)
-                aligned_list.append(geo_h_out.transform(g_inv).tensor.to(orig_dtype))
+                aligned_list.append(geo_h_out.transform(g_inv).tensor.to(enc_dtype))
 
         aligned_stack = torch.stack(aligned_list, dim=1)               # [BT, N, D_out]
         equi = self._apply_frame_averaging(aligned_stack, BT)          # [BT, D_out]
