@@ -142,20 +142,14 @@ class ArgsConfig:
     # Mixture dataset parameters
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
-
-    use_advantage_conditioning: bool = True
-    """"""
-
+    
     advantage_cfg_dropout_prob: float = 0.3
     """"""
 
     cfg_guidance_weight: float = 1.0
     """"""
 
-    use_value_head: bool = False
-    """"""
-
-    hidden_dim: int = 512
+    hidden_dim: int = 2048
     """"""
 
     num_bins: int = 201 # B = 201 as in pi*0.6
@@ -390,14 +384,12 @@ def main(config: ArgsConfig):
 
     if config._phase == "action_head":
         print("Training Action Head!!!")
-        model.action_head.config.use_advantage_conditioning = config.use_advantage_conditioning
         model.action_head.config.advantage_cfg_dropout_prob = config.advantage_cfg_dropout_prob
         model.action_head.config.cfg_guidance_weight = config.cfg_guidance_weight
         model.action_head.set_phase_policy()
 
     if config._phase == "action_head":
         print("Training Value Head!!!")
-        model.action_head.config.use_value_head = config.use_value_head
         model.action_head.config.hidden_dim = config.hidden_dim
         model.action_head.config.num_bins = config.num_bins
         model.action_head.config.value_loss_coeff = config.value_loss_coeff

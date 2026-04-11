@@ -465,16 +465,6 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     num_target_vision_tokens: int = field(
         default=32, metadata={"help": "Number of target vision tokens."}
     )
-
-    use_advantage_conditioning: bool = field(
-        default=True,
-        metadata={
-            "help": (
-                "Enable RECAP-style advantage conditioning. "
-                "Requires `advantage_label` in action_input during training."
-            )
-        },
-    )
     advantage_cfg_dropout_prob: float = field(
         default=0.3,
         metadata={
@@ -495,18 +485,6 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
                 "  v_guided = v_null + w * (v_pos − v_null). "
                 "Provably improves expected return for any w≥1 (CFGRL Remark 2). "
                 "Typical useful range: [1.5, 2.5]"
-            )
-        },
-    )
-
-    use_value_head: bool = field(
-        default=True,
-        metadata={
-            "help": (
-                "Attach a distributional value head pϕ(V|o_t,l) (RECAP §IV-A). "
-                "When enabled, forward() also returns `value_loss`. "
-                "The value head is trained jointly with the policy via a weighted "
-                "cross-entropy loss on discretised empirical returns."
             )
         },
     )
@@ -614,36 +592,30 @@ class FlowmatchingActionHead(nn.Module):
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
     def init_advantage_conditioning(self):
-        if self.config.use_advantage_conditioning:
-            self.advantage_embedding = AdvantageEmbedding(2048)
-            print(
-                f"[RECAP] Advantage conditioning ENABLED  "
-                f"(cfg_dropout={self.config.advantage_cfg_dropout_prob}, "
-                f"cfg_guidance_weight={self.config.cfg_guidance_weight})"
-            )
-        else:
-            self.advantage_embedding = None
+        self.advantage_embedding = AdvantageEmbedding(2048)
+        print(
+            f"[RECAP] Advantage conditioning ENABLED  "
+            f"(cfg_dropout={self.config.advantage_cfg_dropout_prob}, "
+            f"cfg_guidance_weight={self.config.cfg_guidance_weight})"
+        )
 
     def init_value_head(self):
-        if self.config.use_value_head:
-            vh_kwargs = {
-                "backbone_embedding_dim": self.config.backbone_embedding_dim,
-                "state_dim": self.config.max_state_dim,
-                "seq_dim": self.config.backbone_embedding_dim,
-                "hidden_dim": self.config.hidden_dim,
-                "num_bins": self.config.num_bins,
-                "value_loss_coeff": self.config.value_loss_coeff,
-            }
-            vh_config = DistributionalValueHeadConfig(**vh_kwargs)
-            self.value_head = DistributionalValueHead(vh_config)
-            print(
-                f"[RECAP] Distributional value head ENABLED  "
-                f"(num_bins={vh_config.num_bins}, "
-                f"value_loss_coeff={vh_config.value_loss_coeff} "
-                f"hidden_dim={vh_config.hidden_dim}), "
-            )
-        else:
-            self.value_head = None
+        vh_kwargs = {
+            "backbone_embedding_dim": self.config.backbone_embedding_dim,
+            "state_dim": self.config.max_state_dim,
+            "seq_dim": self.config.backbone_embedding_dim,
+            "hidden_dim": self.config.hidden_dim,
+            "num_bins": self.config.num_bins,
+            "value_loss_coeff": self.config.value_loss_coeff,
+        }
+        vh_config = DistributionalValueHeadConfig(**vh_kwargs)
+        self.value_head = DistributionalValueHead(vh_config)
+        print(
+            f"[RECAP] Distributional value head ENABLED  "
+            f"(num_bins={vh_config.num_bins}, "
+            f"value_loss_coeff={vh_config.value_loss_coeff} "
+            f"hidden_dim={vh_config.hidden_dim}), "
+        )
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -1014,6 +986,7 @@ class FlowmatchingActionHead(nn.Module):
             output_dict = self.forward_action_head(backbone_output, action_input)
         elif self._phase == "value_head":
             output_dict = self.forward_value_head(backbone_output, action_input)
+        exit(0)
         return output_dict
 
     @torch.no_grad()
@@ -1054,26 +1027,22 @@ class FlowmatchingActionHead(nn.Module):
         )
 
         # Prepare advantage-conditioned and unconditional encoder contexts
-        use_adv = self.config.use_advantage_conditioning
         w = self.config.cfg_guidance_weight
-        dual_pass = use_adv and (w != 1.0)
+        dual_pass = (w != 1.0)
  
-        if use_adv:
-            # Conditional context: I_t = POS
-            vl_embs_cond, vl_attn_mask_cond = self._apply_advantage_conditioning(
+        # Conditional context: I_t = POS
+        vl_embs_cond, vl_attn_mask_cond = self._apply_advantage_conditioning(
+            vl_embs, vl_attn_mask,
+            advantage_label=torch.full(
+                (batch_size,), AdvantageEmbedding.POS_IDX, dtype=torch.long, device=device
+            ),
+        )
+        if dual_pass:
+            # Unconditional context: I_t = NULL
+            vl_embs_null, vl_attn_mask_null = self._apply_advantage_conditioning(
                 vl_embs, vl_attn_mask,
-                advantage_label=torch.full(
-                    (batch_size,), AdvantageEmbedding.POS_IDX, dtype=torch.long, device=device
-                ),
+                advantage_label=None,   # -> all NULL_IDX
             )
-            if dual_pass:
-                # Unconditional context: I_t = NULL
-                vl_embs_null, vl_attn_mask_null = self._apply_advantage_conditioning(
-                    vl_embs, vl_attn_mask,
-                    advantage_label=None,   # -> all NULL_IDX
-                )
-        else:
-            vl_embs_cond, vl_attn_mask_cond = vl_embs, vl_attn_mask
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
