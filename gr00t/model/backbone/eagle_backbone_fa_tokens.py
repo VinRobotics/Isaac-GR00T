@@ -153,11 +153,6 @@ class EquiAdapter(nn.Module):
         # lang_proj: project VLM output at image positions into equi space (invariant).
         self.lang_proj = nn.Linear(d_llm, d_eq)
 
-        # lang_embed / noequi_embed: reformat VLM output tokens as trivial-in-regular repr.
-        # trivial-in-regular: R^blocks expanded as [v,v,...,v]×G → invariant subspace of regular repr.
-        self.lang_embed   = nn.Linear(d_eq, blocks)
-        self.noequi_embed = nn.Linear(d_eq, blocks)
-
         # Identity init: CA output = 0 at training start → h_equi passes through unchanged.
         for ca_blk in self.ca_blocks:
             for p in ca_blk.attn1.v_proj.parameters():
@@ -188,11 +183,11 @@ class EquiAdapter(nn.Module):
         Returns:
             (h_vis, inv_tokens) tuple:
               h_vis:      [B, n_equi*T_vis, D]           equivariant vision tokens (regular repr)
-              inv_tokens: [B, n_noequi*T_vis + T_lang, blocks]  invariant scalar tokens (D//n_group)
+              inv_tokens: [B, n_noequi*T_vis + T_lang, D]  raw VLM invariant tokens
 
         Pipeline:
           CA: h_equi queries attend to lang_proj(vlm_img) context (invariant).
-          inv_tokens: noequi/text VLM output projected to scalar dim (no group expansion).
+          inv_tokens: noequi/text VLM output passed through directly.
         """
         B, n_equi, T, D = h_equi.shape
         dt = next(self.ca_blocks[0].parameters()).dtype
@@ -209,11 +204,11 @@ class EquiAdapter(nn.Module):
         if self.adapter_scale.item() != 1.0:
             h_vis = h_vis_in + (h_vis - h_vis_in) * self.adapter_scale
 
-        # Concatenate invariant scalar tokens directly from VLM output.
+        # Pass VLM text/noequi tokens through directly as invariant context.
         if noequi_vlm is not None:
-            inv_tokens = torch.cat([noequi_vlm.to(dt), vlm_text.to(dt)], dim=1)
+            inv_tokens = torch.cat([noequi_vlm.to(dt), vlm_text.to(dt)], dim=1)  # [B, T_noequi+T_lang, D]
         else:
-            inv_tokens = vlm_text.to(dt)
+            inv_tokens = vlm_text.to(dt)                                          # [B, T_lang, D]
 
         return h_vis.to(h_equi.dtype), inv_tokens.to(h_equi.dtype)
 

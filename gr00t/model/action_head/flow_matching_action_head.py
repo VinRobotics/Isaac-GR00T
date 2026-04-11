@@ -410,11 +410,7 @@ class FlowmatchingActionHead(nn.Module):
         # ── Projections ──────────────────────────────────────────────────────────────────
         # equi_proj: 1536 → 1024  (equivariant, projects FA equi features to DiT hidden dim)
         self.equi_proj = enn.Linear(self.state_out_type, self.state_hidden_type)
-
-        # vl_inv_proj: D/N → cross_attn_dim  (invariant, for inv_dit cross-attention context)
-        _inv_scalar_dim = config.backbone_embedding_dim // self.n_group
         _cross_attn_dim = config.diffusion_model_cfg.get("cross_attention_dim", config.backbone_embedding_dim)
-        self.vl_inv_proj = nn.Linear(_inv_scalar_dim, _cross_attn_dim)
 
         # ── EquiResAdapter: lightweight equivariant corrections ───────────────────────────
         _equi_blk = config.hidden_size // self.n_group
@@ -749,7 +745,6 @@ class FlowmatchingActionHead(nn.Module):
         if not tune_projector:
             print("set requires_grad false for tune projector")
             self.equi_proj.requires_grad_(False)
-            self.vl_inv_proj.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.temporal_pos_embed.requires_grad_(False)
                 self.temporal_pos_proj.requires_grad_(False)
@@ -876,7 +871,7 @@ class FlowmatchingActionHead(nn.Module):
 
         # Store invariant features for inv_dit cross-attention
         if "backbone_inv_features" in backbone_output:
-            inv_features = self.vl_inv_proj(backbone_output.backbone_inv_features)
+            inv_features = backbone_output.backbone_inv_features
             if self.vlln_inv is not None:
                 inv_features = self.vlln_inv(inv_features)
             if self.vl_inv_self_attention is not None:
@@ -946,21 +941,12 @@ class FlowmatchingActionHead(nn.Module):
         # ── Invariant branch: frozen pretrained DiT ───────────────────────────
         # vl_inv_features already projected + LN + SA by process_backbone_output
         encoder_mask = backbone_output.backbone_attention_mask
-        if "vl_inv_features" in backbone_output:
-            vl_inv_proj = backbone_output.vl_inv_features
-        else:
-            # Fallback: extract invariant scalars from equi features via mean over group slots
-            vl_equi = backbone_output.vl_features
-            N = self.n_group
-            Bv, Tv, Dv = vl_equi.shape
-            vl_inv_proj = self.vl_inv_proj(
-                vl_equi.reshape(Bv, Tv, Dv // N, N).mean(-1).to(self.vl_inv_proj.weight.dtype)
-            )
+        vl_inv_ctx = backbone_output.vl_inv_features if "vl_inv_features" in backbone_output else backbone_output.vl_features
 
         sa_embs_inv = torch.cat([inv_state, inv_action], dim=1)  # [B, T_sa, D]
         inv_output  = self.inv_dit(
             hidden_states=sa_embs_inv,
-            encoder_hidden_states=vl_inv_proj,
+            encoder_hidden_states=vl_inv_ctx,
             encoder_attention_mask=encoder_mask,
             timestep=t_discretized,
         )                                                          # [B, T_sa, hidden_size]
@@ -1030,16 +1016,8 @@ class FlowmatchingActionHead(nn.Module):
             inv_state  = self._add_temporal_pos_embed(inv_state)
 
         # ── Prepare vl_inv context for inv_dit ───────────────────────────────
-        # vl_inv_features already projected + LN + SA by process_backbone_output
-        if "vl_inv_features" in backbone_output:
-            vl_inv_proj = backbone_output.vl_inv_features
-        else:
-            vl_equi = backbone_output.vl_features
-            N = self.n_group
-            Bv, Tv, Dv = vl_equi.shape
-            vl_inv_proj = self.vl_inv_proj(
-                vl_equi.reshape(Bv, Tv, Dv // N, N).mean(-1).to(self.vl_inv_proj.weight.dtype)
-            )
+        # vl_inv_features already processed (LN + SA) by process_backbone_output
+        vl_inv_proj = backbone_output.vl_inv_features if "vl_inv_features" in backbone_output else backbone_output.vl_features
 
         device = inv_state.device
         batch_size = B
@@ -1076,7 +1054,7 @@ class FlowmatchingActionHead(nn.Module):
             sa_embs_inv = torch.cat([inv_state, inv_action], dim=1)
             inv_output  = self.inv_dit(
                 hidden_states=sa_embs_inv,
-                encoder_hidden_states=vl_inv_proj,
+                encoder_hidden_states=vl_inv_proj,  # set above
                 encoder_attention_mask=encoder_mask,
                 timestep=timesteps_tensor,
             )
