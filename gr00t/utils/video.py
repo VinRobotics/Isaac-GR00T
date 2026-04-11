@@ -144,14 +144,24 @@ def get_frames_by_timestamps(
         # load all frames until last requested frame
         loaded_frames = []
         loaded_ts = []
-        for frame in reader:
-            current_ts = frame["pts"]
-            loaded_frames.append(frame["data"].numpy())
-            loaded_ts.append(current_ts)
-            if current_ts >= last_ts:
-                break
+        try:
+            for frame in reader:
+                current_ts = frame["pts"]
+                loaded_frames.append(frame["data"].numpy())
+                loaded_ts.append(current_ts)
+                if current_ts >= last_ts:
+                    break
+        except av.error.InvalidDataError:
+            # Some datasets contain corrupted/invalid packets; skip them and use
+            # whatever frames were successfully decoded up to this point.
+            pass
         reader.container.close()
         reader = None
+        if not loaded_frames:
+            raise RuntimeError(
+                f"No frames could be decoded from video: {video_path}. "
+                "The file may be corrupted."
+            )
         frames = np.array(loaded_frames)
         loaded_ts = np.array(loaded_ts)
 
