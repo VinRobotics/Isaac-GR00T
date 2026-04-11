@@ -167,6 +167,11 @@ class EquiAdapter(nn.Module):
             for p in ca_blk.ff.fc2.parameters():
                 nn.init.zeros_(p)
 
+        # Warm-up scale: linearly ramp adapter delta from 0 → 1 over warmup_steps.
+        # Initialized to 1.0 (full strength) so the default behavior is unchanged.
+        # Call set_adapter_warmup_scale(step, warmup_steps) from the trainer each step.
+        self.register_buffer("adapter_scale", torch.ones(1))
+
     def forward(
         self,
         h_equi: torch.Tensor,
@@ -194,8 +199,14 @@ class EquiAdapter(nn.Module):
         # CA context: project vlm_img into equi space (invariant).
         h_cond = self.lang_proj(vlm_img.to(dt))                        # [B, n_equi*T, D]
         h_vis = h_equi.to(dt).reshape(B, n_equi * T, D)
+        h_vis_in = h_vis                                                # save skip for warm-up scaling
         for ca_blk in self.ca_blocks:
             h_vis = ca_blk(h_vis, encoder_hidden_states=h_cond)
+        # Scale only the adapter delta (not the skip path) by the warm-up factor.
+        # At init: delta ≈ 0 (zero-init) → scale has no effect until adapter starts learning.
+        # During warm-up: adapter_scale ramps 0→1 so newly learned deltas enter gradually.
+        if self.adapter_scale.item() != 1.0:
+            h_vis = h_vis_in + (h_vis - h_vis_in) * self.adapter_scale
 
         # Reformat noequi/text as trivial-in-regular: project to R^blocks → [v,v,...,v]×G.
         def to_trivial_reg(x, embed):
@@ -568,6 +579,27 @@ class EagleBackboneFATokens(nn.Module):
             print(f"  {n}")
         if not trainable:
             print("  Warning: no trainable parameters found.")
+
+    def set_adapter_warmup_scale(self, step: int, warmup_steps: int) -> None:
+        """
+        Update the EquiAdapter warm-up scale based on the current training step.
+
+        Call this once per training step (before or after the forward pass).
+        The adapter delta is multiplied by min(1.0, step / warmup_steps), so the
+        adapter's learned contribution ramps in linearly from 0 → 1 over the first
+        `warmup_steps` steps.  After warm-up the scale is fixed at 1.0.
+
+        Example (in training loop or Trainer callback):
+            model.backbone.set_adapter_warmup_scale(global_step, warmup_steps=500)
+
+        Args:
+            step:          current global training step (0-indexed)
+            warmup_steps:  number of steps over which to ramp; 0 = no warm-up (scale=1)
+        """
+        if warmup_steps <= 0:
+            return
+        scale = min(1.0, step / warmup_steps)
+        self.equi_adapter.adapter_scale.fill_(scale)
 
     def load_pretrained_vlm(self, checkpoint_path: str) -> None:
         """

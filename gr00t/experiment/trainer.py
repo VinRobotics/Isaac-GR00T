@@ -64,6 +64,7 @@ class BaseSampler(Sampler):
 class DualBrainTrainer(transformers.Trainer):
     def __init__(self, **kwargs):
         self.compute_dtype = kwargs.pop("compute_dtype")
+        self.adapter_warmup_steps = kwargs.pop("adapter_warmup_steps", 0)
         super().__init__(**kwargs)
         # Allowlist numpy globals for safe RNG state unpickling in PyTorch 2.1+
         torch.serialization.add_safe_globals(
@@ -92,6 +93,19 @@ class DualBrainTrainer(transformers.Trainer):
                     break
                 candidate = getattr(candidate, "module", None)
             self._static_graph_set = True
+
+        # EquiAdapter warm-up: linearly ramp adapter_scale 0→1 over the first
+        # `adapter_warmup_steps` training steps.  Reads warmup_steps from
+        # TrainingArguments if set, otherwise no-ops (scale stays at 1.0).
+        warmup_steps = self.adapter_warmup_steps
+        if warmup_steps > 0:
+            # Unwrap DDP / Accelerate wrappers to reach the raw GR00T model
+            raw_model = model
+            while hasattr(raw_model, "module"):
+                raw_model = raw_model.module
+            if hasattr(raw_model, "backbone") and hasattr(raw_model.backbone, "set_adapter_warmup_scale"):
+                raw_model.backbone.set_adapter_warmup_scale(self.state.global_step, warmup_steps)
+
         return super().training_step(model, inputs, num_items_in_batch)
 
     def _get_train_sampler(self):

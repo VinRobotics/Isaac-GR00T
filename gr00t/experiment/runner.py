@@ -37,6 +37,7 @@ class TrainRunner:
         training_args: TrainingArguments,
         train_dataset: LeRobotSingleDataset | LeRobotMixtureDataset,
         resume_from_checkpoint: bool = False,
+        adapter_warmup_steps: int = 0,
     ):
         self.training_args = training_args
         self.output_dir = Path(training_args.output_dir)
@@ -64,6 +65,7 @@ class TrainRunner:
             train_dataset=train_dataset,
             data_collator=data_collator,
             compute_dtype=compute_dtype,
+            adapter_warmup_steps=adapter_warmup_steps,
         )
         self.trainer = trainer
 
@@ -128,6 +130,7 @@ class TrainRunner:
         data_collator,
         compute_dtype,
         global_batch_size=None,
+        adapter_warmup_steps=0,
     ):
         # Set the gradient accumulation steps if global_batch_size is provided
         if global_batch_size is not None:
@@ -146,6 +149,7 @@ class TrainRunner:
             train_dataset=train_dataset,
             data_collator=data_collator,
             compute_dtype=compute_dtype,
+            adapter_warmup_steps=adapter_warmup_steps,
         )
 
         # Add checkpoint format callback to ensure experiment_cfg is copied to each checkpoint

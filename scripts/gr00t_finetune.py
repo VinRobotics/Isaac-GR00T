@@ -137,6 +137,10 @@ class ArgsConfig:
     rot_aug: bool = False
     """Whether to apply rotation augmentation during training."""
 
+    adapter_warmup_steps: int = 2000
+    """Number of steps to linearly ramp the EquiAdapter output from 0→1.
+    0 (default) disables warm-up (adapter is fully active from step 0)."""
+
     dataloader_num_workers: int = 12
     """Number of workers for data loading per GPU."""
 
@@ -394,6 +398,7 @@ def main(config: ArgsConfig):
         model=model,
         training_args=training_args,
         resume_from_checkpoint=config.resume,
+        adapter_warmup_steps=config.adapter_warmup_steps,
     )
 
     # 2.3 run experiment

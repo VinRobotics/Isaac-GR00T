@@ -41,7 +41,7 @@ from gr00t.model.action_head.action_encoder import (
 )
 from gr00t.model.common import RotationTransformer
 
-from .equivariant_cross_attention_dit import EDiT, EquiVisionTransformer
+from .equivariant_cross_attention_dit import EDiT, EquiVisionTransformer, EquivariantLayerNorm
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -307,6 +307,11 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     backbone_language_embedding_dim: int = field(
         default=2048, metadata={"help": "Language feature dim from backbone LLM (D_llm)."}
     )
+    use_vl_layer_norm: bool = field(
+        default=True,
+        metadata={"help": "Apply EquivariantLayerNorm to backbone VL features before DiT cross-attention. "
+                          "Stabilises scale of randomly-initialised backbone new layers vs frozen VLM output."}
+    )
     def __init__(self, **kwargs):
         import dataclasses
         super().__init__(**kwargs)
@@ -388,6 +393,16 @@ class FlowmatchingActionHead(nn.Module):
         
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+
+        # Equivariant LayerNorm applied to backbone VL features before DiT cross-attention.
+        # backbone_embedding_dim is project_to_dim from backbone (default 1536 = n_group * blocks).
+        # EquivariantLayerNorm normalises per block-slot across the group dimension, preserving equivariance.
+        if config.use_vl_layer_norm:
+            _vl_blocks = config.backbone_embedding_dim // self.n_group
+            _vl_type = enn.FieldType(self.group, [self.group.regular_repr] * _vl_blocks)
+            self.vl_layer_norm = EquivariantLayerNorm(_vl_type, affine=False)
+        else:
+            self.vl_layer_norm = None
 
         if config.add_pos_embed:
             # Equivariant temporal position embeddings for state and action tokens.
@@ -786,6 +801,16 @@ class FlowmatchingActionHead(nn.Module):
             vl_features = equi_proj.reshape(B, n_equi * T, -1)
             attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
             backbone_output.data["backbone_attention_mask"] = attn_mask
+
+        # Equivariant LayerNorm over backbone features before DiT cross-attention.
+        # Normalises per block-slot across the group dimension without breaking equivariance.
+        if self.vl_layer_norm is not None:
+            Bv, Tv, Dv = vl_features.shape
+            vl_geo = enn.GeometricTensor(
+                vl_features.reshape(Bv * Tv, Dv).to(dtype=torch.float32),
+                self.vl_layer_norm.field_type,
+            )
+            vl_features = self.vl_layer_norm(vl_geo).tensor.reshape(Bv, Tv, Dv).to(dtype=equi_vis.dtype)
 
         backbone_output.data["vl_features"] = vl_features
         return backbone_output
