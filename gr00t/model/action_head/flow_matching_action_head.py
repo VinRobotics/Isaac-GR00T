@@ -163,6 +163,36 @@ class EquiCategorySpecificLinear(nn.Module):
 
 
 class MultiEmbodimentActionEncoder(nn.Module):
+    """Plain (non-equivariant) action encoder matching baseline gr00t_baseline_locht1 exactly.
+    Used inside FAEncoder so baseline checkpoint weights load without remapping."""
+    def __init__(self, action_dim, hidden_size, num_embodiments):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_embodiments = num_embodiments
+        self.W1 = CategorySpecificLinear(num_embodiments, action_dim, hidden_size)
+        self.W2 = CategorySpecificLinear(num_embodiments, 2 * hidden_size, hidden_size)
+        self.W3 = CategorySpecificLinear(num_embodiments, hidden_size, hidden_size)
+        self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
+
+    def forward(self, actions, timesteps, cat_ids):
+        """
+        actions:   [B, T, action_dim]
+        timesteps: [B,]
+        cat_ids:   [B,]
+        returns:   [B, T, hidden_size]
+        """
+        B, T, _ = actions.shape
+        if timesteps.dim() == 1 and timesteps.shape[0] == B:
+            timesteps = timesteps.unsqueeze(1).expand(-1, T)
+        a_emb = self.W1(actions, cat_ids)
+        tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.dtype)
+        x = torch.cat([a_emb, tau_emb], dim=-1)
+        x = swish(self.W2(x, cat_ids))
+        x = self.W3(x, cat_ids)
+        return x
+
+
+class EquiMultiEmbodimentActionEncoder(nn.Module):
     def __init__(self, in_type, out_type, num_embodiments):
         super().__init__()
         self.in_type = in_type
@@ -381,13 +411,15 @@ class FlowmatchingActionHead(nn.Module):
         inv_dit_cfg = {k: v for k, v in config.diffusion_model_cfg.items() if k != "n_group"}
         self.inv_dit = DiT(**inv_dit_cfg)
 
-        # ── FA encoders: FA wraps frozen pretrained encoders ──────────────────────────────
+        # ── FA encoders: FA wraps plain pretrained encoders (exact baseline architecture) ──
+        # Plain (non-equivariant) encoders so that baseline checkpoint weights load exactly.
+        # FA provides equivariance externally via group averaging.
         self.fa_state_encoder = FAEncoder(
-            pretrained_encoder=EquiCategorySpecificMLP(
+            pretrained_encoder=CategorySpecificMLP(
                 num_categories=config.max_num_embodiments,
-                in_type=self.state_in_type,
-                hidden_type=self.state_hidden_type,
-                out_type=self.state_out_type,
+                input_dim=config.max_state_dim,
+                hidden_dim=config.hidden_size,
+                output_dim=config.input_embedding_dim,
             ),
             in_type=self.state_in_type,
             n_group=self.n_group,
@@ -395,8 +427,8 @@ class FlowmatchingActionHead(nn.Module):
         )
         self.fa_action_encoder = FAEncoder(
             pretrained_encoder=MultiEmbodimentActionEncoder(
-                in_type=self.action_type,
-                out_type=self.action_out_type,
+                action_dim=config.action_dim,
+                hidden_size=config.input_embedding_dim,
                 num_embodiments=config.max_num_embodiments,
             ),
             in_type=self.action_type,
@@ -781,8 +813,8 @@ class FlowmatchingActionHead(nn.Module):
         """
         remapped = {}
         skip_prefixes = (
-            "action_decoder.",
-            "equi_res_adapter.",
+            "action_decoder.",       # fresh equi decoder
+            "equi_res_adapter.",     # fresh equi adapter
             "future_tokens_equi_proj.", "vl_equi_proj.", "vlln.",
             "vl_self_attention.", "language_proj.", "language_lift.", "equi_vis_proj.",
         )
@@ -793,6 +825,10 @@ class FlowmatchingActionHead(nn.Module):
                 remapped["fa_state_encoder.pretrained_encoder." + key[len("state_encoder."):]] = value
             elif key.startswith("action_encoder."):
                 remapped["fa_action_encoder.pretrained_encoder." + key[len("action_encoder."):]] = value
+            elif key == "position_embedding.weight":
+                # Baseline used one shared pos embed (1024-dim) for both state and action.
+                # Reuse for inv branch pos embed; equi branch gets fresh init.
+                remapped["inv_temporal_pos_embed.weight"] = value
             elif key.startswith(skip_prefixes):
                 print(f"Skipping (fresh init): {key}")
             else:
@@ -809,9 +845,13 @@ class FlowmatchingActionHead(nn.Module):
             self.fa_action_encoder.pretrained_encoder.eval()
             if not getattr(self.config, "tune_inv_dit", False):
                 self.inv_dit.eval()
-            if not self.tune_projector and self.config.add_pos_embed:
-                self.temporal_pos_embed.eval()
-                self.temporal_pos_proj.eval()
+            if not self.tune_projector:
+                self.inv_state_proj.eval()
+                self.inv_action_proj.eval()
+                if self.config.add_pos_embed:
+                    self.temporal_pos_embed.eval()
+                    self.temporal_pos_proj.eval()
+                    self.inv_temporal_pos_embed.eval()
             if not self.tune_diffusion_model:
                 self.equi_res_adapter.eval()
 
@@ -947,7 +987,7 @@ class FlowmatchingActionHead(nn.Module):
             einops.rearrange(noisy_trajectory, 'b t c -> (b t) c'), self.action_type
         )
         action_emb_id = embodiment_id.repeat(T_a)
-        equi_action, inv_action = self.fa_action_encoder.encode(geo_action, action_emb_id, t_discretized)
+        equi_action, inv_action = self.fa_action_encoder.encode(geo_action, action_emb_id, t_discretized.repeat(T_a))
         equi_action = einops.rearrange(equi_action, '(b t) c -> b t c', b=B, t=T_a)
         inv_action  = einops.rearrange(inv_action,  '(b t) c -> b t c', b=B, t=T_a)
 
@@ -1068,7 +1108,7 @@ class FlowmatchingActionHead(nn.Module):
                 einops.rearrange(actions, 'b t c -> (b t) c'), self.action_type
             )
             equi_action, inv_action = self.fa_action_encoder.encode(
-                geo_action, action_emb_id, timesteps_tensor
+                geo_action, action_emb_id, timesteps_tensor.repeat(T_a)
             )
             equi_action = einops.rearrange(equi_action, '(b t) c -> b t c', b=B, t=T_a)
             inv_action  = einops.rearrange(inv_action,  '(b t) c -> b t c', b=B, t=T_a)

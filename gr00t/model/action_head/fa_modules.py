@@ -117,13 +117,18 @@ class FAEncoder(nn.Module):
                 rotated_inputs.append(enn.GeometricTensor(rotated, self.in_type))
 
         # Run encoder in normal autocast context.
+        # Pretrained encoders are plain (non-equivariant) — pass raw tensor, get raw tensor back.
+        # CategorySpecificLinear uses bmm and expects [B, T, D]; we have [BT, D] so unsqueeze T=1.
         h_list = []
-        for g_idx, h_x_geo in enumerate(rotated_inputs):
+        for h_x_geo in rotated_inputs:
+            x = h_x_geo.tensor.unsqueeze(1)  # [BT, 1, D]
             if timestep is not None:
-                out = self.pretrained_encoder(h_x_geo, timestep, cat_ids).tensor
+                out = self.pretrained_encoder(x, timestep, cat_ids)
             else:
-                out = self.pretrained_encoder(h_x_geo, cat_ids).tensor
-            h_list.append(out)
+                out = self.pretrained_encoder(x, cat_ids)
+            if hasattr(out, 'tensor'):
+                out = out.tensor
+            h_list.append(out.squeeze(1))  # [BT, D]
 
         h_stack = torch.stack(h_list, dim=0)  # [N, BT, D_out]
 
