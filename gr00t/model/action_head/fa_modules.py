@@ -33,25 +33,27 @@ class FAEncoder(nn.Module):
     """
     Frame Averaging wrapper around a frozen pretrained (non-equivariant) encoder.
 
+    The pretrained encoder is NOT stored inside this module so that it can live
+    at the top level of the action head with its original checkpoint name
+    (e.g. ``state_encoder`` / ``action_encoder``).  Pass it explicitly to
+    :meth:`encode`.
+
     Computes:
         equi = FA_equi(x) = (1/N) Σ_h  ρ_out(h⁻¹) · f(h·x)   [regular repr]
         inv  = FA_inv(x)  = (1/N) Σ_h  f(h·x)                  [invariant plain mean]
 
     Input rotation:  geo_input.transform(g_elem)  using input field type
     Output rotation: wrap with fa_output_type, call .transform(h_inv)
-    _apply_frame_averaging: identical to C8EquivariantTimmObsEncoder
     """
 
     def __init__(
         self,
-        pretrained_encoder: nn.Module,
         in_type: enn.FieldType,
         n_group: int,
         output_dim: int,
         input_truncate_dim: Optional[int] = None,
     ):
         super().__init__()
-        self.pretrained_encoder = pretrained_encoder
         self.in_type = in_type
         self.n_group = n_group
         self.output_dim = output_dim
@@ -92,13 +94,15 @@ class FAEncoder(nn.Module):
         self,
         geo_input: enn.GeometricTensor,
         cat_ids: torch.Tensor,
+        pretrained_encoder: nn.Module,
         timestep: Optional[torch.Tensor] = None,
     ):
         """
         Args:
-            geo_input: GeometricTensor with self.in_type, shape [(B*T), D_in]
-            cat_ids:   [(B*T),] embodiment ids
-            timestep:  [B,] diffusion timestep (action encoder only)
+            geo_input:          GeometricTensor with self.in_type, shape [(B*T), D_in]
+            cat_ids:            [(B*T),] embodiment ids
+            pretrained_encoder: the (frozen) plain encoder to call for each rotated input
+            timestep:           [B,] diffusion timestep (action encoder only)
         Returns:
             equi: [(B*T), D_out]  equivariant regular repr
             inv:  [(B*T), D_out]  invariant plain mean
@@ -109,7 +113,7 @@ class FAEncoder(nn.Module):
 
         # Pre-compute all rotated inputs with autocast disabled (escnn.transform → .numpy() requires float32).
         # Cast back to the encoder's weight dtype immediately after transform.
-        enc_dtype = next(self.pretrained_encoder.parameters()).dtype
+        enc_dtype = next(pretrained_encoder.parameters()).dtype
         rotated_inputs = []
         with torch.autocast(device_type=device_type, enabled=False):
             geo_input_f32 = enn.GeometricTensor(geo_input.tensor.float(), self.in_type)
@@ -127,9 +131,9 @@ class FAEncoder(nn.Module):
             if self.input_truncate_dim is not None:
                 x = x[:, :, :self.input_truncate_dim]
             if timestep is not None:
-                out = self.pretrained_encoder(x, timestep, cat_ids)
+                out = pretrained_encoder(x, timestep, cat_ids)
             else:
-                out = self.pretrained_encoder(x, cat_ids)
+                out = pretrained_encoder(x, cat_ids)
             if hasattr(out, 'tensor'):
                 out = out.tensor
             h_list.append(out.squeeze(1))  # [BT, D]

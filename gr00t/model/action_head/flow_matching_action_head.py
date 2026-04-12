@@ -14,7 +14,6 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-import time
 
 import torch
 import torch.nn.functional as F
@@ -406,33 +405,35 @@ class FlowmatchingActionHead(nn.Module):
         self.action_type = self.getJointFieldType(is_action=True) if not self.rel_action else self.getActionRelFieldType(is_action=True)
         self.action_out_type = enn.FieldType(self.group, int(self.input_embedding_dim / self.n_group) * [self.group.regular_repr])
 
-        # ── inv_dit: frozen pretrained plain DiT (loaded from baseline checkpoint) ──────────
+        # ── DiT: same name as baseline so from_pretrained loads weights directly ──────────
         # cross_attention_dim is set to backbone.project_to_dim by gr00t_finetune.py;
         # n_group is excluded (DiT is not equivariant).
         inv_dit_cfg = {k: v for k, v in config.diffusion_model_cfg.items() if k != "n_group"}
-        self.inv_dit = DiT(**inv_dit_cfg)
+        self.model = DiT(**inv_dit_cfg)
 
-        # ── FA encoders: FA wraps plain pretrained encoders (exact baseline architecture) ──
-        # Plain (non-equivariant) encoders so that baseline checkpoint weights load exactly.
+        # ── Pretrained encoders at top level: same names as baseline checkpoint ──────────
+        # Stored here (not inside FAEncoder) so that from_pretrained maps keys directly.
         # FA provides equivariance externally via group averaging.
-        self.fa_state_encoder = FAEncoder(
-            pretrained_encoder=CategorySpecificMLP(
-                num_categories=config.max_num_embodiments,
-                input_dim=config.max_state_dim,
-                hidden_dim=config.hidden_size,
-                output_dim=config.input_embedding_dim,
-            ),
+        self.state_encoder = CategorySpecificMLP(
+            num_categories=config.max_num_embodiments,
+            input_dim=config.max_state_dim,
+            hidden_dim=config.hidden_size,
+            output_dim=config.input_embedding_dim,
+        )
+        self.action_encoder = MultiEmbodimentActionEncoder(
+            action_dim=config.action_dim,
+            hidden_size=config.input_embedding_dim,
+            num_embodiments=config.max_num_embodiments,
+        )
+
+        # ── FA wrappers: hold only the group-averaging metadata (no pretrained encoder) ──
+        self._fa_state = FAEncoder(
             in_type=self.state_in_type,
             n_group=self.n_group,
             output_dim=config.input_embedding_dim,
             input_truncate_dim=config.max_state_dim,
         )
-        self.fa_action_encoder = FAEncoder(
-            pretrained_encoder=MultiEmbodimentActionEncoder(
-                action_dim=config.action_dim,
-                hidden_size=config.input_embedding_dim,
-                num_embodiments=config.max_num_embodiments,
-            ),
+        self._fa_action = FAEncoder(
             in_type=self.action_type,
             n_group=self.n_group,
             output_dim=config.input_embedding_dim,
@@ -443,14 +444,10 @@ class FlowmatchingActionHead(nn.Module):
         # equi_proj: input_embedding_dim → hidden_size  (equivariant, FA equi features → DiT hidden dim)
         self.equi_proj = enn.Linear(self.state_out_type, self.state_hidden_type)
         # inv_state_proj / inv_action_proj / inv_future_proj: input_embedding_dim → hidden_size
-        if config.input_embedding_dim != config.hidden_size:
-            self.inv_state_proj  = nn.Linear(config.input_embedding_dim, config.hidden_size)
-            self.inv_action_proj = nn.Linear(config.input_embedding_dim, config.hidden_size)
-            self.inv_future_proj = nn.Linear(config.input_embedding_dim, config.hidden_size)
-        else:
-            self.inv_state_proj  = nn.Identity()
-            self.inv_action_proj = nn.Identity()
-            self.inv_future_proj = nn.Identity()
+
+        self.inv_state_proj  = nn.Linear(config.input_embedding_dim, config.input_embedding_dim)
+        self.inv_action_proj = nn.Linear(config.input_embedding_dim, config.input_embedding_dim)
+
         _cross_attn_dim = config.diffusion_model_cfg.get("cross_attention_dim", config.backbone_embedding_dim)
 
         # ── EquiResAdapter: lightweight equivariant corrections ───────────────────────────
@@ -506,8 +503,8 @@ class FlowmatchingActionHead(nn.Module):
             nn.init.normal_(self.temporal_pos_embed.weight, mean=0.0, std=0.02)
             # Plain temporal position embeddings (inv branch): input_embedding_dim, same as baseline.
             # Loaded from baseline's position_embedding — applied before inv_proj (at 1536 dim).
-            self.inv_temporal_pos_embed = nn.Embedding(config.max_seq_len, config.input_embedding_dim)
-            nn.init.normal_(self.inv_temporal_pos_embed.weight, mean=0.0, std=0.02)
+            self.position_embedding = nn.Embedding(config.max_seq_len, config.input_embedding_dim)
+            nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
@@ -783,20 +780,19 @@ class FlowmatchingActionHead(nn.Module):
         self.config.tune_inv_dit = tune_inv_dit
         for p in self.parameters():
             p.requires_grad = True
-        # Always freeze pretrained encoders inside FA wrappers
-        self.fa_state_encoder.pretrained_encoder.requires_grad_(False)
-        self.fa_action_encoder.pretrained_encoder.requires_grad_(False)
-        # Freeze inv_dit unless explicitly requested
+        # Always freeze pretrained encoders
+        self.state_encoder.requires_grad_(False)
+        self.action_encoder.requires_grad_(False)
+        # Freeze model (DiT) unless explicitly requested
         if not tune_inv_dit:
-            self.inv_dit.requires_grad_(False)
+            self.model.requires_grad_(False)
         if not tune_projector:
             print("set requires_grad false for tune projector")
             self.equi_proj.requires_grad_(False)
             self.inv_state_proj.requires_grad_(False)
             self.inv_action_proj.requires_grad_(False)
-            self.inv_future_proj.requires_grad_(False)
             if self.config.add_pos_embed:
-                self.inv_temporal_pos_embed.requires_grad_(False)
+                self.position_embedding.requires_grad_(False)
                 self.temporal_pos_embed.requires_grad_(False)
                 self.temporal_pos_proj.requires_grad_(False)
         if not tune_diffusion_model:
@@ -809,62 +805,65 @@ class FlowmatchingActionHead(nn.Module):
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         """
-        Remaps baseline checkpoint keys to the new dual-stream architecture.
-
-        Baseline (gr00t_baseline_locht1) → new name:
-          model.*          → inv_dit.*
-          state_encoder.*  → fa_state_encoder.pretrained_encoder.*
-          action_encoder.* → fa_action_encoder.pretrained_encoder.*
-          action_decoder.* → skipped (fresh init)
-          equi_res_adapter.* → skipped (fresh init)
+        Module names now match baseline_gr00t_locht1 exactly so no remapping is needed.
+        Keys that belong to freshly-initialised equivariant modules (action_decoder,
+        equi_res_adapter, …) are dropped before calling super() to avoid shape errors
+        when loading from a plain baseline checkpoint.
         """
-        remapped = {}
         skip_prefixes = (
-            "action_decoder.",       # fresh equi decoder
-            "equi_res_adapter.",     # fresh equi adapter
+            "action_decoder.",
+            "equi_res_adapter.",
             "future_tokens_equi_proj.", "vl_equi_proj.", "vlln.",
-            "vl_self_attention.", "language_proj.", "language_lift.", "equi_vis_proj.",
+            "vl_self_attention.", "language_proj.", "language_lift.", "equi_vis_proj.", "inv_state_proj.", "inv_action_proj.", 
         )
-        for key, value in state_dict.items():
-            if key.startswith("model."):
-                print(f"Remapping {key} → inv_dit.{key[len('model.'):]} for pretrained DiT weights")
-                remapped["inv_dit." + key[len("model."):]] = value
-            elif key.startswith("state_encoder."):
-                print(f"Remapping {key} → fa_state_encoder.pretrained_encoder.{key[len('state_encoder.'):]} for pretrained state encoder weights")
-                remapped["fa_state_encoder.pretrained_encoder." + key[len("state_encoder."):]] = value
-            elif key.startswith("action_encoder."):
-                print(f"Remapping {key} → fa_action_encoder.pretrained_encoder.{key[len('action_encoder.'):]} for pretrained action encoder weights")
-                remapped["fa_action_encoder.pretrained_encoder." + key[len("action_encoder."):]] = value
-            elif key == "position_embedding.weight":
-                print(f"Remapping {key} → temporal_pos_embed.weight for pretrained temporal position embedding")
-                # Baseline used one shared pos embed (1024-dim) for both state and action.
-                # Reuse for inv branch pos embed; equi branch gets fresh init.
-                remapped["inv_temporal_pos_embed.weight"] = value
-            elif key.startswith(skip_prefixes):
-                print(f"Skipping (fresh init): {key}")
+        filtered = {}
+        skipped = []
+        for k, v in state_dict.items():
+            if k.startswith(skip_prefixes):
+                skipped.append(k)
             else:
-                remapped[key] = value
-        time.sleep(60)  # Ensure all print statements are flushed before loading state dict
-        return super().load_state_dict(remapped, strict=False, assign=assign)
+                filtered[k] = v
+
+        if skipped:
+            print(f"[load_state_dict] Skipped {len(skipped)} keys (fresh-init equi modules): {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
+
+        # Track which pretrained modules get weights
+        pretrained_keys = {"model": [], "state_encoder": [], "action_encoder": [], "position_embedding": []}
+        for k in filtered:
+            for prefix in pretrained_keys:
+                if k.startswith(prefix + ".") or k == prefix:
+                    pretrained_keys[prefix].append(k)
+
+        for prefix, keys in pretrained_keys.items():
+            if keys:
+                print(f"[load_state_dict] Loading {len(keys)} keys into '{prefix}' (e.g. {keys[0]})")
+            else:
+                print(f"[load_state_dict] WARNING: no keys found for '{prefix}' — weights will be random!")
+
+        result = super().load_state_dict(filtered, strict=False, assign=assign)
+        if result.missing_keys:
+            print(f"[load_state_dict] Missing keys ({len(result.missing_keys)}): {result.missing_keys[:5]}{'...' if len(result.missing_keys) > 5 else ''}")
+        if result.unexpected_keys:
+            print(f"[load_state_dict] Unexpected keys ({len(result.unexpected_keys)}): {result.unexpected_keys[:5]}{'...' if len(result.unexpected_keys) > 5 else ''}")
+        return result
 
     def set_frozen_modules_to_eval_mode(self):
         """
         Huggingface calls model.train() each step — keep frozen modules in eval.
         """
         if self.training:
-            # Pretrained encoders inside FA wrappers are always frozen
-            self.fa_state_encoder.pretrained_encoder.eval()
-            self.fa_action_encoder.pretrained_encoder.eval()
+            # Pretrained encoders are always frozen
+            self.state_encoder.eval()
+            self.action_encoder.eval()
             if not getattr(self.config, "tune_inv_dit", False):
-                self.inv_dit.eval()
+                self.model.eval()
             if not self.tune_projector:
                 self.inv_state_proj.eval()
                 self.inv_action_proj.eval()
-                self.inv_future_proj.eval()
                 if self.config.add_pos_embed:
                     self.temporal_pos_embed.eval()
                     self.temporal_pos_proj.eval()
-                    self.inv_temporal_pos_embed.eval()
+                    self.position_embedding.eval()
             if not self.tune_diffusion_model:
                 self.equi_res_adapter.eval()
 
@@ -887,7 +886,7 @@ class FlowmatchingActionHead(nn.Module):
         Applied before inv_proj — matches baseline position_embedding usage."""
         T = features.shape[1]
         pos_ids = torch.arange(T, device=features.device)
-        pos_emb = self.inv_temporal_pos_embed(pos_ids)  # [T, input_embedding_dim]
+        pos_emb = self.position_embedding(pos_ids)  # [T, input_embedding_dim]
         return features + pos_emb.unsqueeze(0).to(features.dtype)
 
     def sample_time(self, batch_size, device, dtype):
@@ -983,7 +982,7 @@ class FlowmatchingActionHead(nn.Module):
 
         # ── FA State encoding ─────────────────────────────────────────────────
         geo_state = self.getJointGeometricTensor(action_input.state, is_action=False)
-        equi_state, inv_state = self.fa_state_encoder.encode(geo_state, embodiment_id.repeat(T_s))
+        equi_state, inv_state = self._fa_state.encode(geo_state, embodiment_id.repeat(T_s), self.state_encoder)
         equi_state = einops.rearrange(equi_state, '(b t) c -> b t c', b=B, t=T_s)
         inv_state  = einops.rearrange(inv_state,  '(b t) c -> b t c', b=B, t=T_s)
 
@@ -1001,31 +1000,30 @@ class FlowmatchingActionHead(nn.Module):
             einops.rearrange(noisy_trajectory, 'b t c -> (b t) c'), self.action_type
         )
         action_emb_id = embodiment_id.repeat(T_a)
-        equi_action, inv_action = self.fa_action_encoder.encode(geo_action, action_emb_id, t_discretized.repeat(T_a))
+        equi_action, inv_action = self._fa_action.encode(geo_action, action_emb_id, self.action_encoder, t_discretized.repeat(T_a))
         equi_action = einops.rearrange(equi_action, '(b t) c -> b t c', b=B, t=T_a)
         inv_action  = einops.rearrange(inv_action,  '(b t) c -> b t c', b=B, t=T_a)
 
         ref_dtype = inv_state.dtype
         # Inv branch: add pos_embed (at 1536) only to action, matching baseline.
+
+        inv_state_p  = self.inv_state_proj(inv_state.to(ref_dtype))   # [B, T_s, hidden_size]
+        inv_action_p = self.inv_action_proj(inv_action.to(ref_dtype)) # [B, T_a, hidden_size]
         if self.config.add_pos_embed:
             equi_state  = self._add_temporal_pos_embed(equi_state)
             equi_action = self._add_temporal_pos_embed(equi_action)
             inv_action  = self._add_inv_temporal_pos_embed(inv_action)  # [B, T_a, 1536]
 
-        # Project inv branch 1536 → hidden_size after pos_embed
-        inv_state_p  = self.inv_state_proj(inv_state.to(ref_dtype))   # [B, T_s, hidden_size]
-        inv_action_p = self.inv_action_proj(inv_action.to(ref_dtype)) # [B, T_a, hidden_size]
 
         # future_tokens: matches baseline sa_embs = (state, future_tokens, action)
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1)
-        future_tokens_inv = self.inv_future_proj(future_tokens.to(ref_dtype))  # [B, T_fut, hidden_size]
 
         # ── Invariant branch: frozen pretrained DiT ───────────────────────────
         encoder_mask = backbone_output.backbone_attention_mask
         vl_inv_ctx = backbone_output.vl_inv_features if "vl_inv_features" in backbone_output else backbone_output.vl_features
 
-        sa_embs_inv = torch.cat([inv_state_p, future_tokens_inv, inv_action_p], dim=1)  # [B, T_sa, hidden_size]
-        inv_output  = self.inv_dit(
+        sa_embs_inv = torch.cat([inv_state_p, future_tokens, inv_action_p], dim=1)  # [B, T_sa, hidden_size]
+        inv_output  = self.model(
             hidden_states=sa_embs_inv,
             encoder_hidden_states=vl_inv_ctx.to(ref_dtype),
             encoder_attention_mask=encoder_mask,
@@ -1076,10 +1074,10 @@ class FlowmatchingActionHead(nn.Module):
 
     @torch.no_grad()
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
-        self.inv_dit.eval()
+        self.model.eval()
         self.action_decoder.eval()
-        self.fa_state_encoder.eval()
-        self.fa_action_encoder.eval()
+        self._fa_state.eval()
+        self._fa_action.eval()
         self.equi_res_adapter.eval()
 
         backbone_output = self.process_backbone_output(backbone_output)
@@ -1089,7 +1087,7 @@ class FlowmatchingActionHead(nn.Module):
 
         # ── FA State encoding (once, outside denoising loop) ─────────────────
         geo_state = self.getJointGeometricTensor(action_input.state, is_action=False)
-        equi_state, inv_state = self.fa_state_encoder.encode(geo_state, embodiment_id.repeat(T_s))
+        equi_state, inv_state = self._fa_state.encode(geo_state, embodiment_id.repeat(T_s), self.state_encoder)
         equi_state = einops.rearrange(equi_state, '(b t) c -> b t c', b=B, t=T_s)
         inv_state  = einops.rearrange(inv_state,  '(b t) c -> b t c', b=B, t=T_s)
         # Project inv_state (no pos_embed on state — matches baseline)
@@ -1098,9 +1096,7 @@ class FlowmatchingActionHead(nn.Module):
             equi_state = self._add_temporal_pos_embed(equi_state)
 
         # future_tokens for inv branch (matches baseline sa_embs structure)
-        future_tokens_inv = self.inv_future_proj(
-            self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1).to(inv_state.dtype)
-        )  # [B, T_fut, hidden_size]
+        future_tokens_inv = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1).to(inv_state.dtype)
 
         # ── Prepare vl_inv context for inv_dit ───────────────────────────────
         # vl_inv_features already processed (LN + SA) by process_backbone_output
@@ -1128,8 +1124,8 @@ class FlowmatchingActionHead(nn.Module):
             geo_action = enn.GeometricTensor(
                 einops.rearrange(actions, 'b t c -> (b t) c'), self.action_type
             )
-            equi_action, inv_action = self.fa_action_encoder.encode(
-                geo_action, action_emb_id, timesteps_tensor.repeat(T_a)
+            equi_action, inv_action = self._fa_action.encode(
+                geo_action, action_emb_id, self.action_encoder, timesteps_tensor.repeat(T_a)
             )
             equi_action = einops.rearrange(equi_action, '(b t) c -> b t c', b=B, t=T_a)
             inv_action  = einops.rearrange(inv_action,  '(b t) c -> b t c', b=B, t=T_a)
@@ -1142,7 +1138,7 @@ class FlowmatchingActionHead(nn.Module):
 
             # Invariant branch
             sa_embs_inv = torch.cat([inv_state_p, future_tokens_inv, inv_action_p], dim=1)  # [B, T_sa, hidden_size]
-            inv_output  = self.inv_dit(
+            inv_output  = self.model(
                 hidden_states=sa_embs_inv,
                 encoder_hidden_states=vl_inv_proj.to(ref_dtype),
                 encoder_attention_mask=encoder_mask,
