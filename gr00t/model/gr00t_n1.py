@@ -260,6 +260,7 @@ class GR00T_N1_5(PreTrainedModel):
         tune_llm = kwargs.pop("tune_llm", False)
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
+        tune_inv_dit = kwargs.pop("tune_inv_dit", True)
         load_backbone_only = kwargs.pop("load_backbone_only", False)
         backbone_cfg_overrides = kwargs.pop("backbone_cfg_overrides", {})
         rot_aug = kwargs.pop("rot_aug", None)
@@ -341,7 +342,8 @@ class GR00T_N1_5(PreTrainedModel):
             tune_visual=tune_visual, tune_llm=tune_llm
         )
         pretrained_model.action_head.set_trainable_parameters(
-            tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
+            tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model,
+            tune_inv_dit=tune_inv_dit,
         )
         return pretrained_model
 

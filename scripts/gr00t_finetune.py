@@ -103,6 +103,9 @@ class ArgsConfig:
     tune_diffusion_model: bool = True
     """Whether to fine-tune the diffusion model."""
 
+    tune_inv_dit: bool = True
+    """Whether to fine-tune the inv_dit (FA hybrid arch). Should be True when FA encoders are used."""
+
     resume: bool = False
     """Whether to resume from a checkpoint."""
 
@@ -256,6 +259,7 @@ def main(config: ArgsConfig):
         tune_visual=config.tune_visual,  # backbone's vision tower
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
+        tune_inv_dit=config.tune_inv_dit,  # FA hybrid: whether inv_dit adapts to FA encoder outputs
         load_backbone_only=True,  # load backbone only, not the action head
         backbone_cfg_overrides=backbone_cfg_overrides,
         rot_aug=config.rot_aug,

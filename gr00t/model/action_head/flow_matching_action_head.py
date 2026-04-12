@@ -323,9 +323,6 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     tune_inv_dit: bool = field(
         default=True, metadata={"help": "Whether to fine-tune the frozen pretrained DiT (inv_dit)."}
     )
-    vl_self_attention_cfg: dict = field(
-        default_factory=lambda: None, metadata={"help": "Config for SelfAttentionTransformer on inv features. None disables it."}
-    )
     def __init__(self, **kwargs):
         import dataclasses
         super().__init__(**kwargs)
@@ -408,8 +405,15 @@ class FlowmatchingActionHead(nn.Module):
         )
 
         # ── Projections ──────────────────────────────────────────────────────────────────
-        # equi_proj: 1536 → 1024  (equivariant, projects FA equi features to DiT hidden dim)
+        # equi_proj: input_embedding_dim → hidden_size  (equivariant, FA equi features → DiT hidden dim)
         self.equi_proj = enn.Linear(self.state_out_type, self.state_hidden_type)
+        # inv_state_proj / inv_action_proj: input_embedding_dim → hidden_size
+        if config.input_embedding_dim != config.hidden_size:
+            self.inv_state_proj  = nn.Linear(config.input_embedding_dim, config.hidden_size)
+            self.inv_action_proj = nn.Linear(config.input_embedding_dim, config.hidden_size)
+        else:
+            self.inv_state_proj  = nn.Identity()
+            self.inv_action_proj = nn.Identity()
         _cross_attn_dim = config.diffusion_model_cfg.get("cross_attention_dim", config.backbone_embedding_dim)
 
         # ── EquiResAdapter: lightweight equivariant corrections ───────────────────────────
@@ -447,6 +451,7 @@ class FlowmatchingActionHead(nn.Module):
         # ── Inv branch: LayerNorm + SelfAttention (mirrors baseline process_backbone_output) ─
         _cross_attn_dim = config.diffusion_model_cfg.get("cross_attention_dim", config.backbone_embedding_dim)
         if getattr(config, "vl_self_attention_cfg", None) is not None:
+            print("Using VL self-attention in inv branch with config:", config.vl_self_attention_cfg)
             self.vlln_inv = nn.LayerNorm(_cross_attn_dim)
             self.vl_inv_self_attention = SelfAttentionTransformer(**config.vl_self_attention_cfg)
         else:
@@ -454,7 +459,7 @@ class FlowmatchingActionHead(nn.Module):
             self.vl_inv_self_attention = None
 
         if config.add_pos_embed:
-            # Equivariant temporal position embeddings: trivial → state_out_type (regular).
+            # Equivariant temporal position embeddings (equi branch): trivial → state_out_type (regular).
             _D = config.input_embedding_dim
             self.temporal_pos_trivial_type = enn.FieldType(
                 self.group, [self.group.trivial_repr] * _D
@@ -462,6 +467,9 @@ class FlowmatchingActionHead(nn.Module):
             self.temporal_pos_embed = nn.Embedding(config.max_seq_len, _D)
             self.temporal_pos_proj = enn.Linear(self.temporal_pos_trivial_type, self.state_out_type)
             nn.init.normal_(self.temporal_pos_embed.weight, mean=0.0, std=0.02)
+            # Plain temporal position embeddings (inv branch): hidden_size dim.
+            self.inv_temporal_pos_embed = nn.Embedding(config.max_seq_len, config.hidden_size)
+            nn.init.normal_(self.inv_temporal_pos_embed.weight, mean=0.0, std=0.02)
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
@@ -731,21 +739,25 @@ class FlowmatchingActionHead(nn.Module):
         new_mask[:, :, :n_real_trans] = 1
         return new_mask
 
-    def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
+    def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool, tune_inv_dit: bool = True):
         self.tune_projector = tune_projector
         self.tune_diffusion_model = tune_diffusion_model
+        self.config.tune_inv_dit = tune_inv_dit
         for p in self.parameters():
             p.requires_grad = True
         # Always freeze pretrained encoders inside FA wrappers
         self.fa_state_encoder.pretrained_encoder.requires_grad_(False)
         self.fa_action_encoder.pretrained_encoder.requires_grad_(False)
-        # Always freeze inv_dit unless explicitly requested
-        if not getattr(self.config, "tune_inv_dit", False):
+        # Freeze inv_dit unless explicitly requested
+        if not tune_inv_dit:
             self.inv_dit.requires_grad_(False)
         if not tune_projector:
             print("set requires_grad false for tune projector")
             self.equi_proj.requires_grad_(False)
+            self.inv_state_proj.requires_grad_(False)
+            self.inv_action_proj.requires_grad_(False)
             if self.config.add_pos_embed:
+                self.inv_temporal_pos_embed.requires_grad_(False)
                 self.temporal_pos_embed.requires_grad_(False)
                 self.temporal_pos_proj.requires_grad_(False)
         if not tune_diffusion_model:
@@ -808,13 +820,20 @@ class FlowmatchingActionHead(nn.Module):
         self.equi_res_adapter.set_warmup_scale(step, warmup_steps)
 
     def _add_temporal_pos_embed(self, features: torch.Tensor) -> torch.Tensor:
-        """Add equivariant temporal position embeddings to a [B, T, D] feature tensor."""
+        """Add equivariant temporal position embeddings (equi branch) to [B, T, D]."""
         T = features.shape[1]
         device = features.device
         pos_ids = torch.arange(T, device=device)
         pos_emb = self.temporal_pos_proj(
             enn.GeometricTensor(self.temporal_pos_embed(pos_ids), self.temporal_pos_trivial_type)
         ).tensor  # [T, D]
+        return features + pos_emb.unsqueeze(0).to(features.dtype)
+
+    def _add_inv_temporal_pos_embed(self, features: torch.Tensor) -> torch.Tensor:
+        """Add plain temporal position embeddings (inv branch) to [B, T, hidden_size]."""
+        T = features.shape[1]
+        pos_ids = torch.arange(T, device=features.device)
+        pos_emb = self.inv_temporal_pos_embed(pos_ids)  # [T, hidden_size]
         return features + pos_emb.unsqueeze(0).to(features.dtype)
 
     def sample_time(self, batch_size, device, dtype):
@@ -932,19 +951,23 @@ class FlowmatchingActionHead(nn.Module):
         equi_action = einops.rearrange(equi_action, '(b t) c -> b t c', b=B, t=T_a)
         inv_action  = einops.rearrange(inv_action,  '(b t) c -> b t c', b=B, t=T_a)
 
+        # Project inv branch to hidden_size before pos embed
+        ref_dtype = inv_state.dtype
+        inv_state_p  = self.inv_state_proj(inv_state.to(ref_dtype))   # [B, T_s, hidden_size]
+        inv_action_p = self.inv_action_proj(inv_action.to(ref_dtype)) # [B, T_a, hidden_size]
+
         if self.config.add_pos_embed:
-            equi_state  = self._add_temporal_pos_embed(equi_state)
-            inv_state   = self._add_temporal_pos_embed(inv_state)
-            equi_action = self._add_temporal_pos_embed(equi_action)
-            inv_action  = self._add_temporal_pos_embed(inv_action)
+            equi_state   = self._add_temporal_pos_embed(equi_state)
+            equi_action  = self._add_temporal_pos_embed(equi_action)
+            inv_state_p  = self._add_inv_temporal_pos_embed(inv_state_p)
+            inv_action_p = self._add_inv_temporal_pos_embed(inv_action_p)
 
         # ── Invariant branch: frozen pretrained DiT ───────────────────────────
         # vl_inv_features already projected + LN + SA by process_backbone_output
         encoder_mask = backbone_output.backbone_attention_mask
         vl_inv_ctx = backbone_output.vl_inv_features if "vl_inv_features" in backbone_output else backbone_output.vl_features
 
-        ref_dtype = inv_state.dtype
-        sa_embs_inv = torch.cat([inv_state, inv_action], dim=1)  # [B, T_sa, D]
+        sa_embs_inv = torch.cat([inv_state_p, inv_action_p], dim=1)  # [B, T_sa, hidden_size]
         inv_output  = self.inv_dit(
             hidden_states=sa_embs_inv,
             encoder_hidden_states=vl_inv_ctx.to(ref_dtype),
@@ -1012,9 +1035,11 @@ class FlowmatchingActionHead(nn.Module):
         equi_state, inv_state = self.fa_state_encoder.encode(geo_state, embodiment_id.repeat(T_s))
         equi_state = einops.rearrange(equi_state, '(b t) c -> b t c', b=B, t=T_s)
         inv_state  = einops.rearrange(inv_state,  '(b t) c -> b t c', b=B, t=T_s)
+        # Project inv_state before pos embed
+        inv_state_p = self.inv_state_proj(inv_state.to(inv_state.dtype))  # [B, T_s, hidden_size]
         if self.config.add_pos_embed:
-            equi_state = self._add_temporal_pos_embed(equi_state)
-            inv_state  = self._add_temporal_pos_embed(inv_state)
+            equi_state  = self._add_temporal_pos_embed(equi_state)
+            inv_state_p = self._add_inv_temporal_pos_embed(inv_state_p)
 
         # ── Prepare vl_inv context for inv_dit ───────────────────────────────
         # vl_inv_features already processed (LN + SA) by process_backbone_output
@@ -1047,13 +1072,15 @@ class FlowmatchingActionHead(nn.Module):
             )
             equi_action = einops.rearrange(equi_action, '(b t) c -> b t c', b=B, t=T_a)
             inv_action  = einops.rearrange(inv_action,  '(b t) c -> b t c', b=B, t=T_a)
+            # Project inv_action before pos embed
+            ref_dtype = inv_state_p.dtype
+            inv_action_p = self.inv_action_proj(inv_action.to(ref_dtype))  # [B, T_a, hidden_size]
             if self.config.add_pos_embed:
-                equi_action = self._add_temporal_pos_embed(equi_action)
-                inv_action  = self._add_temporal_pos_embed(inv_action)
+                equi_action  = self._add_temporal_pos_embed(equi_action)
+                inv_action_p = self._add_inv_temporal_pos_embed(inv_action_p)
 
             # Invariant branch
-            ref_dtype = inv_state.dtype
-            sa_embs_inv = torch.cat([inv_state, inv_action], dim=1)
+            sa_embs_inv = torch.cat([inv_state_p, inv_action_p], dim=1)  # [B, T_sa, hidden_size]
             inv_output  = self.inv_dit(
                 hidden_states=sa_embs_inv,
                 encoder_hidden_states=vl_inv_proj.to(ref_dtype),
