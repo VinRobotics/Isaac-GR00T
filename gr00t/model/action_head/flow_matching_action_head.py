@@ -424,6 +424,7 @@ class FlowmatchingActionHead(nn.Module):
             in_type=self.state_in_type,
             n_group=self.n_group,
             output_dim=config.input_embedding_dim,
+            input_truncate_dim=config.max_state_dim,
         )
         self.fa_action_encoder = FAEncoder(
             pretrained_encoder=MultiEmbodimentActionEncoder(
@@ -434,6 +435,7 @@ class FlowmatchingActionHead(nn.Module):
             in_type=self.action_type,
             n_group=self.n_group,
             output_dim=config.input_embedding_dim,
+            input_truncate_dim=config.action_dim,
         )
 
         # ── Projections ──────────────────────────────────────────────────────────────────

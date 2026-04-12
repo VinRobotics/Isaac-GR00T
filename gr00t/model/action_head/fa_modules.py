@@ -48,12 +48,14 @@ class FAEncoder(nn.Module):
         in_type: enn.FieldType,
         n_group: int,
         output_dim: int,
+        input_truncate_dim: Optional[int] = None,
     ):
         super().__init__()
         self.pretrained_encoder = pretrained_encoder
         self.in_type = in_type
         self.n_group = n_group
         self.output_dim = output_dim
+        self.input_truncate_dim = input_truncate_dim
 
         assert output_dim % n_group == 0, "output_dim must be divisible by n_group"
         blocks = output_dim // n_group
@@ -122,6 +124,8 @@ class FAEncoder(nn.Module):
         h_list = []
         for h_x_geo in rotated_inputs:
             x = h_x_geo.tensor.unsqueeze(1)  # [BT, 1, D]
+            if self.input_truncate_dim is not None:
+                x = x[:, :, :self.input_truncate_dim]
             if timestep is not None:
                 out = self.pretrained_encoder(x, timestep, cat_ids)
             else:
