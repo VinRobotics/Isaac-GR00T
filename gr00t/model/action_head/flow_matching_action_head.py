@@ -439,13 +439,15 @@ class FlowmatchingActionHead(nn.Module):
         # ── Projections ──────────────────────────────────────────────────────────────────
         # equi_proj: input_embedding_dim → hidden_size  (equivariant, FA equi features → DiT hidden dim)
         self.equi_proj = enn.Linear(self.state_out_type, self.state_hidden_type)
-        # inv_state_proj / inv_action_proj: input_embedding_dim → hidden_size
+        # inv_state_proj / inv_action_proj / inv_future_proj: input_embedding_dim → hidden_size
         if config.input_embedding_dim != config.hidden_size:
             self.inv_state_proj  = nn.Linear(config.input_embedding_dim, config.hidden_size)
             self.inv_action_proj = nn.Linear(config.input_embedding_dim, config.hidden_size)
+            self.inv_future_proj = nn.Linear(config.input_embedding_dim, config.hidden_size)
         else:
             self.inv_state_proj  = nn.Identity()
             self.inv_action_proj = nn.Identity()
+            self.inv_future_proj = nn.Identity()
         _cross_attn_dim = config.diffusion_model_cfg.get("cross_attention_dim", config.backbone_embedding_dim)
 
         # ── EquiResAdapter: lightweight equivariant corrections ───────────────────────────
@@ -499,8 +501,9 @@ class FlowmatchingActionHead(nn.Module):
             self.temporal_pos_embed = nn.Embedding(config.max_seq_len, _D)
             self.temporal_pos_proj = enn.Linear(self.temporal_pos_trivial_type, self.state_out_type)
             nn.init.normal_(self.temporal_pos_embed.weight, mean=0.0, std=0.02)
-            # Plain temporal position embeddings (inv branch): hidden_size dim.
-            self.inv_temporal_pos_embed = nn.Embedding(config.max_seq_len, config.hidden_size)
+            # Plain temporal position embeddings (inv branch): input_embedding_dim, same as baseline.
+            # Loaded from baseline's position_embedding — applied before inv_proj (at 1536 dim).
+            self.inv_temporal_pos_embed = nn.Embedding(config.max_seq_len, config.input_embedding_dim)
             nn.init.normal_(self.inv_temporal_pos_embed.weight, mean=0.0, std=0.02)
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
@@ -788,6 +791,7 @@ class FlowmatchingActionHead(nn.Module):
             self.equi_proj.requires_grad_(False)
             self.inv_state_proj.requires_grad_(False)
             self.inv_action_proj.requires_grad_(False)
+            self.inv_future_proj.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.inv_temporal_pos_embed.requires_grad_(False)
                 self.temporal_pos_embed.requires_grad_(False)
@@ -820,12 +824,16 @@ class FlowmatchingActionHead(nn.Module):
         )
         for key, value in state_dict.items():
             if key.startswith("model."):
+                print(f"Remapping {key} → inv_dit.{key[len('model.'):]} for pretrained DiT weights")
                 remapped["inv_dit." + key[len("model."):]] = value
             elif key.startswith("state_encoder."):
+                print(f"Remapping {key} → fa_state_encoder.pretrained_encoder.{key[len('state_encoder.'):]} for pretrained state encoder weights")
                 remapped["fa_state_encoder.pretrained_encoder." + key[len("state_encoder."):]] = value
             elif key.startswith("action_encoder."):
+                print(f"Remapping {key} → fa_action_encoder.pretrained_encoder.{key[len('action_encoder.'):]} for pretrained action encoder weights")
                 remapped["fa_action_encoder.pretrained_encoder." + key[len("action_encoder."):]] = value
             elif key == "position_embedding.weight":
+                print(f"Remapping {key} → temporal_pos_embed.weight for pretrained temporal position embedding")
                 # Baseline used one shared pos embed (1024-dim) for both state and action.
                 # Reuse for inv branch pos embed; equi branch gets fresh init.
                 remapped["inv_temporal_pos_embed.weight"] = value
@@ -848,6 +856,7 @@ class FlowmatchingActionHead(nn.Module):
             if not self.tune_projector:
                 self.inv_state_proj.eval()
                 self.inv_action_proj.eval()
+                self.inv_future_proj.eval()
                 if self.config.add_pos_embed:
                     self.temporal_pos_embed.eval()
                     self.temporal_pos_proj.eval()
@@ -870,10 +879,11 @@ class FlowmatchingActionHead(nn.Module):
         return features + pos_emb.unsqueeze(0).to(features.dtype)
 
     def _add_inv_temporal_pos_embed(self, features: torch.Tensor) -> torch.Tensor:
-        """Add plain temporal position embeddings (inv branch) to [B, T, hidden_size]."""
+        """Add plain temporal position embeddings (inv branch) to [B, T, input_embedding_dim].
+        Applied before inv_proj — matches baseline position_embedding usage."""
         T = features.shape[1]
         pos_ids = torch.arange(T, device=features.device)
-        pos_emb = self.inv_temporal_pos_embed(pos_ids)  # [T, hidden_size]
+        pos_emb = self.inv_temporal_pos_embed(pos_ids)  # [T, input_embedding_dim]
         return features + pos_emb.unsqueeze(0).to(features.dtype)
 
     def sample_time(self, batch_size, device, dtype):
@@ -991,23 +1001,26 @@ class FlowmatchingActionHead(nn.Module):
         equi_action = einops.rearrange(equi_action, '(b t) c -> b t c', b=B, t=T_a)
         inv_action  = einops.rearrange(inv_action,  '(b t) c -> b t c', b=B, t=T_a)
 
-        # Project inv branch to hidden_size before pos embed
         ref_dtype = inv_state.dtype
+        # Inv branch: add pos_embed (at 1536) only to action, matching baseline.
+        if self.config.add_pos_embed:
+            equi_state  = self._add_temporal_pos_embed(equi_state)
+            equi_action = self._add_temporal_pos_embed(equi_action)
+            inv_action  = self._add_inv_temporal_pos_embed(inv_action)  # [B, T_a, 1536]
+
+        # Project inv branch 1536 → hidden_size after pos_embed
         inv_state_p  = self.inv_state_proj(inv_state.to(ref_dtype))   # [B, T_s, hidden_size]
         inv_action_p = self.inv_action_proj(inv_action.to(ref_dtype)) # [B, T_a, hidden_size]
 
-        if self.config.add_pos_embed:
-            equi_state   = self._add_temporal_pos_embed(equi_state)
-            equi_action  = self._add_temporal_pos_embed(equi_action)
-            inv_state_p  = self._add_inv_temporal_pos_embed(inv_state_p)
-            inv_action_p = self._add_inv_temporal_pos_embed(inv_action_p)
+        # future_tokens: matches baseline sa_embs = (state, future_tokens, action)
+        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1)
+        future_tokens_inv = self.inv_future_proj(future_tokens.to(ref_dtype))  # [B, T_fut, hidden_size]
 
         # ── Invariant branch: frozen pretrained DiT ───────────────────────────
-        # vl_inv_features already projected + LN + SA by process_backbone_output
         encoder_mask = backbone_output.backbone_attention_mask
         vl_inv_ctx = backbone_output.vl_inv_features if "vl_inv_features" in backbone_output else backbone_output.vl_features
 
-        sa_embs_inv = torch.cat([inv_state_p, inv_action_p], dim=1)  # [B, T_sa, hidden_size]
+        sa_embs_inv = torch.cat([inv_state_p, future_tokens_inv, inv_action_p], dim=1)  # [B, T_sa, hidden_size]
         inv_output  = self.inv_dit(
             hidden_states=sa_embs_inv,
             encoder_hidden_states=vl_inv_ctx.to(ref_dtype),
@@ -1075,11 +1088,15 @@ class FlowmatchingActionHead(nn.Module):
         equi_state, inv_state = self.fa_state_encoder.encode(geo_state, embodiment_id.repeat(T_s))
         equi_state = einops.rearrange(equi_state, '(b t) c -> b t c', b=B, t=T_s)
         inv_state  = einops.rearrange(inv_state,  '(b t) c -> b t c', b=B, t=T_s)
-        # Project inv_state before pos embed
+        # Project inv_state (no pos_embed on state — matches baseline)
         inv_state_p = self.inv_state_proj(inv_state.to(inv_state.dtype))  # [B, T_s, hidden_size]
         if self.config.add_pos_embed:
-            equi_state  = self._add_temporal_pos_embed(equi_state)
-            inv_state_p = self._add_inv_temporal_pos_embed(inv_state_p)
+            equi_state = self._add_temporal_pos_embed(equi_state)
+
+        # future_tokens for inv branch (matches baseline sa_embs structure)
+        future_tokens_inv = self.inv_future_proj(
+            self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1).to(inv_state.dtype)
+        )  # [B, T_fut, hidden_size]
 
         # ── Prepare vl_inv context for inv_dit ───────────────────────────────
         # vl_inv_features already processed (LN + SA) by process_backbone_output
@@ -1120,7 +1137,7 @@ class FlowmatchingActionHead(nn.Module):
                 inv_action_p = self._add_inv_temporal_pos_embed(inv_action_p)
 
             # Invariant branch
-            sa_embs_inv = torch.cat([inv_state_p, inv_action_p], dim=1)  # [B, T_sa, hidden_size]
+            sa_embs_inv = torch.cat([inv_state_p, future_tokens_inv, inv_action_p], dim=1)  # [B, T_sa, hidden_size]
             inv_output  = self.inv_dit(
                 hidden_states=sa_embs_inv,
                 encoder_hidden_states=vl_inv_proj.to(ref_dtype),
