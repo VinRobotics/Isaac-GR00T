@@ -589,7 +589,20 @@ class FlowmatchingActionHead(nn.Module):
         self.init_advantage_conditioning()
         self.init_value_head()
 
-        self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+        self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)    
+        
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        filtered_state_dict = {}
+        for key, value in state_dict.items():
+            # Skip old-style state_encoder weights
+            if self.config._phase == "value_head":
+                if key.startswith("value_head") or key.startswith("advantage_embedding"):
+                    print(f"Skipping incompatible state_encoder weight: {key}")
+                    continue
+            filtered_state_dict[key] = value
+        # print(filtered_state_dict)
+        # Call parent's load_state_dict with filtered state
+        return super().load_state_dict(filtered_state_dict, strict=False, assign=assign)
 
     def init_advantage_conditioning(self):
         self.advantage_embedding = AdvantageEmbedding(2048)
@@ -648,19 +661,16 @@ class FlowmatchingActionHead(nn.Module):
             Value head trainable.
         """
         # Freeze everything
-        for _, p in self.parameters():
+        for p in self.parameters():
             p.requires_grad = False
         # Unfreeze value head
-        for _, p in self.value_head.parameters():
+        for p in self.value_head.parameters():
             p.requires_grad = True
         # Unfreeze advantage embedding (learns alongside value head)
-        if self.advantage_embedding is not None:
-            for _, p in self.advantage_embedding.parameters():
-                p.requires_grad = True
 
         self._phase = "value_head"
         print("[RECAP] ── Phase 1: VALUE_HEAD ──")
-        print(f"  Trainable params: {sum(p.numel() for _, p in self.vl_self_attention.parameters() if p.requires_grad):,}")
+        print(f"  Trainable params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
 
     def set_phase_policy(self):
         """
@@ -672,16 +682,16 @@ class FlowmatchingActionHead(nn.Module):
         # Restore policy trainability
         self.set_trainable_parameters(self.config.tune_projector, self.config.tune_diffusion_model)
         # Freeze value head
-        for _, p in self.value_head.parameters():
+        for p in self.value_head.parameters():
             p.requires_grad = False
         # Advantage embedding always trainable in policy phase
         if self.advantage_embedding is not None:
-            for _, p in self.advantage_embedding.parameters():
+            for p in self.advantage_embedding.parameters():
                 p.requires_grad = True
 
-        self._phase = "policy"
+        self._phase = "action_head"
         print("[RECAP] ── Phase 2: POLICY ──")
-        print(f"  Trainable params: {sum(p.numel() for _, p in self.parameters() if p.requires_grad):,}")
+        print(f"  Trainable params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
 
     def set_frozen_modules_to_eval_mode(self):
         """
@@ -818,9 +828,8 @@ class FlowmatchingActionHead(nn.Module):
         embodiment_id = action_input.embodiment_id
 
         # Inject advantage token
-        if self.config.use_advantage_conditioning:
-            assert "reward" in action_input.keys(), f"No reward found in {action_input.keys()=}"
-            reward = torch.squeeze(action_input["reward"], dim=-1)
+        assert "reward" in action_input.keys(), f"No reward found in {action_input.keys()=}"
+        reward = torch.squeeze(action_input["reward"], dim=-1)
 
         t = action_input["reward.current_frame_idx"].squeeze(dim=-1)
         episode_lengths = action_input["reward.episode_lengths"].squeeze(dim=-1)
@@ -986,7 +995,6 @@ class FlowmatchingActionHead(nn.Module):
             output_dict = self.forward_action_head(backbone_output, action_input)
         elif self._phase == "value_head":
             output_dict = self.forward_value_head(backbone_output, action_input)
-        exit(0)
         return output_dict
 
     @torch.no_grad()

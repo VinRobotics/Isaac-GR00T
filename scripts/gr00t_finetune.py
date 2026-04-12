@@ -380,7 +380,15 @@ def main(config: ArgsConfig):
             tune_projector=config.tune_projector, tune_diffusion_model=config.tune_diffusion_model
         )
 
-    model.action_head.config._phase = config._phase
+    import copy
+    from gr00t.model.action_head.flow_matching_action_head import (
+        FlowmatchingActionHead,
+    )
+    new_action_head_config = copy.deepcopy(model.action_head.config)
+    new_action_head_config._phase = config._phase
+    new_action_head = FlowmatchingActionHead(new_action_head_config)
+    new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
+    model.action_head = new_action_head
 
     if config._phase == "action_head":
         print("Training Action Head!!!")
@@ -388,7 +396,7 @@ def main(config: ArgsConfig):
         model.action_head.config.cfg_guidance_weight = config.cfg_guidance_weight
         model.action_head.set_phase_policy()
 
-    if config._phase == "action_head":
+    if config._phase == "value_head":
         print("Training Value Head!!!")
         model.action_head.config.hidden_dim = config.hidden_dim
         model.action_head.config.num_bins = config.num_bins
