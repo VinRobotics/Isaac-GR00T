@@ -463,6 +463,13 @@ class FlowmatchingActionHead(nn.Module):
             final_dropout=config.diffusion_model_cfg.get("final_dropout", True),
         )
 
+        # ── Inv → equi lifting: learned equivariant projection ───────────────────────────
+        # Maps inv_output (plain/trivial, D dims) into regular repr (D dims) so it can be
+        # fused with equi_delta via simple addition.  Replaces the manual scalar-replication
+        # trick with a proper learned equivariant linear (trivial → regular).
+        _inv_trivial_type = enn.FieldType(self.group, [self.group.trivial_repr] * config.hidden_size)
+        self.inv_lift = enn.Linear(_inv_trivial_type, self.state_hidden_type, initialize=True)
+
         # ── Action decoder (fresh init — geometry-corrected output → action space) ────────
         self.action_decoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -1039,29 +1046,30 @@ class FlowmatchingActionHead(nn.Module):
                 self.state_out_type,
             )
         ).tensor
-        equi_sa_proj = einops.rearrange(equi_sa_proj, '(b t) c -> b t c',
-                                        b=sa_embs_equi.shape[0], t=sa_embs_equi.shape[1])
-        equi_delta = self.equi_res_adapter(equi_sa_proj.to(ref_dtype), context=inv_output)  # [B, T_sa, hidden_size]
+        # Only run the equi adapter on action tokens and add correction to the action
+        # slice of inv_output.  The inv branch has [state, future_tokens, action] while
+        # the equi branch has [state, action], so we use only the last T_a tokens.
+        equi_action_proj = einops.rearrange(equi_sa_proj, '(b t) c -> b t c',
+                                            b=sa_embs_equi.shape[0], t=sa_embs_equi.shape[1])[:, -T_a:]
+        inv_action_ctx = inv_output[:, -T_a:]  # [B, T_a, hidden_size]
+        equi_delta = self.equi_res_adapter(equi_action_proj.to(ref_dtype), context=inv_action_ctx)  # [B, T_a, hidden_size]
 
-        # ── Residual fusion: lift inv_output to regular repr + add equi delta ─
-        N = self.n_group
-        T_sa = inv_output.shape[1]
-        D = inv_output.shape[2]
-        # Lift inv_output to trivial-in-regular repr:
-        # average each (D/N)-block over N group slots → scalar, then replicate N times.
-        inv_scalar = inv_output.view(B, T_sa, D // N, N).mean(-1)      # [B, T_sa, D//N]
-        inv_lifted = inv_scalar.unsqueeze(-1).expand(-1, -1, -1, N).reshape(B, T_sa, D)
-        output = inv_lifted + equi_delta                           # [B, T_sa, hidden_size]
+        # ── Residual fusion: learned equivariant lifting of inv → regular repr ──────────
+        # inv_lift: enn.Linear(trivial[D] → regular[D]) — learned, equivariant induction map.
+        # At init this is a random small-weight map; equi_delta is zero-init, so the
+        # pretrained DiT output flows through gradually as inv_lift is learned.
+        inv_action = inv_output[:, -T_a:].to(ref_dtype)            # [B, T_a, D]
+        inv_action_flat = einops.rearrange(inv_action, 'b t c -> (b t) c')
+        inv_lifted_geo = self.inv_lift(
+            enn.GeometricTensor(inv_action_flat, self.inv_lift.in_type)
+        )                                                           # [B*T_a, D] regular repr
+        output = inv_lifted_geo.tensor + equi_delta.view(-1, equi_delta.shape[-1])  # [B*T_a, D]
 
-        # ── Equi action decoder ───────────────────────────────────────────────
-        action_decoder_emb_id = embodiment_id.repeat(T_sa)
-        output_flat = enn.GeometricTensor(
-            einops.rearrange(output, 'b t c -> (b t) c'), self.state_hidden_type
-        )
-        pred = self.action_decoder(output_flat, action_decoder_emb_id)
-        pred = einops.rearrange(pred.tensor, '(b t) c -> b t c', b=B, t=T_sa)
-
-        pred_actions = pred[:, -T_a:]
+        # ── Equi action decoder (action tokens only) ─────────────────────────
+        action_decoder_emb_id = embodiment_id.repeat(T_a)
+        output_geo = enn.GeometricTensor(output, self.state_hidden_type)
+        pred = self.action_decoder(output_geo, action_decoder_emb_id)
+        pred_actions = einops.rearrange(pred.tensor, '(b t) c -> b t c', b=B, t=T_a)
 
         with torch.no_grad():
             velocity_dim = velocity.shape[-1]
@@ -1111,8 +1119,6 @@ class FlowmatchingActionHead(nn.Module):
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
 
-        N = self.n_group
-
         for t in range(num_steps):
             t_cont = t / float(num_steps)
             t_discretized = int(t_cont * self.num_timestep_buckets)
@@ -1152,27 +1158,25 @@ class FlowmatchingActionHead(nn.Module):
                     einops.rearrange(sa_embs_equi, 'b t c -> (b t) c'), self.state_out_type
                 )
             ).tensor
-            equi_sa_proj = einops.rearrange(
+            # Only run adapter on action tokens; cross-attend against action slice of inv_output.
+            equi_action_proj = einops.rearrange(
                 equi_sa_proj, '(b t) c -> b t c', b=B, t=sa_embs_equi.shape[1]
+            )[:, -T_a:]
+            inv_action_ctx = inv_output[:, -T_a:]
+            equi_delta = self.equi_res_adapter(equi_action_proj.to(ref_dtype), context=inv_action_ctx)
+
+            # Residual fusion: learned equivariant lifting of inv → regular repr
+            inv_action = inv_output[:, -T_a:].to(ref_dtype)
+            inv_action_flat = einops.rearrange(inv_action, 'b t c -> (b t) c')
+            inv_lifted_geo = self.inv_lift(
+                enn.GeometricTensor(inv_action_flat, self.inv_lift.in_type)
             )
-            equi_delta = self.equi_res_adapter(equi_sa_proj.to(ref_dtype), context=inv_output)
+            output = inv_lifted_geo.tensor + equi_delta.view(-1, equi_delta.shape[-1])  # [B*T_a, D]
 
-            # Residual fusion
-            T_sa = inv_output.shape[1]
-            D = inv_output.shape[2]
-            inv_scalar = inv_output.view(B, T_sa, D // N, N).mean(-1)      # [B, T_sa, D//N]
-            inv_lifted = inv_scalar.unsqueeze(-1).expand(-1, -1, -1, N).reshape(B, T_sa, D)
-            output = inv_lifted + equi_delta
-
-            # Decode
-            dec_emb_id = embodiment_id.repeat(T_sa)
-            output_flat = enn.GeometricTensor(
-                einops.rearrange(output, 'b t c -> (b t) c'), self.state_hidden_type
-            )
-            pred = self.action_decoder(output_flat, dec_emb_id)
-            pred = einops.rearrange(pred.tensor, '(b t) c -> b t c', b=B, t=T_sa)
-
-            pred_velocity = pred[:, -self.action_horizon:]
+            # Decode action tokens only
+            dec_emb_id = embodiment_id.repeat(T_a)
+            pred = self.action_decoder(enn.GeometricTensor(output, self.state_hidden_type), dec_emb_id)
+            pred_velocity = einops.rearrange(pred.tensor, '(b t) c -> b t c', b=B, t=T_a)
             actions = actions + dt * pred_velocity
 
         actions = self.getActionOutput(actions)
