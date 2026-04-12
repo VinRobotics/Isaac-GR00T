@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+import time
 
 import torch
 import torch.nn.functional as F
@@ -843,6 +844,7 @@ class FlowmatchingActionHead(nn.Module):
                 print(f"Skipping (fresh init): {key}")
             else:
                 remapped[key] = value
+        time.sleep(60)  # Ensure all print statements are flushed before loading state dict
         return super().load_state_dict(remapped, strict=False, assign=assign)
 
     def set_frozen_modules_to_eval_mode(self):
