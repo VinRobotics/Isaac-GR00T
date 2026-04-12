@@ -321,7 +321,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=500, metadata={"help": "Warm-up steps for EquiResAdapter scale 0→1."}
     )
     tune_inv_dit: bool = field(
-        default=False, metadata={"help": "Whether to fine-tune the frozen pretrained DiT (inv_dit)."}
+        default=True, metadata={"help": "Whether to fine-tune the frozen pretrained DiT (inv_dit)."}
     )
     vl_self_attention_cfg: dict = field(
         default_factory=lambda: None, metadata={"help": "Config for SelfAttentionTransformer on inv features. None disables it."}
