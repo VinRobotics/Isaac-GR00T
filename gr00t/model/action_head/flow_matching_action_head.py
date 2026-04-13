@@ -221,7 +221,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     )
 
     use_advantage_conditioning: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": (
                 "Enable RECAP-style advantage conditioning. "
