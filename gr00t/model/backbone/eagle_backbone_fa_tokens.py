@@ -14,47 +14,54 @@
 # limitations under the License.
 
 """
-Eagle Backbone with Late Frame Averaging on Full Vision Tokens.
+Eagle Backbone with Late Frame Averaging on Full Vision Tokens + Equivariant Gate Fusion.
 
-This version preserves all vision transformer tokens instead of using pooled features,
-giving vision features equal importance to state and action tokens.
-Frame averaging is applied on the full token sequence with proper spatial alignment.
-
-Key differences from EagleBackboneFA (pooled):
-- Output: [B, num_imgs, T_vision, D_vision] instead of [B, num_imgs, D_pool]
-- Preserves spatial/token information (256 tokens vs 1 pooled vector)
-- Better balance with state/action tokens in downstream processing
-- Each token is a regular representation of the CN group
+Preserves all vision transformer tokens (no pooling) and applies equivariant frame averaging
+on the full token sequence. Each output token lives in the regular representation of CN.
 
 Frame Averaging Formula:
-    FA(x) = (1/|G|) * Σ_g ρ(g) · π(g⁻¹) · f(g·x)
+    FA(x) = (1/|G|) * Σ_g ρ(g⁻¹) · π(g⁻¹) · f(g·x)
 
 Where:
-- g is a rotation from the cyclic group CN
-- f(g·x) = features from rotated image (tokens at rotated positions)
-- π(g⁻¹) = inverse spatial permutation (revert tokens to original positions)
-- ρ(g) = feature-space transformation (regular representation)
+- g: rotation from cyclic group CN (n_group rotations)
+- f(g·x): features from rotated image at spatially permuted positions
+- π(g⁻¹): inverse token-grid permutation (realigns tokens to original spatial positions)
+- ρ(g⁻¹): cyclic block-shift on D = G×blocks feature channels (regular representation)
 
-This ensures proper per-token equivariance: f(g·x)[p] = ρ(g) · f(x)[π(g)·p]
-After spatial alignment, tokens across all rotations represent the same spatial content.
+Equivariance: FA(r·x)[p] = ρ(r) · FA(x)[π(r)·p]   for all r ∈ CN, patch position p.
 
-Pipeline (EquiLLM-faithful, Section 3.2 of arXiv:2502.11149):
-    1. FA (Phase 1): Rotate images N times, extract features, apply FA:
-       fa_equi_raw = equivariant FA (with ρ(h⁻¹) ⊗ π(h⁻¹))  → regular repr tokens
-       fa_inv_raw  = invariant FA (plain average, no transformation) → invariant tokens
-       Both bypass the LLM (skip connections, EquiLLM X̃' and H' analogs).
-    2. Invariant FA + Eagle LLM (Phase 2): fa_inv_raw projected → injected into frozen VLM.
-       VLM attends jointly over invariant vision + text tokens → vlm_hidden.
-       Analogy: EquiLLM's Projector(H') + Prompt P → LLM → H^llm.
-    3. EquiAdapter (Phase 3): faithful EquiLLM adapter (Eq. 6).
-       h_cond     = lang_proj(equi_vlm) + h_inv_skip  ← EquiLLM: H^r = proj(H^llm) + H'
-       SA+CA loop = SA(h_equi) → CA(h_equi ← h_cond) ← EquiLLM: EGNN(H^r, X̃')
-       text_ca    = standard CA: Q=[noequi|text], K=V=inv(h_vis)  ← text attends to vision,
-                    stays invariant (both Q and K/V invariant → output invariant ✓)
-    4. Output: [B, n_equi*T_vis + n_noequi*T_vis + T_lang, D]
-       [:n_equi*T]        equivariant vision tokens (regular repr)
-       [n_equi*T:-T_lang] non-equi camera tokens (trivial-in-regular, invariant)
-       [-T_lang:]         language tokens (trivial-in-regular, invariant)
+Pipeline:
+    1. FA (Phase 1) — rotation augmentation + frame averaging:
+         h_equi_raw : equivariant FA  [ρ(g⁻¹) ⊗ π(g⁻¹)] → regular repr tokens  [B, n_equi, T, D]
+         h_inv_raw  : invariant FA    [plain average]      → invariant tokens      [B, n_equi, T, D_eagle]
+         Both computed without the LLM (skip connections).
+
+    2. VLM (Phase 2) — invariant vision injected into the frozen Eagle VLM:
+         h_inv_raw → inv_fa_proj → replaces SigLIP tokens inside Eagle LLM
+         VLM jointly attends over invariant vision + text → produces:
+           equi_vlm  : VLM output at equi-image positions   [B, n_equi*T, D]   (invariant)
+           noequi_vlm: VLM output at non-equi positions      [B, n_noequi*T, D] (invariant)
+           vlm_text  : VLM output at text positions          [B, T_lang, D]     (invariant)
+
+    3. EquiAdapter (Phase 3) — equivariant semantic-conditioned gate fusion:
+
+       Equi token fusion (geometry ← language+vision context):
+         s_text        = mean_T(vlm_text)                    [B, 1, D]   undiluted language signal
+         s_vis         = mean_N(cat[equi_vlm, noequi_vlm?])  [B, 1, D]   vision context
+         h_equi_pooled = mean_G(h_equi_raw)                  [B, N, blk] invariant pool of geometry
+         g_inv         = σ(W_gate([s_text; s_vis; h_equi_pooled]))        invariant gate
+         h_equi_out    = g_inv_reg ⊙ tile(w_s(s_inv), G)
+                       + (1-g_inv_reg) ⊙ w_g_per_block(h_equi_raw)       equivariant ✓
+
+       Invariant token fusion (text/noequi ← fused geometry context):
+         equi_summary  = mean_N(mean_G(h_equi_out))          [B, 1, blk] cross-modal, no circularity
+         g_inv_tok     = σ(W_gate_inv([token; equi_summary]))             invariant gate
+         out           = tile(g ⊙ proj(token) + (1-g) ⊙ proj(equi_summary), G)  trivial-in-regular ✓
+
+    4. Output token sequence: [B, n_equi*T + n_noequi*T + T_lang, D]
+         [:n_equi*T]         equivariant vision tokens  (regular repr)
+         [n_equi*T:-T_lang]  non-equi camera tokens     (trivial-in-regular, invariant)
+         [-T_lang:]          language tokens             (trivial-in-regular, invariant)
 """
 
 import os
@@ -361,15 +368,7 @@ class EagleBackboneFATokens(nn.Module):
         # Output lives in vision_dim (= d_eagle) space; project to d_eagle for VLM injection.
         self.inv_fa_proj = nn.Linear(d_eagle, d_eagle)
 
-        # ── Phase 3: Invariant FA projector for EquiAdapter (H' skip) ───────
-        # Projects h_inv_raw (invariant FA features) to project_to_dim.
-        # This is the H' skip connection in EquiLLM: bypasses LLM, goes directly to adapter.
-        # Separate from inv_fa_proj (which projects to d_eagle for LLM injection, Phase 2).
-        self.inv_adapter_proj = nn.Linear(d_eagle, self.project_to_dim)
-
-        # ── Phase 3: EquiAdapter (num_layers × SA+CA blocks) ────────────────
-        # EquiLLM-faithful: h_r = lang_proj(vl_equi) + h_inv (additive, not concat)
-        # SA on h_prime only; CA ← h_r.  Language tokens appended to output unchanged.
+        # ── Phase 3: EquiAdapter (gate fusion) ──────────────────────────────
         self.equi_adapter = EquiAdapter(
             d_eq=self.project_to_dim,
             n_group=n_group,
@@ -569,7 +568,6 @@ class EagleBackboneFATokens(nn.Module):
         "vision_proj.",
         "eagle_linear.",
         "inv_fa_proj.",
-        "inv_adapter_proj.",
         "equi_adapter.",
     )
 
