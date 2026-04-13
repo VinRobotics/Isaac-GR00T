@@ -493,11 +493,11 @@ class FlowmatchingActionHead(nn.Module):
         _cross_attn_dim = config.diffusion_model_cfg.get("cross_attention_dim", config.backbone_embedding_dim)
         if getattr(config, "vl_self_attention_cfg", None) is not None:
             print("Using VL self-attention in inv branch with config:", config.vl_self_attention_cfg)
-            self.vlln_inv = nn.LayerNorm(_cross_attn_dim)
-            self.vl_inv_self_attention = SelfAttentionTransformer(**config.vl_self_attention_cfg)
+            self.vlln = nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
+            self.vl_self_attention = SelfAttentionTransformer(**config.vl_self_attention_cfg)
         else:
-            self.vlln_inv = None
-            self.vl_inv_self_attention = None
+            self.vlln = None
+            self.vl_self_attention = None
 
         if config.add_pos_embed:
             # Equivariant temporal position embeddings (equi branch): trivial → state_out_type (regular).
@@ -820,8 +820,8 @@ class FlowmatchingActionHead(nn.Module):
         skip_prefixes = (
             "action_decoder.",
             "equi_res_adapter.",
-            "future_tokens_equi_proj.", "vl_equi_proj.", "vlln.",
-            "vl_self_attention.", "language_proj.", "language_lift.", "equi_vis_proj.", "inv_state_proj.", "inv_action_proj.", 
+            "future_tokens_equi_proj.", "vl_equi_proj.",
+            "language_proj.", "language_lift.", "equi_vis_proj.", "inv_state_proj.", "inv_action_proj.",
         )
         filtered = {}
         skipped = []
@@ -951,10 +951,10 @@ class FlowmatchingActionHead(nn.Module):
         # Store invariant features for inv_dit cross-attention
         if "backbone_inv_features" in backbone_output:
             inv_features = backbone_output.backbone_inv_features
-            if self.vlln_inv is not None:
-                inv_features = self.vlln_inv(inv_features)
-            if self.vl_inv_self_attention is not None:
-                inv_features = self.vl_inv_self_attention(inv_features)
+            if self.vlln is not None:
+                inv_features = self.vlln(inv_features)
+            if self.vl_self_attention is not None:
+                inv_features = self.vl_self_attention(inv_features)
             backbone_output.data["vl_inv_features"] = inv_features
 
         return backbone_output
