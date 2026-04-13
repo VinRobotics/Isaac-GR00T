@@ -84,27 +84,32 @@ class EquiAdapter(nn.Module):
     """
     Phase 3: EquiLLM-faithful equivariant adapter (Section 3.2, Eq. 6).
 
-    Single CA block: h_equi queries ← vlm_img keys/values (invariant context).
-    No SA — vlm_img already contains rich cross-modal context from the frozen VLM,
-    and h_equi has spatial structure from FA. One CA pass is sufficient to inject
-    language/visual context into the equivariant tokens.
+    EquiLLM adapter design:
+      H^r   = proj(H^llm) + H'          # additive: re-project LLM output, add with invariant skip H'
+      output = EGNN(H^r, X̃')            # equivariant processing conditioned on H^r
 
-    Token-based adaptation:
-      h_cond    = lang_proj(vlm_img)          # project VLM output into equi space (invariant)
-      h_adapted = CA(h_equi, context=h_cond)  # equivariant queries attend to invariant context
+    Token-based adaptation (Frame Averaging replaces geometric GNN encoder):
+      H'  analog = h_inv_skip  (invariant FA skip, bypasses LLM — plain average, no ρ(h⁻¹))
+      X̃'  analog = h_equi      (equivariant FA skip, regular repr, bypasses LLM)
+      H^llm analog = vlm_img   (VLM output at equi-image token positions)
 
-    Equivariance: CA queries come from h_equi (regular repr); K/V come from h_cond (invariant).
-    Attention weights are the same across all group slots → permutation of group slots
-    commutes with attention → output remains equivariant ✓
+      h_cond    = lang_proj(vlm_img) + h_inv_skip   # EquiLLM Eq.6: H^r = proj(H^llm) + H'
+      h_adapted = EquiProcess(h_equi, h_cond)        # SA on h_equi, CA context = h_cond
+
+    EquiProcess replaces EGNN (no graph structure available):
+      SA: equivariant self-attention on h_equi only (language tokens NOT in SA)
+      CA: h_equi queries ← h_cond keys/values (invariant context, mirrors H^r conditioning X̃')
 
     Language tokens (VLM output at text positions) are appended to output unchanged.
+    They were NOT mixed into equivariant SA — only enter as context via h_cond (which is
+    computed from vlm_img, which was produced by the VLM attending to both image + text).
 
-    Output: [B, n_equi*T_vis + n_noequi*T_vis + T_lang, D]
-      [:n_equi*T_vis]    equivariant vision tokens (CA-modulated, regular repr)
-      [n_equi*T:-T_lang] non-equi camera tokens   (trivial-in-regular, invariant)
-      [-T_lang:]         language tokens           (trivial-in-regular, invariant)
+    Output: [B, n_equi*T_vis + T_lang, D]
+      [:n_equi*T_vis] equivariant vision tokens (processed by adapter)
+      [n_equi*T_vis:] invariant language tokens (direct VLM output, appended)
 
-    Identity init: zero-init v_proj + o_proj + ff.fc2 → CA output = 0 at init ✓
+    Identity init: zero-init o_proj + ff.fc2 → SA output = residual ✓
+                   zero-init v_proj + o_proj on CA → CA output = 0 at init ✓
     """
 
     def __init__(
@@ -114,7 +119,7 @@ class EquiAdapter(nn.Module):
         n_group: int,
         num_heads: int = 32,
         attention_head_dim: int = 64,
-        num_layers: int = 1,  # CA-only blocks (SA removed)
+        num_layers: int = 4,
     ):
         super().__init__()
         self.n_group = n_group
@@ -132,12 +137,25 @@ class EquiAdapter(nn.Module):
 
         # h_prime type: equivariant vision tokens (regular repr)
         equi_type     = enn.FieldType(gs, [gs.regular_repr] * blocks)
-        # h_cond type: invariant context (trivial repr)
+        # h_r type: invariant context (trivial repr) — d_llm == d_eq here
         inv_type      = enn.FieldType(gs, [gs.trivial_repr] * d_llm)
         ff_inner_type = enn.FieldType(gs, [gs.regular_repr] * blocks)
 
-        # CA: h_equi queries ← lang_proj(vlm_img) keys/values (invariant context).
-        # No SA — downstream DiT handles token interaction; VLM already did cross-modal mixing.
+        # SA: equivariant self-attention on h_prime only (no language tokens)
+        self.sa_blocks = nn.ModuleList([
+            BasicTransformerBlock(
+                in_type=equi_type,
+                cross_attention_type=equi_type,
+                inner_type=ff_inner_type,
+                num_attention_heads=num_heads,
+                attention_head_dim=attention_head_dim,
+                norm_type="layer_norm",
+            )
+            for _ in range(num_layers)
+        ])
+
+        # CA: h_prime ← h_r  (equivariant queries, invariant context)
+        # Mirrors EquiLLM's EGNN using H^r to condition X̃' updates.
         self.ca_blocks = nn.ModuleList([
             BasicTransformerBlock(
                 in_type=equi_type,
@@ -150,27 +168,29 @@ class EquiAdapter(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # lang_proj: project VLM output at image positions into equi space (invariant).
+        # lang_proj: re-projects VLM output at image positions back to h_inv space.
+        # Mirrors EquiLLM's "projection layer to re-project H^llm back into H' space".
+        # h_r = lang_proj(vl_equi) + h_inv  ←→  H^r = proj(H^llm) + H'
         self.lang_proj = nn.Linear(d_llm, d_eq)
 
         # lang_embed / noequi_embed: reformat VLM output tokens as trivial-in-regular repr.
         # trivial-in-regular: R^blocks expanded as [v,v,...,v]×G → invariant subspace of regular repr.
+        # VLM already cross-attended text ↔ noequi ↔ inv(equi vision); no extra attention needed.
         self.lang_embed   = nn.Linear(d_eq, blocks)
         self.noequi_embed = nn.Linear(d_eq, blocks)
 
-        # Identity init: CA output = 0 at training start → h_equi passes through unchanged.
-        for ca_blk in self.ca_blocks:
+        # Identity init
+        for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
+            for p in sa_blk.attn1.o_proj.parameters():
+                nn.init.zeros_(p)
+            for p in sa_blk.ff.fc2.parameters():
+                nn.init.zeros_(p)
             for p in ca_blk.attn1.v_proj.parameters():
                 nn.init.zeros_(p)
             for p in ca_blk.attn1.o_proj.parameters():
                 nn.init.zeros_(p)
             for p in ca_blk.ff.fc2.parameters():
                 nn.init.zeros_(p)
-
-        # Warm-up scale: linearly ramp adapter delta from 0 → 1 over warmup_steps.
-        # Initialized to 1.0 (full strength) so the default behavior is unchanged.
-        # Call set_adapter_warmup_scale(step, warmup_steps) from the trainer each step.
-        self.register_buffer("adapter_scale", torch.ones(1))
 
     def forward(
         self,
@@ -189,24 +209,24 @@ class EquiAdapter(nn.Module):
             [B, n_equi*T_vis + n_noequi*T_vis + T_lang, D]
 
         Pipeline:
-          CA: h_equi queries attend to lang_proj(vlm_img) context (invariant).
+          SA+CA loop: equivariant SA+CA on h_vis; CA context = VLM image tokens + text tokens.
           Output: [h_vis (equivariant) | noequi_trivial_reg | text_trivial_reg]
             noequi/text reformatted as trivial-in-regular for downstream DiT compatibility.
         """
         B, n_equi, T, D = h_equi.shape
-        dt = next(self.ca_blocks[0].parameters()).dtype
+        dt = next(self.sa_blocks[0].parameters()).dtype
 
-        # CA context: project vlm_img into equi space (invariant).
+        # CA context: purely VLM-conditioned (vlm_img already cross-attended image+text in LLM)
+        # + raw text tokens for direct spatial word access.
+        # h_inv_skip (H') omitted: raw vision features dilute the language signal;
+        # geometric structure is carried by h_equi through SA instead.
         h_cond = self.lang_proj(vlm_img.to(dt))                        # [B, n_equi*T, D]
+        # Equivariant SA+CA on vision tokens; CA context extended with text tokens.
+        # ca_blk zero-init (v/o proj) + text_to_cond zero-init → identity at start.
         h_vis = h_equi.to(dt).reshape(B, n_equi * T, D)
-        h_vis_in = h_vis                                                # save skip for warm-up scaling
-        for ca_blk in self.ca_blocks:
+        for sa_blk, ca_blk in zip(self.sa_blocks, self.ca_blocks):
+            h_vis = sa_blk(h_vis)
             h_vis = ca_blk(h_vis, encoder_hidden_states=h_cond)
-        # Scale only the adapter delta (not the skip path) by the warm-up factor.
-        # At init: delta ≈ 0 (zero-init) → scale has no effect until adapter starts learning.
-        # During warm-up: adapter_scale ramps 0→1 so newly learned deltas enter gradually.
-        if self.adapter_scale.item() != 1.0:
-            h_vis = h_vis_in + (h_vis - h_vis_in) * self.adapter_scale
 
         # Reformat noequi/text as trivial-in-regular: project to R^blocks → [v,v,...,v]×G.
         def to_trivial_reg(x, embed):
@@ -259,7 +279,7 @@ class EagleBackboneFATokens(nn.Module):
         use_inv_projector_for_vlm: bool = True,  # Phase 2: inject inv-proj tokens into LLM
         equi_adapter_num_heads: int = 32,         # heads in SA/CA (reduced for data efficiency)
         equi_adapter_attention_head_dim: int = 64, # head dim; scalar_dim = num_heads * head_dim
-        equi_adapter_num_layers: int = 1,        # CA-only blocks
+        equi_adapter_num_layers: int = 2,        # SA+CA blocks (reduced for data efficiency)
     ):
         """
         Args:
@@ -342,9 +362,9 @@ class EagleBackboneFATokens(nn.Module):
         # Separate from inv_fa_proj (which projects to d_eagle for LLM injection, Phase 2).
         self.inv_adapter_proj = nn.Linear(d_eagle, self.project_to_dim)
 
-        # ── Phase 3: EquiAdapter (num_layers × CA blocks, no SA) ────────────────
-        # CA: h_equi queries attend to lang_proj(vlm_img) context (invariant).
-        # Language tokens appended to output unchanged.
+        # ── Phase 3: EquiAdapter (num_layers × SA+CA blocks) ────────────────
+        # EquiLLM-faithful: h_r = lang_proj(vl_equi) + h_inv (additive, not concat)
+        # SA on h_prime only; CA ← h_r.  Language tokens appended to output unchanged.
         self.equi_adapter = EquiAdapter(
             d_eq=self.project_to_dim,
             d_llm=self.project_to_dim,
@@ -370,7 +390,7 @@ class EagleBackboneFATokens(nn.Module):
         print(f"  non_equi_image_indices: {self.non_equi_image_indices}")
         print(f"  output_type: {self.output_type}")
         print(f"  use_inv_projector_for_vlm: {self.use_inv_projector_for_vlm}")
-        print(f"  equi_adapter_num_layers:       {self.equi_adapter_num_layers} (CA-only blocks)")
+        print(f"  equi_adapter_num_layers:       {self.equi_adapter_num_layers} (SA+CA blocks)")
         print(f"  equi_adapter_num_heads:        {self.equi_adapter_num_heads}")
         print(f"  equi_adapter_attention_head_dim: {self.equi_adapter_attention_head_dim}  (scalar_dim={self.equi_adapter_num_heads * self.equi_adapter_attention_head_dim})")
         print(f"  Using FULL vision tokens (not pooled)")
@@ -579,27 +599,6 @@ class EagleBackboneFATokens(nn.Module):
             print(f"  {n}")
         if not trainable:
             print("  Warning: no trainable parameters found.")
-
-    def set_adapter_warmup_scale(self, step: int, warmup_steps: int) -> None:
-        """
-        Update the EquiAdapter warm-up scale based on the current training step.
-
-        Call this once per training step (before or after the forward pass).
-        The adapter delta is multiplied by min(1.0, step / warmup_steps), so the
-        adapter's learned contribution ramps in linearly from 0 → 1 over the first
-        `warmup_steps` steps.  After warm-up the scale is fixed at 1.0.
-
-        Example (in training loop or Trainer callback):
-            model.backbone.set_adapter_warmup_scale(global_step, warmup_steps=500)
-
-        Args:
-            step:          current global training step (0-indexed)
-            warmup_steps:  number of steps over which to ramp; 0 = no warm-up (scale=1)
-        """
-        if warmup_steps <= 0:
-            return
-        scale = min(1.0, step / warmup_steps)
-        self.equi_adapter.adapter_scale.fill_(scale)
 
     def load_pretrained_vlm(self, checkpoint_path: str) -> None:
         """
