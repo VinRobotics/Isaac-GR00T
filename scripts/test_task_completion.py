@@ -23,20 +23,20 @@ from gr00t.task_completion.dataset import WindowFrameTaskCompletionDataset
 # Config
 # ---------------------------------------------------------------------------
 
-DATASET_PATH = "/home/locht1/Documents/locht1/code_convert/output/vr_h31_place_completion_test"
+DATASET_PATH = "/mnt/data/sftp/data/locht1/lerobot_vrh31_place_success_fail_4"
 
 # Temporal window: list of offsets relative to current step (last entry must be 0).
 # Examples:
 #   [0]             → single frame
 #   [-4, -3, -2, -1, 0] → 5 consecutive frames
 #   [-10, -5, 0]    → 3 frames with stride 5
-DELTA_INDICES = list(reversed([-i * 10 for i in range(10)]))
+DELTA_INDICES = list(reversed([-i * 10 for i in range(5)]))
 
-VIDEO_KEYS = ["video.cam_head", "video.cam_left", "video.cam_right"]
+VIDEO_KEYS = ["video.cam_head", "video.cam_left"]
 LANGUAGE_KEY = "annotation.human.task_description"
-TASK_COMPLETION_KEY = "observation.tasks.done"
+TASK_COMPLETION_KEY = "observation.tasks.label"
 
-OUTPUT_DIR = os.path.basename(DATASET_PATH)
+OUTPUT_DIR = "/mnt/data/sftp/data/locht1/test_task_completion"
 THRESHOLD = 0.5
 
 # ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Inference
 # ---------------------------------------------------------------------------
 
-client = RobotInferenceClient()
+client = RobotInferenceClient(port=6666)
 
 correct = 0
 total = 0
@@ -77,8 +77,8 @@ for i, data in enumerate(tqdm(dataset)):
     obs = {k: v for k, v in data.items() if TASK_COMPLETION_KEY not in k}
 
     result = client.get_task_completion(obs)
-    pred_prob = float(result["task_completion_pred"])
-    pred = int(pred_prob >= THRESHOLD)
+    pred_prob = result["task_completion_pred"]
+    pred = np.argmax(pred_prob)
 
     label_raw = data[TASK_COMPLETION_KEY]
     if isinstance(label_raw, torch.Tensor):
@@ -111,9 +111,10 @@ for i, data in enumerate(tqdm(dataset)):
         img_arr = img_arr.astype(np.uint8)
 
     img = Image.fromarray(img_arr)
-    fname = f"img_{i:04d}_pred{pred}_{pred_prob:.2f}_label{label}.png"
+    fname = f"img_{i:04d}_pred{pred}_label{label}.png"
     img.save(os.path.join(OUTPUT_DIR, fname))
 
-    print(f"[{i:04d}] prob={pred_prob:.3f}  pred={pred}  label={label}  correct={is_correct}  acc={correct/total:.3f}")
+    print(f"[{i:04d}] prob={pred_prob}  pred={pred}  label={label}  correct={is_correct}  acc={correct/total:.3f}")
 
 print(f"\nFinal accuracy: {correct}/{total} = {correct/total:.4f}")
+ 
