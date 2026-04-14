@@ -200,29 +200,29 @@ class EquivariantAttention(nn.Module):
         self._equivariant_qkv = both_regular
 
         if both_regular:
-            # InvQK + EquiV attention:
+            # GeoQK + EquiV attention (geometric inner-product attention):
             #
-            #   Q, K  ← enn.Linear(regular → trivial)  by Schur: W·ρ(g)=W → mean over G-orbit
+            #   Q, K  ← enn.Linear(regular → regular)  equivariant, circulant
             #   V     ← enn.Linear(regular → regular)  equivariant, circulant
             #   o_proj← enn.Linear(regular → regular)  equivariant, circulant
             #
-            # Equivariance proof (same as EquivariantAttentionPool):
-            #   attn_weight = softmax(Q_inv · K_inv)  — invariant (trivial scalars) ✓
-            #   out = Σ_k  attn_weight_k · V_k        — invariant_scalar × equivariant = equivariant ✓
+            # Equivariance proof:
+            #   score(g·x, g·y) = ⟨ρ(g)Q, ρ(g)K⟩ = ⟨Q, K⟩   [ρ(g) orthogonal] → invariant ✓
+            #   out(g·x)        = Σ_k score_k · ρ(g)·V_k = ρ(g)·out(x)           → equivariant ✓
             #
-            # Capacity vs old circulant Q,K:
-            #   Old  enn.Linear(regular*n_in, regular*n_out): n_in*n_out*G params, circulant constraint
-            #   New  enn.Linear(regular*n_in, trivial*scalar_dim): n_in*scalar_dim params, UNCONSTRAINED
-            #   (Schur: Hom_G(regular,trivial) = mean map → n_in free params per output → same count)
-            #   → same param count, zero circulant constraint on attention patterns
+            # Why this is better than regular → trivial (group-mean) Q/K:
+            #   - Trivial Q/K collapse the entire G-orbit to its mean, discarding ALL directional info.
+            #   - Regular Q/K preserve the full orientation structure; the geometric inner product
+            #     ⟨Q, K⟩ = Σ_g Q[g]·K[g] measures how Q and K *co-align across each group element*,
+            #     giving attention patterns sensitive to shared orientation, not just invariant norms.
+            #   - Still exactly G-invariant: no equivariance is broken.
             #
             n_regular = self.scalar_dim // self.G
-            self.qkv_type   = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
-            self.inv_qk_type = enn.FieldType(gspace, [gspace.trivial_repr] * self.scalar_dim)
+            self.qkv_type = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
 
-            # Q, K: regular → trivial (escnn enforces group-mean → unconstrained output)
-            self.q_proj = enn.Linear(in_type,          self.inv_qk_type, bias=bias)
-            self.k_proj = enn.Linear(self.cross_type,  self.inv_qk_type, bias=bias)
+            # Q, K: regular → regular (equivariant; geometric inner product ⟨Q,K⟩ is G-invariant)
+            self.q_proj = enn.Linear(in_type,         self.qkv_type, bias=bias)
+            self.k_proj = enn.Linear(self.cross_type, self.qkv_type, bias=bias)
             # V, o_proj: equivariant (circulant) to preserve equivariant values
             self.v_proj = enn.Linear(self.cross_type, self.qkv_type, bias=bias)
             self.o_proj = enn.Linear(self.qkv_type,   in_type,       bias=out_bias)
@@ -295,8 +295,8 @@ class EquivariantAttention(nn.Module):
         q_geo = enn.GeometricTensor(q_flat, self.in_type)
         k_geo = enn.GeometricTensor(k_flat, self.cross_type)
 
-        Q = self.q_proj(q_geo).tensor    # (B*Tq, scalar_dim)  — trivial repr (invariant)
-        K = self.k_proj(k_geo).tensor    # (B*Tk, scalar_dim)  — trivial repr (invariant)
+        Q = self.q_proj(q_geo).tensor    # (B*Tq, scalar_dim)  — regular repr (equivariant, geo info)
+        K = self.k_proj(k_geo).tensor    # (B*Tk, scalar_dim)  — regular repr (equivariant, geo info)
         V = self.v_proj(k_geo).tensor    # (B*Tk, scalar_dim)  — regular repr (equivariant)
 
         # reshape back
@@ -310,7 +310,8 @@ class EquivariantAttention(nn.Module):
         K = einops.rearrange(K, "b t (h d) -> b t h d", h=self.H)
         V = einops.rearrange(V, "b t (h d) -> b t h d", h=self.H)
 
-        # Scaled dot-product attention (equivariant because Q,K are scalar reps)
+        # Scaled dot-product attention using geometric inner product ⟨Q,K⟩
+        # G-invariant because ρ(g) is orthogonal: ⟨ρ(g)Q, ρ(g)K⟩ = ⟨Q, K⟩
         # attn: (B, H, Tq, Tk)
         attn = torch.einsum("b t h d, b k h d -> b h t k", Q, K) * self.scale
         

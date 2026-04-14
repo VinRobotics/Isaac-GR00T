@@ -1082,13 +1082,13 @@ class EagleBackboneFATokens(nn.Module):
                 ).reshape(B * n_equi, num_vision_tokens, vision_dim)
                 fa_equi_accum.append(feat_rot_equi)
 
-        # fa_equi_raw: X̃' analog — equivariant FA output [B, n_equi, T, vision_dim]
+        # fa_equi_raw: — equivariant FA output [B, n_equi, T, vision_dim]
         fa_equi_raw = (
             torch.stack(fa_equi_accum, dim=1)
             .mean(dim=1)
             .reshape(B, n_equi, num_vision_tokens, vision_dim)
         )
-        # fa_inv_raw: H' analog — invariant FA output [B, n_equi, T, vision_dim] (plain average)
+        # fa_inv_raw: — invariant FA output [B, n_equi, T, vision_dim] (plain average)
         fa_inv_raw = (
             torch.stack(fa_inv_accum, dim=1)
             .mean(dim=1)
@@ -1124,24 +1124,19 @@ class EagleBackboneFATokens(nn.Module):
         # vlm_text: VLM output at text positions — formatted trivial-in-regular and appended to output.
         vlm_text = vlm_features[:, text_pos, :]                           # [B, T_lang, project_to_dim]
 
-        # equi_vlm: VLM output at equi-image positions — H^llm analog in EquiLLM.
-        # Filling order in _forward_llm_with_injected_vision: equi tokens first, noequi after.
+        # equi_vlm: VLM output at equi-image positions
         img_pos_idx  = (~text_pos).nonzero(as_tuple=True)[0]              # all image positions
         equi_img_idx = img_pos_idx[:n_equi * num_vision_tokens]           # first n_equi*T
         equi_vlm = vlm_features[:, equi_img_idx, :]                        # [B, n_equi*T, project_to_dim]
 
         # noequi_vlm: VLM output at non-equi image positions — invariant (not rotated).
-        # Passed separately to EquiAdapter: used as invariant CA context during vision SA+CA,
-        # then embedded as trivial-in-regular and joined with h_vis in the final mix SA block.
         noequi_img_idx = img_pos_idx[n_equi * num_vision_tokens:]         # remaining image positions
         noequi_vlm = (
             vlm_features[:, noequi_img_idx, :]                            # [B, n_noequi*T, project_to_dim]
             if noequi_img_idx.numel() > 0 else None
         )
 
-        # ── Phase 3: EquiAdapter (EquiLLM-faithful) ───────────────────────────
-        # SA+CA on h_equi; mix_sa_block joints all tokens in regular repr.
-        # Output: [B, n_equi*T_vis + n_noequi*T + T_lang, project_to_dim]
+        # ── Phase 3: EquiAdapter───────────────────────────
         h_adapted = self.equi_adapter(h_equi, equi_vlm, vlm_text, noequi_vlm=noequi_vlm)
 
         return h_adapted, eagle_input["attention_mask"]
