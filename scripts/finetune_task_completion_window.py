@@ -111,14 +111,30 @@ class ArgsConfig:
     num_gpus: int = 1
 
     class_weight: Optional[float] = None
-    """Upweight success (done=1) labels. If None, computed automatically from the dataset
-    as n_negative / n_positive. Set explicitly to override (e.g. 9.0)."""
+    """Manual override for success weight (class 1).  If None, weights are computed
+    automatically: doing=1.0, success=n_doing/n_success, failure=n_doing/n_failure.
+    This anchors doing at 1.0 and scales the rarer terminal classes proportionally."""
+
+    use_focal_loss: bool = True
+    """Use focal loss instead of standard CrossEntropyLoss.  Focal loss down-weights
+    easy/confident correct predictions and amplifies gradients for hard mis-classified
+    examples — especially useful when success and failure look nearly identical."""
+
+    focal_gamma: float = 2.0
+    """Focusing parameter for focal loss.  Higher gamma → stronger focus on hard
+    examples.  gamma=0 reduces to weighted CE; gamma=2 is the standard value."""
 
     seq_dim: int = 2048
     """Backbone output projection dim (must match model_path's project_to_dim)."""
 
     hidden_dim: int = 1024
     """Hidden dim for the TaskCompletionDetector MLP."""
+
+    last_frac: float = 1 / 5
+    """Fraction of the packed token sequence treated as the 'last frame' for the
+    temporal-contrast path inside TaskCompletionDetector.  Set to 1/window_size
+    (e.g. 1/6 for a 6-frame window).  The contrast captures what changed in the
+    most recent frame — the key signal for fine-grained success/failure tasks."""
 
     detector_init_path: Optional[str] = None
     """Optional path to a task_completion_detection.pt to warm-start from."""
@@ -186,24 +202,27 @@ def main(args: ArgsConfig):
 
     # --- Class weight ---
     if args.class_weight is not None:
-        # Scalar override: upweight success (class 1) relative to doing (class 0).
-        # Use [1.0, class_weight, 1.0] — failure weight kept at 1.0.
-        class_weight = [1.0, args.class_weight, 1.0]
+        # Manual override: success weight provided; failure scales the same way.
+        # doing=1.0, success=class_weight, failure=class_weight (symmetric terminal classes).
+        class_weight = [1.0, args.class_weight, args.class_weight]
     else:
-        # Auto-compute balanced weights by aggregating label counts across all datasets.
+        # Auto-compute weights anchored to doing (class 0 = reference = 1.0).
+        # success/failure weights = n_doing / n_class, so rarer terminal classes
+        # receive proportionally higher loss weight without deflating doing below 1.
         import numpy as _np
         counts = _np.zeros(3, dtype=_np.int64)
         for ds in datasets:
             c = ds.count_labels()
             if c is not None:
                 counts += c
-        n_total = counts.sum()
-        if n_total == 0:
+        if counts.sum() == 0 or counts[0] == 0:
             class_weight = None
         else:
+            n_doing = int(counts[0])
             class_weight = [
-                float(n_total / (3 * counts[c])) if counts[c] > 0 else 1.0
-                for c in range(3)
+                1.0,                                                          # doing  — anchor
+                float(n_doing / counts[1]) if counts[1] > 0 else 1.0,        # success
+                float(n_doing / counts[2]) if counts[2] > 0 else 1.0,        # failure
             ]
         print(f"Auto class_weight: {class_weight}  (counts per class: {counts.tolist()})")
 
@@ -214,6 +233,9 @@ def main(args: ArgsConfig):
         hidden_dim=args.hidden_dim,
         freeze_backbone=True,
         class_weight=class_weight,
+        use_focal_loss=args.use_focal_loss,
+        focal_gamma=args.focal_gamma,
+        last_frac=args.last_frac,
     )
 
     if args.detector_init_path is not None:

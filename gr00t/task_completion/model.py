@@ -28,6 +28,44 @@ from gr00t.model.backbone.eagle_backbone import EagleBackbone
 from gr00t.model.action_head.task_completion import TaskCompletionDetector
 
 
+class FocalLoss(nn.Module):
+    """
+    Multi-class focal loss.
+
+    For fine-grained tasks where success/failure look nearly identical
+    (e.g. part in holes vs. slightly off), the model tends to make
+    confident wrong predictions on failure.  Focal loss suppresses the
+    gradient from easy/confident correct predictions and amplifies it
+    for hard mis-classified examples.
+
+    FL(p_t) = -w_t * (1 - p_t)^gamma * log(p_t)
+    gamma=0 → weighted CrossEntropy; gamma=2 is the standard value.
+    """
+
+    def __init__(
+        self,
+        weight: Optional[torch.Tensor] = None,
+        gamma: float = 2.0,
+        reduction: str = "mean",
+    ):
+        super().__init__()
+        # Use register_buffer so the weight moves with .to(device)
+        if weight is not None:
+            self.register_buffer("weight", weight)
+        else:
+            self.weight = None
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
+        pt = torch.exp(-ce)
+        focal = (1.0 - pt) ** self.gamma * ce
+        if self.reduction == "mean":
+            return focal.mean()
+        return focal.sum()
+
+
 class WindowTaskCompletionModel(nn.Module):
     """
     Parameters
@@ -52,6 +90,9 @@ class WindowTaskCompletionModel(nn.Module):
         hidden_dim: int,
         freeze_backbone: bool = True,
         class_weight: Optional[list] = None,
+        use_focal_loss: bool = True,
+        focal_gamma: float = 2.0,
+        last_frac: float = 1 / 5,
     ):
         super().__init__()
 
@@ -64,10 +105,14 @@ class WindowTaskCompletionModel(nn.Module):
             seq_dim=seq_dim,
             hidden_dim=hidden_dim,
             num_classes=3,
+            last_frac=last_frac,
         )
 
-        cw = torch.tensor(class_weight) if class_weight is not None else None
-        self.loss_fn = nn.CrossEntropyLoss(weight=cw)
+        cw = torch.tensor(class_weight, dtype=torch.float32) if class_weight is not None else None
+        if use_focal_loss:
+            self.loss_fn = FocalLoss(weight=cw, gamma=focal_gamma)
+        else:
+            self.loss_fn = nn.CrossEntropyLoss(weight=cw)
 
     # ------------------------------------------------------------------
     # Forward
@@ -125,6 +170,9 @@ class WindowTaskCompletionModel(nn.Module):
         hidden_dim: int = 1024,
         freeze_backbone: bool = True,
         class_weight: Optional[list] = None,
+        use_focal_loss: bool = True,
+        focal_gamma: float = 2.0,
+        last_frac: float = 1 / 5,
     ) -> "WindowTaskCompletionModel":
         """
         Load only the EagleBackbone from a GR00T-N1.5 checkpoint.
@@ -149,6 +197,9 @@ class WindowTaskCompletionModel(nn.Module):
             hidden_dim=hidden_dim,
             freeze_backbone=freeze_backbone,
             class_weight=class_weight,
+            use_focal_loss=use_focal_loss,
+            focal_gamma=focal_gamma,
+            last_frac=last_frac,
         )
 
     def load_detector_weights(self, path: str | Path):
