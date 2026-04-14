@@ -100,7 +100,9 @@ class ArgsConfig:
 
     max_steps: int = 3000
     learning_rate: float = 1e-4
-    weight_decay: float = 1e-5
+    weight_decay: float = 1e-3
+    dropout: float = 0.5
+    """Dropout rate for the TaskCompletionDetector MLP."""
     warmup_ratio: float = 0.05
     gradient_accumulation_steps: int = 1
     save_steps: int = 500
@@ -127,7 +129,7 @@ class ArgsConfig:
     seq_dim: int = 2048
     """Backbone output projection dim (must match model_path's project_to_dim)."""
 
-    hidden_dim: int = 1024
+    hidden_dim: int = 256
     """Hidden dim for the TaskCompletionDetector MLP."""
 
     last_frac: float = 1 / 5
@@ -236,6 +238,7 @@ def main(args: ArgsConfig):
         use_focal_loss=args.use_focal_loss,
         focal_gamma=args.focal_gamma,
         last_frac=args.last_frac,
+        dropout=args.dropout,
     )
 
     if args.detector_init_path is not None:

@@ -93,6 +93,7 @@ class WindowTaskCompletionModel(nn.Module):
         use_focal_loss: bool = True,
         focal_gamma: float = 2.0,
         last_frac: float = 1 / 5,
+        dropout: float = 0.3,
     ):
         super().__init__()
 
@@ -106,6 +107,7 @@ class WindowTaskCompletionModel(nn.Module):
             hidden_dim=hidden_dim,
             num_classes=3,
             last_frac=last_frac,
+            dropout=dropout,
         )
 
         cw = torch.tensor(class_weight, dtype=torch.float32) if class_weight is not None else None
@@ -136,7 +138,7 @@ class WindowTaskCompletionModel(nn.Module):
             "task_completion_pred" : (B, 3) softmax probabilities (0=doing, 1=success, 2=failure)
         """
         backbone_frozen = all(not p.requires_grad for p in self.backbone.parameters())
-        ctx = torch.no_grad() if backbone_frozen else torch.enable_grad()
+        ctx = torch.no_grad()
 
         with ctx:
             backbone_input = self.backbone.prepare_input(batch)
@@ -167,12 +169,13 @@ class WindowTaskCompletionModel(nn.Module):
         cls,
         model_path: str,
         seq_dim: int = 1536,
-        hidden_dim: int = 1024,
+        hidden_dim: int = 512,
         freeze_backbone: bool = True,
         class_weight: Optional[list] = None,
         use_focal_loss: bool = True,
         focal_gamma: float = 2.0,
         last_frac: float = 1 / 5,
+        dropout: float = 0.3,
     ) -> "WindowTaskCompletionModel":
         """
         Load only the EagleBackbone from a GR00T-N1.5 checkpoint.
@@ -200,6 +203,7 @@ class WindowTaskCompletionModel(nn.Module):
             use_focal_loss=use_focal_loss,
             focal_gamma=focal_gamma,
             last_frac=last_frac,
+            dropout=dropout,
         )
 
     def load_detector_weights(self, path: str | Path):
