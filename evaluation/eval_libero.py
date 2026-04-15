@@ -249,15 +249,12 @@ def eval_libero_all(args:Args):
     print("🎯 LIBERO Simulation Evaluation")
     print("=" * 80)
     tasks = [
-        'libero_10',
-        'libero_spatial',
-        'libero_goal',
-        'libero_object',
+        args.task_suite_name
     ]
     ctx = mp.get_context("spawn")
     results = dict()
 
-    with ProcessPoolExecutor(max_workers=4, mp_context=ctx) as pool:
+    with ProcessPoolExecutor(max_workers=len(tasks), mp_context=ctx) as pool:
         futures = {pool.submit(eval_libero, args, task): task for task in tasks}
         for fut in as_completed(futures):
             task = futures[fut]
