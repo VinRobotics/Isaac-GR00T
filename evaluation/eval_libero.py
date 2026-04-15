@@ -13,6 +13,7 @@ import logging
 import math
 import pathlib
 import multiprocessing as mp  # added for parallel workers
+from typing import Optional
 
 import imageio
 from libero.libero import benchmark
@@ -86,14 +87,14 @@ class Args:
     task_suite_name: str="libero_goal"
     save_videos_root: str = "/mnt/data/sftp/data/locht1/libero_eval_results"
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
-    num_trials_per_task: int = 20 #50  # Number of rollouts per task
+    num_trials_per_task: int = 10 #50  # Number of rollouts per task
 
     seed: int = 7  # Random Seed (for reproducibility)
     exp_name: str = "test"
     model_type: str = "pi0"
 
 
-def eval_libero(args: Args, task_suite_name:str=None) -> None:
+def eval_libero(args: Args, task_suite_name: Optional[str]=None, task_ids: Optional[list]=None) -> None:
     # Set random seed
     np.random.seed(args.seed)
 
@@ -104,6 +105,9 @@ def eval_libero(args: Args, task_suite_name:str=None) -> None:
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
+
+    if task_ids is None:
+        task_ids = list(range(num_tasks_in_suite))
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -120,7 +124,8 @@ def eval_libero(args: Args, task_suite_name:str=None) -> None:
 
     log_dir = pathlib.Path(f"{args.save_videos_root}/log/eval_results/{args.exp_name}")
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"{args.task_suite_name}.log"
+    task_range_tag = f"tasks_{task_ids[0]}-{task_ids[-1]}" if task_ids else "all"
+    log_file = log_dir / f"{args.task_suite_name}_{task_range_tag}.log"
 
     handler = logging.FileHandler(log_file, mode="w")
     handler.setFormatter(
@@ -155,7 +160,7 @@ def eval_libero(args: Args, task_suite_name:str=None) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_id in tqdm.tqdm(task_ids):
         logging.info(f"Task_id: {task_id}")
 
         # Get task
@@ -246,22 +251,30 @@ def eval_libero(args: Args, task_suite_name:str=None) -> None:
 
 def eval_libero_all(args:Args):
     print("=" * 80)
-    print("🎯 LIBERO Simulation Evaluation")
+    print("LIBERO Simulation Evaluation")
     print("=" * 80)
-    tasks = [
-        args.task_suite_name
+
+    task_splits = [
+        list(range(0, 5)),   # pool 0: tasks [0..4]
+        list(range(5, 10)),  # pool 1: tasks [5..9]
     ]
+
     ctx = mp.get_context("spawn")
     results = dict()
 
-    with ProcessPoolExecutor(max_workers=len(tasks), mp_context=ctx) as pool:
-        futures = {pool.submit(eval_libero, args, task): task for task in tasks}
+    with ProcessPoolExecutor(max_workers=len(task_splits), mp_context=ctx) as pool:
+        futures = {
+            pool.submit(eval_libero, args, args.task_suite_name, task_ids): task_ids
+            for task_ids in task_splits
+        }
         for fut in as_completed(futures):
-            task = futures[fut]
+            task_ids = futures[fut]
+            label = f"tasks_{task_ids[0]}-{task_ids[-1]}"
             try:
-                results[task] = fut.result()
+                results[label] = fut.result()
+                print(f"[DONE] {label}")
             except Exception as e:
-                print(f"[ERROR] Task '{task}' failed: {e}")
+                print(f"[ERROR] {label} failed: {e}")
 
     print("All done. Results:", results)
 
