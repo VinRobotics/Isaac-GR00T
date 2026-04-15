@@ -83,7 +83,7 @@ class Args:
     pretrained_model_path: str = "/projects/extern/kisski/kisski-umg-fairpact-2/dir.project/VLA/binh/VLA-Humanoid/outputs/train/2025-11-26/11-34-23_libero_100%_base_12layers_only/checkpoints/060000/pretrained_model"
     resize_size: int = 256
     infer_chunk: int = 10
-    task_suite_name="libero_goal"
+    task_suite_name: str="libero_goal"
     save_videos_root: str = "/mnt/data/sftp/data/locht1/libero_eval_results"
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 10 #50  # Number of rollouts per task
