@@ -232,6 +232,8 @@ def main(args: ArgsConfig):
         use_focal_loss=args.use_focal_loss,
         focal_gamma=args.focal_gamma,
         dropout=args.dropout,
+        num_frames=len(delta_indices),
+        num_cameras=len(video_keys),
     )
 
     if args.detector_init_path is not None:

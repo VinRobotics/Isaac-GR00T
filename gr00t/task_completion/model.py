@@ -93,6 +93,8 @@ class WindowTaskCompletionModel(nn.Module):
         use_focal_loss: bool = True,
         focal_gamma: float = 2.0,
         dropout: float = 0.3,
+        num_frames: int = 5,
+        num_cameras: int = 2,
     ):
         super().__init__()
 
@@ -106,6 +108,8 @@ class WindowTaskCompletionModel(nn.Module):
             hidden_dim=hidden_dim,
             num_classes=3,
             dropout=dropout,
+            num_frames=num_frames,
+            num_cameras=num_cameras,
         )
 
         cw = torch.tensor(class_weight, dtype=torch.float32) if class_weight is not None else None
@@ -173,6 +177,8 @@ class WindowTaskCompletionModel(nn.Module):
         use_focal_loss: bool = True,
         focal_gamma: float = 2.0,
         dropout: float = 0.3,
+        num_frames: int = 5,
+        num_cameras: int = 2,
     ) -> "WindowTaskCompletionModel":
         """
         Load only the EagleBackbone from a GR00T-N1.5 checkpoint.
@@ -200,6 +206,8 @@ class WindowTaskCompletionModel(nn.Module):
             use_focal_loss=use_focal_loss,
             focal_gamma=focal_gamma,
             dropout=dropout,
+            num_frames=num_frames,
+            num_cameras=num_cameras,
         )
 
     def load_detector_weights(self, path: str | Path):

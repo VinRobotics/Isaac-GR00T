@@ -239,6 +239,11 @@ def main(args: ArgsConfig):
                 map_location="cpu",
                 weights_only=True,
             )
+            if task_completion_config is not None:
+                policy.model.replace_task_completion_detector(
+                    num_frames=len(task_completion_config.delta_indices),
+                    num_cameras=len(task_completion_config.video_keys),
+                )
             policy.model.task_completion_detection.load_state_dict(tcd_state)
             print(f"Loaded task_completion_detection weights from: {args.task_completion_detection_path}")
 

@@ -86,9 +86,9 @@ class GR00T_N1_5(PreTrainedModel):
         action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
         self.action_head = FlowmatchingActionHead(action_head_cfg)
 
+        self._tc_seq_dim = action_head_cfg.backbone_embedding_dim
         self.task_completion_detection = TaskCompletionDetector(
-            seq_dim=action_head_cfg.backbone_embedding_dim,
-            hidden_dim=action_head_cfg.hidden_size,
+            seq_dim=self._tc_seq_dim,
         )
 
         self.action_horizon = config.action_horizon
@@ -335,6 +335,34 @@ class GR00T_N1_5(PreTrainedModel):
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
         )
         return pretrained_model
+
+    def replace_task_completion_detector(
+        self,
+        num_frames: int,
+        num_cameras: int,
+        hidden_dim: int = 1024,
+        dropout: float = 0.3,
+    ):
+        """Replace the placeholder TaskCompletionDetector with one configured for
+        the actual window size and camera count, then load weights into it.
+
+        Call this BEFORE load_state_dict so shapes match.
+
+        Example (inference_service.py)::
+
+            policy.model.replace_task_completion_detector(
+                num_frames=len(tc_config.delta_indices),
+                num_cameras=len(tc_config.video_keys),
+            )
+            policy.model.task_completion_detection.load_state_dict(tcd_state)
+        """
+        self.task_completion_detection = TaskCompletionDetector(
+            seq_dim=self._tc_seq_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            num_frames=num_frames,
+            num_cameras=num_cameras,
+        ).to(next(self.backbone.parameters()).device)
 
 
 # register
