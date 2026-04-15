@@ -132,12 +132,6 @@ class ArgsConfig:
     hidden_dim: int = 256
     """Hidden dim for the TaskCompletionDetector MLP."""
 
-    last_frac: float = 1 / 5
-    """Fraction of the packed token sequence treated as the 'last frame' for the
-    temporal-contrast path inside TaskCompletionDetector.  Set to 1/window_size
-    (e.g. 1/6 for a 6-frame window).  The contrast captures what changed in the
-    most recent frame — the key signal for fine-grained success/failure tasks."""
-
     detector_init_path: Optional[str] = None
     """Optional path to a task_completion_detection.pt to warm-start from."""
 
@@ -237,7 +231,6 @@ def main(args: ArgsConfig):
         class_weight=class_weight,
         use_focal_loss=args.use_focal_loss,
         focal_gamma=args.focal_gamma,
-        last_frac=args.last_frac,
         dropout=args.dropout,
     )
 

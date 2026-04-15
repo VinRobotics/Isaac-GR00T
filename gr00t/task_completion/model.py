@@ -92,7 +92,6 @@ class WindowTaskCompletionModel(nn.Module):
         class_weight: Optional[list] = None,
         use_focal_loss: bool = True,
         focal_gamma: float = 2.0,
-        last_frac: float = 1 / 5,
         dropout: float = 0.3,
     ):
         super().__init__()
@@ -106,7 +105,6 @@ class WindowTaskCompletionModel(nn.Module):
             seq_dim=seq_dim,
             hidden_dim=hidden_dim,
             num_classes=3,
-            last_frac=last_frac,
             dropout=dropout,
         )
 
@@ -174,7 +172,6 @@ class WindowTaskCompletionModel(nn.Module):
         class_weight: Optional[list] = None,
         use_focal_loss: bool = True,
         focal_gamma: float = 2.0,
-        last_frac: float = 1 / 5,
         dropout: float = 0.3,
     ) -> "WindowTaskCompletionModel":
         """
@@ -202,7 +199,6 @@ class WindowTaskCompletionModel(nn.Module):
             class_weight=class_weight,
             use_focal_loss=use_focal_loss,
             focal_gamma=focal_gamma,
-            last_frac=last_frac,
             dropout=dropout,
         )
 

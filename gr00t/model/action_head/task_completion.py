@@ -8,16 +8,8 @@ class TaskCompletionDetector(nn.Module):
 
     Architecture
     ------------
-    Two signals are concatenated and fed through a small MLP:
-
-    1. last_mean  — mean of the last `last_frac` tokens (current frame state)
-    2. delta      — last_mean minus the historical mean (what changed)
-
-    The backbone (Eagle) already cross-attends across all packed frames, so
-    a global CLS-style aggregation is redundant here.  The explicit temporal
-    delta is the key discriminating signal: success and failure diverge from
-    "doing" only in the final frames, and expressing that delta directly gives
-    the MLP the right inductive bias without needing cross-attention.
+    A learnable CLS token cross-attends over the full packed token sequence
+    (all window frames) via a single MHA layer, then feeds into a small MLP.
 
     Parameters
     ----------
@@ -30,9 +22,8 @@ class TaskCompletionDetector(nn.Module):
         Dropout rate inside the MLP.  0.4–0.5 recommended for frozen backbone.
     num_classes : int
         Number of output classes (default 3: doing / success / failure).
-    last_frac : float
-        Fraction of the token sequence treated as the "last frame".
-        Set to 1/window_size (e.g. 0.2 for a 5-frame window).
+    num_heads : int
+        Number of attention heads for CLS pooling.
     """
 
     def __init__(
@@ -41,22 +32,35 @@ class TaskCompletionDetector(nn.Module):
         hidden_dim: int = 256,
         dropout: float = 0.5,
         num_classes: int = 3,
-        last_frac: float = 0.2,
+        num_heads: int = 8,
     ):
         super().__init__()
-        self.last_frac = last_frac
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, seq_dim))
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=seq_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_norm = nn.LayerNorm(seq_dim)
 
         self.mlp = nn.Sequential(
-            nn.LayerNorm(seq_dim * 2),
-            nn.Linear(seq_dim * 2, hidden_dim),
+            nn.LayerNorm(seq_dim),
+            nn.Linear(seq_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_classes),
         )
 
         self._init_weights()
 
     def _init_weights(self):
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
         for m in self.mlp.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
@@ -73,12 +77,10 @@ class TaskCompletionDetector(nn.Module):
             logits: (B, num_classes)  — 0=doing, 1=success, 2=failure
         """
         x = x.float()
-        T = x.shape[1]
-        n_last = max(1, int(T * self.last_frac))
+        B = x.shape[0]
 
-        last_mean = x[:, -n_last:].mean(dim=1)   # (B, D) — current frame state
-        hist_mean = x[:, :-n_last].mean(dim=1)   # (B, D) — history
-        delta = last_mean - hist_mean             # (B, D) — what changed
+        cls = self.cls_token.expand(B, -1, -1)        # (B, 1, D)
+        cls_out, _ = self.attn(cls, x, x)             # CLS attends over full sequence
+        cls_out = self.attn_norm(cls_out.squeeze(1))  # (B, D)
 
-        feat = torch.cat([last_mean, delta], dim=-1)  # (B, 2*D)
-        return self.mlp(feat)
+        return self.mlp(cls_out)
