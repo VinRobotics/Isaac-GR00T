@@ -97,7 +97,7 @@ def eval_rot_libero(args: RotArgs, task_suite_name: Optional[str] = None, task_i
         rotated_states, _ = load_rotated_states(
             args.task_suite_name,
             task_id,
-            rotated_states_dir=rotated_states_dir,
+            rotated_states_dir=f"{args.rotated_states_dir}/{args.task_suite_name}" if rotated_states_dir else None,
         )
 
         task_episodes, task_successes = 0, 0
