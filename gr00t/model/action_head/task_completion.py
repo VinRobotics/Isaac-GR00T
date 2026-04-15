@@ -29,7 +29,7 @@ class TaskCompletionDetector(nn.Module):
     def __init__(
         self,
         seq_dim: int,
-        hidden_dim: int = 256,
+        hidden_dim: int = 1024,
         dropout: float = 0.5,
         num_classes: int = 3,
         num_heads: int = 8,
@@ -46,6 +46,7 @@ class TaskCompletionDetector(nn.Module):
         )
         self.attn_norm = nn.LayerNorm(seq_dim)
 
+        # 1024 → 512 → 256 → 128 → num_classes
         self.mlp = nn.Sequential(
             nn.LayerNorm(seq_dim),
             nn.Linear(seq_dim, hidden_dim),
@@ -54,7 +55,13 @@ class TaskCompletionDetector(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, num_classes),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 4, hidden_dim // 8),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 8, num_classes),
         )
 
         self._init_weights()

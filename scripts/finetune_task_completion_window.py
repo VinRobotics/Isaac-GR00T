@@ -101,7 +101,7 @@ class ArgsConfig:
     max_steps: int = 3000
     learning_rate: float = 1e-4
     weight_decay: float = 1e-3
-    dropout: float = 0.5
+    dropout: float = 0.3
     """Dropout rate for the TaskCompletionDetector MLP."""
     warmup_ratio: float = 0.05
     gradient_accumulation_steps: int = 1
@@ -129,7 +129,7 @@ class ArgsConfig:
     seq_dim: int = 2048
     """Backbone output projection dim (must match model_path's project_to_dim)."""
 
-    hidden_dim: int = 256
+    hidden_dim: int = 1024
     """Hidden dim for the TaskCompletionDetector MLP."""
 
     detector_init_path: Optional[str] = None

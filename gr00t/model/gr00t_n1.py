@@ -88,7 +88,7 @@ class GR00T_N1_5(PreTrainedModel):
 
         self.task_completion_detection = TaskCompletionDetector(
             seq_dim=action_head_cfg.backbone_embedding_dim,
-            hidden_dim=256,
+            hidden_dim=action_head_cfg.hidden_size,
         )
 
         self.action_horizon = config.action_horizon

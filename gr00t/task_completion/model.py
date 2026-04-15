@@ -167,7 +167,7 @@ class WindowTaskCompletionModel(nn.Module):
         cls,
         model_path: str,
         seq_dim: int = 1536,
-        hidden_dim: int = 512,
+        hidden_dim: int = 1024,
         freeze_backbone: bool = True,
         class_weight: Optional[list] = None,
         use_focal_loss: bool = True,
