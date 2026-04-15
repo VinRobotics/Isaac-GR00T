@@ -2024,7 +2024,7 @@ class VRH31GripperBothForRL(BaseDataConfig):
         # "action.right_arm",
         "action.left_arm",
         "action.gripper_open",
-        "action.task_progress",
+        # "action.task_progress",
     ]
     language_keys = ["annotation.human.task_description"]
     reward_keys = [
