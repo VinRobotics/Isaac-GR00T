@@ -4,7 +4,7 @@ import os
 import sys 
 
 sys.path.insert(0, "/home/locht1/gr00t_rtc")
-sys.path.insert(0, "/mnt/data/sftp/data/locht1/libero_benchmark")
+sys.path.insert(0, "/mnt/data/sftp/data/locht1/LIBERO_benchmark")
 
 
 import collections
@@ -86,7 +86,7 @@ class Args:
     task_suite_name="libero_goal"
     save_videos_root: str = "/mnt/data/sftp/data/locht1/libero_eval_results"
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
-    num_trials_per_task: int = 10 #50  # Number of rollouts per task
+    num_trials_per_task: int = 20 #50  # Number of rollouts per task
 
     seed: int = 7  # Random Seed (for reproducibility)
     exp_name: str = "test"
