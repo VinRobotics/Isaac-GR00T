@@ -42,6 +42,8 @@ from gr00t.model.action_head.action_encoder import (
 from gr00t.model.common import RotationTransformer
 
 from .equivariant_cross_attention_dit import EDiT, EquiVisionTransformer
+from .cross_attention_dit import SelfAttentionTransformer
+from gr00t.model.backbone.eagle_backbone_fa_tokens import EquiAdapter
 
 
 def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
@@ -284,10 +286,10 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         "attention_head_dim": 64,
         "dropout": 0.2,
         "final_dropout": True,
-        "num_attention_heads": 32,
+        "num_attention_heads": 24,  # 24 * 64 = 1536 = backbone_embedding_dim
         "num_layers": 4,
         "positional_embeddings": None
-        }, metadata={"help": "VL self-attention configuration (n_group is injected from top-level)."}
+        }, metadata={"help": "VL self-attention configuration. inner_dim = num_attention_heads * attention_head_dim must equal backbone_embedding_dim."}
     )
     num_target_vision_tokens: int = field(
         default=32, metadata={"help": "Number of target vision tokens."}
@@ -388,6 +390,24 @@ class FlowmatchingActionHead(nn.Module):
         
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+
+        # ── VLLN + self-attention: process concatenated trivial features ──────
+        # Mirrors the gr00t_baseline_locht1 approach: LayerNorm then SA transformer.
+        # inner_dim of SA must equal backbone_embedding_dim (enforced by vl_self_attention_cfg default).
+        self.vlln = (
+            nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
+        )
+        self.vl_self_attention = (
+            SelfAttentionTransformer(**config.vl_self_attention_cfg)
+            if config.use_vlln
+            else nn.Identity()
+        )
+
+        # ── EquiAdapter: fuse equi regular tokens with processed trivial features ──
+        self.equi_adapter = EquiAdapter(
+            d_eq=config.backbone_embedding_dim,
+            n_group=self.n_group,
+        )
 
         if config.add_pos_embed:
             # Equivariant temporal position embeddings for state and action tokens.
@@ -679,6 +699,9 @@ class FlowmatchingActionHead(nn.Module):
             self.state_encoder.requires_grad_(False)
             self.action_encoder.requires_grad_(False)
             self.action_decoder.requires_grad_(False)
+            self.vlln.requires_grad_(False)
+            self.vl_self_attention.requires_grad_(False)
+            self.equi_adapter.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.temporal_pos_embed.requires_grad_(False)
                 self.temporal_pos_proj.requires_grad_(False)
@@ -730,6 +753,9 @@ class FlowmatchingActionHead(nn.Module):
                 self.state_encoder.eval()
                 self.action_encoder.eval()
                 self.action_decoder.eval()
+                self.vlln.eval()
+                self.vl_self_attention.eval()
+                self.equi_adapter.eval()
                 if self.config.add_pos_embed:
                     self.temporal_pos_embed.eval()
                     self.temporal_pos_proj.eval()
@@ -759,35 +785,50 @@ class FlowmatchingActionHead(nn.Module):
         """
         Process backbone features into DiT cross-attention context.
 
-        Equivariant cameras (e.g. top-down):
-          backbone_equi_vision_features [B, n_equi, T, D]
-            → + 2-D pos embed
-            → equi_vis_self_attn         equivariant self-attn → [B*n_equi, T, cross_attn_dim]
-            → reshape                    [B, n_equi*T, cross_attn_dim]
-
-        Non-equivariant cameras (e.g. wrist), optional:
-          backbone_noequi_vision_features [B, n_noequi, T, D]
-            → noequi_vis_proj            plain nn.Linear → [B, n_noequi*T, cross_attn_dim]
-
-        Both concatenated → vl_features [B, (n_equi+n_noequi)*T, cross_attn_dim]
+        Pipeline:
+          1. Concat trivial features [equi | noequi | language] → trivial_feature [B, T_total, D]
+          2. VLLN (LayerNorm) + self-attention → processed trivial [B, T_total, D]
+          3. Split back into equi_vlm, noequi_vlm, vlm_text using original token counts
+          4. EquiAdapter fuses equi_regular + processed trivial → [B, n_equi*T + n_noequi*T + T_lang, D]
+          5. Store as vl_features for DiT cross-attention
         """
-        equi_vis = backbone_output.backbone_equi_vision_features
-        if equi_vis.dim() == 3:
-            # Backbone returns flat [B, n_equi*T_vis + T_lang, D] — use as-is
-            B = equi_vis.shape[0]
-            vl_features = equi_vis
-            if "backbone_attention_mask" not in backbone_output:
-                attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
-                backbone_output.data["backbone_attention_mask"] = attn_mask
+        h_equi     = backbone_output.backbone_equi_regular_features      # [B, n_equi, T, D]
+        equi_triv  = backbone_output.backbone_equi_trivial_features       # [B, n_equi*T, D]
+        noequi_triv= backbone_output.backbone_noequi_trivial_features     # [B, n_noequi*T, D]
+        lang_triv  = backbone_output.backbone_language_trivial_features   # [B, T_lang, D]
+
+        B = h_equi.shape[0]
+        n_equi_tok  = equi_triv.shape[1]
+        n_noequi_tok= noequi_triv.shape[1]
+
+        # Step 1: concat trivial features
+        parts = [equi_triv]
+        if n_noequi_tok > 0:
+            parts.append(noequi_triv)
+        parts.append(lang_triv)
+        trivial_feature = torch.cat(parts, dim=1)       # [B, T_total, D]
+
+        # Step 2: VLLN + self-attention
+        trivial_feature = self.vlln(trivial_feature)
+        trivial_feature = self.vl_self_attention(trivial_feature)
+
+        # Step 3: split back using original token counts
+        equi_vlm = trivial_feature[:, :n_equi_tok, :]
+        if n_noequi_tok > 0:
+            noequi_vlm = trivial_feature[:, n_equi_tok:n_equi_tok + n_noequi_tok, :]
         else:
-            # Legacy 4D path: [B, n_equi, T, D]
-            B, n_equi, T, D = equi_vis.shape
-            equi_proj = equi_vis.reshape(B * n_equi, T, D)
-            vl_features = equi_proj.reshape(B, n_equi * T, -1)
-            attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=equi_vis.device)
-            backbone_output.data["backbone_attention_mask"] = attn_mask
+            noequi_vlm = None
+        vlm_text = trivial_feature[:, n_equi_tok + n_noequi_tok:, :]
+
+        # Step 4: EquiAdapter — fuse equi regular repr with processed trivial context
+        vl_features = self.equi_adapter(h_equi, equi_vlm, vlm_text, noequi_vlm=noequi_vlm)
+        # [B, n_equi*T + n_noequi*T + T_lang, D]
+
+        # Step 5: all-ones attention mask matching output token count
+        attn_mask = torch.ones(B, vl_features.shape[1], dtype=torch.long, device=vl_features.device)
 
         backbone_output.data["vl_features"] = vl_features
+        backbone_output.data["backbone_attention_mask"] = attn_mask
         return backbone_output
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:

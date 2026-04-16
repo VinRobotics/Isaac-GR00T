@@ -43,25 +43,16 @@ Pipeline:
            noequi_vlm: VLM output at non-equi positions      [B, n_noequi*T, D] (invariant)
            vlm_text  : VLM output at text positions          [B, T_lang, D]     (invariant)
 
-    3. EquiAdapter (Phase 3) — equivariant semantic-conditioned gate fusion:
+    3. Output — four separate feature tensors returned for the action head:
+         backbone_equi_regular_features   : [B, n_equi, T, D]      equivariant FA tokens (regular repr)
+         backbone_equi_trivial_features   : [B, n_equi*T, D]        VLM at equi-image positions (invariant)
+         backbone_noequi_trivial_features : [B, n_noequi*T, D]      VLM at non-equi positions (invariant)
+         backbone_language_trivial_features: [B, T_lang, D]         VLM at text positions (invariant)
 
-       Equi token fusion (geometry ← language+vision context):
-         s_text        = mean_T(vlm_text)                    [B, 1, D]   undiluted language signal
-         s_vis         = mean_N(cat[equi_vlm, noequi_vlm?])  [B, 1, D]   vision context
-         h_equi_pooled = mean_G(h_equi_raw)                  [B, N, blk] invariant pool of geometry
-         g_inv         = σ(W_gate([s_text; s_vis; h_equi_pooled]))        invariant gate
-         h_equi_out    = g_inv_reg ⊙ tile(w_s(s_inv), G)
-                       + (1-g_inv_reg) ⊙ w_g_per_block(h_equi_raw)       equivariant ✓
-
-       Invariant token fusion (text/noequi ← fused geometry context):
-         equi_summary  = mean_N(mean_G(h_equi_out))          [B, 1, blk] cross-modal, no circularity
-         g_inv_tok     = σ(W_gate_inv([token; equi_summary]))             invariant gate
-         out           = tile(g ⊙ proj(token) + (1-g) ⊙ proj(equi_summary), G)  trivial-in-regular ✓
-
-    4. Output token sequence: [B, n_equi*T + n_noequi*T + T_lang, D]
-         [:n_equi*T]         equivariant vision tokens  (regular repr)
-         [n_equi*T:-T_lang]  non-equi camera tokens     (trivial-in-regular, invariant)
-         [-T_lang:]          language tokens             (trivial-in-regular, invariant)
+       EquiAdapter (Phase 3) is applied inside the action head after VLLN + self-attention
+       on the concatenated trivial features. The gate uses a single unified s_ctx (mean over
+       all SA-processed trivial tokens) instead of separate s_text/s_vis, since SA has already
+       equalised cross-modal information across all tokens.
 """
 
 import os
@@ -90,48 +81,47 @@ class EquiAdapter(nn.Module):
     """
     Equivariant semantic-conditioned gate fusion of equivariant FA tokens with VLM context.
 
+    Assumes trivial inputs (equi_vlm, noequi_vlm, vlm_text) have already been processed
+    by VLLN + self-attention in the action head, so all tokens carry cross-modal context.
+    The separate s_text / s_vis distinction is therefore collapsed into a single s_ctx:
+    the mean over all trivial tokens is unbiased since SA has already equalized information.
+
     Inputs:
       h_equi    — equivariant FA tokens (regular repr, group-major D = G * blocks)
-      equi_vlm  — VLM output at equi-image positions       (invariant)
-      noequi_vlm— VLM output at non-equi camera positions  (invariant, optional)
-      vlm_text  — VLM output at text positions             (invariant)
+      equi_vlm  — SA-processed VLM tokens at equi-image positions       (invariant)
+      noequi_vlm— SA-processed VLM tokens at non-equi camera positions  (invariant, optional)
+      vlm_text  — SA-processed VLM tokens at text positions             (invariant)
 
     Equivariance guarantee:
-      Under group action r (cyclic shift of G blocks in the regular repr):
-        h_equi     → cyclic_shift(h_equi)    [equivariant]
-        h_inv      → h_inv                   [all VLM outputs are invariant]
-
       Gate uses only invariant inputs:
-        h_equi_pooled = mean_G(h_equi_reg)    [invariant pooling of equi tokens]
-        g_inv         = σ(W_gate([s_inv_bcast; h_equi_pooled]))   [invariant]
-        g_inv_reg     = tile(g_inv, G)        [trivial-in-regular → invariant under cyclic shift]
+        s_ctx         = mean(cat([equi_vlm, noequi_vlm?, vlm_text]))  [invariant]
+        h_equi_pooled = mean_G(h_equi_reg)                            [invariant]
+        g_inv         = σ(W_gate([s_ctx; h_equi_pooled]))             [invariant]
+        g_inv_reg     = tile(g_inv, G)   [trivial-in-regular → invariant under cyclic shift ✓]
 
       Both fusion branches are equivariant:
-        h_equi_proj = w_g(h_equi_reg)         [w_g per block = block-circulant → equivariant]
-        s_inv_reg   = tile(w_s(s_inv), G)    [trivial-in-regular → equivariant]
+        h_equi_proj = w_g(h_equi_reg)    [block-circulant → equivariant ✓]
+        s_ctx_reg   = tile(w_s(s_ctx), G)[trivial-in-regular → equivariant ✓]
 
-      Output: h_equi_out = g_inv_reg ⊙ s_inv_reg + (1 - g_inv_reg) ⊙ h_equi_proj
+      Output: h_equi_out = g_inv_reg ⊙ s_ctx_reg + (1 - g_inv_reg) ⊙ h_equi_proj
                                               [invariant gate × equivariant branches → equivariant ✓]
 
     Pipeline:
-      s_text        = mean_T(vlm_text)                          [B, 1, D]   language-only (undiluted)
-      s_vis         = mean_N(cat([equi_vlm, noequi_vlm?]))      [B, 1, D]   vision-only
-      s_inv         = (s_text + s_vis) / 2                      [B, 1, D]   for semantic branch
-      h_equi_pooled = mean_G(h_equi_reg)                        [B, N, blk] invariant
-      g_inv         = σ(W_gate([s_text; s_vis; h_equi_pooled])) [B, N, blk] invariant gate
-      g_inv_reg     = tile(g_inv, G)                            [B, N, D]   trivial-in-regular
-      h_equi_proj   = w_g(h_equi_reg)                           [B, N, D]   equivariant
-      s_inv_reg     = tile(w_s(s_inv_bcast), G)                [B, N, D]   trivial-in-regular
-      h_equi_out    = g_inv_reg ⊙ s_inv_reg
-                    + (1-g_inv_reg) ⊙ h_equi_proj              [B, N, D]   equivariant ✓
+      s_ctx         = mean_all(cat([equi_vlm, noequi_vlm?, vlm_text])) [B, 1, D]   unified context
+      h_equi_pooled = mean_G(h_equi_reg)                               [B, N, blk] invariant
+      g_inv         = σ(W_gate([s_ctx; h_equi_pooled]))                [B, N, blk] invariant gate
+      g_inv_reg     = tile(g_inv, G)                                   [B, N, D]   trivial-in-regular
+      h_equi_proj   = w_g(h_equi_reg)                                  [B, N, D]   equivariant
+      s_ctx_reg     = tile(w_s(s_ctx_bcast), G)                        [B, N, D]   trivial-in-regular
+      h_equi_out    = g_inv_reg ⊙ s_ctx_reg
+                    + (1-g_inv_reg) ⊙ h_equi_proj                     [B, N, D]   equivariant ✓
 
-    Invariant token fusion (text / noequi cameras, shared weights):
-      equi_summary  = mean_N(mean_G(h_equi_out))               [B, 1, blk] invariant (cross-modal)
-      ctx           = expand(equi_summary, T_x)                 [B, T, blk]
-      g_inv_tok     = σ(W_gate_inv([token(D); ctx(blk)]))       [B, T, blk] invariant gate
-      scalar        = g_inv_tok ⊙ inv_proj_tok(token)
-                    + (1-g_inv_tok) ⊙ inv_proj_ctx(ctx)        [B, T, blk] invariant fused
-      out           = tile(scalar, G)                           [B, T, D]   trivial-in-regular ✓
+    Trivial token lifting (text / noequi cameras, shared weights):
+      SA has already given trivial tokens rich cross-modal context. The DiT cross-attention
+      will bridge equi and trivial tokens jointly. We only need to project + tile to
+      trivial-in-regular repr — no gated geometry injection needed.
+      scalar = inv_proj_tok(token)                            [B, T, blk]
+      out    = tile(scalar, G)                                [B, T, D]   trivial-in-regular ✓
     """
 
     def __init__(
@@ -147,11 +137,11 @@ class EquiAdapter(nn.Module):
         blocks = D // G
         self.blocks = blocks
 
-        # Equi gate: [s_text(D); s_vis(D); h_equi_pooled(blocks)] → per-block gate weights
-        # s_text and s_vis kept separate: vision tokens vastly outnumber text tokens so a
-        # combined mean dilutes fine-grained spatial language ("left", "behind", etc.).
-        # All inputs are invariant → gate is invariant ✓
-        self.W_gate = nn.Linear(2 * D + blocks, blocks)
+        # Equi gate: [s_ctx(D); h_equi_pooled(blocks)] → per-block gate weights.
+        # s_ctx is a single mean over all SA-processed trivial tokens — cross-modal
+        # dilution is no longer a concern since SA has already equalised information.
+        # All inputs invariant → gate is invariant ✓
+        self.W_gate = nn.Linear(D + blocks, blocks)
 
         # Equivariant projection of F_geo: applied independently to each group block
         # (same linear per block = block-circulant = equivariant) ✓
@@ -160,13 +150,10 @@ class EquiAdapter(nn.Module):
         # Semantic projection: invariant → one block value, tiled G times (trivial-in-regular) ✓
         self.w_s = nn.Linear(D, blocks)
 
-        # Invariant token gate fusion: gate([token; equi_summary]) → blend per-token VLM
-        # with the fused equi output summary. Cross-modal (no circularity): equi conditions
-        # on VLM context, inv tokens condition on equi output.
-        # Shared weights across text and noequi (both are D-dim invariant VLM outputs).
-        self.W_gate_inv   = nn.Linear(D + blocks, blocks)  # [token(D); equi_summary(blocks)] → gate
-        self.inv_proj_tok = nn.Linear(D, blocks)            # per-token VLM projection
-        self.inv_proj_ctx = nn.Linear(blocks, blocks)       # equi summary projection
+        # Trivial token projection: project D → blocks before tiling to regular repr.
+        # No gated geometry injection — SA already gave tokens cross-modal context and
+        # the DiT cross-attention handles equi↔trivial bridging in the sequence.
+        self.inv_proj_tok = nn.Linear(D, blocks)
 
     def forward(
         self,
@@ -178,9 +165,9 @@ class EquiAdapter(nn.Module):
         """
         Args:
             h_equi:     [B, n_equi, T_vis, D]    equivariant FA tokens (regular repr, group-major)
-            equi_vlm:   [B, n_equi*T_vis, D]     VLM output at equi-image positions (invariant)
-            vlm_text:   [B, T_lang, D]            VLM output at text positions (invariant)
-            noequi_vlm: [B, n_noequi*T_vis, D]   VLM output at non-equi positions (invariant, optional)
+            equi_vlm:   [B, n_equi*T_vis, D]     SA-processed VLM tokens at equi positions (invariant)
+            vlm_text:   [B, T_lang, D]            SA-processed VLM tokens at text positions (invariant)
+            noequi_vlm: [B, n_noequi*T_vis, D]   SA-processed VLM tokens at non-equi positions (optional)
         Returns:
             [B, n_equi*T_vis + n_noequi*T_vis + T_lang, D]  — equivariant ++ invariant tokens
         """
@@ -193,65 +180,48 @@ class EquiAdapter(nn.Module):
         # Equivariant tokens in group-major layout [B, N, G, blocks]
         h_equi_f = h_equi.to(dt).reshape(B, N, G, blocks)
 
-        # Separate invariant summaries — kept apart to preserve fine-grained language signal.
-        # Vision tokens (N_patches) vastly outnumber text tokens (T_lang): a combined mean
-        # would dilute spatial language ("left", "behind") before reaching the gate.
-        vlm_text_dt  = vlm_text.to(dt)
-        equi_vlm_dt  = equi_vlm.to(dt)
-        s_text = vlm_text_dt.mean(dim=1, keepdim=True)                 # [B, 1, D]  language-only
-        vis_parts = [equi_vlm_dt]
+        # Single unified context: mean over all SA-processed trivial tokens.
+        # SA has already equalised cross-modal information, so a combined mean is unbiased.
+        trivial_parts = [equi_vlm.to(dt)]
         if noequi_vlm is not None:
-            vis_parts.append(noequi_vlm.to(dt))
-        s_vis  = torch.cat(vis_parts, dim=1).mean(dim=1, keepdim=True) # [B, 1, D]  vision-only
-
-        # Global context for w_s (semantic branch of equi fusion): blend text + vision
-        s_inv       = (s_text + s_vis) * 0.5                           # [B, 1, D]  invariant
-        s_inv_bcast = s_inv.expand(B, N, D)                            # [B, N, D]
+            trivial_parts.append(noequi_vlm.to(dt))
+        trivial_parts.append(vlm_text.to(dt))
+        s_ctx = torch.cat(trivial_parts, dim=1).mean(dim=1, keepdim=True)  # [B, 1, D]  invariant
+        s_ctx_bcast = s_ctx.expand(B, N, D)                                # [B, N, D]
 
         # Invariant pooling of equi tokens: mean over G blocks → [B, N, blocks]
-        h_equi_pooled = h_equi_f.mean(dim=2)                           # [B, N, blocks]  invariant ✓
+        h_equi_pooled = h_equi_f.mean(dim=2)                               # [B, N, blocks]  invariant ✓
 
-        # Eq. 3: gate sees s_text and s_vis separately → can weight language vs vision independently
-        # All inputs invariant → gate is invariant ✓
-        s_text_bcast = s_text.expand(B, N, D)                          # [B, N, D]
-        s_vis_bcast  = s_vis.expand(B, N, D)                           # [B, N, D]
-        gate_in = torch.cat([s_text_bcast, s_vis_bcast, h_equi_pooled], dim=-1)  # [B, N, 2D+blocks]
-        g_inv   = torch.sigmoid(self.W_gate(gate_in))                  # [B, N, blocks]
+        # Gate: [s_ctx; h_equi_pooled] → per-block weights. All inputs invariant → gate invariant ✓
+        gate_in = torch.cat([s_ctx_bcast, h_equi_pooled], dim=-1)          # [B, N, D+blocks]
+        g_inv   = torch.sigmoid(self.W_gate(gate_in))                      # [B, N, blocks]
         # Tile to regular repr (trivial-in-regular) → invariant under cyclic shift ✓
         g_inv_reg = g_inv.unsqueeze(2).expand(-1, -1, G, -1).reshape(B, N, D)  # [B, N, D]
 
-        # Eq. 4: equivariant fusion
+        # Equivariant fusion:
         # w_g applied per group-block → equivariant projection ✓
-        h_equi_proj = self.w_g(h_equi_f).reshape(B, N, D)           # [B, N, D]  (equivariant)
-        # w_s then tile → trivial-in-regular (invariant embedded in regular repr) ✓
-        s_inv_proj = self.w_s(s_inv_bcast)                            # [B, N, blocks]
-        s_inv_reg  = s_inv_proj.unsqueeze(2).expand(-1, -1, G, -1).reshape(B, N, D)  # [B, N, D]
+        h_equi_proj = self.w_g(h_equi_f).reshape(B, N, D)                 # [B, N, D]  equivariant
+        # w_s then tile → trivial-in-regular ✓
+        s_ctx_proj = self.w_s(s_ctx_bcast)                                 # [B, N, blocks]
+        s_ctx_reg  = s_ctx_proj.unsqueeze(2).expand(-1, -1, G, -1).reshape(B, N, D)  # [B, N, D]
 
         # Invariant gate × equivariant branches → equivariant output ✓
-        h_equi_out = g_inv_reg * s_inv_reg + (1 - g_inv_reg) * h_equi_proj  # [B, N, D]
+        h_equi_out = g_inv_reg * s_ctx_reg + (1 - g_inv_reg) * h_equi_proj  # [B, N, D]
 
-        # Invariant summary of equi output: mean over G blocks then over N patches → [B, 1, blocks]
-        # Used as cross-modal context for inv tokens (no circularity: inv tokens not included here)
-        equi_summary = h_equi_out.reshape(B, N, G, blocks).mean(dim=2).mean(dim=1, keepdim=True)
-
-        # Gate fuse invariant tokens: blend per-token VLM with equi_summary context,
-        # then tile to trivial-in-regular. Both branches invariant → output invariant ✓
-        def fuse_inv_reg(x: torch.Tensor) -> torch.Tensor:
-            T_x = x.shape[1]
-            ctx = equi_summary.expand(B, T_x, blocks)                  # [B, T, blocks]
-            g = torch.sigmoid(
-                self.W_gate_inv(torch.cat([x, ctx], dim=-1))           # [B, T, D+blocks]
-            )                                                           # [B, T, blocks]
-            scalar = g * self.inv_proj_tok(x) + (1 - g) * self.inv_proj_ctx(ctx)
-            return (scalar.unsqueeze(-2)                                # [B, T, blocks]
+        # Lift trivial tokens to trivial-in-regular repr: project D → blocks, tile G times.
+        # SA already gave tokens rich cross-modal context; DiT cross-attention handles
+        # equi↔trivial bridging in the full sequence — no gated geometry injection needed.
+        def lift_to_regular(x: torch.Tensor) -> torch.Tensor:
+            scalar = self.inv_proj_tok(x)                               # [B, T, blocks]
+            return (scalar.unsqueeze(-2)
                     .expand(-1, -1, G, -1)
-                    .reshape(x.shape[0], -1, D))                       # [B, T, D]  trivial-in-regular
+                    .reshape(x.shape[0], -1, D))                        # [B, T, D]  trivial-in-regular
 
-        text_inv_reg = fuse_inv_reg(vlm_text.to(dt))
+        text_reg = lift_to_regular(vlm_text.to(dt))
         if noequi_vlm is not None:
-            noequi_inv_reg = fuse_inv_reg(noequi_vlm.to(dt))
-            return torch.cat([h_equi_out, noequi_inv_reg, text_inv_reg], dim=1).to(h_equi.dtype)
-        return torch.cat([h_equi_out, text_inv_reg], dim=1).to(h_equi.dtype)
+            noequi_reg = lift_to_regular(noequi_vlm.to(dt))
+            return torch.cat([h_equi_out, noequi_reg, text_reg], dim=1).to(h_equi.dtype)
+        return torch.cat([h_equi_out, text_reg], dim=1).to(h_equi.dtype)
 
 
 class EagleBackboneFATokens(nn.Module):
@@ -287,11 +257,8 @@ class EagleBackboneFATokens(nn.Module):
         num_images_per_sample: int = 1,
         rotate_image_indices: List[int] | None = None,  # Which images to rotate (None = all)
         output_type: str = 'reg',  # 'reg' for regular representation
-        # Phase 2/3: equivariant adapter
+        # Phase 2: equivariant adapter config (EquiAdapter is now in the action head)
         use_inv_projector_for_vlm: bool = True,  # Phase 2: inject inv-proj tokens into LLM
-        equi_adapter_num_heads: int = 32,         # heads in SA/CA (reduced for data efficiency)
-        equi_adapter_attention_head_dim: int = 64, # head dim; scalar_dim = num_heads * head_dim
-        equi_adapter_num_layers: int = 2,        # SA+CA blocks (reduced for data efficiency)
     ):
         """
         Args:
@@ -316,9 +283,6 @@ class EagleBackboneFATokens(nn.Module):
         self.output_type = output_type
         self.project_to_dim = project_to_dim if project_to_dim else 2048
         self.use_inv_projector_for_vlm = use_inv_projector_for_vlm
-        self.equi_adapter_num_heads = equi_adapter_num_heads
-        self.equi_adapter_attention_head_dim = equi_adapter_attention_head_dim
-        self.equi_adapter_num_layers = equi_adapter_num_layers
 
         if rotate_image_indices is None:
             self.rotate_image_indices = list(range(num_images_per_sample))
@@ -368,12 +332,6 @@ class EagleBackboneFATokens(nn.Module):
         # Output lives in vision_dim (= d_eagle) space; project to d_eagle for VLM injection.
         self.inv_fa_proj = nn.Linear(d_eagle, d_eagle)
 
-        # ── Phase 3: EquiAdapter (gate fusion) ──────────────────────────────
-        self.equi_adapter = EquiAdapter(
-            d_eq=self.project_to_dim,
-            n_group=n_group,
-        )
-
         # Initialize rotation and frame averaging components
         self._init_rotation_matrices()
         self._init_permutation_matrices()
@@ -390,9 +348,7 @@ class EagleBackboneFATokens(nn.Module):
         print(f"  non_equi_image_indices: {self.non_equi_image_indices}")
         print(f"  output_type: {self.output_type}")
         print(f"  use_inv_projector_for_vlm: {self.use_inv_projector_for_vlm}")
-        print(f"  equi_adapter_num_layers:       {self.equi_adapter_num_layers} (SA+CA blocks)")
-        print(f"  equi_adapter_num_heads:        {self.equi_adapter_num_heads}")
-        print(f"  equi_adapter_attention_head_dim: {self.equi_adapter_attention_head_dim}  (scalar_dim={self.equi_adapter_num_heads * self.equi_adapter_attention_head_dim})")
+        print(f"  EquiAdapter (Phase 3) handled in action head after VLLN + self-attention")
         print(f"  Using FULL vision tokens (not pooled)")
         print(f"  Token grid size: {self.token_grid_size}x{self.token_grid_size}")
 
@@ -568,7 +524,6 @@ class EagleBackboneFATokens(nn.Module):
         "vision_proj.",
         "eagle_linear.",
         "inv_fa_proj.",
-        "equi_adapter.",
     )
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
@@ -577,7 +532,7 @@ class EagleBackboneFATokens(nn.Module):
 
         tune_llm / tune_visual are kept as arguments for API compatibility but
         the VLM is always frozen here — only vision_proj, eagle_linear,
-        inv_projector and equi_adapter are trained.
+        and inv_fa_proj are trained. EquiAdapter is now in the action head.
         """
         self.tune_llm = False
         self.tune_visual = False
@@ -606,7 +561,7 @@ class EagleBackboneFATokens(nn.Module):
         Handles sharded safetensors (model.safetensors.index.json),
         single safetensors, and pytorch_model.bin formats.
         Keys are expected to be prefixed with "backbone." in the checkpoint.
-        New layers (vision_proj, equi_adapter, etc.) that are absent from the
+        New layers (vision_proj, inv_fa_proj, etc.) that are absent from the
         checkpoint are left with their random initialisation.
         """
         import json
@@ -663,7 +618,7 @@ class EagleBackboneFATokens(nn.Module):
     def new_layers_state_dict(self) -> dict:
         """
         Return state dict of only the new equivariant layers (vision_proj,
-        eagle_linear, inv_projector, equi_adapter).  Use this to save a
+        eagle_linear, inv_fa_proj).  Use this to save a
         lightweight checkpoint after fine-tuning.
         """
         return {
@@ -997,35 +952,17 @@ class EagleBackboneFATokens(nn.Module):
     def forward_eagle(self, vl_input: BatchFeature) -> tuple:
         """
         Forward through Eagle model with frame averaging on full vision tokens,
-        followed by Invariant FA projection (Phase 2) and EquiAdapter (Phase 3).
+        followed by Invariant FA projection (Phase 2).
 
-        Frame Averaging for COVARIANT equivariance:
-
-            FA(x) = (1/|G|) * Σ_h ρ(h⁻¹) · f(h·x)
-
-        Using ρ(h⁻¹) gives:  FA(g·x) = ρ(g) · FA(x)
-
-        After FA:
-          h_equi    = fa_equi_raw projected  [B, n_equi, T, project_to_dim]  (equivariant)
-          vlm_features = eagle_linear(vlm_hidden) [B, T_total, project_to_dim]  (invariant, image+lang)
-          h_adapted = equi_adapter(h_equi, vlm_features)                    (equivariant, language-conditioned)
-
-        H_out is returned as BOTH:
-          - backbone_equi_vision_features [B, n_equi, T, D] for DiT self-attention prefix
-          - backbone_vision_language_features [B, n_equi*T, D] for DiT cross-attention context
-
-        The cross-attention context is the equi_adapter output (not raw H_llm), so it
-        already encodes vision equivariance AND language conditioning and can be used
-        directly in DiT cross-attention without further processing.
-
-        Args:
-            vl_input: Input batch with eagle_ prefixed keys
+        Phase 3 (EquiAdapter) is handled in the action head after VLLN + self-attention
+        on the concatenated trivial features.
 
         Returns:
-            (h_adapted, attention_mask) tuple
-              h_adapted: [B, n_equi*T_vis + T_lang, project_to_dim] — adapter output
-                         [:n_equi*T_vis] equivariant vision tokens (group-major)
-                         [n_equi*T_vis:] invariant language tokens (trivial-in-regular)
+            (h_equi, equi_vlm, noequi_vlm, vlm_text, attention_mask) tuple
+              h_equi:     [B, n_equi, T, project_to_dim]    equivariant FA tokens (regular repr)
+              equi_vlm:   [B, n_equi*T, project_to_dim]     VLM at equi-image positions (invariant)
+              noequi_vlm: [B, n_noequi*T, project_to_dim]   VLM at non-equi positions (or None)
+              vlm_text:   [B, T_lang, project_to_dim]       VLM at text positions (invariant)
         """
         eagle_prefix = "eagle_"
 
@@ -1136,10 +1073,9 @@ class EagleBackboneFATokens(nn.Module):
             if noequi_img_idx.numel() > 0 else None
         )
 
-        # ── Phase 3: EquiAdapter───────────────────────────
-        h_adapted = self.equi_adapter(h_equi, equi_vlm, vlm_text, noequi_vlm=noequi_vlm)
-
-        return h_adapted, eagle_input["attention_mask"]
+        # EquiAdapter (Phase 3) is handled in the action head after VLLN + self-attention.
+        # Return the four raw feature tensors for downstream processing.
+        return h_equi, equi_vlm, noequi_vlm, vlm_text, eagle_input["attention_mask"]
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         """
@@ -1150,28 +1086,30 @@ class EagleBackboneFATokens(nn.Module):
 
         Returns:
             BatchFeature with:
-                - backbone_equi_vision_features: [B, n_equi*T_vision + n_noequi*T_vision + T_lang, D]
-                    All tokens in regular repr (equivariant group-major layout).
-                    [:n_equi*T]           equivariant vision tokens (FA + equi SA+CA + mix SA).
-                    [n_equi*T:-T_lang]    non-equi camera tokens (trivial-in-regular, mix SA updated).
-                    [-T_lang:]            language tokens (trivial-in-regular, mix SA updated).
+                - backbone_equi_regular_features:    [B, n_equi, T, D]      equivariant FA tokens (regular repr)
+                - backbone_equi_trivial_features:    [B, n_equi*T, D]       VLM at equi-image positions (invariant)
+                - backbone_noequi_trivial_features:  [B, n_noequi*T, D]     VLM at non-equi positions (invariant; [B, 0, D] if none)
+                - backbone_language_trivial_features:[B, T_lang, D]         VLM at text positions (invariant)
                 - backbone_attention_mask: attention mask from Eagle tokeniser
+
+            EquiAdapter (Phase 3) is applied inside the action head after VLLN + self-attention
+            on the concatenated trivial features.
         """
         self.set_frozen_modules_to_eval_mode()
 
-        h_adapted, eagle_mask = self.forward_eagle(vl_input)
+        h_equi, equi_vlm, noequi_vlm, vlm_text, eagle_mask = self.forward_eagle(vl_input)
 
-        # DDP compatibility: ensure all trainable parameters participate in loss
-        if self.training and self.tune_visual:
-            dummy_term = torch.tensor(
-                0.0, device=h_adapted.device, dtype=h_adapted.dtype, requires_grad=True
-            )
-            for param in self.parameters():
-                if param.requires_grad:
-                    dummy_term = dummy_term + 0.0 * param.sum()
-            h_adapted = h_adapted + dummy_term
+        B = h_equi.shape[0]
+        D = self.project_to_dim
+        noequi_out = (
+            noequi_vlm if noequi_vlm is not None
+            else torch.zeros(B, 0, D, device=h_equi.device, dtype=h_equi.dtype)
+        )
 
         return BatchFeature(data={
-            "backbone_equi_vision_features": h_adapted,  # [B, n_equi*T_vision + T_lang, D]
-            "backbone_attention_mask": eagle_mask,
+            "backbone_equi_regular_features":     h_equi,      # [B, n_equi, T, D]
+            "backbone_equi_trivial_features":     equi_vlm,    # [B, n_equi*T, D]
+            "backbone_noequi_trivial_features":   noequi_out,  # [B, n_noequi*T, D]
+            "backbone_language_trivial_features": vlm_text,    # [B, T_lang, D]
+            "backbone_attention_mask":            eagle_mask,
         })

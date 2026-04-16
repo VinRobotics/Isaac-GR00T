@@ -32,7 +32,7 @@ from .action_head.flow_matching_action_head import (
 from .backbone import EagleBackboneFATokens
 from .common import RotRandomizer
 
-BACKBONE_FEATURE_KEY = "backbone_equi_vision_features"
+BACKBONE_FEATURE_KEY = "backbone_equi_regular_features"
 ACTION_KEY = "action_pred"
 LOSS_KEY = "loss"
 ERROR_MSG = "Error: unexpected input/output"
