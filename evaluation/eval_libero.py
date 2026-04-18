@@ -16,9 +16,6 @@ import multiprocessing as mp  # added for parallel workers
 from typing import Optional
 
 import imageio
-from libero.libero import benchmark
-from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
 import numpy as np
 import tqdm
 import tyro
@@ -40,6 +37,8 @@ LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
+    from libero.libero import get_libero_path
+    from libero.libero.envs import OffScreenRenderEnv
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
     env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
@@ -92,11 +91,21 @@ class Args:
     seed: int = 7  # Random Seed (for reproducibility)
     exp_name: str = "test"
     model_type: str = "pi0"
+    # Path to a directory containing a LIBERO config.yaml with custom asset/bddl paths.
+    # Equivalent to setting the LIBERO_CONFIG_PATH environment variable.
+    # Leave empty to use the default ~/.libero/config.yaml.
+    libero_config_path: str = ""
 
 
 def eval_libero(args: Args, task_suite_name: Optional[str]=None, task_ids: Optional[list]=None) -> None:
     # Set random seed
     np.random.seed(args.seed)
+
+    # Must be set before importing libero, as it reads this at module-load time.
+    if args.libero_config_path:
+        os.environ["LIBERO_CONFIG_PATH"] = args.libero_config_path
+
+    from libero.libero import benchmark  # noqa: PLC0415
 
     if task_suite_name is not None:
         args.task_suite_name = task_suite_name
