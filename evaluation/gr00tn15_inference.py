@@ -44,6 +44,9 @@ class Gr00tn15_inference():
             sys.exit(1)
 
 
+    def get_mimicgen_action(self, obs, task_description):
+        return self.get_libero_action(obs, task_description)
+
     def get_libero_action(self, obs, task_description):
         data = self._process_observation(obs, task_description)
         try:
