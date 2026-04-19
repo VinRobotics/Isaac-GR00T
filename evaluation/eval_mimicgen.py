@@ -6,6 +6,7 @@ sys.path.insert(0, "/home/locht1/gr00t_equi_fa")
 import dataclasses
 import logging
 import pathlib
+import random
 from typing import Optional
 
 import imageio
@@ -66,7 +67,7 @@ MIMICGEN_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 MIMICGEN_ENV_RESOLUTION = 84
 
 
-def _make_env(env_name: str, resolution: int, seed: int, robosuite_assets_path: str = ""):
+def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = ""):
     import robosuite as suite
     import robosuite.models
     from robosuite.controllers import load_controller_config
@@ -76,7 +77,7 @@ def _make_env(env_name: str, resolution: int, seed: int, robosuite_assets_path: 
         robosuite.models.assets_root = robosuite_assets_path
 
     ctrl = load_controller_config(default_controller="OSC_POSE")
-    env = suite.make(
+    return suite.make(
         env_name=env_name,
         robots="Panda",
         controller_configs=ctrl,
@@ -90,8 +91,6 @@ def _make_env(env_name: str, resolution: int, seed: int, robosuite_assets_path: 
         reward_shaping=False,
         ignore_done=False,
     )
-    env.seed(seed)
-    return env
 
 
 def to_video_frame(arr):
@@ -172,12 +171,13 @@ def eval_mimicgen(args: Args) -> None:
 
         task_instruction = TASK_TO_INSTRUCTION[task_name]
         max_steps = TASK_MAX_STEPS[task_name]
-        env = _make_env(env_name, args.resize_size, args.seed, args.robosuite_assets_path)
+        env = _make_env(env_name, args.resize_size, args.robosuite_assets_path)
 
         task_episodes, task_successes = 0, 0
 
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task), desc=task_name):
-            env.reset()
+            random.seed(args.seed + episode_idx)
+            np.random.seed(args.seed + episode_idx)
             obs = env.reset()
             t = 0
             done = False
