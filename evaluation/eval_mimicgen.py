@@ -197,8 +197,8 @@ def eval_mimicgen(args: Args) -> None:
                     obs, _, done, info = env.step(act.tolist())
                     t += 1
 
-                    replay_images.append(to_video_frame(obs["agentview_image"]))
-                    replay_images_wrist.append(to_video_frame(obs["robot0_eye_in_hand_image"]))
+                    replay_images.append(to_video_frame(obs["agentview_image"][::-1, ::-1]))
+                    replay_images_wrist.append(to_video_frame(obs["robot0_eye_in_hand_image"][::-1, ::-1]))
 
                     if done or info.get("success", False):
                         done = True
