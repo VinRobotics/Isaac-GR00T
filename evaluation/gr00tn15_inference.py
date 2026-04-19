@@ -92,7 +92,6 @@ class Gr00tn15_inference():
             raw_gripper = action_array[-1].item()
             # action_array = self.normalize_gripper_action(action_array, binarize=True)
             action_array = invert_gripper_action_mimicgen(action_array)
-            print(f"[mimicgen gripper t={t}] raw={raw_gripper:.3f} -> env={action_array[-1].item():.1f} ({'close' if action_array[-1] > 0 else 'open'})")
             actions.append(action_array)
         return np.stack(actions, axis=0)  # shape: (10, D)
 
