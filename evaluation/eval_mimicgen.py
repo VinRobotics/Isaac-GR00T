@@ -77,6 +77,23 @@ def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = ""):
         robosuite.models.assets_root = robosuite_assets_path
 
     ctrl = load_controller_config(default_controller="OSC_POSE")
+    ctrl.update({
+        "input_max": 1,
+        "input_min": -1,
+        "output_max": [0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
+        "output_min": [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5],
+        "kp": 150,
+        "damping": 1,
+        "impedance_mode": "fixed",
+        "kp_limits": [0, 300],
+        "damping_limits": [0, 10],
+        "position_limits": None,
+        "orientation_limits": None,
+        "uncouple_pos_ori": True,
+        "control_delta": True,
+        "interpolation": None,
+        "ramp_ratio": 0.2,
+    })
     return suite.make(
         env_name=env_name,
         robots="Panda",
@@ -84,12 +101,13 @@ def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = ""):
         has_renderer=False,
         has_offscreen_renderer=True,
         use_camera_obs=True,
+        use_object_obs=False,
         camera_names=["agentview", "robot0_eye_in_hand"],
         camera_heights=resolution,
         camera_widths=resolution,
         control_freq=20,
         reward_shaping=False,
-        ignore_done=False,
+        ignore_done=True,
     )
 
 
@@ -197,8 +215,8 @@ def eval_mimicgen(args: Args) -> None:
                     obs, _, done, info = env.step(act.tolist())
                     t += 1
 
-                    replay_images.append(to_video_frame(obs["agentview_image"][::-1, ::-1]))
-                    replay_images_wrist.append(to_video_frame(obs["robot0_eye_in_hand_image"][::-1, ::-1]))
+                    replay_images.append(to_video_frame(obs["agentview_image"]))
+                    replay_images_wrist.append(to_video_frame(obs["robot0_eye_in_hand_image"]))
 
                     if done or info.get("success", False):
                         done = True
