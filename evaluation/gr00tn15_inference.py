@@ -45,18 +45,21 @@ class Gr00tn15_inference():
 
 
     def get_mimicgen_action(self, obs, task_description):
-        return self.get_libero_action(obs, task_description)
-
-    def get_libero_action(self, obs, task_description):
-        data = self._process_observation(obs, task_description)
+        data = self._process_observation(obs, task_description, flip_images=False)
         try:
-            # action_chunk, _ = self.policy.get_action(data)
             action_chunk = self.policy.get_action(data)
         except Exception as e:
             print(f"Error querying server: {e}")
-            # Return no-op action on failure
             return np.array(LIBERO_DUMMY_ACTION, dtype=np.float32)
+        return self.convert_to_libero_action_chunk(action_chunk)
 
+    def get_libero_action(self, obs, task_description):
+        data = self._process_observation(obs, task_description, flip_images=True)
+        try:
+            action_chunk = self.policy.get_action(data)
+        except Exception as e:
+            print(f"Error querying server: {e}")
+            return np.array(LIBERO_DUMMY_ACTION, dtype=np.float32)
         return self.convert_to_libero_action_chunk(action_chunk)
 
 
@@ -92,13 +95,16 @@ class Gr00tn15_inference():
         return np.stack(actions, axis=0)  # shape: (10, D)
 
 
-    def _process_observation(self, obs, task_description):
+    def _process_observation(self, obs, task_description, flip_images=False):
 
         xyz = obs["robot0_eef_pos"]
         rpy = _quat2axisangle(obs["robot0_eef_quat"])
         gripper = obs["robot0_gripper_qpos"]
-        img = obs["agentview_image"][::-1, ::-1]
-        wrist_img = obs["robot0_eye_in_hand_image"][::-1, ::-1]
+        img = obs["agentview_image"]
+        wrist_img = obs["robot0_eye_in_hand_image"]
+        if flip_images:
+            img = img[::-1, ::-1]
+            wrist_img = wrist_img[::-1, ::-1]
 
         # Ensure images are uint8
         img = img.astype(np.uint8)
