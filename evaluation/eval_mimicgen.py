@@ -1,7 +1,7 @@
 # eval_mimicgen.py
 
 import sys
-sys.path.insert(0, "/home/locht1/gr00t_equi_dit")
+sys.path.insert(0, "/home/locht1/gr00t_rtc")
 
 import dataclasses
 import logging
