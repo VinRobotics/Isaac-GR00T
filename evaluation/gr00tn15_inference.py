@@ -90,8 +90,8 @@ class Gr00tn15_inference():
 
             action_array = np.array(action_components, dtype=np.float32)
             raw_gripper = action_array[-1].item()
-            action_array = self.normalize_gripper_action(action_array, binarize=True)
-            action_array = invert_gripper_action(action_array)
+            # action_array = self.normalize_gripper_action(action_array, binarize=True)
+            action_array = invert_gripper_action_mimicgen(action_array)
             print(f"[mimicgen gripper t={t}] raw={raw_gripper:.3f} -> env={action_array[-1].item():.1f} ({'close' if action_array[-1] > 0 else 'open'})")
             actions.append(action_array)
         return np.stack(actions, axis=0)  # shape: (10, D)
@@ -226,4 +226,13 @@ def invert_gripper_action(action):
     the RLDS dataloader aligns gripper actions such that 0 = close, 1 = open.
     """
     action[..., -1] = action[..., -1] * -1.0
+    return action
+
+def invert_gripper_action_mimicgen(action):
+    """
+    Flips the sign of the gripper action (last dimension of action vector).
+    This is necessary for some environments where -1 = open, +1 = close, since
+    the RLDS dataloader aligns gripper actions such that 0 = close, 1 = open.
+    """
+    action[..., -1] = 1 - action[..., -1]
     return action
