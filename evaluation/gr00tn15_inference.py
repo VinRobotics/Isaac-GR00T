@@ -45,7 +45,7 @@ class Gr00tn15_inference():
 
 
     def get_mimicgen_action(self, obs, task_description):
-        data = self._process_observation(obs, task_description, flip_images=False)
+        data = self._process_observation(obs, task_description, flip_mode="horizontal")
         try:
             action_chunk = self.policy.get_action(data)
         except Exception as e:
@@ -54,7 +54,7 @@ class Gr00tn15_inference():
         return self.convert_to_libero_action_chunk(action_chunk)
 
     def get_libero_action(self, obs, task_description):
-        data = self._process_observation(obs, task_description, flip_images=True)
+        data = self._process_observation(obs, task_description, flip_mode="both")
         try:
             action_chunk = self.policy.get_action(data)
         except Exception as e:
@@ -95,14 +95,17 @@ class Gr00tn15_inference():
         return np.stack(actions, axis=0)  # shape: (10, D)
 
 
-    def _process_observation(self, obs, task_description, flip_images=False):
+    def _process_observation(self, obs, task_description, flip_mode=None):
 
         xyz = obs["robot0_eef_pos"]
         rpy = _quat2axisangle(obs["robot0_eef_quat"])
         gripper = obs["robot0_gripper_qpos"]
         img = obs["agentview_image"]
         wrist_img = obs["robot0_eye_in_hand_image"]
-        if flip_images:
+        if flip_mode == "horizontal":
+            img = img[:, ::-1]
+            wrist_img = wrist_img[:, ::-1]
+        elif flip_mode == "both":
             img = img[::-1, ::-1]
             wrist_img = wrist_img[::-1, ::-1]
 
