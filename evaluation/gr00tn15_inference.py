@@ -51,7 +51,7 @@ class Gr00tn15_inference():
         except Exception as e:
             print(f"Error querying server: {e}")
             return np.array(LIBERO_DUMMY_ACTION, dtype=np.float32)
-        return self.convert_to_libero_action_chunk(action_chunk)
+        return self.convert_to_mimicgen_action_chunk(action_chunk)
 
     def get_libero_action(self, obs, task_description):
         data = self._process_observation(obs, task_description, flip_mode="both")
@@ -61,6 +61,40 @@ class Gr00tn15_inference():
             print(f"Error querying server: {e}")
             return np.array(LIBERO_DUMMY_ACTION, dtype=np.float32)
         return self.convert_to_libero_action_chunk(action_chunk)
+    
+    
+    def convert_to_mimicgen_action_chunk(self, action_chunk: dict, start_idx: int = 0):
+        actions = []
+        # action_chunk = self.post_process_action_chunk(action_chunk)
+        for t in range(start_idx, start_idx + self.infer_chunk):
+            action_components = []
+            for key in self.action_keys:
+                val = action_chunk.get(f"action.{key}")[0]
+                # print(val.shape)
+                if val is None:
+                    raise ValueError(f"Missing key action.{key} in server response")
+
+                # Handle per-timestep selection. Support scalars and arrays.
+                if hasattr(val, "shape") and len(val.shape) > 0:
+                    # Protect against out-of-range idx
+                    if t >= val.shape[0]:
+                        raise IndexError(f"Requested idx {t} for key {key}, but available length is {val.shape[0]}")
+                    val_t = val[t]
+                else:
+                    # Scalar per key; same value for all timesteps
+                    val_t = val
+
+                # If the timestep value is vector-valued, extend; if scalar, append
+                val_t = np.array(val_t, dtype=np.float32).reshape(-1)
+                action_components.extend(val_t.tolist())
+
+            action_array = np.array(action_components, dtype=np.float32)
+            raw_gripper = action_array[-1].item()
+            action_array = self.normalize_gripper_action(action_array, binarize=True)
+            action_array = invert_gripper_action(action_array)
+            print(f"[mimicgen gripper t={t}] raw={raw_gripper:.3f} -> env={action_array[-1].item():.1f} ({'close' if action_array[-1] > 0 else 'open'})")
+            actions.append(action_array)
+        return np.stack(actions, axis=0)  # shape: (10, D)
 
 
     def convert_to_libero_action_chunk(self, action_chunk: dict, start_idx: int = 0):
