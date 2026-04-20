@@ -2,6 +2,7 @@
 
 import sys
 sys.path.insert(0, "/home/locht1/gr00t_rtc")
+sys.path.insert(0, "/mnt/data/sftp/data/locht1/mimicgen_evaluation/mimicgen")
 
 import dataclasses
 import logging
@@ -71,7 +72,7 @@ def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = ""):
     import robosuite as suite
     import robosuite.models
     from robosuite.controllers import load_controller_config
-    import mimicgen.envs.robosuite  # noqa: F401 — registers MimicGen envs
+    import mimicgen_envs.envs.robosuite  # noqa: F401 — registers MimicGen envs
 
     if robosuite_assets_path:
         robosuite.models.assets_root = robosuite_assets_path
