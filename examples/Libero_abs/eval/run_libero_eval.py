@@ -60,6 +60,7 @@ class GenerateConfig:
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 5                    # Number of rollouts per task
     rotation_randomization: bool = False                     # Whether to apply random SO(2) rotation to all objects in the initial state for diversity
+    skip_tasks: int = -1                                 # Number of tasks to skip at the start of the suite (for resuming partial evaluations)
     #################################################################################################################
     # fmt: on
     """Port to connect to."""
@@ -204,6 +205,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
     # Start evaluation
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+        # Skip tasks if specified
+        if cfg.skip_tasks > 0 and task_id < cfg.skip_tasks:
+            continue
+
         # Get task
         task = task_suite.get_task(task_id)
 
