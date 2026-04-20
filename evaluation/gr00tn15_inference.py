@@ -89,9 +89,6 @@ class Gr00tn15_inference():
                 action_components.extend(val_t.tolist())
 
             action_array = np.array(action_components, dtype=np.float32)
-            raw_gripper = action_array[-1].item()
-            # action_array = self.normalize_gripper_action(action_array, binarize=True)
-            action_array = invert_gripper_action_mimicgen(action_array)
             actions.append(action_array)
         return np.stack(actions, axis=0)  # shape: (10, D)
 
