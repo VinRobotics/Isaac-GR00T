@@ -18,16 +18,16 @@ from evaluation.gr00tn15_inference import Gr00tn15_inference, _quat2axisangle, i
 
 
 TASK_TO_ENV: dict[str, str] = {
-    "coffee":                "Coffee_D2",
-    "coffee preparation":    "CoffeePreparation_D1",
-    "hammer cleanup":        "HammerCleanup_D1",
-    "kitchen":               "Kitchen_D1",
-    "mug cleanup":           "MugCleanup_D1",
-    "nut assembly":          "NutAssembly_D0",
-    "pick place":            "PickPlace_D0",
     "square":                "Square_D2",
     "stack":                 "Stack_D1",
     "stack three":           "StackThree_D1",
+    "hammer cleanup":        "HammerCleanup_D1",
+    "kitchen":               "Kitchen_D1",
+    "coffee":                "Coffee_D2",
+    "coffee preparation":    "CoffeePreparation_D1",
+    "mug cleanup":           "MugCleanup_D1",
+    "nut assembly":          "NutAssembly_D0",
+    "pick place":            "PickPlace_D0",
     "threading":             "Threading_D2",
     "three piece assembly":  "ThreePieceAssembly_D2",
 }
