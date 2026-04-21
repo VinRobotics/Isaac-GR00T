@@ -67,6 +67,24 @@ MIMICGEN_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 MIMICGEN_ENV_RESOLUTION = 84
 
 
+class _SuccessDoneWrapper:
+    """Propagates is_success into done so callers can rely on done=True to stop."""
+    def __init__(self, env):
+        self.env = env
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        info["is_success"] = self.env.is_success()["task"]
+        done = done or bool(info["is_success"])
+        return obs, reward, done, info
+
+    def reset(self):
+        return self.env.reset()
+
+
 def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = ""):
     import robosuite as suite
     import robosuite.models
@@ -94,7 +112,7 @@ def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = ""):
         "interpolation": None,
         "ramp_ratio": 0.2,
     })
-    return suite.make(
+    env = suite.make(
         env_name=env_name,
         robots="Panda",
         controller_configs=ctrl,
@@ -109,6 +127,7 @@ def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = ""):
         reward_shaping=False,
         ignore_done=True,
     )
+    return _SuccessDoneWrapper(env)
 
 
 def to_video_frame(arr):
@@ -218,14 +237,14 @@ def eval_mimicgen(args: Args) -> None:
                     replay_images.append(to_video_frame(obs["agentview_image"][:, ::-1]))
                     replay_images_wrist.append(to_video_frame(obs["robot0_eye_in_hand_image"][:, ::-1]))
 
-                    if done or info.get("success", False):
+                    if done or info.get("is_success", False):
                         done = True
                         break
 
                 if done:
                     break
 
-            success = done or bool(info.get("success", False))
+            success = done or bool(info.get("is_success", False))
             if success:
                 task_successes += 1
                 total_successes += 1
