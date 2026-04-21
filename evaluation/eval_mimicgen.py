@@ -77,7 +77,7 @@ class _SuccessDoneWrapper:
 
     def step(self, action):
         obs, reward, done, info = self.env.step(action)
-        info["is_success"] = self.env.is_success()["task"]
+        info["is_success"] = bool(self.env._check_success())
         done = done or bool(info["is_success"])
         return obs, reward, done, info
 
