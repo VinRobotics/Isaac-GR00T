@@ -100,7 +100,7 @@ correct = 0
 total = 0
 
 for batch in tqdm(loader):
-    labels_raw = batch.pop(TASK_COMPLETION_KEY)  # (B, 1)
+    labels_raw = batch.pop("task_completion")  # (B, 1)
     if isinstance(labels_raw, torch.Tensor):
         labels = labels_raw.flatten().long().tolist()
     else:

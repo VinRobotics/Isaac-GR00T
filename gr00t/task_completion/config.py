@@ -115,7 +115,7 @@ class WindowTaskCompletionConfig:
                 action_horizon=1,
                 max_state_dim=self.max_state_dim,
                 max_action_dim=self.max_action_dim,
-                use_task_completion=training,   # include label only when training
+                use_task_completion=True,  # always include label (needed for eval too)
                 training=training,
                 camera_major_order=True,  # cam_head_t0…tN, cam_left_t0…tN, cam_right_t0…tN
             ),
