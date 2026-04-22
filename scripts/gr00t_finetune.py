@@ -24,7 +24,7 @@ import torch
 import tyro
 from transformers import TrainingArguments
 
-from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset
+from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset, LeRobotMixtureDatasetV2
 from gr00t.data.schema import EmbodimentTag
 from gr00t.experiment.data_config import load_data_config
 from gr00t.experiment.runner import TrainRunner
@@ -40,6 +40,9 @@ class ArgsConfig:
     # Dataset parameters
     dataset_path: List[str]
     """Path to the dataset directory or directories, we assume all datasets have the same data config"""
+
+    new_dataset_path: List[str] = ()  # type: ignore[assignment]
+    """Path to the new dataset directory or directories for continual learning (50/50 mix with dataset_path). Leave empty to disable."""
 
     output_dir: str = "/tmp/gr00t"
     """Directory to save model checkpoints."""
@@ -217,6 +220,35 @@ def _copy_partial_action_expert_weights(old_dict, new_dict, old_dim, new_dim):
 # main training function
 #####################################################################################
 
+def load_dataset(dataset_path, balance_dataset_weights, balance_trajectory_weights, modality_configs, transforms, embodiment_tag, video_backend) -> LeRobotMixtureDataset:
+    # Always return LeRobotMixtureDataset so LeRobotMixtureDatasetV2 can safely
+    # access .merged_metadata and .datasets on either input.
+    single_datasets = []
+    for p in dataset_path:
+        assert os.path.exists(p), f"Dataset path {p} does not exist"
+        single_datasets.append(
+            LeRobotSingleDataset(
+                dataset_path=p,
+                modality_configs=modality_configs,
+                transforms=transforms,
+                embodiment_tag=embodiment_tag,
+                video_backend=video_backend,
+            )
+        )
+
+    dataset = LeRobotMixtureDataset(
+        data_mixture=[(d, 1.0) for d in single_datasets],
+        mode="train",
+        balance_dataset_weights=balance_dataset_weights,
+        balance_trajectory_weights=balance_trajectory_weights,
+        seed=42,
+        metadata_config={
+            "percentile_mixing_method": "weighted_average",
+        },
+    )
+    print(f"Loaded {len(single_datasets)} datasets from {dataset_path}")
+    return dataset
+
 
 def main(config: ArgsConfig):
     """Main training function."""
@@ -229,44 +261,35 @@ def main(config: ArgsConfig):
     transforms = data_config_cls.transform()
 
     # 1.2 data loader: we will use either single dataset or mixture dataset
-    if len(config.dataset_path) == 1:
-        train_dataset = LeRobotSingleDataset(
-            dataset_path=config.dataset_path[0],
-            modality_configs=modality_configs,
-            transforms=transforms,
-            embodiment_tag=embodiment_tag,  # This will override the dataset's embodiment tag to "new_embodiment"
-            video_backend=config.video_backend,
+    train_dataset = load_dataset(
+        config.dataset_path,
+        config.balance_dataset_weights,
+        config.balance_trajectory_weights,
+        modality_configs,
+        transforms,
+        embodiment_tag,
+        config.video_backend,
+    )
+    
+    if len(config.new_dataset_path) > 0:
+        new_dataset = load_dataset(
+            config.new_dataset_path,
+            config.balance_dataset_weights,
+            config.balance_trajectory_weights,
+            modality_configs,
+            transforms,
+            embodiment_tag,
+            config.video_backend,
         )
-    else:
-        single_datasets = []
-        for p in config.dataset_path:
-            assert os.path.exists(p), f"Dataset path {p} does not exist"
-            ## We use the same transforms, modality configs, and embodiment tag for all datasets here,
-            ## in reality, you can use dataset from different modalities and embodiment tags
-            dataset = LeRobotSingleDataset(
-                dataset_path=p,
-                modality_configs=modality_configs,
-                transforms=transforms,
-                embodiment_tag=embodiment_tag,
-                video_backend=config.video_backend,
-            )
-            single_datasets.append(dataset)
-
-        train_dataset = LeRobotMixtureDataset(
-            data_mixture=[
-                (dataset, 1.0)  # we will use equal weights for all datasets
-                for dataset in single_datasets
-            ],
-            mode="train",
-            balance_dataset_weights=config.balance_dataset_weights,
-            balance_trajectory_weights=config.balance_trajectory_weights,
-            seed=42,
+        
+        train_dataset = LeRobotMixtureDatasetV2(
+            old_data_mixture = train_dataset,
+            new_data_mixture = new_dataset,
             metadata_config={
                 "percentile_mixing_method": "weighted_average",
-            },
+            },  
         )
-        print(f"Loaded {len(single_datasets)} datasets, with {config.dataset_path} ")
-
+        
     # ------------ step 2: load model ------------
     # First, get the data config to determine action horizon
     data_action_horizon = len(data_config_cls.action_indices)

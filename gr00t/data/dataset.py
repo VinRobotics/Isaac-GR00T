@@ -1381,3 +1381,104 @@ class LeRobotMixtureDataset(Dataset):
             )
         for dataset in self.datasets:
             dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
+
+class LeRobotMixtureDatasetV2(Dataset):
+    """
+    A 50/50 mixture of two LeRobotMixtureDataset instances (old and new data).
+
+    When the DataLoader fetches a contiguous batch of size B, half the samples
+    come from old_data_mixture and half from new_data_mixture.  This is achieved
+    by mapping even global indices to old and odd global indices to new.
+
+    Statistics from both mixtures are merged with equal (0.5 / 0.5) weights and
+    propagated back to every underlying LeRobotSingleDataset so normalisation
+    is consistent across old and new data.
+    """
+
+    def __init__(
+        self,
+        old_data_mixture: LeRobotMixtureDataset,
+        new_data_mixture: LeRobotMixtureDataset,
+        metadata_config: dict = {
+            "percentile_mixing_method": "min_max",
+        },
+    ):
+        """
+        Args:
+            old_data_mixture: Pre-built LeRobotMixtureDataset for old/replay data.
+            new_data_mixture: Pre-built LeRobotMixtureDataset for new task data.
+            metadata_config: Passed to LeRobotMixtureDataset.merge_metadata.
+        """
+        self.old_data_mixture = old_data_mixture
+        self.new_data_mixture = new_data_mixture
+
+        self.update_metadata(metadata_config)
+
+    # ------------------------------------------------------------------
+    # Epoch management
+    # ------------------------------------------------------------------
+
+    def set_epoch(self, epoch: int):
+        self.old_data_mixture.set_epoch(epoch)
+        self.new_data_mixture.set_epoch(epoch)
+
+    # ------------------------------------------------------------------
+    # Core Dataset interface
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        # Each sub-mixture contributes equally; the larger one sets the epoch length.
+        return 2 * max(len(self.old_data_mixture), len(self.new_data_mixture))
+
+    def __getitem__(self, index: int) -> dict:
+        sub_index = index // 2
+        if index % 2 == 0:
+            return self.old_data_mixture[sub_index % len(self.old_data_mixture)]
+        else:
+            return self.new_data_mixture[sub_index % len(self.new_data_mixture)]
+
+    def __str__(self) -> str:
+        return json.dumps(
+            {
+                "LeRobotMixtureDatasetV2": {
+                    "old_data_mixture (50%)": str(self.old_data_mixture),
+                    "new_data_mixture (50%)": str(self.new_data_mixture),
+                    "total_length": len(self),
+                }
+            },
+            indent=2,
+        )
+
+    # ------------------------------------------------------------------
+    # Metadata helpers
+    # ------------------------------------------------------------------
+
+    def update_metadata(self, metadata_config: dict) -> None:
+        """Merge statistics from old and new mixtures with equal 0.5/0.5 weights.
+
+        The merged metadata is then propagated to every underlying
+        LeRobotSingleDataset so that all transforms use consistent normalisation
+        statistics derived from the combined distribution.
+        """
+        percentile_mixing_method = metadata_config["percentile_mixing_method"]
+
+        # Collect one merged DatasetMetadata per embodiment tag from each mixture.
+        # Each mixture has already merged its own datasets; we now merge across mixtures.
+        all_metadatas: dict[str, list[DatasetMetadata]] = {}
+        for mixture in (self.old_data_mixture, self.new_data_mixture):
+            for tag, metadata in mixture.merged_metadata.items():
+                all_metadatas.setdefault(tag, []).append(metadata)
+
+        self.merged_metadata: dict[str, DatasetMetadata] = {}
+        for tag, metadatas in all_metadatas.items():
+            self.merged_metadata[tag] = LeRobotMixtureDataset.merge_metadata(
+                metadatas=metadatas,
+                # Equal weight for old and new regardless of dataset sizes.
+                dataset_sampling_weights=[0.5] * len(metadatas),
+                percentile_mixing_method=percentile_mixing_method,
+            )
+
+        # Push merged metadata down to every underlying single dataset.
+        for mixture in (self.old_data_mixture, self.new_data_mixture):
+            for dataset in mixture.datasets:
+                dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
