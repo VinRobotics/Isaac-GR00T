@@ -60,10 +60,7 @@ class TaskCompletionDetector(nn.Module):
             nn.Linear(hidden_dim // 2, hidden_dim // 4),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 4, hidden_dim // 8),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 8, num_classes),
+            nn.Linear(hidden_dim // 4, num_classes),
         )
 
         self._init_weights()
