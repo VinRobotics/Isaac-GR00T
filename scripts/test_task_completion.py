@@ -12,7 +12,6 @@ Usage:
 import os
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -106,9 +105,6 @@ for batch in tqdm(loader):
     else:
         labels = np.asarray(labels_raw).flatten().tolist()
 
-    # keep a copy of the first camera frames before moving batch to device
-    img_tensors = batch[VIDEO_KEYS[0]].clone()  # (B, T, H, W, C) or similar
-
     batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
     with torch.no_grad():
@@ -123,26 +119,7 @@ for batch in tqdm(loader):
         correct += is_correct
         total += 1
 
-        img_arr = img_tensors[j].numpy()
-
-        # Take last frame if window > 1: shape (T, H, W, C) or (H, W, C)
-        if img_arr.ndim == 4:
-            img_arr = img_arr[-1]
-
-        # (C, H, W) → (H, W, C)
-        if img_arr.ndim == 3 and img_arr.shape[0] == 3:
-            img_arr = np.transpose(img_arr, (1, 2, 0))
-
-        if img_arr.max() <= 1.0:
-            img_arr = (img_arr * 255).astype(np.uint8)
-        else:
-            img_arr = img_arr.astype(np.uint8)
-
-        img = Image.fromarray(img_arr)
         idx = total - 1
-        fname = f"img_{idx:04d}_pred{pred}_label{label}.png"
-        img.save(os.path.join(OUTPUT_DIR, fname))
-
         print(f"[{idx:04d}] prob={pred_prob}  pred={pred}  label={label}  correct={is_correct}  acc={correct/total:.3f}")
 
 print(f"\nFinal accuracy: {correct}/{total} = {correct/total:.4f}")
