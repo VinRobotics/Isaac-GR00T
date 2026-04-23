@@ -239,7 +239,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
             "num_attention_heads": 32,
             "num_layers": 16,
             "output_dim": 1024,
-            "use_relative_position_bias": False,  # disabled: equivariant absolute pos embeds handle ordering
+            "use_group_rope": False,
         }, metadata={"help": "Diffusion model configuration (n_group is injected from top-level)."}
     )
     input_embedding_dim: int = field(

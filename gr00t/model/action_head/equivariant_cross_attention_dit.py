@@ -294,35 +294,6 @@ class EquivariantAttention(nn.Module):
         # Applying ρ(g^t) to Q_t and K_t makes ⟨Q_i, K_j⟩ depend on relative offset (j-i).
         self.rope = GroupRoPE(self.qkv_type) if (use_group_rope and both_regular) else None
 
-    def _get_relative_position_bias(self, Tq, Tk, device):
-        """
-        Compute relative position bias matrix.
-        This is equivariant because it only depends on relative distances.
-        
-        Returns: (H, Tq, Tk) bias tensor
-        """
-        # Create position indices
-        q_pos = torch.arange(Tq, device=device).unsqueeze(1)  # (Tq, 1)
-        k_pos = torch.arange(Tk, device=device).unsqueeze(0)  # (1, Tk)
-        
-        # Compute relative positions and clip
-        relative_position = q_pos - k_pos  # (Tq, Tk)
-        relative_position = torch.clamp(
-            relative_position,
-            -self.max_relative_position,
-            self.max_relative_position
-        )
-        
-        # Shift to make all indices positive
-        relative_position_index = relative_position + self.max_relative_position  # (Tq, Tk)
-        
-        # Index into learned bias
-        # relative_position_bias: (H, 2*max_relative_position + 1)
-        # Output: (H, Tq, Tk)
-        bias = self.relative_position_bias[:, relative_position_index]  # (H, Tq, Tk)
-        
-        return bias
-    
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
         """
         hidden_states         : (B, Tq, Cq*G)
@@ -331,9 +302,8 @@ class EquivariantAttention(nn.Module):
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
-        B, Tq, _ = hidden_states.shape
-        B2, Tk, _ = encoder_hidden_states.shape
-        assert B == B2
+        B = hidden_states.shape[0]
+        assert encoder_hidden_states.shape[0] == B
 
         # Flatten for projection
         q_flat = einops.rearrange(hidden_states,         "b t d -> (b t) d")
@@ -342,45 +312,40 @@ class EquivariantAttention(nn.Module):
         q_geo = enn.GeometricTensor(q_flat, self.in_type)
         k_geo = enn.GeometricTensor(k_flat, self.cross_type)
 
-        Q = self.q_proj(q_geo).tensor    # (B*Tq, scalar_dim)  — regular repr (equivariant, geo info)
-        K = self.k_proj(k_geo).tensor    # (B*Tk, scalar_dim)  — regular repr (equivariant, geo info)
-        V = self.v_proj(k_geo).tensor    # (B*Tk, scalar_dim)  — regular repr (equivariant)
+        Q = self.q_proj(q_geo).tensor    # (B*Tq, scalar_dim)
+        K = self.k_proj(k_geo).tensor    # (B*Tk, scalar_dim)
+        V = self.v_proj(k_geo).tensor    # (B*Tk, scalar_dim)
 
-        # reshape back
+        # reshape back: (B, T, scalar_dim)
         Q = einops.rearrange(Q, "(b t) d -> b t d", b=B)
         K = einops.rearrange(K, "(b t) d -> b t d", b=B)
         V = einops.rearrange(V, "(b t) d -> b t d", b=B)
 
-        # Split into heads using einops
-        # Q,K,V: (B, T, H, Dh)
+        # Apply GroupRoPE before head split: encodes relative temporal position
+        # via the group's cyclic structure. ⟨ρ(g^i)Q, ρ(g^j)K⟩ depends only on (j-i).
+        if self.rope is not None:
+            Q = self.rope.rotate(Q)
+            K = self.rope.rotate(K)
+
+        # Split into heads: (B, T, H, Dh)
         Q = einops.rearrange(Q, "b t (h d) -> b t h d", h=self.H)
         K = einops.rearrange(K, "b t (h d) -> b t h d", h=self.H)
         V = einops.rearrange(V, "b t (h d) -> b t h d", h=self.H)
 
-        # Scaled dot-product attention using geometric inner product ⟨Q,K⟩
-        # G-invariant because ρ(g) is orthogonal: ⟨ρ(g)Q, ρ(g)K⟩ = ⟨Q, K⟩
-        # attn: (B, H, Tq, Tk)
+        # Scaled dot-product attention — G-invariant: ⟨ρ(g)Q, ρ(g)K⟩ = ⟨Q, K⟩
         attn = torch.einsum("b t h d, b k h d -> b h t k", Q, K) * self.scale
-        
-        # Add relative position bias (equivariant because it's translation-invariant)
-        if self.use_relative_position_bias:
-            rel_pos_bias = self._get_relative_position_bias(Tq, Tk, attn.device)  # (H, Tq, Tk)
-            attn = attn + rel_pos_bias.unsqueeze(0)  # (B, H, Tq, Tk)
-        
+
         if attention_mask is not None:
             attn = attn + attention_mask[:, None, :, :]
 
         attn = torch.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
-        # Apply attention to V
-        # out: (B, H, Tq, Dh)
+        # Weighted sum of values: (B, H, Tq, Dh)
         out = torch.einsum("b h t k, b k h d -> b h t d", attn, V)
 
-        # merge heads
+        # Merge heads and project back to in_type
         out = einops.rearrange(out, "b h t d -> (b t) (h d)")
-
-        # Lift back to group representation with ESCNN (scalar or regular depending on mode)
         out_geo = enn.GeometricTensor(out, self.qkv_type)
         out = self.o_proj(out_geo).tensor          # (B*Tq, Cq*G)
         out = einops.rearrange(out, "(b t) d -> b t d", b=B)
