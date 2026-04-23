@@ -861,7 +861,7 @@ class FlowmatchingActionHead(nn.Module):
         )
 
         if self.config.add_pos_embed:
-            state_features = self._add_temporal_pos_embed(state_features)
+            # state_features = self._add_temporal_pos_embed(state_features)
             action_features = self._add_temporal_pos_embed(action_features)
 
         # State + action only — vision is cross-attention context, not a prefix

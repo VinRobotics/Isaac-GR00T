@@ -106,6 +106,60 @@ class TimestepEncoder(nn.Module):
         timesteps_emb = self.timestep_embedder(timesteps_proj)  # (N, D)
         return timesteps_emb
 
+
+class GroupRoPE(nn.Module):
+    """
+    Group Rotary Position Embedding for cyclic groups C_n.
+
+    Applies ρ(g^t) to features at temporal position t, where g is the generator
+    of C_n (a cyclic shift of the regular representation). The inner product
+
+        ⟨ρ(g^i) Q_i,  ρ(g^j) K_j⟩  =  ⟨Q_i,  ρ(g^{j-i}) K_j⟩
+
+    depends only on the relative offset (j-i), so temporal ordering is encoded
+    through the group's own cyclic structure — parameter-free, no max_relative_position.
+
+    For regular_repr, ρ(g^t) is a cyclic permutation of blocks of size n, so the
+    rotation reduces to a gather operation with no matrix multiplication.
+
+    Equivariance: applying a global group rotation g* to all features commutes with
+    the position-dependent rotation ρ(g^t), so the full attention remains equivariant.
+    """
+
+    def __init__(self, field_type: enn.FieldType):
+        super().__init__()
+        self.n = field_type.gspace.fibergroup.order()
+        self.D = field_type.size
+        assert self.D % self.n == 0, (
+            f"field_type.size {self.D} must be divisible by group order {self.n}"
+        )
+        self.M = self.D // self.n  # number of regular_repr copies
+
+    def rotate(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x : (B, T, D) — features in regular_repr space (D = M * n)
+        Returns (B, T, D) where token at position t is rotated by ρ(g^{t mod n}).
+
+        ρ(g^t) on a regular_repr block of size n:  out[i] = in[(i - t) mod n]
+        This is a cyclic right-shift by t — implemented with a gather for all T in parallel.
+        """
+        B, T, D = x.shape
+        n, M = self.n, self.M
+
+        # Expose group dimension: (B, T, M, n)
+        x_blocks = x.view(B, T, M, n)
+
+        # Source index for position t, output slot i: (i - t) % n
+        t_mod = torch.arange(T, device=x.device) % n          # (T,)
+        n_idx = torch.arange(n, device=x.device)               # (n,)
+        src_idx = (n_idx.unsqueeze(0) - t_mod.unsqueeze(1)) % n  # (T, n)
+
+        # Expand for gather and apply: (B, T, M, n)
+        src_idx_exp = src_idx.unsqueeze(0).unsqueeze(2).expand(B, T, M, n)
+        x_rotated = torch.gather(x_blocks, dim=-1, index=src_idx_exp)
+
+        return x_rotated.view(B, T, D)
+
 class EquivariantAdaLayerNorm(nn.Module):
     """
     Equivariant Adaptive Layer Normalization.
@@ -172,8 +226,7 @@ class EquivariantAttention(nn.Module):
         dropout=0.0,
         bias=True,
         out_bias=True,
-        use_relative_position_bias=False,
-        max_relative_position=32,
+        use_group_rope=False,
     ):
         super().__init__()
 
@@ -236,16 +289,10 @@ class EquivariantAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
         self.scale = (dim_head) ** -0.5
-        
-        # Relative position bias (equivariant because it's based on relative distances)
-        self.use_relative_position_bias = use_relative_position_bias
-        if use_relative_position_bias:
-            self.max_relative_position = max_relative_position
-            # Learnable relative position bias per head
-            # Shape: (heads, 2*max_relative_position + 1)
-            self.relative_position_bias = nn.Parameter(
-                torch.zeros(heads, 2 * max_relative_position + 1)
-            )
+
+        # GroupRoPE: only valid when both Q and K live in regular_repr space (self-attention).
+        # Applying ρ(g^t) to Q_t and K_t makes ⟨Q_i, K_j⟩ depend on relative offset (j-i).
+        self.rope = GroupRoPE(self.qkv_type) if (use_group_rope and both_regular) else None
 
     def _get_relative_position_bias(self, Tq, Tk, device):
         """
@@ -542,8 +589,7 @@ class BasicTransformerBlock(nn.Module):
         norm_eps: float = 1e-5,
         final_dropout: bool = False,
         attention_out_bias: bool = True,
-        use_relative_position_bias: bool = False,
-        max_relative_position: int = 32,
+        use_group_rope: bool = False,
     ):
         super().__init__()
 
@@ -554,10 +600,10 @@ class BasicTransformerBlock(nn.Module):
         self.inner_type = inner_type
         # temb_type for trivial timestep embedding
         self.temb_type = temb_type
-        
+
         # Store norm_type for forward pass
         self.norm_type = norm_type
-        
+
         # Define 3 blocks. Each block has its own normalization layer.
         # 1. Self-Attn
         if norm_type == "ada_norm":
@@ -573,8 +619,7 @@ class BasicTransformerBlock(nn.Module):
             dropout=dropout,
             bias=attention_bias,
             out_bias=attention_out_bias,
-            use_relative_position_bias=use_relative_position_bias,
-            max_relative_position=max_relative_position,
+            use_group_rope=use_group_rope,
         )
 
         # 3. Feed-forward
@@ -690,8 +735,7 @@ class EDiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
-        use_relative_position_bias: bool = False,
-        max_relative_position: int = 32,
+        use_group_rope: bool = True,
     ):
         super().__init__()
 
@@ -766,8 +810,7 @@ class EDiT(ModelMixin, ConfigMixin):
                     norm_type=norm_type,
                     norm_eps=self.config.norm_eps,
                     final_dropout=final_dropout,
-                    use_relative_position_bias=use_relative_position_bias,
-                    max_relative_position=max_relative_position,
+                    use_group_rope=use_group_rope and use_self_attn,
                 )
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)
