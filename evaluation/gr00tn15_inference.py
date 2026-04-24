@@ -45,7 +45,7 @@ class Gr00tn15_inference():
 
 
     def get_mimicgen_action(self, obs, task_description):
-        data = self._process_observation(obs, task_description, flip_mode="horizontal")
+        data = self._process_observation(obs, task_description, flip_mode="vertical")
         try:
             action_chunk = self.policy.get_action(data)
         except Exception as e:
@@ -135,6 +135,9 @@ class Gr00tn15_inference():
         if flip_mode == "horizontal":
             img = img[:, ::-1]
             wrist_img = wrist_img[:, ::-1]
+        elif flip_mode == "vertical":
+            img = img[::-1]
+            wrist_img = wrist_img[::-1]
         elif flip_mode == "both":
             img = img[::-1, ::-1]
             wrist_img = wrist_img[::-1, ::-1]
