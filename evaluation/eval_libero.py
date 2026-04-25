@@ -200,32 +200,36 @@ def eval_libero(args: Args, task_suite_name: Optional[str]=None, task_ids: Optio
             if task_episodes % 10 == 0:
                 logging.info(f"Task_id: {task_id} | Starting episode {task_episodes+1}... | {task_description}")
             while t < max_steps + args.num_steps_wait:
-                # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
-                # and we need to wait for them to fall
-                if t < args.num_steps_wait:
-                    obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
-                    t += 1
-                    continue
+                try:
+                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
+                    # and we need to wait for them to fall
+                    if t < args.num_steps_wait:
+                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                        t += 1
+                        continue
 
-                # start_time = time.time()
-                action_chunk = mypolicy.get_libero_action(obs, task_description)
-                # print(f"Inference speed: {time.time() - start_time} s")
+                    # start_time = time.time()
+                    action_chunk = mypolicy.get_libero_action(obs, task_description)
+                    # print(f"Inference speed: {time.time() - start_time} s")
 
-                for act in action_chunk:
-                    obs, reward, done, info = env.step(act.tolist())
-                    t +=1
+                    for act in action_chunk:
+                        obs, reward, done, info = env.step(act.tolist())
+                        t +=1
 
-                    replay_image = obs["agentview_image"][::-1, ::-1]
-                    replay_images.append(to_video_frame(replay_image))
+                        replay_image = obs["agentview_image"][::-1, ::-1]
+                        replay_images.append(to_video_frame(replay_image))
 
-                    replay_image_wrist = obs["robot0_eye_in_hand_image"][::-1, ::-1]
-                    replay_images_wrist.append(to_video_frame(replay_image_wrist))
+                        replay_image_wrist = obs["robot0_eye_in_hand_image"][::-1, ::-1]
+                        replay_images_wrist.append(to_video_frame(replay_image_wrist))
 
+                        if done:
+                            task_successes += 1
+                            total_successes += 1
+                            break
                     if done:
-                        task_successes += 1
-                        total_successes += 1
                         break
-                if done:
+                except Exception as e:
+                    logging.info(f"Caught exception: {e}\n")
                     break
 
             task_episodes +=1
