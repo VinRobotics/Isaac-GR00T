@@ -2124,6 +2124,266 @@ class VRH3LeftHandConfig(BaseDataConfig):
 
 ###########################################################################################
 
+class EquiALOHA_1Hand_Config(BaseDataConfig):
+    video_keys = ["video.image", "video.wrist_image"]
+    # video.image (index 0) = top/head camera → equivariant FA
+    # video.wrist_image (index 1) = wrist camera → VL only, skipped from equi_vision_embs
+    state_keys = [
+        "state.x",
+        "state.y",
+        "state.z",
+        "state.roll",
+        "state.pitch",
+        "state.yaw",
+        "state.gripper",
+    ]
+    action_keys = [
+        "action.x",
+        "action.y",
+        "action.z",
+        "action.roll",
+        "action.pitch",
+        "action.yaw",
+        "action.gripper",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+    num_hand = 1
+    rot_type="axis_angle"
+    rel_action=False
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """
+        Backbone rotation config for equivariant frame averaging.
+
+        - num_images_per_sample=2: Eagle VL/LLM pass sees BOTH cameras (top + wrist).
+        - rotate_image_indices=[0]: Only the top/head camera (index 0) is rotated for FA.
+          The wrist camera (index 1) is skipped from equi_vision_embs entirely.
+
+        Result:
+          backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only (equivariant)
+          backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
+        """
+        return {
+            "num_images_per_sample": 2,
+            "rotate_image_indices": [0],
+        }
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.x": "min_max",
+                    "state.y": "min_max",
+                    "state.z": "min_max",
+                    "state.gripper": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
+                },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.x": "min_max",
+                    "action.y": "min_max",
+                    "action.z": "min_max",
+                    "action.gripper": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
+                },
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+                num_hand=self.num_hand,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+class EquiALOHA_2Hand_Config(BaseDataConfig):
+    video_keys = ["video.image", "video.left_wrist_image", "video.right_wrist_image"]
+    # video.image (index 0) = top/head camera → equivariant FA
+    # video.left_wrist_image (index 1) = left wrist camera → VL only, skipped from equi_vision_embs
+    # video.right_wrist_image (index 2) = right wrist camera → VL only, skipped from equi_vision_embs
+    state_keys = [
+        "state.l_xyz",
+        "state.l_rpy",
+        "state.l_gripper",
+        
+        "state.r_xyz",
+        "state.r_rpy",
+        "state.r_gripper",
+    ]
+    action_keys = [
+        "action.l_xyz",
+        "action.l_rpy",
+        "action.l_gripper",
+        
+        "action.r_xyz",
+        "action.r_rpy",
+        "action.r_gripper",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+    num_hand = 1
+    rot_type="axis_angle"
+    rel_action=False
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """
+        Backbone rotation config for equivariant frame averaging.
+
+        - num_images_per_sample=3: Eagle VL/LLM pass sees ALL cameras (top + both wrists).
+        - rotate_image_indices=[0]: Only the top/head camera (index 0) is rotated for FA.
+          The wrist cameras (indices 1 and 2) are skipped from equi_vision_embs entirely.
+
+        Result:
+          backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only (equivariant)
+          backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
+        """
+        return {
+            "num_images_per_sample": 3,
+            "rotate_image_indices": [0],
+        }
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.l_xyz": "min_max",
+                    "state.l_gripper": "min_max",
+                    "state.r_xyz": "min_max",
+                    "state.r_gripper": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
+                },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.l_xyz": "min_max",
+                    "action.l_gripper": "min_max",
+                    "action.r_xyz": "min_max",
+                    "action.r_gripper": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
+                },
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+                num_hand=self.num_hand,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+##############################################################################################
+    
+
 DATA_CONFIG_MAP = {
     "fourier_gr1_arms_waist": FourierGr1ArmsWaistDataConfig(),
     "fourier_gr1_arms_only": FourierGr1ArmsOnlyDataConfig(),
@@ -2150,4 +2410,6 @@ DATA_CONFIG_MAP = {
     "aloha_right_arm_only": AlohaRightArmConfig(),
     "aloha_right_arm_30_only": AlohaRightArm30Config(),
     "equi_rel_mimicgen": EquiRelMimicgenConfig(),
+    "equi_aloha_1hand": EquiALOHA_1Hand_Config(),
+    "equi_aloha_2hand": EquiALOHA_2Hand_Config(),
 }
