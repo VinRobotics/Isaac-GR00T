@@ -307,6 +307,9 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     backbone_language_embedding_dim: int = field(
         default=2048, metadata={"help": "Language feature dim from backbone LLM (D_llm)."}
     )
+    realworld: bool = field(
+        default=True, metadata={"help": "If True, use num_embodiments=1 for action_encoder, action_decoder, state_encoder."}
+    )
     def __init__(self, **kwargs):
         import dataclasses
         super().__init__(**kwargs)
@@ -362,25 +365,27 @@ class FlowmatchingActionHead(nn.Module):
         
         self.quaternion_to_matrix = RotationTransformer('quaternion', 'matrix')
         self.axisangle_to_matrix = RotationTransformer('axis_angle', 'matrix')
-        
+
+        _num_embodiments = 1 if config.realworld else config.max_num_embodiments
+
         self.state_encoder = EquiCategorySpecificMLP(
-            num_categories=config.max_num_embodiments,
+            num_categories=_num_embodiments,
             in_type=self.state_in_type,
             hidden_type=self.state_hidden_type,
             out_type=self.state_out_type,
         )
-        
+
         self.action_type = self.getJointFieldType(is_action=True) if not self.rel_action else self.getActionRelFieldType(is_action=True)
         self.action_out_type = enn.FieldType(self.group, int(self.input_embedding_dim / self.n_group) * [self.group.regular_repr])
-        
+
         self.action_encoder = MultiEmbodimentActionEncoder(
             in_type=self.action_type,
             out_type=self.action_out_type,
-            num_embodiments=config.max_num_embodiments,
+            num_embodiments=_num_embodiments,
         )
-        
+
         self.action_decoder = EquiCategorySpecificMLP(
-            num_categories=config.max_num_embodiments,
+            num_categories=_num_embodiments,
             in_type=self.state_hidden_type,
             hidden_type=self.state_hidden_type,
             out_type=self.action_type,
@@ -821,7 +826,9 @@ class FlowmatchingActionHead(nn.Module):
 
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
-        
+        if self.config.realworld:
+            embodiment_id = torch.zeros_like(embodiment_id)
+
         # Embed state.
         B, T, _ = action_input.state.shape
         state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
@@ -926,6 +933,8 @@ class FlowmatchingActionHead(nn.Module):
         encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*K], all-ones
 
         embodiment_id = action_input.embodiment_id
+        if self.config.realworld:
+            embodiment_id = torch.zeros_like(embodiment_id)
 
         # Embed state.
         B, T, _ = action_input.state.shape
