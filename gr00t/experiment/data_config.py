@@ -2279,7 +2279,7 @@ class EquiALOHA_2Hand_Config(BaseDataConfig):
     observation_indices = [0]
     state_indices = [0]
     action_indices = list(range(16))
-    num_hand = 1
+    num_hand = 2
     rot_type="axis_angle"
     rel_action=False
 
