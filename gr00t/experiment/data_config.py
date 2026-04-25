@@ -2260,19 +2260,17 @@ class EquiALOHA_2Hand_Config(BaseDataConfig):
     state_keys = [
         "state.l_xyz",
         "state.l_rpy",
-        "state.l_gripper",
-        
         "state.r_xyz",
         "state.r_rpy",
+        "state.l_gripper",
         "state.r_gripper",
     ]
     action_keys = [
         "action.l_xyz",
         "action.l_rpy",
-        "action.l_gripper",
-        
         "action.r_xyz",
         "action.r_rpy",
+        "action.l_gripper",
         "action.r_gripper",
     ]
     language_keys = ["annotation.human.action.task_description"]
@@ -2346,8 +2344,8 @@ class EquiALOHA_2Hand_Config(BaseDataConfig):
                 apply_to=self.state_keys,
                 normalization_modes={
                     "state.l_xyz": "min_max",
-                    "state.l_gripper": "min_max",
                     "state.r_xyz": "min_max",
+                    "state.l_gripper": "min_max",
                     "state.r_gripper": "min_max",
                     # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
                 },
@@ -2358,8 +2356,8 @@ class EquiALOHA_2Hand_Config(BaseDataConfig):
                 apply_to=self.action_keys,
                 normalization_modes={
                     "action.l_xyz": "min_max",
-                    "action.l_gripper": "min_max",
                     "action.r_xyz": "min_max",
+                    "action.l_gripper": "min_max",
                     "action.r_gripper": "min_max",
                     # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
                 },
