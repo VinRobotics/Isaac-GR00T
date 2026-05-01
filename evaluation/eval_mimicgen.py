@@ -50,22 +50,37 @@ TASK_TO_INSTRUCTION: dict[str, str] = {
 
 # Per-task step budget: ~1.5× observed dataset max, rounded to nearest 50.
 TASK_MAX_STEPS: dict[str, int] = {
-    "coffee":               380,
-    "coffee preparation":   1150,
-    "hammer cleanup":       490,
-    "kitchen":              1000,
-    "mug cleanup":          570,
-    "nut assembly":         650,
-    "pick place":           1200,
-    "square":               260,
-    "stack":                200,
-    "stack three":          450,
-    "threading":            400,
-    "three piece assembly": 560,
+    "coffee":               400,
+    "coffee preparation":   1200,
+    "hammer cleanup":       540,
+    "kitchen":              1050,
+    "mug cleanup":          620,
+    "nut assembly":         700,
+    "pick place":           1250,
+    "square":               400,
+    "stack":                400,
+    "stack three":          500,
+    "threading":            500,
+    "three piece assembly": 600,
+}
+
+TASK_TO_ROBOT: dict[str, str] = {
+    "coffee":               "Panda",
+    "coffee preparation":   "Panda",
+    "hammer cleanup":       "Panda",
+    "kitchen":              "Panda",
+    "mug cleanup":          "Panda",
+    "nut assembly":         "Sawyer",
+    "pick place":           "Sawyer",
+    "square":               "Panda",
+    "stack":                "Panda",
+    "stack three":          "Panda",
+    "threading":            "Panda",
+    "three piece assembly": "Panda",
 }
 
 MIMICGEN_DUMMY_ACTION = [0.0] * 6 + [-1.0]
-MIMICGEN_ENV_RESOLUTION = 84
+MIMICGEN_ENV_RESOLUTION = 256
 
 
 class _SuccessDoneWrapper:
@@ -86,7 +101,7 @@ class _SuccessDoneWrapper:
         return self.env.reset()
 
 
-def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = ""):
+def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = "", robot: str = "Panda"):
     import robosuite as suite
     import robosuite.models
     from robosuite.controllers import load_controller_config
@@ -115,7 +130,7 @@ def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = ""):
     })
     env = suite.make(
         env_name=env_name,
-        robots="Panda",
+        robots=robot,
         controller_configs=ctrl,
         has_renderer=False,
         has_offscreen_renderer=True,
@@ -209,7 +224,8 @@ def eval_mimicgen(args: Args) -> None:
 
         task_instruction = TASK_TO_INSTRUCTION[task_name]
         max_steps = TASK_MAX_STEPS[task_name]
-        env = _make_env(env_name, args.resize_size, args.robosuite_assets_path)
+        robot = TASK_TO_ROBOT.get(task_name, "Panda")
+        env = _make_env(env_name, args.resize_size, args.robosuite_assets_path, robot)
 
         task_episodes, task_successes = 0, 0
 
