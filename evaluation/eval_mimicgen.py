@@ -23,7 +23,7 @@ TASK_TO_ENV: dict[str, str] = {
     "stack":                 "Stack_D1",
     "stack three":           "StackThree_D1",
     "hammer cleanup":        "HammerCleanup_D1",
-    "kitchen":               "Kitchen_D1",
+    # "kitchen":               "Kitchen_D1",
     "coffee":                "Coffee_D2",
     "coffee preparation":    "CoffeePreparation_D1",
     "mug cleanup":           "MugCleanup_D1",
@@ -37,7 +37,7 @@ TASK_TO_INSTRUCTION: dict[str, str] = {
     "coffee":               "Pick up the white coffee pod and place it into the red holder of the coffee machine.",
     "coffee preparation":   "Place the mug under the black coffee machine, pull open the red drawer, then take the white coffee pod from the drawer and insert it into the red holder of the coffee machine.",
     "hammer cleanup":       "Pull the drawer open, pick up the hammer and place it inside the drawer, and then push the drawer closed.",
-    "kitchen":              "Turn the stove on, pick up the grey container and place it on the stove, then pick up the brown food item and place it inside the grey container, then push the container onto the red trivet.",
+    # "kitchen":              "Turn the stove on, pick up the grey container and place it on the stove, then pick up the brown food item and place it inside the grey container, then push the container onto the red trivet.",
     "mug cleanup":          "Pull the drawer open, pick up the mug and place it inside the drawer, then push the drawer closed.",
     "nut assembly":         "Pick up the square-shaped brown nut and slide it onto the square brown peg, then pick up the round silver nut and slide it onto the round silver peg.",
     "pick place":           "Pick up the white milk box and place it in the top-left bin, pick up the red cereal box and place it in the top-right of the dark tray, pick up the red can and place it in the bottom-right of the dark tray, and finally pick up the brown square box and place it in the bottom-left bin of the dark tray.",
@@ -53,7 +53,7 @@ TASK_MAX_STEPS: dict[str, int] = {
     "coffee":               400,
     "coffee preparation":   1200,
     "hammer cleanup":       540,
-    "kitchen":              1050,
+    # "kitchen":              1050,
     "mug cleanup":          620,
     "nut assembly":         700,
     "pick place":           1250,
@@ -68,7 +68,7 @@ TASK_TO_ROBOT: dict[str, str] = {
     "coffee":               "Panda",
     "coffee preparation":   "Panda",
     "hammer cleanup":       "Panda",
-    "kitchen":              "Panda",
+    # "kitchen":              "Panda",
     "mug cleanup":          "Panda",
     "nut assembly":         "Sawyer",
     "pick place":           "Sawyer",
@@ -166,7 +166,7 @@ def to_video_frame(arr):
 @dataclasses.dataclass
 class Args:
     pretrained_model_path: str = ""
-    resize_size: int = 84
+    resize_size: int = 256
     infer_chunk: int = 10
     save_videos_root: str = "/tmp/mimicgen_eval_results"
     num_steps_wait: int = 5
