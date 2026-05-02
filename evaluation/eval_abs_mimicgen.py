@@ -6,8 +6,10 @@ sys.path.insert(0, "/mnt/data/sftp/data/locht1/mimicgen_evaluation/mimicgen")
 
 import dataclasses
 import logging
+import multiprocessing as mp
 import pathlib
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Optional
 
 import imageio
@@ -245,12 +247,18 @@ class Args:
     robosuite_assets_path: str = ""
 
 
-def eval_abs_mimicgen(args: Args) -> None:
+def eval_abs_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
     np.random.seed(args.seed)
+
+    if tasks is not None:
+        args.tasks = tasks
+
+    tasks_to_run = args.tasks if args.tasks else list(TASK_TO_ENV.keys())
+    task_range_tag = f"tasks_{tasks_to_run[0].replace(' ', '_')}-{tasks_to_run[-1].replace(' ', '_')}" if tasks_to_run else "all"
 
     log_dir = pathlib.Path(f"{args.save_videos_root}/log/eval_results/{args.exp_name}")
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "mimicgen_abs.log"
+    log_file = log_dir / f"mimicgen_abs_{task_range_tag}.log"
 
     handler = logging.FileHandler(log_file, mode="w")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
@@ -263,8 +271,6 @@ def eval_abs_mimicgen(args: Args) -> None:
     except Exception as e:
         logging.error(f"Failed to load policy: {e}")
         return
-
-    tasks_to_run = args.tasks if args.tasks else list(TASK_TO_ENV.keys())
 
     total_episodes, total_successes = 0, 0
     summary_rows = []
@@ -373,5 +379,41 @@ def eval_abs_mimicgen(args: Args) -> None:
     logging.info(f"Total success rate: {total_successes}/{total_episodes} ({overall_pct:.1f}%)")
 
 
+def eval_abs_mimicgen_all(args: Args) -> None:
+    print("=" * 80)
+    print("MimicGen Abs Simulation Evaluation")
+    print("=" * 80)
+
+    all_tasks = args.tasks if args.tasks else list(TASK_TO_ENV.keys())
+    mid = len(all_tasks) // 2
+    task_splits = [all_tasks[:mid], all_tasks[mid:]]
+
+    ctx = mp.get_context("spawn")
+    results = dict()
+
+    with ProcessPoolExecutor(max_workers=len(task_splits), mp_context=ctx) as pool:
+        futures = {
+            pool.submit(eval_abs_mimicgen, args, task_ids): task_ids
+            for task_ids in task_splits
+        }
+        for fut in as_completed(futures):
+            task_ids = futures[fut]
+            label = f"tasks_{task_ids[0].replace(' ', '_')}-{task_ids[-1].replace(' ', '_')}"
+            try:
+                results[label] = fut.result()
+                print(f"[DONE] {label}")
+            except Exception as e:
+                print(f"[ERROR] {label} failed: {e}")
+
+    print("All done. Results:", results)
+
+
 if __name__ == "__main__":
-    tyro.cli(eval_abs_mimicgen)
+    try:
+        mp.set_start_method("spawn", force=True)
+        import torch
+        torch.multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    tyro.cli(eval_abs_mimicgen_all)
