@@ -9,8 +9,6 @@ from gr00t.model.policy import Gr00tPolicy
 # Import config
 from gr00t.experiment.data_config import EquiRelLiberoConfig
 from gr00t.data.schema import EmbodimentTag
-from scipy.spatial.transform import Rotation
-
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 
@@ -130,7 +128,7 @@ class Gr00tn15_inference():
     def _process_observation(self, obs, task_description, flip_mode=None):
 
         xyz = obs["robot0_eef_pos"]
-        rpy = _mimicgen_quat2axisangle(obs["robot0_eef_quat"]) if flip_mode == "vertical" else _quat2axisangle(obs["robot0_eef_quat"])
+        rpy = _quat2axisangle(obs["robot0_eef_quat"])
         gripper = obs["robot0_gripper_qpos"]
         img = obs["agentview_image"]
         wrist_img = obs["robot0_eye_in_hand_image"]
@@ -180,10 +178,6 @@ class Gr00tn15_inference():
 
         return action
 
-def _mimicgen_quat2axisangle(quat):
-    ee_rpy = Rotation.from_quat(quat).as_rotvec()
-    return ee_rpy
-    
 
 def _quat2axisangle(quat):
     """
