@@ -114,21 +114,7 @@ def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = "", r
 
     ctrl = load_controller_config(default_controller="OSC_POSE")
     ctrl.update({
-        "input_max": 1,
-        "input_min": -1,
-        "output_max": [0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
-        "output_min": [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5],
-        "kp": 150,
-        "damping": 1,
-        "impedance_mode": "fixed",
-        "kp_limits": [0, 300],
-        "damping_limits": [0, 10],
-        "position_limits": None,
-        "orientation_limits": None,
-        "uncouple_pos_ori": True,
         "control_delta": True,
-        "interpolation": None,
-        "ramp_ratio": 0.2,
     })
     env = suite.make(
         env_name=env_name,
