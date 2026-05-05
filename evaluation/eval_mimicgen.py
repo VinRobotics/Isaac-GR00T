@@ -117,7 +117,8 @@ def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = "", r
     # Initialize ObsUtils without registering image keys as rgb so robomimic
     # leaves camera observations as raw uint8 HWC arrays.
     ObsUtils.initialize_obs_modality_mapping_from_dict({
-        "low_dim": [],
+        "low_dim": ["robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"],
+        "rgb": ["agentview_image", "robot0_eye_in_hand_image"],
     })
 
     ctrl = load_controller_config(default_controller="OSC_POSE")

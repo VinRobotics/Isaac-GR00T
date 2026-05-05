@@ -47,7 +47,7 @@ class Gr00tn15_inference():
 
 
     def get_mimicgen_action(self, obs, task_description):
-        data = self._process_observation(obs, task_description, flip_mode="vertical")
+        data = self._process_observation(obs, task_description, flip_mode=None)
         try:
             action_chunk = self.policy.get_action(data)
         except Exception as e:
