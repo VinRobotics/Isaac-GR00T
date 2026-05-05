@@ -95,7 +95,7 @@ class _SuccessDoneWrapper:
 
     def step(self, action):
         obs, reward, done, info = self.env.step(action)
-        info["is_success"] = bool(self.env._check_success())
+        info["is_success"] = bool(self.env.is_success()["task"])
         done = done or bool(info["is_success"])
         return obs, reward, done, info
 
@@ -104,47 +104,53 @@ class _SuccessDoneWrapper:
 
 
 def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = "", robot: str = "Panda"):
-    import robosuite as suite
     import robosuite.models
     from robosuite.controllers import load_controller_config
+    import robomimic.utils.env_utils as EnvUtils
+    import robomimic.utils.obs_utils as ObsUtils
     import mimicgen_envs.envs.robosuite  # noqa: F401 — registers MimicGen envs
 
     if robosuite_assets_path:
+        import robosuite
         robosuite.models.assets_root = robosuite_assets_path
 
-    ctrl = load_controller_config(default_controller="OSC_POSE")
-    ctrl.update({
-        "input_max": 1,
-        "input_min": -1,
-        "output_max": [0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
-        "output_min": [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5],
-        "kp": 150,
-        "damping": 1,
-        "impedance_mode": "fixed",
-        "kp_limits": [0, 300],
-        "damping_limits": [0, 10],
-        "position_limits": None,
-        "orientation_limits": None,
-        "uncouple_pos_ori": True,
-        "control_delta": True,
-        "interpolation": None,
-        "ramp_ratio": 0.2,
+    # Initialize ObsUtils without registering image keys as rgb so robomimic
+    # leaves camera observations as raw uint8 HWC arrays.
+    ObsUtils.initialize_obs_modality_mapping_from_dict({
+        "low_dim": ["robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"],
+        "rgb": ["agentview_image", "robot0_eye_in_hand_image"],
     })
-    env = suite.make(
-        env_name=env_name,
-        robots=robot,
-        controller_configs=ctrl,
-        has_renderer=False,
-        has_offscreen_renderer=True,
-        use_camera_obs=True,
-        use_object_obs=False,
-        camera_names=["agentview", "robot0_eye_in_hand"],
-        camera_heights=resolution,
-        camera_widths=resolution,
-        control_freq=20,
-        reward_shaping=False,
-        ignore_done=True,
+
+    ctrl = load_controller_config(default_controller="OSC_POSE")
+    ctrl["control_delta"] = True
+
+    env_meta = {
+        "type": 1,  # EnvType.ROBOSUITE_TYPE
+        "env_name": env_name,
+        "env_kwargs": {
+            "robots": robot,
+            "controller_configs": ctrl,
+            "has_renderer": False,
+            "has_offscreen_renderer": True,
+            "use_camera_obs": True,
+            "use_object_obs": False,
+            "camera_names": ["agentview", "robot0_eye_in_hand"],
+            "camera_heights": resolution,
+            "camera_widths": resolution,
+            "control_freq": 20,
+            "reward_shaping": False,
+            "ignore_done": True,
+        },
+    }
+
+    env = EnvUtils.create_env_from_metadata(
+        env_meta=env_meta,
+        render=False,
+        render_offscreen=True,
+        use_image_obs=True,
     )
+    # Disable hard reset to reduce memory consumption (matches equidiff runner).
+    env.env.hard_reset = False
     return _SuccessDoneWrapper(env)
 
 
@@ -257,8 +263,8 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
                     obs, _, done, info = env.step(act.tolist())
                     t += 1
 
-                    replay_images.append(to_video_frame(obs["agentview_image"][::-1]))
-                    replay_images_wrist.append(to_video_frame(obs["robot0_eye_in_hand_image"][::-1]))
+                    replay_images.append(to_video_frame(obs["agentview_image"])[::-1])
+                    replay_images_wrist.append(to_video_frame(obs["robot0_eye_in_hand_image"])[::-1])
 
                     if done or info.get("is_success", False):
                         done = True
