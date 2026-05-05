@@ -130,10 +130,19 @@ class Gr00tn15_inference():
     def _process_observation(self, obs, task_description, flip_mode=None):
 
         xyz = obs["robot0_eef_pos"]
-        rpy = _mimicgen_quat2axisangle(obs["robot0_eef_quat"]) if flip_mode == "vertical" else _quat2axisangle(obs["robot0_eef_quat"])
+        rpy = _mimicgen_quat2axisangle(obs["robot0_eef_quat"])
         gripper = obs["robot0_gripper_qpos"]
         img = obs["agentview_image"]
         wrist_img = obs["robot0_eye_in_hand_image"]
+
+        # robomimic rgb modality returns (C, H, W) float [0, 1]; convert to (H, W, C) uint8
+        if img.ndim == 3 and img.shape[0] == 3:
+            img = (np.moveaxis(img, 0, -1) * 255).clip(0, 255).astype(np.uint8)
+            wrist_img = (np.moveaxis(wrist_img, 0, -1) * 255).clip(0, 255).astype(np.uint8)
+        else:
+            img = img.astype(np.uint8)
+            wrist_img = wrist_img.astype(np.uint8)
+
         if flip_mode == "horizontal":
             img = img[:, ::-1]
             wrist_img = wrist_img[:, ::-1]
@@ -143,10 +152,6 @@ class Gr00tn15_inference():
         elif flip_mode == "both":
             img = img[::-1, ::-1]
             wrist_img = wrist_img[::-1, ::-1]
-
-        # Ensure images are uint8
-        img = img.astype(np.uint8)
-        wrist_img = wrist_img.astype(np.uint8)
 
         # GR00T N1.6 expects:
         # - video: shape (B, T, H, W, C) - add batch and temporal dims
