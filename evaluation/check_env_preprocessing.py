@@ -26,14 +26,32 @@ Outputs (per branch):
       (same structure)
 """
 
+import builtins
 import dataclasses
+import os
 import pathlib
 import sys
+from typing import Optional
 
 import imageio
 import numpy as np
 import tyro
-from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Robosuite hardcodes /tmp/robosuite.log which is often owned by another user
+# on shared servers. Redirect it to the user's home directory before any
+# robosuite-touching import can run.
+# ---------------------------------------------------------------------------
+_rs_log = pathlib.Path.home() / ".cache" / "robosuite.log"
+_rs_log.parent.mkdir(parents=True, exist_ok=True)
+_orig_open = builtins.open
+
+def _open_shim(f, *args, **kwargs):
+    if str(f) == "/tmp/robosuite.log":
+        f = str(_rs_log)
+    return _orig_open(f, *args, **kwargs)
+
+builtins.open = _open_shim
 
 
 DUMMY_ACTION = [0.0] * 6 + [-1.0]
