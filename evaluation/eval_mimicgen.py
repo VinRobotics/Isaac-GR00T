@@ -12,7 +12,7 @@ import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Optional
 
-import imageio
+import av
 import numpy as np
 import tqdm
 import tyro
@@ -117,7 +117,21 @@ def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = "", r
 
     ctrl = load_controller_config(default_controller="OSC_POSE")
     ctrl.update({
+        "input_max": 1,
+        "input_min": -1,
+        "output_max": [0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
+        "output_min": [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5],
+        "kp": 150,
+        "damping": 1,
+        "impedance_mode": "fixed",
+        "kp_limits": [0, 300],
+        "damping_limits": [0, 10],
+        "position_limits": None,
+        "orientation_limits": None,
+        "uncouple_pos_ori": True,
         "control_delta": True,
+        "interpolation": None,
+        "ramp_ratio": 0.2,
     })
     env = suite.make(
         env_name=env_name,
@@ -135,6 +149,24 @@ def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = "", r
         ignore_done=True,
     )
     return _SuccessDoneWrapper(env)
+
+
+def write_video(path: pathlib.Path, frames: list, fps: int = 20) -> None:
+    """Encode frames to video matching LeRobot dataset quality (AV1, crf=30, yuv420p)."""
+    if not frames:
+        return
+    h, w = frames[0].shape[:2]
+    with av.open(str(path), "w") as output:
+        stream = output.add_stream("libsvtav1", fps, options={"crf": "30", "g": "2"})
+        stream.pix_fmt = "yuv420p"
+        stream.width = w
+        stream.height = h
+        for frame_arr in frames:
+            frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(frame_arr), format="rgb24")
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        for packet in stream.encode():
+            output.mux(packet)
 
 
 def to_video_frame(arr):
@@ -260,18 +292,8 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
             suffix = "success" if success else "failure"
             tag = f"{task_name.replace(' ', '_')}_seed{args.seed}_ep{episode_idx}"
 
-            imageio.mimwrite(
-                save_video_dir / f"{tag}_static_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
-                codec="libx264",
-            )
-            imageio.mimwrite(
-                save_video_dir / f"{tag}_wrist_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images_wrist],
-                fps=10,
-                codec="libx264",
-            )
+            write_video(save_video_dir / f"{tag}_static_{suffix}.mp4", replay_images)
+            write_video(save_video_dir / f"{tag}_wrist_{suffix}.mp4", replay_images_wrist)
 
             logging.info(f"  ep {episode_idx}: {'success' if success else 'failure'}  steps={t}")
 
