@@ -233,12 +233,7 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
             info = {}
             replay_images = []
             replay_images_wrist = []
-            while t < max_steps + args.num_steps_wait:
-                if t < args.num_steps_wait:
-                    obs, _, done, info = env.step(MIMICGEN_DUMMY_ACTION)
-                    t += 1
-                    continue
-
+            while t < max_steps:
                 action_chunk = mypolicy.get_mimicgen_action(obs, task_instruction)
 
                 for act in action_chunk:
