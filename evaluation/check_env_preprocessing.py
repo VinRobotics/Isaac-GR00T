@@ -290,10 +290,9 @@ def capture_mimicgen(args: Args, out_root: pathlib.Path):
 
     mimicgen_dir = out_root / "mimicgen"
 
+    grip_hold = _gripper_hold_action(obs)  # compute once from reset obs
+    action = np.array(DUMMY_ACTION_ARM + [grip_hold], dtype=np.float32)
     for t in range(WAIT_STEPS + CAPTURE_STEPS):
-        # Hold gripper at its current position instead of commanding close (-1)
-        grip = _gripper_hold_action(obs)
-        action = np.array(DUMMY_ACTION_ARM + [grip], dtype=np.float32)
         obs, _, done, _ = env.step(action.tolist())
 
         if t >= WAIT_STEPS:
