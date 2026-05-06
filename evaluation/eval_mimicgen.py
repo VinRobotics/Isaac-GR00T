@@ -81,7 +81,7 @@ TASK_TO_ROBOT: dict[str, str] = {
     "three piece assembly": "Panda",
 }
 
-MIMICGEN_DUMMY_ACTION = [0.0] * 6 + [-1.0]
+MIMICGEN_DUMMY_ACTION = [0.0] * 6 + [1.0]
 MIMICGEN_ENV_RESOLUTION = 256
 
 
