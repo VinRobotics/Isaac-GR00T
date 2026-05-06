@@ -81,16 +81,10 @@ TASK_TO_ROBOT: dict[str, str] = {
     "three piece assembly": "Panda",
 }
 
-MIMICGEN_DUMMY_ACTION = [0.0] * 6 + [0.0]
-FRANKA_GRIPPER_JOINT_MAX = 0.04  # meters; Franka finger joint limit
-
-
-def _gripper_hold_action(obs: dict) -> float:
-    """Gripper action that holds the current qpos unchanged.
-    Franka qpos[0] in [0, 0.04] maps linearly to action in [-1, +1].
-    """
-    q = float(obs["robot0_gripper_qpos"][0])
-    return float(np.clip(2.0 * q / FRANKA_GRIPPER_JOINT_MAX - 1.0, -1.0, 1.0))
+_GRIPPER_INIT_QPOS = 0.020833   # all tasks start at this qpos in training data
+_FRANKA_GRIPPER_MAX = 0.04      # Franka finger joint limit (meters)
+_GRIPPER_WAIT_ACTION = 2.0 * _GRIPPER_INIT_QPOS / _FRANKA_GRIPPER_MAX - 1.0  # ≈ 0.0417
+MIMICGEN_DUMMY_ACTION = [0.0] * 6 + [_GRIPPER_WAIT_ACTION]
 MIMICGEN_ENV_RESOLUTION = 256
 
 
@@ -239,12 +233,9 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
             info = {}
             replay_images = []
             replay_images_wrist = []
-            gripper_hold = _gripper_hold_action(obs)
-            wait_action = [0.0] * 6 + [gripper_hold]
-
             while t < max_steps + args.num_steps_wait:
                 if t < args.num_steps_wait:
-                    obs, _, done, info = env.step(wait_action)
+                    obs, _, done, info = env.step(MIMICGEN_DUMMY_ACTION)
                     t += 1
                     continue
 
