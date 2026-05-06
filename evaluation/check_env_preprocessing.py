@@ -54,7 +54,18 @@ def _open_shim(f, *args, **kwargs):
 builtins.open = _open_shim
 
 
-DUMMY_ACTION = [0.0] * 6 + [-1.0]
+DUMMY_ACTION_ARM = [0.0] * 6   # zero delta for arm
+FRANKA_GRIPPER_JOINT_MAX = 0.04  # meters; Franka finger joint limit
+
+
+def _gripper_hold_action(obs: dict) -> float:
+    """Return the gripper action value that holds the current qpos unchanged.
+
+    Franka qpos[0] ∈ [0, 0.04] maps linearly to action ∈ [-1, +1].
+    Sending this action commands the controller to stay at the current position.
+    """
+    q = float(obs["robot0_gripper_qpos"][0])
+    return float(np.clip(2.0 * q / FRANKA_GRIPPER_JOINT_MAX - 1.0, -1.0, 1.0))
 RESOLUTION = 256
 WAIT_STEPS = 5
 CAPTURE_STEPS = 10       # how many timesteps (after wait) to capture
@@ -280,7 +291,9 @@ def capture_mimicgen(args: Args, out_root: pathlib.Path):
     mimicgen_dir = out_root / "mimicgen"
 
     for t in range(WAIT_STEPS + CAPTURE_STEPS):
-        action = np.array(DUMMY_ACTION, dtype=np.float32)
+        # Hold gripper at its current position instead of commanding close (-1)
+        grip = _gripper_hold_action(obs)
+        action = np.array(DUMMY_ACTION_ARM + [grip], dtype=np.float32)
         obs, _, done, _ = env.step(action.tolist())
 
         if t >= WAIT_STEPS:
