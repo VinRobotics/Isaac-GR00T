@@ -125,12 +125,8 @@ class EquiAdapter(nn.Module):
       h_equi_out    = g_inv_reg ⊙ s_inv_reg
                     + (1-g_inv_reg) ⊙ h_equi_proj              [B, N, D]   equivariant ✓
 
-    Invariant token fusion (text / noequi cameras, shared weights):
-      equi_summary  = mean_N(mean_G(h_equi_out))               [B, 1, blk] invariant (cross-modal)
-      ctx           = expand(equi_summary, T_x)                 [B, T, blk]
-      g_inv_tok     = σ(W_gate_inv([token(D); ctx(blk)]))       [B, T, blk] invariant gate
-      scalar        = g_inv_tok ⊙ inv_proj_tok(token)
-                    + (1-g_inv_tok) ⊙ inv_proj_ctx(ctx)        [B, T, blk] invariant fused
+    Invariant token lift (text / noequi cameras, shared weights):
+      scalar        = inv_proj_tok(token)                       [B, T, blk] invariant
       out           = tile(scalar, G)                           [B, T, D]   trivial-in-regular ✓
     """
 
@@ -160,13 +156,9 @@ class EquiAdapter(nn.Module):
         # Semantic projection: invariant → one block value, tiled G times (trivial-in-regular) ✓
         self.w_s = nn.Linear(D, blocks)
 
-        # Invariant token gate fusion: gate([token; equi_summary]) → blend per-token VLM
-        # with the fused equi output summary. Cross-modal (no circularity): equi conditions
-        # on VLM context, inv tokens condition on equi output.
-        # Shared weights across text and noequi (both are D-dim invariant VLM outputs).
-        self.W_gate_inv   = nn.Linear(D + blocks, blocks)  # [token(D); equi_summary(blocks)] → gate
-        self.inv_proj_tok = nn.Linear(D, blocks)            # per-token VLM projection
-        self.inv_proj_ctx = nn.Linear(blocks, blocks)       # equi summary projection
+        # Invariant → trivial-in-regular lift: project to blocks, tile G times.
+        # Shared across text and noequi tokens.
+        self.inv_proj_tok = nn.Linear(D, blocks)
 
     def forward(
         self,
@@ -230,26 +222,18 @@ class EquiAdapter(nn.Module):
         # Invariant gate × equivariant branches → equivariant output ✓
         h_equi_out = g_inv_reg * s_inv_reg + (1 - g_inv_reg) * h_equi_proj  # [B, N, D]
 
-        # Invariant summary of equi output: mean over G blocks then over N patches → [B, 1, blocks]
-        # Used as cross-modal context for inv tokens (no circularity: inv tokens not included here)
-        equi_summary = h_equi_out.reshape(B, N, G, blocks).mean(dim=2).mean(dim=1, keepdim=True)
-
-        # Gate fuse invariant tokens: blend per-token VLM with equi_summary context,
-        # then tile to trivial-in-regular. Both branches invariant → output invariant ✓
-        def fuse_inv_reg(x: torch.Tensor) -> torch.Tensor:
-            T_x = x.shape[1]
-            ctx = equi_summary.expand(B, T_x, blocks)                  # [B, T, blocks]
-            g = torch.sigmoid(
-                self.W_gate_inv(torch.cat([x, ctx], dim=-1))           # [B, T, D+blocks]
-            )                                                           # [B, T, blocks]
-            scalar = g * self.inv_proj_tok(x) + (1 - g) * self.inv_proj_ctx(ctx)
-            return (scalar.unsqueeze(-2)                                # [B, T, blocks]
+        # Lift invariant tokens to trivial-in-regular: project to blocks, tile G times.
+        # Action head attends to both equi and text tokens via cross-attention, so geometric
+        # context reaches text conditioning without needing to bake it in here.
+        def lift_inv_reg(x: torch.Tensor) -> torch.Tensor:
+            scalar = self.inv_proj_tok(x.to(dt))                       # [B, T, blocks]
+            return (scalar.unsqueeze(-2)
                     .expand(-1, -1, G, -1)
                     .reshape(x.shape[0], -1, D))                       # [B, T, D]  trivial-in-regular
 
-        text_inv_reg = fuse_inv_reg(vlm_text.to(dt))
+        text_inv_reg = lift_inv_reg(vlm_text)
         if noequi_vlm is not None:
-            noequi_inv_reg = fuse_inv_reg(noequi_vlm.to(dt))
+            noequi_inv_reg = lift_inv_reg(noequi_vlm)
             return torch.cat([h_equi_out, noequi_inv_reg, text_inv_reg], dim=1).to(h_equi.dtype)
         return torch.cat([h_equi_out, text_inv_reg], dim=1).to(h_equi.dtype)
 
