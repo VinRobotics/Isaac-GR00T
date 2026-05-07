@@ -85,7 +85,7 @@ _GRIPPER_INIT_QPOS = 0.020833   # all tasks start at this qpos in training data
 _FRANKA_GRIPPER_MAX = 0.04      # Franka finger joint limit (meters)
 _GRIPPER_WAIT_ACTION = 2.0 * _GRIPPER_INIT_QPOS / _FRANKA_GRIPPER_MAX - 1.0  # ≈ 0.0417
 MIMICGEN_DUMMY_ACTION = [0.0] * 6 + [_GRIPPER_WAIT_ACTION]
-MIMICGEN_ENV_RESOLUTION = 256
+MIMICGEN_ENV_RESOLUTION = 84
 
 
 class _SuccessDoneWrapper:
@@ -157,7 +157,7 @@ def to_video_frame(arr):
 @dataclasses.dataclass
 class Args:
     pretrained_model_path: str = ""
-    resize_size: int = 256
+    resize_size: int = 84
     infer_chunk: int = 10
     save_videos_root: str = "/tmp/mimicgen_eval_results"
     num_steps_wait: int = 5
