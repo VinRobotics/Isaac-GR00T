@@ -55,6 +55,25 @@ class Gr00tn15_inference():
             return np.array(LIBERO_DUMMY_ACTION, dtype=np.float32)
         return self.convert_to_mimicgen_action_chunk(action_chunk)
 
+    def get_mimicgen_action_equidiff(self, obs, task_description):
+        """
+        Variant for use with robomimic's EnvRobosuite (equidiff env init).
+
+        robomimic's EnvRobosuite.get_observation() already applies [::-1] to
+        correct OpenGL's upside-down rendering, so images arrive right-side-up.
+        Using flip_mode=None avoids double-flipping.
+
+        Use get_mimicgen_action() (flip_mode="vertical") when the env is created
+        via robosuite's suite.make() directly, where images are still inverted.
+        """
+        data = self._process_observation(obs, task_description, flip_mode=None)
+        try:
+            action_chunk = self.policy.get_action(data)
+        except Exception as e:
+            print(f"Error querying server: {e}")
+            return np.array(LIBERO_DUMMY_ACTION, dtype=np.float32)
+        return self.convert_to_mimicgen_action_chunk(action_chunk)
+
     def get_libero_action(self, obs, task_description):
         data = self._process_observation(obs, task_description, flip_mode="both")
         try:
@@ -91,6 +110,8 @@ class Gr00tn15_inference():
                 action_components.extend(val_t.tolist())
 
             action_array = np.array(action_components, dtype=np.float32)
+            action_array = self.normalize_gripper_action(action_array, binarize=True)  # your existing normalization
+            action_array = invert_gripper_action(action_array)
             actions.append(action_array)
         return np.stack(actions, axis=0)  # shape: (10, D)
 
