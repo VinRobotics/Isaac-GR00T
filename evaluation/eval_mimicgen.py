@@ -25,7 +25,7 @@ TASK_TO_ENV: dict[str, str] = {
     "stack":                 "Stack_D1",
     "stack three":           "StackThree_D1",
     "hammer cleanup":        "HammerCleanup_D1",
-    # "kitchen":               "Kitchen_D1",
+    "kitchen":               "Kitchen_D1",
     "coffee":                "Coffee_D2",
     "coffee preparation":    "CoffeePreparation_D1",
     "mug cleanup":           "MugCleanup_D1",
@@ -36,18 +36,18 @@ TASK_TO_ENV: dict[str, str] = {
 }
 
 TASK_TO_INSTRUCTION: dict[str, str] = {
-    "coffee":               "Pick up the white coffee pod and place it into the red holder of the coffee machine.",
-    "coffee preparation":   "Place the mug under the black coffee machine, pull open the red drawer, then take the white coffee pod from the drawer and insert it into the red holder of the coffee machine.",
-    "hammer cleanup":       "Pull the drawer open, pick up the hammer and place it inside the drawer, and then push the drawer closed.",
-    # "kitchen":              "Turn the stove on, pick up the grey container and place it on the stove, then pick up the brown food item and place it inside the grey container, then push the container onto the red trivet.",
-    "mug cleanup":          "Pull the drawer open, pick up the mug and place it inside the drawer, then push the drawer closed.",
-    "nut assembly":         "Pick up the square-shaped brown nut and slide it onto the square brown peg, then pick up the round silver nut and slide it onto the round silver peg.",
-    "pick place":           "Pick up the white milk box and place it in the top-left bin, pick up the red cereal box and place it in the top-right of the dark tray, pick up the red can and place it in the bottom-right of the dark tray, and finally pick up the brown square box and place it in the bottom-left bin of the dark tray.",
-    "square":               "Pick up the square-shaped brown nut and slide it onto the square brown peg.",
-    "stack":                "Pick up the red block and stack it directly on top of the green block.",
-    "stack three":          "Stack the red block on top of the green block, then stack the blue block on top of the red block.",
-    "threading":            "Pick up the black handle of the threading tool and carefully insert the thin needle tip through the small metal loop on the wooden stand.",
-    "three piece assembly": "Place the small T-shaped red block into the center of the hollow square base, then pick up the large notched red block and stack it on top of the T-shaped block to complete the assembly.",
+    "stack_three": "Stack red on green, then blue on red.",
+    "coffee_preparation": "Place mug under coffee machine, open red drawer, take white pod and insert into red holder.",
+    "hammer_cleanup": "Open drawer, place hammer inside, close drawer.",
+    "coffee": "Place white coffee pod into red holder.",
+    "nut_assembly": "Slide square brown nut onto square peg, then round silver nut onto round peg.",
+    "pick_place": "Place milk box in top-left bin, cereal box in top-right tray, red can in bottom-right tray, brown box in bottom-left tray.",
+    "square": "Slide square brown nut onto square peg.",
+    "threading": "Pick up threading tool and insert needle tip through the metal loop on the stand.",
+    "three_piece_assembly": "Insert T-shaped red block into square base, then stack large notched red block on top.",
+    "kitchen": "Turn on stove, place grey container on stove, add brown food inside, push container onto red trivet.",
+    "mug_cleanup": "Open drawer, place mug inside, close drawer.",
+    "stack": "Stack red block on top of green block."
 }
 
 # Per-task step budget: ~1.5× observed dataset max, rounded to nearest 50.
@@ -55,7 +55,7 @@ TASK_MAX_STEPS: dict[str, int] = {
     "coffee":               400,
     "coffee preparation":   1200,
     "hammer cleanup":       540,
-    # "kitchen":              1050,
+    "kitchen":              1050,
     "mug cleanup":          620,
     "nut assembly":         700,
     "pick place":           1250,
@@ -70,7 +70,7 @@ TASK_TO_ROBOT: dict[str, str] = {
     "coffee":               "Panda",
     "coffee preparation":   "Panda",
     "hammer cleanup":       "Panda",
-    # "kitchen":              "Panda",
+    "kitchen":              "Panda",
     "mug cleanup":          "Panda",
     "nut assembly":         "Sawyer",
     "pick place":           "Sawyer",
