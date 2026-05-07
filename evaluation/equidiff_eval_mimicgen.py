@@ -1,9 +1,27 @@
-# eval_mimicgen.py
+# equidiff_eval_mimicgen.py
+#
+# Evaluates GR00T with relative control on MimicGen environments using
+# equidiff's exact environment initialization pattern:
+#   - env_meta is loaded from the task's HDF5 dataset (FileUtils.get_env_metadata_from_dataset)
+#   - env is created via EnvUtils.create_env_from_metadata (robomimic's EnvRobosuite)
+#   - ObsUtils modality mapping is initialized before env creation
+#
+# Observation format from robomimic EnvRobosuite:
+#   - Images: HWC uint8, already vertically flipped by robomimic (OpenGL correction).
+#     No manual flip is needed – use get_mimicgen_action_equidiff() in gr00tn15_inference.
+#   - Other keys (eef_pos, eef_quat, gripper_qpos): same as raw robosuite.
+#
+# Inference loop differences from eval_mimicgen.py:
+#   1. No warm-up dummy steps (equidiff starts inference immediately after reset).
+#   2. No _SuccessDoneWrapper; episode runs to max_steps (ignore_done in env_meta).
+#   3. Success = max reward > 0 across full episode, matching equidiff's
+#      np.max(all_rewards[i]) criterion.
 
 import sys
 sys.path.insert(0, "/home/locht1/gr00t_rtc")
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/mimicgen_evaluation/mimicgen")
 
+import collections
 import dataclasses
 import logging
 import multiprocessing as mp
@@ -17,8 +35,10 @@ import numpy as np
 import tqdm
 import tyro
 
-from evaluation.gr00tn15_inference import Gr00tn15_inference, _quat2axisangle, invert_gripper_action
+from evaluation.gr00tn15_inference import Gr00tn15_inference
 
+
+# ── Task metadata ──────────────────────────────────────────────────────────────
 
 TASK_TO_ENV: dict[str, str] = {
     "square":                "Square_D2",
@@ -33,6 +53,23 @@ TASK_TO_ENV: dict[str, str] = {
     "pick place":            "PickPlace_D0",
     "threading":             "Threading_D2",
     "three piece assembly":  "ThreePieceAssembly_D2",
+}
+
+# equidiff dataset names follow mimicgen convention: lowercase snake_case
+# e.g. data/robomimic/datasets/square_d2/square_d2.hdf5
+TASK_TO_DATASET_NAME: dict[str, str] = {
+    "square":                "square_d2",
+    "stack":                 "stack_d1",
+    "stack three":           "stack_three_d1",
+    "hammer cleanup":        "hammer_cleanup_d1",
+    "kitchen":               "kitchen_d1",
+    "coffee":                "coffee_d2",
+    "coffee preparation":    "coffee_preparation_d1",
+    "mug cleanup":           "mug_cleanup_d1",
+    "nut assembly":          "nut_assembly_d0",
+    "pick place":            "pick_place_d0",
+    "threading":             "threading_d2",
+    "three piece assembly":  "three_piece_assembly_d2",
 }
 
 TASK_TO_INSTRUCTION: dict[str, str] = {
@@ -50,7 +87,6 @@ TASK_TO_INSTRUCTION: dict[str, str] = {
     "stack": "Stack red block on top of green block."
 }
 
-# Per-task step budget: ~1.5× observed dataset max, rounded to nearest 50.
 TASK_MAX_STEPS: dict[str, int] = {
     "coffee":               400,
     "coffee preparation":   1200,
@@ -81,61 +117,67 @@ TASK_TO_ROBOT: dict[str, str] = {
     "three piece assembly": "Panda",
 }
 
-_GRIPPER_INIT_QPOS = 0.020833   # all tasks start at this qpos in training data
-_FRANKA_GRIPPER_MAX = 0.04      # Franka finger joint limit (meters)
-_GRIPPER_WAIT_ACTION = 2.0 * _GRIPPER_INIT_QPOS / _FRANKA_GRIPPER_MAX - 1.0  # ≈ 0.0417
-MIMICGEN_DUMMY_ACTION = [0.0] * 6 + [_GRIPPER_WAIT_ACTION]
-MIMICGEN_ENV_RESOLUTION = 84
+# Obs keys that equidiff's mimicgen_rel.yaml shape_meta declares
+_IMAGE_OBS_KEYS = ["agentview_image", "robot0_eye_in_hand_image"]
+_LOWDIM_OBS_KEYS = ["robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"]
 
 
-class _SuccessDoneWrapper:
-    """Propagates is_success into done so callers can rely on done=True to stop."""
-    def __init__(self, env):
-        self.env = env
+# ── Environment creation (equidiff pattern) ────────────────────────────────────
 
-    def __getattr__(self, name):
-        return getattr(self.env, name)
-
-    def step(self, action):
-        obs, reward, done, info = self.env.step(action)
-        info["is_success"] = bool(self.env._check_success())
-        done = done or bool(info["is_success"])
-        return obs, reward, done, info
-
-    def reset(self):
-        return self.env.reset()
+def _init_obs_utils():
+    """Initialize robomimic ObsUtils modality mapping (must run before env creation)."""
+    import robomimic.utils.obs_utils as ObsUtils
+    modality_mapping = collections.defaultdict(list)
+    modality_mapping["rgb"].extend(_IMAGE_OBS_KEYS)
+    modality_mapping["low_dim"].extend(_LOWDIM_OBS_KEYS)
+    ObsUtils.initialize_obs_modality_mapping_from_dict(modality_mapping)
 
 
-def _make_env(env_name: str, resolution: int, robosuite_assets_path: str = "", robot: str = "Panda"):
-    import robosuite as suite
-    import robosuite.models
-    from robosuite.controllers import load_controller_config
-    import mimicgen_envs.envs.robosuite  # noqa: F401 — registers MimicGen envs
+def _make_env(dataset_path: str, resolution: int):
+    """
+    Create a MimicGen / robomimic env from a dataset's stored env_meta.
 
-    if robosuite_assets_path:
-        robosuite.models.assets_root = robosuite_assets_path
+    This mirrors equidiff's robomimic_image_runner.py:
+        env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path)
+        env = EnvUtils.create_env_from_metadata(env_meta, ...)
 
-    ctrl = load_controller_config(default_controller="OSC_POSE")
-    ctrl.update({
-        "control_delta": True,
-    })
-    env = suite.make(
-        env_name=env_name,
-        robots=robot,
-        controller_configs=ctrl,
-        has_renderer=False,
-        has_offscreen_renderer=True,
-        use_camera_obs=True,
-        use_object_obs=False,
-        camera_names=["agentview", "robot0_eye_in_hand"],
-        camera_heights=resolution,
-        camera_widths=resolution,
-        control_freq=20,
-        reward_shaping=False,
-        ignore_done=True,
+    The returned env is a robomimic EnvRobosuite object.  Its step/reset API is
+    identical to robosuite's, but images are already vertically flipped by
+    robomimic (correcting OpenGL's upside-down rendering), so no manual flip is
+    needed when building policy inputs.
+
+    control_delta stays True (relative control) as stored in the dataset's
+    env_meta – equidiff's abs_action=False path leaves this unchanged.
+    """
+    import robomimic.utils.file_utils as FileUtils
+    import robomimic.utils.env_utils as EnvUtils
+    import mimicgen_envs.envs.robosuite  # noqa: F401 – registers MimicGen envs
+
+    _init_obs_utils()
+
+    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path)
+
+    # Override camera resolution to match our model's training resolution.
+    env_meta["env_kwargs"]["camera_heights"] = resolution
+    env_meta["env_kwargs"]["camera_widths"] = resolution
+
+    # Ensure image obs are enabled.
+    env_meta["env_kwargs"]["use_camera_obs"] = True
+    env_meta["env_kwargs"]["use_object_obs"] = False
+
+    # hard_reset wastes memory; disable as equidiff does.
+    env = EnvUtils.create_env_from_metadata(
+        env_meta=env_meta,
+        render=False,
+        render_offscreen=True,
+        use_image_obs=True,
     )
-    return _SuccessDoneWrapper(env)
+    env.env.hard_reset = False
 
+    return env  # robomimic EnvRobosuite – no _SuccessDoneWrapper
+
+
+# ── Video helpers ──────────────────────────────────────────────────────────────
 
 def to_video_frame(arr):
     arr = np.asarray(arr)
@@ -154,23 +196,26 @@ def to_video_frame(arr):
     return np.ascontiguousarray(arr)
 
 
+# ── CLI args ───────────────────────────────────────────────────────────────────
+
 @dataclasses.dataclass
 class Args:
     pretrained_model_path: str = ""
+    # Root directory that contains per-task dataset folders, following equidiff's
+    # convention:  {dataset_dir}/{task_dataset_name}/{task_dataset_name}.hdf5
+    # e.g.  /data/robomimic/datasets/square_d2/square_d2.hdf5
+    dataset_dir: str = ""
     resize_size: int = 84
     infer_chunk: int = 10
     save_videos_root: str = "/tmp/mimicgen_eval_results"
-    num_steps_wait: int = 5
     num_trials_per_task: int = 10
     seed: int = 7
     exp_name: str = "test"
     model_type: str = "gr00tn15"
-    tasks: Optional[list[str]] = None  # subset of TASK_TO_ENV keys; None = all
-    # Override robosuite's asset root (MuJoCo XMLs, textures, etc.).
-    # Equivalent to pointing robosuite.models.assets_root at a custom folder.
-    # Leave empty to use the default installed package assets.
-    robosuite_assets_path: str = ""
+    tasks: Optional[list[str]] = None
 
+
+# ── Per-process evaluation ─────────────────────────────────────────────────────
 
 def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
     np.random.seed(args.seed)
@@ -179,7 +224,10 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
         args.tasks = tasks
 
     tasks_to_run = args.tasks if args.tasks else list(TASK_TO_ENV.keys())
-    task_range_tag = f"tasks_{tasks_to_run[0].replace(' ', '_')}-{tasks_to_run[-1].replace(' ', '_')}" if tasks_to_run else "all"
+    task_range_tag = (
+        f"tasks_{tasks_to_run[0].replace(' ', '_')}-{tasks_to_run[-1].replace(' ', '_')}"
+        if tasks_to_run else "all"
+    )
 
     log_dir = pathlib.Path(f"{args.save_videos_root}/log/eval_results/{args.exp_name}")
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -209,8 +257,15 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
             logging.warning(f"No env mapping for task '{task_name}', skipping.")
             continue
 
+        dataset_name = TASK_TO_DATASET_NAME[task_name]
+        dataset_path = str(
+            pathlib.Path(args.dataset_dir) / dataset_name / f"{dataset_name}.hdf5"
+        )
+
         logging.info(f"\n{'='*60}\nTask: {task_name}  Env: {env_name}")
+        logging.info(f"Dataset: {dataset_path}")
         print(f"\n{'='*60}\nTask: {task_name}  |  Env: {env_name}")
+        print(f"  Dataset: {dataset_path}")
 
         save_video_dir = pathlib.Path(
             f"{args.save_videos_root}/{args.exp_name}/videos/{task_name.replace(' ', '_')}"
@@ -219,38 +274,61 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
 
         task_instruction = TASK_TO_INSTRUCTION[task_name]
         max_steps = TASK_MAX_STEPS[task_name]
-        robot = TASK_TO_ROBOT.get(task_name, "Panda")
-        env = _make_env(env_name, args.resize_size, args.robosuite_assets_path, robot)
+
+        # equidiff env init: robomimic EnvRobosuite from dataset env_meta
+        env = _make_env(dataset_path, args.resize_size)
 
         task_episodes, task_successes = 0, 0
 
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task), desc=task_name):
             random.seed(args.seed + episode_idx)
             np.random.seed(args.seed + episode_idx)
+
             obs = env.reset()
+
+            # ── equidiff: no warm-up dummy steps ──────────────────────────────
+            # robomimic_image_runner starts inference immediately after env.reset().
+
             t = 0
-            done = False
-            info = {}
+            episode_max_reward = 0.0
             replay_images = []
             replay_images_wrist = []
+
             while t < max_steps:
-                action_chunk = mypolicy.get_mimicgen_action(obs, task_instruction)
+                # get_mimicgen_action_equidiff processes obs with flip_mode=None because
+                # robomimic's EnvRobosuite already flips images ([::-1]) internally.
+                # eval_mimicgen.py uses flip_mode="vertical" on top of suite.make() for
+                # the same net orientation.
+                action_chunk = mypolicy.get_mimicgen_action_equidiff(obs, task_instruction)
 
+                # Execute full chunk, breaking only if env signals done.
+                # Mirrors MultiStepWrapper.step(): loops over actions and breaks on done.
+                chunk_done = False
                 for act in action_chunk:
-                    obs, _, done, info = env.step(act.tolist())
-                    t += 1
-
-                    replay_images.append(to_video_frame(obs["agentview_image"][::-1]))
-                    replay_images_wrist.append(to_video_frame(obs["robot0_eye_in_hand_image"][::-1]))
-
-                    if done or info.get("is_success", False):
-                        done = True
+                    if t >= max_steps:
                         break
 
-                if done:
+                    obs, reward, done, info = env.step(act.tolist())
+                    t += 1
+
+                    # equidiff success criterion: max reward across episode > 0
+                    episode_max_reward = max(episode_max_reward, float(reward))
+
+                    # Images from robomimic EnvRobosuite are already correctly oriented
+                    # (robomimic applies [::-1] flip internally).  No extra flip here.
+                    replay_images.append(to_video_frame(obs["agentview_image"]))
+                    replay_images_wrist.append(to_video_frame(obs["robot0_eye_in_hand_image"]))
+
+                    if done:
+                        chunk_done = True
+                        break
+
+                if chunk_done:
                     break
 
-            success = done or bool(info.get("is_success", False))
+            # equidiff success: np.max(all_rewards[i]) > 0
+            success = episode_max_reward > 0.0 or bool(env._check_success())
+
             if success:
                 task_successes += 1
                 total_successes += 1
@@ -273,12 +351,15 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
                 codec="libx264",
             )
 
-            logging.info(f"  ep {episode_idx}: {'success' if success else 'failure'}  steps={t}")
+            logging.info(
+                f"  ep {episode_idx}: {'success' if success else 'failure'}"
+                f"  steps={t}  max_reward={episode_max_reward:.3f}"
+            )
 
         env.close()
 
         sr = float(task_successes) / float(max(task_episodes, 1))
-        logging.info(f"Task '{task_name}' success rate: {task_successes}/{task_episodes} ({sr*100:.1f}%)")
+        logging.info(f"Task '{task_name}' SR: {task_successes}/{task_episodes} ({sr*100:.1f}%)")
         print(f"  -> {task_name}: {task_successes}/{task_episodes} ({sr*100:.1f}%)")
         summary_rows.append((task_name, task_successes, task_episodes))
 
@@ -288,12 +369,12 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
         print(f"  {task_name:<30s}  {ok:3d}/{total:3d}  ({pct:.1f}%)")
     overall_pct = 100 * total_successes / max(total_episodes, 1)
     print(f"  {'TOTAL':<30s}  {total_successes:3d}/{total_episodes:3d}  ({overall_pct:.1f}%)")
-    logging.info(f"Total success rate: {total_successes}/{total_episodes} ({overall_pct:.1f}%)")
+    logging.info(f"Total SR: {total_successes}/{total_episodes} ({overall_pct:.1f}%)")
 
 
 def eval_mimicgen_all(args: Args) -> None:
     print("=" * 80)
-    print("MimicGen Simulation Evaluation")
+    print("MimicGen Simulation Evaluation (equidiff env init)")
     print("=" * 80)
 
     all_tasks = args.tasks if args.tasks else list(TASK_TO_ENV.keys())
