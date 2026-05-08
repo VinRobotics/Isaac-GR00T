@@ -432,12 +432,13 @@ class FlowmatchingActionHead(nn.Module):
 
         # Per-hand layout (matches getActionGTRelEachHand transform_features):
         # [rho2(2), xy(2), rho12(2), rho11(2), rho01(1), rho02(1), rho03(1)] = 11 dims
-        # Equivariant: irrep(2) + 3*irrep(1) = 8 dims
-        # Trivial from rotation decomp: 3 trivials (rho01/02/03)
+        # rho2 always occupies 2 dims total. For C8 irrep(2) is 2D (1 copy),
+        # for C4 irrep(2) is the sign rep (1D), so we need 2 copies.
+        rho2_copies = 2 // self.group.irrep(2).size
         per_hand = (
-            1 * [self.group.irrep(2)]       # rho2: 2 dims
-            + 3 * [self.group.irrep(1)]     # xy, rho12, rho11: 6 dims
-            + 3 * [self.group.trivial_repr] # rho01, rho02, rho03: 3 dims
+            rho2_copies * [self.group.irrep(2)]  # rho2: 2 dims total
+            + 3 * [self.group.irrep(1)]          # xy, rho12, rho11: 6 dims
+            + 3 * [self.group.trivial_repr]      # rho01, rho02, rho03: 3 dims
         )
 
         # Remaining trivials: z per hand + hand_state = max_dim - (ee_dim-1)*num_hand
