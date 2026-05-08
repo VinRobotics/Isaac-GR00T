@@ -165,6 +165,10 @@ def _make_env(dataset_path: str, resolution: int):
     env_meta["env_kwargs"]["use_camera_obs"] = True
     env_meta["env_kwargs"]["use_object_obs"] = False
 
+    # Prevent premature episode termination: env_meta may store a short horizon
+    # or ignore_done=False, which would cut episodes off before TASK_MAX_STEPS.
+    env_meta["env_kwargs"]["ignore_done"] = True
+
     # hard_reset wastes memory; disable as equidiff does.
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
@@ -173,6 +177,11 @@ def _make_env(dataset_path: str, resolution: int):
         use_image_obs=True,
     )
     env.env.hard_reset = False
+
+    # create_env_from_metadata hardcodes postprocess_visual_obs=True, which
+    # converts images to float32 CHW [0,1].  Disable it so get_observation()
+    # returns right-side-up HWC uint8 directly (the [::-1] flip still runs).
+    env.postprocess_visual_obs = False
 
     return env  # robomimic EnvRobosuite – no _SuccessDoneWrapper
 
@@ -356,7 +365,7 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
                 f"  steps={t}  max_reward={episode_max_reward:.3f}"
             )
 
-        env.close()
+        env.env.close()  # EnvRobosuite has no close(); delegate to inner robosuite env
 
         sr = float(task_successes) / float(max(task_episodes, 1))
         logging.info(f"Task '{task_name}' SR: {task_successes}/{task_episodes} ({sr*100:.1f}%)")
