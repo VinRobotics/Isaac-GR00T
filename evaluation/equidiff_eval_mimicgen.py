@@ -259,7 +259,7 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
 
         dataset_name = TASK_TO_DATASET_NAME[task_name]
         dataset_path = str(
-            pathlib.Path(args.dataset_dir) / dataset_name / f"{dataset_name}.hdf5"
+            pathlib.Path(args.dataset_dir) / f"{dataset_name}.hdf5"
         )
 
         logging.info(f"\n{'='*60}\nTask: {task_name}  Env: {env_name}")
