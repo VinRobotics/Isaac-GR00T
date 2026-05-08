@@ -73,17 +73,17 @@ TASK_TO_DATASET_NAME: dict[str, str] = {
 }
 
 TASK_TO_INSTRUCTION: dict[str, str] = {
-    "stack_three": "Stack red on green, then blue on red.",
-    "coffee_preparation": "Place mug under coffee machine, open red drawer, take white pod and insert into red holder.",
-    "hammer_cleanup": "Open drawer, place hammer inside, close drawer.",
+    "stack three": "Stack red on green, then blue on red.",
+    "coffee preparation": "Place mug under coffee machine, open red drawer, take white pod and insert into red holder.",
+    "hammer cleanup": "Open drawer, place hammer inside, close drawer.",
     "coffee": "Place white coffee pod into red holder.",
-    "nut_assembly": "Slide square brown nut onto square peg, then round silver nut onto round peg.",
-    "pick_place": "Place milk box in top-left bin, cereal box in top-right tray, red can in bottom-right tray, brown box in bottom-left tray.",
+    "nut assembly": "Slide square brown nut onto square peg, then round silver nut onto round peg.",
+    "pick place": "Place milk box in top-left bin, cereal box in top-right tray, red can in bottom-right tray, brown box in bottom-left tray.",
     "square": "Slide square brown nut onto square peg.",
     "threading": "Pick up threading tool and insert needle tip through the metal loop on the stand.",
-    "three_piece_assembly": "Insert T-shaped red block into square base, then stack large notched red block on top.",
+    "three piece assembly": "Insert T-shaped red block into square base, then stack large notched red block on top.",
     "kitchen": "Turn on stove, place grey container on stove, add brown food inside, push container onto red trivet.",
-    "mug_cleanup": "Open drawer, place mug inside, close drawer.",
+    "mug cleanup": "Open drawer, place mug inside, close drawer.",
     "stack": "Stack red block on top of green block."
 }
 
