@@ -155,6 +155,8 @@ class Gr00tn15_inference():
         gripper = obs["robot0_gripper_qpos"]
         img = obs["agentview_image"]
         wrist_img = obs["robot0_eye_in_hand_image"]
+        img = _to_hwc_uint8(img)
+        wrist_img = _to_hwc_uint8(wrist_img)
         if flip_mode == "horizontal":
             img = img[:, ::-1]
             wrist_img = wrist_img[:, ::-1]
@@ -164,10 +166,6 @@ class Gr00tn15_inference():
         elif flip_mode == "both":
             img = img[::-1, ::-1]
             wrist_img = wrist_img[::-1, ::-1]
-
-        # Ensure images are uint8
-        img = img.astype(np.uint8)
-        wrist_img = wrist_img.astype(np.uint8)
 
         # GR00T N1.6 expects:
         # - video: shape (B, T, H, W, C) - add batch and temporal dims
@@ -200,6 +198,15 @@ class Gr00tn15_inference():
             action[..., -1] = np.sign(action[..., -1])
 
         return action
+
+def _to_hwc_uint8(img: np.ndarray) -> np.ndarray:
+    """Convert a robomimic image (float32 CHW [0,1]) to uint8 HWC [0,255]."""
+    if img.dtype != np.uint8:
+        img = (img * 255.0).round().clip(0, 255).astype(np.uint8)
+    if img.ndim == 3 and img.shape[0] in (1, 3, 4):
+        img = img.transpose(1, 2, 0)
+    return img
+
 
 def _mimicgen_quat2axisangle(quat):
     ee_rpy = Rotation.from_quat(quat).as_rotvec()
