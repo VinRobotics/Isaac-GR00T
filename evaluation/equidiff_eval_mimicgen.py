@@ -327,7 +327,7 @@ def eval_mimicgen(args: Args, tasks: Optional[list[str]] = None) -> None:
                     break
 
             # equidiff success: np.max(all_rewards[i]) > 0
-            success = episode_max_reward > 0.0 or bool(env._check_success())
+            success = episode_max_reward > 0.0 or bool(env.is_success()["task"])
 
             if success:
                 task_successes += 1
