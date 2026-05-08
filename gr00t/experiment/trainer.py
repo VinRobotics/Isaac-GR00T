@@ -168,8 +168,12 @@ class DualBrainTrainer(transformers.Trainer):
         else:
             state_dict = self.model.state_dict()
         self.model.train()
+        result = None
         if self.args.should_save:
-            return self.model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=False)
+            result = self.model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=False)
+        del state_dict
+        torch.cuda.empty_cache()
+        return result
 
     def train(
         self,
