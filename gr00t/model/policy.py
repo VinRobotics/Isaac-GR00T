@@ -411,15 +411,33 @@ class Gr00tPolicy(BasePolicy):
             for k in unnormalized_action.keys():
                 unnormalized_action[k] = unnormalized_action[k].squeeze(1)  # remove the 1 dimension
         elif self.smooth_option == "te_eef":
-            for k in unnormalized_action.keys():
-                v = unnormalized_action[k]
+            # The action dict may have separate per-component keys (e.g. arm_eef_pos,
+            # arm_eef_rot, arm_gripper). Concatenate all (B,T,D) tensors in order,
+            # run the quaternion-aware ensemble on the full vector, then split back.
+            keys_3d, split_sizes, is_np_flags, tensors_3d = [], [], [], []
+            keys_other = {}
+
+            for k, v in unnormalized_action.items():
                 is_np = isinstance(v, np.ndarray)
-                if is_np:
-                    v = torch.from_numpy(v.copy()).float()
-                if v.dim() == 3:  # (B, T, D) — run EEF-aware ensemble
-                    v = self.process_output_eef(v)  # -> (B, 1, D)
-                v = v.squeeze(1)  # (B, D)
+                t = torch.from_numpy(v.copy()).float() if is_np else v.float()
+                if t.dim() == 3:  # (B, T, D)
+                    keys_3d.append(k)
+                    split_sizes.append(t.shape[-1])
+                    is_np_flags.append(is_np)
+                    tensors_3d.append(t)
+                else:
+                    keys_other[k] = (t.squeeze(1), is_np)
+
+            if tensors_3d:
+                full_action = torch.cat(tensors_3d, dim=-1)          # (B, T, sum_D)
+                ensembled = self.process_output_eef(full_action)     # (B, 1, sum_D)
+                parts = torch.split(ensembled.squeeze(1), split_sizes, dim=-1)  # [(B, D), ...]
+                for k, part, is_np in zip(keys_3d, parts, is_np_flags):
+                    unnormalized_action[k] = part.numpy() if is_np else part
+
+            for k, (v, is_np) in keys_other.items():
                 unnormalized_action[k] = v.numpy() if is_np else v
+
             if not is_batch:
                 unnormalized_action = squeeze_dict_values(unnormalized_action)
         elif not is_batch:
