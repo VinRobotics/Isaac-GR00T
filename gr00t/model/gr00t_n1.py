@@ -332,9 +332,18 @@ class GR00T_N1_5(PreTrainedModel):
             )
             print(f"Loaded {len(backbone_state_dict)} backbone parameters")
         else:
-            # Load all weights for inference
+            # Load all weights for inference.
+            # Sync action_head_cfg["n_group"] from backbone_cfg["n_group"] so that
+            # old checkpoints saved before this fix (which only persisted n_group in
+            # backbone_cfg) still load correctly.
+            config = AutoConfig.from_pretrained(local_model_path)
+            backbone_n_group = config.backbone_cfg.get("n_group", 4)
+            action_n_group = config.action_head_cfg.get("n_group", 8)
+            if action_n_group != backbone_n_group:
+                print(f"Syncing action_head_cfg n_group: {action_n_group} → {backbone_n_group}")
+                config.action_head_cfg["n_group"] = backbone_n_group
             pretrained_model = super().from_pretrained(
-                local_model_path, local_model_path=local_model_path, **kwargs
+                local_model_path, config=config, local_model_path=local_model_path, **kwargs
             )
 
         pretrained_model.backbone.set_trainable_parameters(

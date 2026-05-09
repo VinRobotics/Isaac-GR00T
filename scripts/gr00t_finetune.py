@@ -264,6 +264,7 @@ def main(config: ArgsConfig):
     # Persist rotation config + n_group in saved config so inference reconstructs correctly
     model.config.backbone_cfg.update(backbone_cfg_overrides)
     model.config.backbone_cfg["n_group"] = model.backbone.n_group
+    model.config.action_head_cfg["n_group"] = model.action_head.n_group
 
     # Update action_horizon and num_hand to match data config
     # Need to recreate action head with correct config since it was initialized with old config
