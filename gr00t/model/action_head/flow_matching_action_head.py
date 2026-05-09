@@ -344,6 +344,8 @@ class FlowmatchingActionHead(nn.Module):
             **config.diffusion_model_cfg,
             "n_group": self.n_group,
         }
+        print("Initializing FlowmatchingActionHead with the following diffusion model config: ", config)
+        print(f"Diffusion model config: {diffusion_cfg}")
         self.model = EDiT(**diffusion_cfg)
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon

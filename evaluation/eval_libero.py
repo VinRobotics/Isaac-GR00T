@@ -3,7 +3,7 @@
 import os 
 import sys 
 
-sys.path.insert(0, "/home/locht1/gr00t_equi_fa")
+sys.path.insert(0, "/home/locht1/gr00t_equi_fa_c4")
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/LIBERO_benchmark")
 
 
