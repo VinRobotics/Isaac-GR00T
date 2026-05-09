@@ -2127,7 +2127,7 @@ class EquiALOHA_1Hand_Config(BaseDataConfig):
     state_indices = [0]
     action_indices = list(range(16))
     num_hand = 1
-    rot_type="axis_angle"
+    rot_type="euler_angles"
     rel_action=False
 
     def modality_config(self):
@@ -2254,7 +2254,7 @@ class EquiALOHA_2Hand_Config(BaseDataConfig):
     state_indices = [0]
     action_indices = list(range(16))
     num_hand = 2
-    rot_type="axis_angle"
+    rot_type="euler_angles"
     rel_action=False
 
     def modality_config(self):
