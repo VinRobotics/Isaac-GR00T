@@ -83,7 +83,7 @@ class ArgsConfig:
     client: bool = False
     """Whether to run the client."""
 
-    smooth_option: Literal["te", "rtc", ""] = ""
+    smooth_option: Literal["te", "te_eef", "rtc", ""] = ""
     """Smooth option for the action generation. Options are 'te' for temporal encoding, 'rtc' for real-time chunking, or empty string for no smoothing."""
 
     denoising_steps: int = 4
