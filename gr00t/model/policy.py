@@ -352,27 +352,52 @@ class Gr00tPolicy(BasePolicy):
     def _detect_checkpoint_num_embodiments(model_path: str) -> int | None:
         """Return the number of embodiment slots actually saved in the checkpoint, or None."""
         import os
-        index_path = os.path.join(model_path, "model.safetensors.index.json")
-        single_path = os.path.join(model_path, "model.safetensors")
         keys = []
-        if os.path.exists(index_path):
-            with open(index_path) as f:
+
+        # Sharded safetensors
+        sf_index = os.path.join(model_path, "model.safetensors.index.json")
+        # Single safetensors
+        sf_single = os.path.join(model_path, "model.safetensors")
+        # Sharded pytorch bin (HuggingFace Trainer default)
+        pt_index = os.path.join(model_path, "pytorch_model.bin.index.json")
+        # Single pytorch bin
+        pt_single = os.path.join(model_path, "pytorch_model.bin")
+
+        if os.path.exists(sf_index):
+            print(f"[Policy] Scanning keys from {sf_index}")
+            with open(sf_index) as f:
                 keys = list(json.load(f).get("weight_map", {}).keys())
-        elif os.path.exists(single_path):
+        elif os.path.exists(sf_single):
+            print(f"[Policy] Scanning keys from {sf_single}")
             try:
                 from safetensors import safe_open
-                with safe_open(single_path, framework="pt") as f:
+                with safe_open(sf_single, framework="pt") as f:
                     keys = list(f.keys())
-            except Exception:
+            except Exception as e:
+                print(f"[Policy] Failed to read safetensors: {e}")
                 return None
+        elif os.path.exists(pt_index):
+            print(f"[Policy] Scanning keys from {pt_index}")
+            with open(pt_index) as f:
+                keys = list(json.load(f).get("weight_map", {}).keys())
+        elif os.path.exists(pt_single):
+            print(f"[Policy] Scanning keys from {pt_single}")
+            sd = torch.load(pt_single, map_location="cpu")
+            keys = list(sd.keys())
         else:
+            print(f"[Policy] No recognized weight file found in {model_path}")
             return None
+
         indices = {
             int(m.group(1))
             for k in keys
             if (m := re.search(r"action_head\.\w+\.layer\d+\.layers\.(\d+)\.", k))
         }
-        return max(indices) + 1 if indices else None
+        if not indices:
+            print(f"[Policy] No embodiment layer keys found in checkpoint.")
+            return None
+        result = max(indices) + 1
+        return result
 
     def _load_model(self, model_path):
         print(f"[Policy] Loading model from: {model_path}")
