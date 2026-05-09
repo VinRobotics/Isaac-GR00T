@@ -16,9 +16,6 @@
 from dataclasses import dataclass, field
 from typing import Tuple
 import copy
-import json
-import os
-import re
 
 import numpy as np
 import torch
@@ -40,36 +37,6 @@ ACTION_KEY = "action_pred"
 LOSS_KEY = "loss"
 ERROR_MSG = "Error: unexpected input/output"
 N_COLOR_CHANNELS = 3
-
-
-def _detect_num_embodiments(checkpoint_path: str) -> int | None:
-    """Inspect checkpoint weight keys to find actual num_embodiments used during training.
-
-    Returns the detected count, or None if it cannot be determined.
-    """
-    # Collect weight keys without loading tensor data
-    keys = []
-    index_path = os.path.join(checkpoint_path, "model.safetensors.index.json")
-    single_path = os.path.join(checkpoint_path, "model.safetensors")
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            keys = list(json.load(f).get("weight_map", {}).keys())
-    elif os.path.exists(single_path):
-        try:
-            from safetensors import safe_open
-            with safe_open(single_path, framework="pt") as f:
-                keys = list(f.keys())
-        except Exception:
-            return None
-    else:
-        return None
-
-    # Keys look like: action_head.action_decoder.layer1.layers.{i}.weights
-    pattern = re.compile(r"action_head\.\w+\.layer\d+\.layers\.(\d+)\.")
-    indices = {int(m.group(1)) for k in keys if (m := pattern.search(k))}
-    if not indices:
-        return None
-    return max(indices) + 1
 
 
 # config
@@ -316,25 +283,9 @@ class GR00T_N1_5(PreTrainedModel):
             )
             local_model_path = pretrained_model_name_or_path
 
-        # Auto-correct realworld/max_num_embodiments to match actual checkpoint weights
-        # before constructing the model, so there are no shape mismatches or unused-weight warnings.
-        config = AutoConfig.from_pretrained(local_model_path)
-        detected = _detect_num_embodiments(local_model_path)
-        if detected is not None:
-            config_realworld = config.action_head_cfg.get("realworld", False)
-            config_n = 1 if config_realworld else config.action_head_cfg.get("max_num_embodiments", 32)
-            if detected != config_n:
-                corrected_realworld = detected == 1
-                print(
-                    f"[gr00t] Checkpoint has num_embodiments={detected} but config says "
-                    f"realworld={config_realworld} (num_embodiments={config_n}). "
-                    f"Auto-correcting: realworld={corrected_realworld}, max_num_embodiments={detected}."
-                )
-                config.action_head_cfg["realworld"] = corrected_realworld
-                config.action_head_cfg["max_num_embodiments"] = detected
-
         if load_backbone_only:
             # Load only backbone weights during finetuning
+            config = AutoConfig.from_pretrained(local_model_path)
             if backbone_cfg_overrides:
                 config.backbone_cfg.update(backbone_cfg_overrides)
             if rot_aug is not None:
@@ -381,9 +332,9 @@ class GR00T_N1_5(PreTrainedModel):
             )
             print(f"Loaded {len(backbone_state_dict)} backbone parameters")
         else:
-            # Load all weights for inference, using the auto-corrected config from above
+            # Load all weights for inference
             pretrained_model = super().from_pretrained(
-                local_model_path, local_model_path=local_model_path, config=config, **kwargs
+                local_model_path, local_model_path=local_model_path, **kwargs
             )
 
         pretrained_model.backbone.set_trainable_parameters(
