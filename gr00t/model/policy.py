@@ -23,6 +23,8 @@ import torch
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
 
+import re
+
 from gr00t.data.dataset import ModalityConfig
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.schema import DatasetMetadata
@@ -346,13 +348,63 @@ class Gr00tPolicy(BasePolicy):
                 return False
         return True
 
+    @staticmethod
+    def _detect_checkpoint_num_embodiments(model_path: str) -> int | None:
+        """Return the number of embodiment slots actually saved in the checkpoint, or None."""
+        import os
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        single_path = os.path.join(model_path, "model.safetensors")
+        keys = []
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                keys = list(json.load(f).get("weight_map", {}).keys())
+        elif os.path.exists(single_path):
+            try:
+                from safetensors import safe_open
+                with safe_open(single_path, framework="pt") as f:
+                    keys = list(f.keys())
+            except Exception:
+                return None
+        else:
+            return None
+        indices = {
+            int(m.group(1))
+            for k in keys
+            if (m := re.search(r"action_head\.\w+\.layer\d+\.layers\.(\d+)\.", k))
+        }
+        return max(indices) + 1 if indices else None
+
     def _load_model(self, model_path):
-        # Load model without specifying torch_dtype to avoid dtype mismatch during ESCNN initialization
+        print(f"[Policy] Loading model from: {model_path}")
+
         model = GR00T_N1_5.from_pretrained(model_path)
-        model.eval()  # Set model to eval mode
-        
+        model.eval()
+
+        cfg = model.action_head.config
+        print(f"[Policy] Action head config: realworld={cfg.realworld}, max_num_embodiments={cfg.max_num_embodiments}, action_horizon={cfg.action_horizon}")
+
+        # If the checkpoint was trained with realworld=True (1 embodiment slot) but the saved
+        # config.json is missing that flag, the model loads with 32 slots and inference hits
+        # slot 31 (new_embodiment) which has random weights. Detect and fix here.
+        ckpt_n = self._detect_checkpoint_num_embodiments(str(self.model_path))
+        print(f"[Policy] Detected embodiment slots in checkpoint: {ckpt_n}")
+
+        if ckpt_n == 1 and not cfg.realworld:
+            from gr00t.model.action_head.flow_matching_action_head import FlowmatchingActionHead
+            print("[Policy] Mismatch: checkpoint has 1 slot but config says realworld=False (32 slots).")
+            print("[Policy] Rebuilding action head with realworld=True and reloading weights from slot 0.")
+            cfg.realworld = True
+            new_action_head = FlowmatchingActionHead(cfg)
+            new_action_head.load_state_dict(model.action_head.state_dict(), strict=False)
+            model.action_head = new_action_head
+            model.config.action_head_cfg["realworld"] = True
+            print("[Policy] Action head rebuilt successfully with realworld=True.")
+        else:
+            print(f"[Policy] Embodiment config OK (realworld={cfg.realworld}, ckpt_slots={ckpt_n}).")
+
         # Cast to desired dtype after initialization is complete
         model = model.to(dtype=COMPUTE_DTYPE)
+        print(f"[Policy] Model cast to dtype: {COMPUTE_DTYPE}")
 
         # Update action_horizon to match modality config
         # Get the expected action horizon from the modality config

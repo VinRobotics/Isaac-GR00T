@@ -825,7 +825,9 @@ class FlowmatchingActionHead(nn.Module):
         encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*K], all-ones
 
         # Get embodiment ID.
-        embodiment_id = torch.zeros_like(action_input.embodiment_id)
+        embodiment_id = action_input.embodiment_id
+        if self.config.realworld:
+            embodiment_id = torch.zeros_like(embodiment_id)
 
         # Embed state.
         B, T, _ = action_input.state.shape
@@ -930,7 +932,9 @@ class FlowmatchingActionHead(nn.Module):
         vl_embs = backbone_output.vl_features                     # [B, n_equi*K, cross_attn_dim]
         encoder_mask = backbone_output.backbone_attention_mask    # [B, n_equi*K], all-ones
 
-        embodiment_id = torch.zeros_like(action_input.embodiment_id)
+        embodiment_id = action_input.embodiment_id
+        if self.config.realworld:
+            embodiment_id = torch.zeros_like(embodiment_id)
 
         # Embed state.
         B, T, _ = action_input.state.shape
