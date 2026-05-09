@@ -316,9 +316,25 @@ class GR00T_N1_5(PreTrainedModel):
             )
             local_model_path = pretrained_model_name_or_path
 
+        # Auto-correct realworld/max_num_embodiments to match actual checkpoint weights
+        # before constructing the model, so there are no shape mismatches or unused-weight warnings.
+        config = AutoConfig.from_pretrained(local_model_path)
+        detected = _detect_num_embodiments(local_model_path)
+        if detected is not None:
+            config_realworld = config.action_head_cfg.get("realworld", False)
+            config_n = 1 if config_realworld else config.action_head_cfg.get("max_num_embodiments", 32)
+            if detected != config_n:
+                corrected_realworld = detected == 1
+                print(
+                    f"[gr00t] Checkpoint has num_embodiments={detected} but config says "
+                    f"realworld={config_realworld} (num_embodiments={config_n}). "
+                    f"Auto-correcting: realworld={corrected_realworld}, max_num_embodiments={detected}."
+                )
+                config.action_head_cfg["realworld"] = corrected_realworld
+                config.action_head_cfg["max_num_embodiments"] = detected
+
         if load_backbone_only:
             # Load only backbone weights during finetuning
-            config = AutoConfig.from_pretrained(local_model_path)
             if backbone_cfg_overrides:
                 config.backbone_cfg.update(backbone_cfg_overrides)
             if rot_aug is not None:
@@ -365,24 +381,7 @@ class GR00T_N1_5(PreTrainedModel):
             )
             print(f"Loaded {len(backbone_state_dict)} backbone parameters")
         else:
-            # Auto-correct realworld/max_num_embodiments from actual checkpoint weights
-            # so config.json mismatches don't cause "unused weights" warnings.
-            config = AutoConfig.from_pretrained(local_model_path)
-            detected = _detect_num_embodiments(local_model_path)
-            if detected is not None:
-                config_realworld = config.action_head_cfg.get("realworld", False)
-                config_n = 1 if config_realworld else config.action_head_cfg.get("max_num_embodiments", 32)
-                if detected != config_n:
-                    corrected_realworld = detected == 1
-                    print(
-                        f"[gr00t] Checkpoint has num_embodiments={detected} but config says "
-                        f"realworld={config_realworld} (num_embodiments={config_n}). "
-                        f"Auto-correcting: realworld={corrected_realworld}, max_num_embodiments={detected}."
-                    )
-                    config.action_head_cfg["realworld"] = corrected_realworld
-                    config.action_head_cfg["max_num_embodiments"] = detected
-
-            # Load all weights for inference
+            # Load all weights for inference, using the auto-corrected config from above
             pretrained_model = super().from_pretrained(
                 local_model_path, local_model_path=local_model_path, config=config, **kwargs
             )
