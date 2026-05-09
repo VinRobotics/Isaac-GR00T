@@ -134,6 +134,15 @@ class Gr00tPolicy(BasePolicy):
                 self.ensemble_weights = torch.exp(-self.k * torch.arange(self.num_queries)).cuda()
                 self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0).cuda()
                 self.reset()
+        elif self.smooth_option == "te_eef":
+            self.temporal_agg = True
+            self.num_queries = 16
+            self.k = 0.015
+            self.eef_pos_dim = 3  # xyz
+            self.eef_rot_dim = 3  # roll, pitch, yaw
+            self.ensemble_weights = torch.exp(-self.k * torch.arange(self.num_queries))
+            self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
+            self.reset()
         elif self.smooth_option == "rtc":
             self.temporal_agg = False
             self.prev_action_chunk = None
@@ -168,6 +177,11 @@ class Gr00tPolicy(BasePolicy):
         self.ensembled_actions = None
         self.ensembled_actions_count = None
         self.prev_action_chunk = None
+        self.cnt = 0
+        # te_eef mode buffers
+        self.ensembled_actions_pos = None
+        self.ensembled_actions_quat = None
+        self.ensembled_actions_grip = None
 
     def process_output(self, actions):
         """
@@ -203,6 +217,114 @@ class Gr00tPolicy(BasePolicy):
         )
         print("PROCESS OUTPUT", action.shape)
         return action
+
+    def process_output_eef(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        EEF-aware temporal ensemble for actions in [xyz, rpy, gripper] format.
+
+        Averages position and gripper in Euclidean space, and rotation via quaternion
+        averaging to avoid Euler-angle wrap-around artifacts near ±π boundaries.
+
+        Args:
+            actions: (B, num_queries, D) unnormalized actions where
+                     D = eef_pos_dim + eef_rot_dim + gripper_dim
+        Returns:
+            (B, 1, D) ensembled action for the current timestep.
+        """
+        from scipy.spatial.transform import Rotation as ScipyR  # type: ignore[import-untyped]
+
+        B, T, _ = actions.shape
+        pos_end = self.eef_pos_dim
+        rot_end = pos_end + self.eef_rot_dim
+        dev = actions.device
+
+        pos = actions[:, :, :pos_end]         # (B, T, 3)
+        rpy = actions[:, :, pos_end:rot_end]  # (B, T, 3)
+        grip = actions[:, :, rot_end:]        # (B, T, G)
+
+        # Convert rpy -> unit quaternion (xyzw convention)
+        rpy_np = rpy.cpu().float().numpy().reshape(-1, self.eef_rot_dim)
+        quat_np = ScipyR.from_euler("xyz", rpy_np).as_quat()  # (-1, 4)
+        quat = torch.from_numpy(quat_np).float().to(dev).reshape(B, T, 4)
+
+        # Enforce sign consistency along time axis so averaging is stable
+        for t in range(1, T):
+            dot = (quat[:, t] * quat[:, t - 1]).sum(dim=-1, keepdim=True)
+            quat[:, t] = torch.where(dot < 0, -quat[:, t], quat[:, t])
+
+        ew = self.ensemble_weights.to(dev)
+        ew_cs = self.ensemble_weights_cumsum.to(dev)
+
+        if self.ensembled_actions_pos is None:
+            self.ensembled_actions_pos = pos.clone()
+            self.ensembled_actions_quat = quat.clone()
+            self.ensembled_actions_grip = grip.clone()
+            self.ensembled_actions_count = torch.ones(
+                (T, 1), dtype=torch.long, device=dev
+            )
+        else:
+            assert self.ensembled_actions_count is not None
+            cnt = self.ensembled_actions_count  # (T_existing, 1)
+            w_old = ew_cs[cnt - 1]              # (T_existing, 1)
+            w_new = ew[cnt]                     # (T_existing, 1)
+            w_total = ew_cs[cnt]                # (T_existing, 1)
+
+            # Update position (Euclidean average)
+            self.ensembled_actions_pos = (
+                self.ensembled_actions_pos * w_old + pos[:, :-1] * w_new
+            ) / w_total
+
+            # Update quaternion (weighted sum then normalize; flip sign to match stored)
+            incoming_q = quat[:, :-1].clone()
+            dot = (incoming_q * self.ensembled_actions_quat).sum(dim=-1, keepdim=True)
+            incoming_q = torch.where(dot < 0, -incoming_q, incoming_q)
+            new_quat = self.ensembled_actions_quat * w_old + incoming_q * w_new
+            norm = new_quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            self.ensembled_actions_quat = new_quat / norm
+
+            # Update gripper (Euclidean average)
+            self.ensembled_actions_grip = (
+                self.ensembled_actions_grip * w_old + grip[:, :-1] * w_new
+            ) / w_total
+
+            self.ensembled_actions_count = torch.clamp(cnt + 1, max=self.num_queries)
+
+            # Append the newest (last) query's action — no prior average yet
+            self.ensembled_actions_pos = torch.cat(
+                [self.ensembled_actions_pos, pos[:, -1:]], dim=1
+            )
+            self.ensembled_actions_quat = torch.cat(
+                [self.ensembled_actions_quat, quat[:, -1:]], dim=1
+            )
+            self.ensembled_actions_grip = torch.cat(
+                [self.ensembled_actions_grip, grip[:, -1:]], dim=1
+            )
+            self.ensembled_actions_count = torch.cat(
+                [self.ensembled_actions_count,
+                 torch.ones_like(self.ensembled_actions_count[-1:])]
+            )
+
+        # Pop the first (current timestep) action
+        out_pos = self.ensembled_actions_pos[:, :1]    # (B, 1, 3)
+        out_quat = self.ensembled_actions_quat[:, :1]  # (B, 1, 4)
+        out_grip = self.ensembled_actions_grip[:, :1]  # (B, 1, G)
+
+        self.ensembled_actions_pos = self.ensembled_actions_pos[:, 1:]
+        self.ensembled_actions_quat = self.ensembled_actions_quat[:, 1:]
+        self.ensembled_actions_grip = self.ensembled_actions_grip[:, 1:]
+        self.ensembled_actions_count = self.ensembled_actions_count[1:]
+
+        # Convert quaternion back to rpy
+        out_quat_np = out_quat.cpu().float().numpy().reshape(-1, 4)
+        out_rpy_np = ScipyR.from_quat(out_quat_np).as_euler("xyz")
+        out_rpy = (
+            torch.from_numpy(out_rpy_np)
+            .float()
+            .to(dev)
+            .reshape(B, 1, self.eef_rot_dim)
+        )
+
+        return torch.cat([out_pos, out_rpy, out_grip], dim=-1)  # (B, 1, D)
 
     def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -267,11 +389,24 @@ class Gr00tPolicy(BasePolicy):
                 )),
                 dim=1,
             )
-        unnormalized_action = self._get_unnormalized_action(normalized_action)        
+
+        unnormalized_action = self._get_unnormalized_action(normalized_action)
 
         if self.smooth_option == "te":
             for k in unnormalized_action.keys():
                 unnormalized_action[k] = unnormalized_action[k].squeeze(1)  # remove the 1 dimension
+        elif self.smooth_option == "te_eef":
+            for k in unnormalized_action.keys():
+                v = unnormalized_action[k]
+                is_np = isinstance(v, np.ndarray)
+                if is_np:
+                    v = torch.from_numpy(v.copy()).float()
+                if v.dim() == 3:  # (B, T, D) — run EEF-aware ensemble
+                    v = self.process_output_eef(v)  # -> (B, 1, D)
+                v = v.squeeze(1)  # (B, D)
+                unnormalized_action[k] = v.numpy() if is_np else v
+            if not is_batch:
+                unnormalized_action = squeeze_dict_values(unnormalized_action)
         elif not is_batch:
             unnormalized_action = squeeze_dict_values(unnormalized_action)
         return unnormalized_action
