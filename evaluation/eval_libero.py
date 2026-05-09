@@ -164,7 +164,9 @@ def eval_libero(args: Args, task_suite_name: Optional[str]=None, task_ids: Optio
             print(f"{args.model_type} is not supported yet")
             pass
     except Exception as e:
+        import traceback
         logging.info(f"Task {args.task_suite_name} | Failed to load policy: {e}")
+        print(traceback.format_exc())
         return
 
     # Start evaluation
