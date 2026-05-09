@@ -4,6 +4,7 @@ import sys
 import math
 import numpy as np 
 import torch
+import traceback
 
 from gr00t.model.policy import Gr00tPolicy
 # Import config
@@ -43,6 +44,7 @@ class Gr00tn15_inference():
             return policy
         except Exception as e:
             print(f"❌ Failed to load policy: {e}")
+            print(traceback.format_exc())
             sys.exit(1)
 
 
