@@ -137,6 +137,9 @@ class ArgsConfig:
     rot_aug: bool = False
     """Whether to apply rotation augmentation during training."""
 
+    realworld: bool = False
+    """If True, use num_embodiments=1 for action_encoder, action_decoder, state_encoder (real-world single-embodiment mode)."""
+
     adapter_warmup_steps: int = 2000
     """Number of steps to linearly ramp the EquiAdapter output from 0→1.
     0 (default) disables warm-up (adapter is fully active from step 0)."""
@@ -228,6 +231,7 @@ def main(config: ArgsConfig):
     data_num_hand = getattr(data_config_cls, "num_hand", 2)
     data_rot_type = getattr(data_config_cls, "rot_type", "quaternion")
     data_rel_action = getattr(data_config_cls, "rel_action", False)
+    data_realworld = config.realworld
     
     # Get rotation config for frame averaging backbone
     rotation_config = data_config_cls.get_rotation_config() if hasattr(data_config_cls, "get_rotation_config") else {}
@@ -271,18 +275,20 @@ def main(config: ArgsConfig):
     num_hand_changed = data_num_hand != model.action_head.config.num_hand
     rot_type_changed = data_rot_type != model.action_head.config.rot_type
     rel_action_changed = data_rel_action != model.action_head.config.rel_action
+    realworld_changed = data_realworld != model.action_head.config.realworld
     new_project_to_dim = backbone_cfg_overrides.get("project_to_dim", None)
     cross_attn_dim_changed = (
         new_project_to_dim is not None
         and new_project_to_dim != model.action_head.config.diffusion_model_cfg.get("cross_attention_dim")
     )
 
-    if action_horizon_changed or num_hand_changed or rot_type_changed or rel_action_changed or cross_attn_dim_changed:
+    if action_horizon_changed or num_hand_changed or rot_type_changed or rel_action_changed or cross_attn_dim_changed or realworld_changed:
         print(
             f"Recreating action head with action_horizon {data_action_horizon} (was {model.action_head.config.action_horizon}), "
             f"num_hand {data_num_hand} (was {model.action_head.config.num_hand}), "
             f"rot_type {data_rot_type} (was {model.action_head.config.rot_type}), "
             f"rel_action {data_rel_action} (was {model.action_head.config.rel_action}), "
+            f"realworld {data_realworld} (was {model.action_head.config.realworld}), "
         )
 
         # Update the action head config
@@ -291,6 +297,7 @@ def main(config: ArgsConfig):
         new_action_head_config.num_hand = data_num_hand
         new_action_head_config.rot_type = data_rot_type
         new_action_head_config.rel_action = data_rel_action
+        new_action_head_config.realworld = data_realworld
         if cross_attn_dim_changed:
             old_cross_attn = new_action_head_config.diffusion_model_cfg.get("cross_attention_dim")
             new_action_head_config.diffusion_model_cfg["cross_attention_dim"] = new_project_to_dim
@@ -327,6 +334,7 @@ def main(config: ArgsConfig):
         model.config.action_head_cfg["rot_type"] = new_action_head_config.rot_type
         model.config.action_head_cfg["rel_action"] = new_action_head_config.rel_action
         model.config.action_head_cfg["action_horizon"] = data_action_horizon
+        model.config.action_head_cfg["realworld"] = data_realworld
         if cross_attn_dim_changed:
             model.config.action_head_cfg["diffusion_model_cfg"]["cross_attention_dim"] = new_project_to_dim
 
