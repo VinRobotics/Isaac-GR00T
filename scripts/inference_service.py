@@ -83,8 +83,11 @@ class ArgsConfig:
     client: bool = False
     """Whether to run the client."""
 
-    smooth_option: Literal["te", "te_eef", "rtc", ""] = ""
-    """Smooth option for the action generation. Options are 'te' for temporal encoding, 'rtc' for real-time chunking, or empty string for no smoothing."""
+    guidance_option: Literal["acg", "cfg", ""] = ""
+    """Guidance option for the action generation. Options are 'acg' for action coherent guidance, 'cfg' for classifier-free guidance or empty string for no guidance"""
+
+    smooth_option: Literal["te", "te_eef", "te_eef_quat", "rtc", "training-time-rtc", ""] = ""
+    """Smooth option for the action generation. Options are 'te' for temporal encoding, 'te_eef' for RPY-input quaternion-aware ensemble, 'te_eef_quat' for direct quaternion-input ensemble, 'rtc' for real-time chunking, 'training-time-rtc' for training-time rtc or empty string for no smoothing."""
 
     denoising_steps: int = 4
     """The number of denoising steps to use."""
