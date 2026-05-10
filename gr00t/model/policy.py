@@ -142,6 +142,15 @@ class Gr00tPolicy(BasePolicy):
             self.ensemble_weights = torch.exp(-self.k * torch.arange(self.num_queries))
             self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
             self.reset()
+        elif self.smooth_option == "te_eef_quat":
+            self.temporal_agg = True
+            self.num_queries = 16
+            self.k = 0.015
+            self.eef_pos_dim = 3  # xyz
+            self.eef_rot_dim = 4  # quaternion xyzw
+            self.ensemble_weights = torch.exp(-self.k * torch.arange(self.num_queries))
+            self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
+            self.reset()
         elif self.smooth_option == "rtc":
             self.temporal_agg = False
             self.prev_action_chunk = None
@@ -326,6 +335,100 @@ class Gr00tPolicy(BasePolicy):
 
         return torch.cat([out_pos, out_rpy, out_grip], dim=-1)  # (B, 1, D)
 
+    def process_output_eef_quat(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        EEF-aware temporal ensemble for actions in [xyz, quat(xyzw), gripper] format.
+
+        Averages position and gripper in Euclidean space, and rotation via quaternion
+        averaging (input quaternions are used directly — no RPY conversion needed).
+
+        Args:
+            actions: (B, num_queries, D) unnormalized actions where
+                     D = eef_pos_dim(3) + eef_rot_dim(4) + gripper_dim
+        Returns:
+            (B, 1, D) ensembled action for the current timestep.
+        """
+        _, T, _ = actions.shape
+        pos_end = self.eef_pos_dim
+        rot_end = pos_end + self.eef_rot_dim
+        dev = actions.device
+
+        pos = actions[:, :, :pos_end]          # (B, T, 3)
+        quat = actions[:, :, pos_end:rot_end]  # (B, T, 4)
+        grip = actions[:, :, rot_end:]         # (B, T, G)
+
+        # Normalize input quaternions to unit sphere
+        quat = quat / quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # Enforce sign consistency along time axis so averaging is stable
+        for t in range(1, T):
+            dot = (quat[:, t] * quat[:, t - 1]).sum(dim=-1, keepdim=True)
+            quat[:, t] = torch.where(dot < 0, -quat[:, t], quat[:, t])
+
+        ew = self.ensemble_weights.to(dev)
+        ew_cs = self.ensemble_weights_cumsum.to(dev)
+
+        if self.ensembled_actions_pos is None:
+            self.ensembled_actions_pos = pos.clone()
+            self.ensembled_actions_quat = quat.clone()
+            self.ensembled_actions_grip = grip.clone()
+            self.ensembled_actions_count = torch.ones(
+                (T, 1), dtype=torch.long, device=dev
+            )
+        else:
+            assert self.ensembled_actions_count is not None
+            cnt = self.ensembled_actions_count  # (T_existing, 1)
+            w_old = ew_cs[cnt - 1]
+            w_new = ew[cnt]
+            w_total = ew_cs[cnt]
+
+            # Update position (Euclidean average)
+            self.ensembled_actions_pos = (
+                self.ensembled_actions_pos * w_old + pos[:, :-1] * w_new
+            ) / w_total
+
+            # Update quaternion (weighted sum then normalize; flip sign to match stored)
+            incoming_q = quat[:, :-1].clone()
+            dot = (incoming_q * self.ensembled_actions_quat).sum(dim=-1, keepdim=True)
+            incoming_q = torch.where(dot < 0, -incoming_q, incoming_q)
+            new_quat = self.ensembled_actions_quat * w_old + incoming_q * w_new
+            norm = new_quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            self.ensembled_actions_quat = new_quat / norm
+
+            # Update gripper (Euclidean average)
+            self.ensembled_actions_grip = (
+                self.ensembled_actions_grip * w_old + grip[:, :-1] * w_new
+            ) / w_total
+
+            self.ensembled_actions_count = torch.clamp(cnt + 1, max=self.num_queries)
+
+            # Append the newest (last) query's action — no prior average yet
+            self.ensembled_actions_pos = torch.cat(
+                [self.ensembled_actions_pos, pos[:, -1:]], dim=1
+            )
+            self.ensembled_actions_quat = torch.cat(
+                [self.ensembled_actions_quat, quat[:, -1:]], dim=1
+            )
+            self.ensembled_actions_grip = torch.cat(
+                [self.ensembled_actions_grip, grip[:, -1:]], dim=1
+            )
+            self.ensembled_actions_count = torch.cat(
+                [self.ensembled_actions_count,
+                 torch.ones_like(self.ensembled_actions_count[-1:])]
+            )
+
+        # Pop the first (current timestep) action
+        out_pos = self.ensembled_actions_pos[:, :1]    # (B, 1, 3)
+        out_quat = self.ensembled_actions_quat[:, :1]  # (B, 1, 4)
+        out_grip = self.ensembled_actions_grip[:, :1]  # (B, 1, G)
+
+        self.ensembled_actions_pos = self.ensembled_actions_pos[:, 1:]
+        self.ensembled_actions_quat = self.ensembled_actions_quat[:, 1:]
+        self.ensembled_actions_grip = self.ensembled_actions_grip[:, 1:]
+        self.ensembled_actions_count = self.ensembled_actions_count[1:]
+
+        return torch.cat([out_pos, out_quat, out_grip], dim=-1)  # (B, 1, D)
+
     def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """
         Make a prediction with the model.
@@ -410,7 +513,7 @@ class Gr00tPolicy(BasePolicy):
         if self.smooth_option == "te":
             for k in unnormalized_action.keys():
                 unnormalized_action[k] = unnormalized_action[k].squeeze(1)  # remove the 1 dimension
-        elif self.smooth_option == "te_eef":
+        elif self.smooth_option in ("te_eef", "te_eef_quat"):
             # The action dict may have separate per-component keys (e.g. arm_eef_pos,
             # arm_eef_rot, arm_gripper). Concatenate all (B,T,D) tensors in order,
             # run the quaternion-aware ensemble on the full vector, then split back.
@@ -429,8 +532,11 @@ class Gr00tPolicy(BasePolicy):
                     keys_other[k] = (t.squeeze(1), is_np)
 
             if tensors_3d:
-                full_action = torch.cat(tensors_3d, dim=-1)          # (B, T, sum_D)
-                ensembled = self.process_output_eef(full_action)     # (B, 1, sum_D)
+                full_action = torch.cat(tensors_3d, dim=-1)  # (B, T, sum_D)
+                if self.smooth_option == "te_eef":
+                    ensembled = self.process_output_eef(full_action)
+                else:
+                    ensembled = self.process_output_eef_quat(full_action)
                 parts = torch.split(ensembled.squeeze(1), split_sizes, dim=-1)  # [(B, D), ...]
                 for k, part, is_np in zip(keys_3d, parts, is_np_flags):
                     unnormalized_action[k] = part.numpy() if is_np else part
