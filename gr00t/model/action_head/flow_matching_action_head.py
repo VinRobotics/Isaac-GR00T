@@ -301,7 +301,11 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     rot_type: str = field(
         default="quaternion", metadata={"help": "Define rot type: quaternion, euler_angles"}
     )
-    
+
+    state_rot_type: str = field(
+        default="", metadata={"help": "Rotation type for state observations (if different from rot_type). Empty string means use rot_type."}
+    )
+
     rel_action: bool = field(
         default=False, metadata={"help": "Whether to predict actions in relative (velocity) space instead of absolute state space."}
     )
@@ -347,7 +351,11 @@ class FlowmatchingActionHead(nn.Module):
 
         # equi state
         self.rel_action = self.config.rel_action
-        self.ee_dim = 7 if self.config.rot_type == "quaternion" else 6
+        _action_rot = self.config.rot_type
+        _state_rot = self.config.state_rot_type if getattr(self.config, "state_rot_type", "") else _action_rot
+        self.action_ee_dim = 7 if _action_rot == "quaternion" else 6
+        self.state_ee_dim = 7 if _state_rot == "quaternion" else 6
+        self.ee_dim = self.action_ee_dim  # backward compat
         self.real_dim = 12 if self.rel_action else 9
         self.group = gspaces.no_base_space(CyclicGroup(self.n_group))
         self.state_in_type = self.getJointFieldType(is_action=False)
@@ -428,12 +436,13 @@ class FlowmatchingActionHead(nn.Module):
     
     def getJointFieldType(self, is_action):
         max_dim = self.config.max_action_dim if is_action else self.config.max_state_dim
+        ee_dim = self.action_ee_dim if is_action else self.state_ee_dim
         return enn.FieldType(
             self.group,
             self.num_hand * 4 * [self.group.irrep(1)] # pos xy, rot 6, left and right
-            + (max_dim - ((self.ee_dim - 1) * self.num_hand)) * [self.group.trivial_repr], # gripper 1, z from both ee is 2
+            + (max_dim - ((ee_dim - 1) * self.num_hand)) * [self.group.trivial_repr], # gripper 1, z from both ee is 2
         )
-        
+
     def getActionRelFieldType(self, is_action):
         max_dim = self.config.max_action_dim if is_action else self.config.max_state_dim
 
@@ -447,17 +456,17 @@ class FlowmatchingActionHead(nn.Module):
             + 3 * [self.group.trivial_repr] # rho01, rho02, rho03: 3 dims
         )
 
-        # Remaining trivials: z per hand + hand_state = max_dim - (ee_dim-1)*num_hand
+        # Remaining trivials: z per hand + hand_state = max_dim - (action_ee_dim-1)*num_hand
         return enn.FieldType(
             self.group,
             self.num_hand * per_hand
-            + (max_dim - (self.ee_dim - 1) * self.num_hand) * [self.group.trivial_repr]
+            + (max_dim - (self.action_ee_dim - 1) * self.num_hand) * [self.group.trivial_repr]
         )
         
     def getJointGeometricTensor(self, state, is_action):
         def getJointGeometricTensorEachHand(ee_state):
             ee_pos = ee_state[:, :, :3] # (bs, t, 3)
-            ee_quat = ee_state[:, :, 3:self.ee_dim] # (bs, t, 4)
+            ee_quat = ee_state[:, :, 3:self.state_ee_dim] # (bs, t, 4 or 3)
             ee_rot = self.get6DRotation(ee_quat)
             pos_xy = ee_pos[:, :, 0:2] # 2
             pos_z = ee_pos[:, :, 2:3] # 1
@@ -475,36 +484,36 @@ class FlowmatchingActionHead(nn.Module):
             )
             return joint_features, pos_z
         if self.num_hand == 2:
-            l_ee_state = state[:, :, :self.ee_dim] # bs, t, 7 
-            r_ee_state = state[:, :, self.ee_dim:self.ee_dim*2] # bs, t, 7  
-            hand_state = state[:, :, self.ee_dim*2:]
-            
+            l_ee_state = state[:, :, :self.state_ee_dim]
+            r_ee_state = state[:, :, self.state_ee_dim:self.state_ee_dim*2]
+            hand_state = state[:, :, self.state_ee_dim*2:]
+
             l_tf, l_pos_z = getJointGeometricTensorEachHand(l_ee_state)
             r_tf, r_pos_z = getJointGeometricTensorEachHand(r_ee_state)
 
             state_features = torch.cat([l_tf, r_tf, l_pos_z, r_pos_z, hand_state], dim=-1)
- 
+
         else:
-            l_ee_state = state[:, :, :self.ee_dim] # bs, t, 7 
-            hand_state = state[:, :, self.ee_dim:]
-            
+            l_ee_state = state[:, :, :self.state_ee_dim]
+            hand_state = state[:, :, self.state_ee_dim:]
+
             l_tf, l_pos_z = getJointGeometricTensorEachHand(l_ee_state)
-            state_features = torch.cat([l_tf, l_pos_z, hand_state], dim=-1)      
+            state_features = torch.cat([l_tf, l_pos_z, hand_state], dim=-1)
         state_features = einops.rearrange(state_features, 'b t c -> (b t) c')
         return enn.GeometricTensor(state_features, self.getJointFieldType(is_action))
     
     def getActionGT(self, action):
         def getActionGTRelEachHand(ee_state):
             ee_pos = ee_state[:, :, :3] # (bs, t, 3)
-            ee_quat = ee_state[:, :, 3:self.ee_dim] # (bs, t, 4)
+            ee_quat = ee_state[:, :, 3:self.action_ee_dim] # (bs, t, 4 or 3)
             ee_rho = self.getMatrixRotation(ee_quat).reshape(*ee_quat.shape[:2], 9) # (bs, t, 9)
             pos_xy = ee_pos[:, :, 0:2] # 2
             pos_z = ee_pos[:, :, 2:3] # 1
 
             ee_rho = torch.matmul(self.p.to(ee_state.device), ee_rho.transpose(-1, -2)).transpose(-1, -2) # (bs, t, 9)
-            
+
             ee_rho01, ee_rho02, ee_rho03, ee_rho11, ee_rho12, ee_rho2 = ee_rho[:, :, 0:1], ee_rho[:, :, 1:2], ee_rho[:, :, 2:3], ee_rho[:, :, 3:5], ee_rho[:, :, 5:7], ee_rho[:, :, 7:9]
-            
+
             transform_features = torch.cat(
                 [
                     ee_rho2, #2
@@ -516,13 +525,13 @@ class FlowmatchingActionHead(nn.Module):
                     ee_rho03,
                 ],
                 dim=-1
-            ) 
-            
+            )
+
             return transform_features, pos_z
-        
+
         def getActionGTEachHand(ee_state):
             ee_pos = ee_state[:, :, :3] # (bs, t, 3)
-            ee_quat = ee_state[:, :, 3:self.ee_dim] # (bs, t, 4)
+            ee_quat = ee_state[:, :, 3:self.action_ee_dim] # (bs, t, 4 or 3)
             ee_rot = self.get6DRotation(ee_quat)
             pos_xy = ee_pos[:, :, 0:2] # 2
             pos_z = ee_pos[:, :, 2:3] # 1
@@ -541,18 +550,18 @@ class FlowmatchingActionHead(nn.Module):
             return transform_features, pos_z
         action_transform = getActionGTRelEachHand if self.rel_action else getActionGTEachHand
         if self.num_hand == 2:
-            l_ee_state = action[:, :, :self.ee_dim] # bs, t, 7 
-            r_ee_state = action[:, :, self.ee_dim:self.ee_dim*2] # bs, t, 7  
-            hand_state = action[:, :, self.ee_dim*2:]
-            
+            l_ee_state = action[:, :, :self.action_ee_dim]
+            r_ee_state = action[:, :, self.action_ee_dim:self.action_ee_dim*2]
+            hand_state = action[:, :, self.action_ee_dim*2:]
+
             l_tf, l_pos_z = action_transform(l_ee_state)
             r_tf, r_pos_z = action_transform(r_ee_state)
 
             state_features = torch.cat([l_tf, r_tf, l_pos_z, r_pos_z, hand_state], dim=-1)
         else:
-            l_ee_state = action[:, :, :self.ee_dim] # bs, t, 7 
-            hand_state = action[:, :, self.ee_dim:]
-            
+            l_ee_state = action[:, :, :self.action_ee_dim]
+            hand_state = action[:, :, self.action_ee_dim:]
+
             l_tf, l_pos_z = action_transform(l_ee_state)
             state_features = torch.cat([l_tf, l_pos_z, hand_state], dim=-1)
         return state_features
@@ -618,7 +627,7 @@ class FlowmatchingActionHead(nn.Module):
             return self.axisangle_to_matrix.forward(quat)
     
     def getQuaternionFromMatrix(self, matrix):
-        if self.ee_dim == 7:
+        if self.action_ee_dim == 7:
             quat = self.quaternion_to_matrix.inverse(matrix)
             return quat[:, :, [1, 2, 3, 0]]  # xyzw
         else:
@@ -627,12 +636,12 @@ class FlowmatchingActionHead(nn.Module):
     def get6DRotation(self, quat):
         # data is in xyzw, but rotation transformer takes wxyz
         if quat.shape[-1] == 4:
-            return self.quaternion_to_sixd.forward(quat[:, :, [3, 0, 1, 2]]) 
+            return self.quaternion_to_sixd.forward(quat[:, :, [3, 0, 1, 2]])
         else:
             return self.axisangle_to_sixd.forward(quat)
-    
+
     def getQuaternionFrom6D(self, rot_6d):
-        if self.ee_dim == 7:
+        if self.action_ee_dim == 7:
             quat = self.quaternion_to_sixd.inverse(rot_6d)
             return quat[:, :, [1, 2, 3, 0]]  # xyzw
         else:
