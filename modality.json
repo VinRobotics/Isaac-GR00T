@@ -1,0 +1,40 @@
+{
+    "state": {
+        "x": {"start": 0, "end": 1},
+        "y": {"start": 1, "end": 2},
+        "z": {"start": 2, "end": 3},
+        "qx": {"start": 3, "end": 4},
+        "qy": {"start": 4, "end": 5},
+        "qz": {"start": 5, "end": 6},
+        "qw": {"start": 6, "end": 7},
+        "gripper_left": {"start": 7, "end": 8},
+        "gripper_right": {"start": 8, "end": 9}
+    },
+    "action": {
+        "x": {"start": 0, "end": 1},
+        "y": {"start": 1, "end": 2},
+        "z": {"start": 2, "end": 3},
+        "ax": {"start": 3, "end": 4},
+        "ay": {"start": 4, "end": 5},
+        "az": {"start": 5, "end": 6},
+        "gripper": {"start": 6, "end": 7},
+        "base_control": {"start": 7, "end": 11},
+        "mode": {"start": 11, "end": 12}
+    },
+    "video": {
+        "right_image": {
+            "original_key": "right_image"
+        },
+        "left_image": {
+            "original_key": "left_image"
+        },
+        "wrist_image": {
+            "original_key": "wrist_image"
+        }
+    },
+    "annotation": {
+        "human.action.task_description": {
+            "original_key": "task_index"
+        }
+    }
+}
