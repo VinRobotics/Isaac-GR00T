@@ -18,7 +18,7 @@
 #      np.max(all_rewards[i]) criterion.
 
 import sys
-sys.path.insert(0, "/home/locht1/gr00t_equi_fa")
+sys.path.insert(0, "/mnt/data/sftp/data/locht1/workspace/gr00t_equi_fa_simpler_fuse/")
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/mimicgen_evaluation/mimicgen")
 
 import collections
