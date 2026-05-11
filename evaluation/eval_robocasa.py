@@ -167,7 +167,7 @@ class Gr00tClientPolicy:
                 embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
                 modality_config=data_config.modality_config(),
                 modality_transform=data_config.transform(),
-                denoising_steps=10, # 8
+                denoising_steps=8, # 8
                 device="cuda",
             )
             return policy
@@ -193,15 +193,15 @@ class Gr00tClientPolicy:
             "video.right_image": np.expand_dims(right_img, axis=0),
             "video.left_image": np.expand_dims(left_img, axis=0),
             "video.wrist_image": np.expand_dims(wrist_img, axis=0),
-            "state.x": np.expand_dims(obs["robot0_base_to_eef_pos"][0], axis=0),
-            "state.y": np.expand_dims(obs["robot0_base_to_eef_pos"][1], axis=0),
-            "state.z": np.expand_dims(obs["robot0_base_to_eef_pos"][2], axis=0),
-            "state.qx": np.expand_dims(obs["robot0_base_to_eef_quat"][0], axis=0),
-            "state.qy": np.expand_dims(obs["robot0_base_to_eef_quat"][1], axis=0),
-            "state.qz": np.expand_dims(obs["robot0_base_to_eef_quat"][2], axis=0),
-            "state.qw": np.expand_dims(obs["robot0_base_to_eef_quat"][3], axis=0),
-            "state.gripper_left": np.expand_dims(obs["robot0_gripper_qpos"][0], axis=0),
-            "state.gripper_right": np.expand_dims(obs["robot0_gripper_qpos"][1], axis=0),
+            "state.x": np.array([[obs["robot0_base_to_eef_pos"][0]]]),
+            "state.y": np.array([[obs["robot0_base_to_eef_pos"][1]]]),
+            "state.z": np.array([[obs["robot0_base_to_eef_pos"][2]]]),
+            "state.qx": np.array([[obs["robot0_base_to_eef_quat"][0]]]),
+            "state.qy": np.array([[obs["robot0_base_to_eef_quat"][1]]]),
+            "state.qz": np.array([[obs["robot0_base_to_eef_quat"][2]]]),
+            "state.qw": np.array([[obs["robot0_base_to_eef_quat"][3]]]),
+            "state.gripper_left": np.array([[obs["robot0_gripper_qpos"][0]]]),
+            "state.gripper_right": np.array([[obs["robot0_gripper_qpos"][1]]]),
             "annotation.human.action.task_description": [lang]
         }
         
