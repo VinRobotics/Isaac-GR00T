@@ -2,7 +2,7 @@ import os
 import sys 
 sys.path.append("/mnt/data/sftp/data/locht1/workspace/robosuite")
 sys.path.append("/mnt/data/sftp/data/locht1/workspace/robocasa")
-sys.path.insert(0, "/home/locht1/gr00t_rtc")
+sys.path.insert(0, "/mnt/data/sftp/data/locht1/workspace/gr00t_equi_fa_robocasa")  # for gr00t imports
 
 import collections
 import dataclasses
