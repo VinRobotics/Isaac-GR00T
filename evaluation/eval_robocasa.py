@@ -167,7 +167,7 @@ class Gr00tClientPolicy:
                 embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
                 modality_config=data_config.modality_config(),
                 modality_transform=data_config.transform(),
-                denoising_steps=10, # 8
+                denoising_steps=8, # 8
                 device="cuda",
             )
             return policy
@@ -193,15 +193,15 @@ class Gr00tClientPolicy:
             "video.right_image": np.expand_dims(right_img, axis=0),
             "video.left_image": np.expand_dims(left_img, axis=0),
             "video.wrist_image": np.expand_dims(wrist_img, axis=0),
-            "state.x": np.expand_dims(obs["robot0_base_to_eef_pos"][0], axis=0),
-            "state.y": np.expand_dims(obs["robot0_base_to_eef_pos"][1], axis=0),
-            "state.z": np.expand_dims(obs["robot0_base_to_eef_pos"][2], axis=0),
-            "state.qx": np.expand_dims(obs["robot0_base_to_eef_quat"][0], axis=0),
-            "state.qy": np.expand_dims(obs["robot0_base_to_eef_quat"][1], axis=0),
-            "state.qz": np.expand_dims(obs["robot0_base_to_eef_quat"][2], axis=0),
-            "state.qw": np.expand_dims(obs["robot0_base_to_eef_quat"][3], axis=0),
-            "state.gripper_left": np.expand_dims(obs["robot0_gripper_qpos"][0], axis=0),
-            "state.gripper_right": np.expand_dims(obs["robot0_gripper_qpos"][1], axis=0),
+            "state.x": np.array([[obs["robot0_base_to_eef_pos"][0]]]),
+            "state.y": np.array([[obs["robot0_base_to_eef_pos"][1]]]),
+            "state.z": np.array([[obs["robot0_base_to_eef_pos"][2]]]),
+            "state.qx": np.array([[obs["robot0_base_to_eef_quat"][0]]]),
+            "state.qy": np.array([[obs["robot0_base_to_eef_quat"][1]]]),
+            "state.qz": np.array([[obs["robot0_base_to_eef_quat"][2]]]),
+            "state.qw": np.array([[obs["robot0_base_to_eef_quat"][3]]]),
+            "state.gripper_left": np.array([[obs["robot0_gripper_qpos"][0]]]),
+            "state.gripper_right": np.array([[obs["robot0_gripper_qpos"][1]]]),
             "annotation.human.action.task_description": [lang]
         }
         
@@ -289,8 +289,8 @@ def eval_robocasa(args: Args, task:str=None) -> None:
         # replay_images = []
         
         # replay_images_wrist = []
-        # replay_images_left = []
-        # replay_images_right = []
+        replay_images_left = []
+        replay_images_right = []
 
         logging.info(f"Starting episode {task_episodes+1}...| Task description: {task_lang}")
         while t < args.horizon + args.num_steps_wait:
@@ -316,11 +316,11 @@ def eval_robocasa(args: Args, task:str=None) -> None:
                 # replay_img_wrist = obs["robot0_eye_in_hand_image"][::-1, :, :]  
                 # replay_images_wrist.append(to_video_frame(replay_img_wrist))
             
-                # replay_img_left = obs["robot0_agentview_left_image"][::-1, :, :]  
-                # replay_images_left.append(to_video_frame(replay_img_left))
+                replay_img_left = obs["robot0_agentview_left_image"][::-1, :, :]  
+                replay_images_left.append(to_video_frame(replay_img_left))
                 
-                # replay_img_right = obs["robot0_agentview_right_image"][::-1, :, :]  
-                # replay_images_right.append(to_video_frame(replay_img_right))
+                replay_img_right = obs["robot0_agentview_right_image"][::-1, :, :]  
+                replay_images_right.append(to_video_frame(replay_img_right))
             
                 if done:
                     task_successes += 1
@@ -346,16 +346,16 @@ def eval_robocasa(args: Args, task:str=None) -> None:
         #     [np.asarray(x) for x in replay_images_wrist],
         #     fps=10,
         # )
-        # imageio.mimwrite(
-        #     pathlib.Path(args.video_out_path) / f"rollout_seed_{args.seed}_trial_{episode_idx}_left_{task_lang}_{suffix}.mp4",
-        #     [np.asarray(x) for x in replay_images_left],
-        #     fps=10,
-        # )
-        # imageio.mimwrite(
-        #     pathlib.Path(args.video_out_path) / f"rollout_seed_{args.seed}_trial_{episode_idx}_right_{task_lang}_{suffix}.mp4",
-        #     [np.asarray(x) for x in replay_images_right],
-        #     fps=10,
-        # )
+        imageio.mimwrite(
+            pathlib.Path(args.video_out_path) / f"rollout_seed_{args.seed}_trial_{episode_idx}_left_{task_lang}_{suffix}.mp4",
+            [np.asarray(x) for x in replay_images_left],
+            fps=20,
+        )
+        imageio.mimwrite(
+            pathlib.Path(args.video_out_path) / f"rollout_seed_{args.seed}_trial_{episode_idx}_right_{task_lang}_{suffix}.mp4",
+            [np.asarray(x) for x in replay_images_right],
+            fps=20,
+        )
         # ================================================================================
 
         # Log current results
