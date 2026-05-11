@@ -289,8 +289,8 @@ def eval_robocasa(args: Args, task:str=None) -> None:
         # replay_images = []
         
         # replay_images_wrist = []
-        # replay_images_left = []
-        # replay_images_right = []
+        replay_images_left = []
+        replay_images_right = []
 
         logging.info(f"Starting episode {task_episodes+1}...| Task description: {task_lang}")
         while t < args.horizon + args.num_steps_wait:
@@ -316,11 +316,11 @@ def eval_robocasa(args: Args, task:str=None) -> None:
                 # replay_img_wrist = obs["robot0_eye_in_hand_image"][::-1, :, :]  
                 # replay_images_wrist.append(to_video_frame(replay_img_wrist))
             
-                # replay_img_left = obs["robot0_agentview_left_image"][::-1, :, :]  
-                # replay_images_left.append(to_video_frame(replay_img_left))
+                replay_img_left = obs["robot0_agentview_left_image"][::-1, :, :]  
+                replay_images_left.append(to_video_frame(replay_img_left))
                 
-                # replay_img_right = obs["robot0_agentview_right_image"][::-1, :, :]  
-                # replay_images_right.append(to_video_frame(replay_img_right))
+                replay_img_right = obs["robot0_agentview_right_image"][::-1, :, :]  
+                replay_images_right.append(to_video_frame(replay_img_right))
             
                 if done:
                     task_successes += 1
@@ -346,16 +346,16 @@ def eval_robocasa(args: Args, task:str=None) -> None:
         #     [np.asarray(x) for x in replay_images_wrist],
         #     fps=10,
         # )
-        # imageio.mimwrite(
-        #     pathlib.Path(args.video_out_path) / f"rollout_seed_{args.seed}_trial_{episode_idx}_left_{task_lang}_{suffix}.mp4",
-        #     [np.asarray(x) for x in replay_images_left],
-        #     fps=10,
-        # )
-        # imageio.mimwrite(
-        #     pathlib.Path(args.video_out_path) / f"rollout_seed_{args.seed}_trial_{episode_idx}_right_{task_lang}_{suffix}.mp4",
-        #     [np.asarray(x) for x in replay_images_right],
-        #     fps=10,
-        # )
+        imageio.mimwrite(
+            pathlib.Path(args.video_out_path) / f"rollout_seed_{args.seed}_trial_{episode_idx}_left_{task_lang}_{suffix}.mp4",
+            [np.asarray(x) for x in replay_images_left],
+            fps=20,
+        )
+        imageio.mimwrite(
+            pathlib.Path(args.video_out_path) / f"rollout_seed_{args.seed}_trial_{episode_idx}_right_{task_lang}_{suffix}.mp4",
+            [np.asarray(x) for x in replay_images_right],
+            fps=20,
+        )
         # ================================================================================
 
         # Log current results
