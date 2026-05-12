@@ -2761,6 +2761,144 @@ class EquiRelRobocasa_1cam_Config(BaseDataConfig):
         ]
 
         return ComposedModalityTransform(transforms=transforms)
+    
+    
+class EquiRelRobocasa_1cam_2_Config(BaseDataConfig):
+    video_keys = ["video.left_image", "video.right_image", "video.wrist_image"]
+    # video.right_image (index 0) = right camera → equivariant FA
+    # video.left_image (index 1) = left camera → equivariant FA
+    # video.wrist_image (index 2) = wrist camera → VL only, skipped from equi_vision_embs
+    state_keys = [
+        "state.x",
+        "state.y",
+        "state.z",
+        "state.qx",
+        "state.qy",
+        "state.qz",
+        "state.qw",
+        "state.gripper_left",
+        "state.gripper_right",
+    ]
+    action_keys = [
+        "action.x",
+        "action.y",
+        "action.z",
+        "action.ax",
+        "action.ay",
+        "action.az",
+        "action.gripper",
+        "action.base_control",
+        "action.mode",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    state_indices = [0]
+    action_indices = list(range(16))
+    num_hand = 1
+    rot_type = "axis_angle"       # action rotation format
+    state_rot_type = "quaternion"  # state observations are quaternion, actions are axis_angle
+    rel_action = True
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """
+        Backbone rotation config for equivariant frame averaging.
+
+        - num_images_per_sample=2: Eagle VL/LLM pass sees BOTH cameras (top + wrist).
+        - rotate_image_indices=[0]: Only the top/head camera (index 0) is rotated for FA.
+          The wrist camera (index 1) is skipped from equi_vision_embs entirely.
+
+        Result:
+          backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only (equivariant)
+          backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
+        """
+        return {
+            "num_images_per_sample": 3,
+            "rotate_image_indices": [0],  # Only the top/head camera is rotated for FA
+        }
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.x": "min_max",
+                    "state.y": "min_max",
+                    "state.z": "min_max",
+                    "state.gripper_left": "min_max",
+                    "state.gripper_right": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
+                },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.x": "min_max",
+                    "action.y": "min_max",
+                    "action.z": "min_max",
+                    "action.gripper": "min_max",
+                    "action.base_control": "min_max",
+                    "action.mode": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
+                },
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+                num_hand=self.num_hand,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
 ##############################################################################################
     
 
@@ -2795,4 +2933,5 @@ DATA_CONFIG_MAP = {
     "equi_mimicgen": EquiMimicgenConfig(),
     "equi_rel_robocasa": EquiRelRobocasaConfig(),
     "equi_rel_robocasa_1cam": EquiRelRobocasa_1cam_Config(),
+    "equi_rel_robocasa_1cam_2": EquiRelRobocasa_1cam_2_Config(),
 }
