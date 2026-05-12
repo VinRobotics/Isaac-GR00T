@@ -411,8 +411,8 @@ def eval_robocasa_all(args:Args):
     print("🎯 ROBOCASA Simulation Evaluation")
     print("=" * 80)
     tasks = [
-        # 'PnPCabToCounter',
-        # 'PnPCounterToCab',
+        'PnPCabToCounter',
+        'PnPCounterToCab',
         'CoffeeSetupMug',
         'TurnOffStove',
         'TurnOnMicrowave'
