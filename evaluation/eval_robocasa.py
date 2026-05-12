@@ -420,7 +420,7 @@ def eval_robocasa_all(args:Args):
     ctx = mp.get_context("spawn")
     results = dict()
     
-    with ProcessPoolExecutor(max_workers=2, mp_context=ctx) as pool:
+    with ProcessPoolExecutor(max_workers=len(tasks), mp_context=ctx) as pool:
         futures = {pool.submit(eval_robocasa, args, task): task for task in tasks}
         for fut in as_completed(futures):
             task = futures[fut]
