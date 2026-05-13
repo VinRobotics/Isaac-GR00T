@@ -297,8 +297,11 @@ def eval_mimicgen_all(args: Args) -> None:
     print("=" * 80)
 
     all_tasks = args.tasks if args.tasks else list(TASK_TO_ENV.keys())
-    mid = len(all_tasks) // 2
-    task_splits = [all_tasks[:mid], all_tasks[mid:]]
+    if len(all_tasks) == 1:
+        task_splits = [all_tasks]
+    else:
+        mid = len(all_tasks) // 2
+        task_splits = [all_tasks[:mid], all_tasks[mid:]]
 
     ctx = mp.get_context("spawn")
     results = dict()
