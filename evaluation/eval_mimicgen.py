@@ -297,6 +297,7 @@ def eval_mimicgen_all(args: Args) -> None:
     print("=" * 80)
 
     all_tasks = args.tasks if args.tasks else list(TASK_TO_ENV.keys())
+    all_tasks = [t.replace("_", " ") for t in all_tasks]
     if len(all_tasks) == 1:
         task_splits = [all_tasks]
     else:
