@@ -859,10 +859,11 @@ class FlowmatchingActionHead(nn.Module):
         # Embed state.
         B, T, _ = action_input.state.shape
         state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
-        state_features = self.state_encoder(state_input, embodiment_id)
+        # getJointGeometricTensor flattens [B,T,D] -> [B*T,D]; repeat embodiment_id to match
+        state_features = self.state_encoder(state_input, embodiment_id.repeat_interleave(T))
         state_features = state_features.tensor
         state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=B, t=T)
-        
+
         # Embed noised action trajectory.
         actions = action_input.action
         
@@ -971,7 +972,8 @@ class FlowmatchingActionHead(nn.Module):
         # Embed state.
         B, T, _ = action_input.state.shape
         state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
-        state_features = self.state_encoder(state_input, embodiment_id)
+        # getJointGeometricTensor flattens [B,T,D] -> [B*T,D]; repeat embodiment_id to match
+        state_features = self.state_encoder(state_input, embodiment_id.repeat_interleave(T))
         state_features = state_features.tensor
         state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=B, t=T)
 
