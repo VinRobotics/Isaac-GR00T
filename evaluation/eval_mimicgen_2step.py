@@ -4,7 +4,7 @@
 # At the very first step of each episode the previous frame is duplicated (zero-order hold).
 
 import sys
-sys.path.insert(0, "/home/locht1/gr00t_equi_fa")
+sys.path.insert(0, "/home/locht1/gr00t_equi_dit")
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/mimicgen_evaluation/mimicgen")
 
 import dataclasses
