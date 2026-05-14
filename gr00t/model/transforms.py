@@ -181,7 +181,7 @@ class GR00TTransform(InvertibleModalityTransform):
         images = batch["images"]  # [V, T, C, H, W]
         images.shape[0]
 
-        np_images = rearrange(images, "v t c h w -> (t v) c h w")
+        np_images = rearrange(images, "v t c h w -> (v t) c h w")
         text_content = []
 
         # handle language
@@ -437,20 +437,20 @@ class GR00TTransformFA(GR00TTransform):
         else:
             rotate_indices = self.rotate_image_indices
         
-        # Rearrange to [T*V, C, H, W] for processing
-        np_images = rearrange(images, "v t c h w -> (t v) c h w")  # [T*V, C, H, W]
-        
+        # Rearrange to [V*T, C, H, W] for processing: camera-major so equi cameras are contiguous
+        np_images = rearrange(images, "v t c h w -> (v t) c h w")  # [V*T, C, H, W]
+
         # Ensure rotation angles are initialized
         if self._rotation_angles is None:
             self._rotation_angles = np.linspace(0, 2 * np.pi, self.n_group + 1)[:-1]
-        
+
         # Create N rotated versions
         all_rotated_images = []
         for rot_idx, angle in enumerate(self._rotation_angles):
             rotated_batch = []
             for img_idx, img in enumerate(np_images):
-                # Determine the view index (img_idx % V gives the view for each timestep)
-                view_idx = img_idx % V
+                # With (v t) ordering: camera index is img_idx // T
+                view_idx = img_idx // T
                 
                 if view_idx in rotate_indices:
                     # Apply rotation with POSITIVE angle for counter-clockwise rotation

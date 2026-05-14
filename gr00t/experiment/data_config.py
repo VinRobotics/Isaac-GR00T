@@ -68,25 +68,31 @@ class BaseDataConfig(ABC):
     def get_rotation_config(self) -> dict:
         """
         Returns configuration for image rotation in the backbone.
-        
+
+        With (v t) image ordering, all T timesteps of each camera are contiguous.
+        Camera c occupies slots [c*T .. c*T+T-1] in the flattened pixel_values.
+
         Returns:
             dict with:
-                - num_images_per_sample: number of video keys (images per sample)
-                - rotate_image_indices: list of indices for images that should be rotated
+                - num_images_per_sample: V * T (cameras × timesteps)
+                - rotate_image_indices: all time-slots belonging to equivariant cameras
         """
-        num_images = len(self.video_keys)
+        V = len(self.video_keys)
+        T = len(getattr(self, "observation_indices", [0]))
+
         if self.rotate_video_keys is None:
-            # Rotate all images
-            rotate_indices = list(range(num_images))
+            equi_cam_indices = list(range(V))
         else:
-            # Only rotate specified video keys
-            rotate_indices = [
-                i for i, key in enumerate(self.video_keys) 
+            equi_cam_indices = [
+                i for i, key in enumerate(self.video_keys)
                 if key in self.rotate_video_keys
             ]
-        
+
+        # Each equi camera c contributes T consecutive slots: c*T, c*T+1, ..., c*T+T-1
+        rotate_indices = [c * T + t for c in equi_cam_indices for t in range(T)]
+
         return {
-            "num_images_per_sample": num_images,
+            "num_images_per_sample": V * T,
             "rotate_image_indices": rotate_indices,
         }
 
@@ -1935,6 +1941,135 @@ class EquiRelMimicgenConfig(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 ##############################################################################################
 
+class EquiRelMimicgen2StepConfig(BaseDataConfig):
+    video_keys = ["video.image", "video.wrist_image"]
+    # video.image (index 0) = top/head camera → equivariant FA
+    # video.wrist_image (index 1) = wrist camera → VL only, skipped from equi_vision_embs
+    state_keys = [
+        "state.x",
+        "state.y",
+        "state.z",
+        "state.roll",
+        "state.pitch",
+        "state.yaw",
+        "state.gripper",
+    ]
+    action_keys = [
+        "action.x",
+        "action.y",
+        "action.z",
+        "action.roll",
+        "action.pitch",
+        "action.yaw",
+        "action.gripper",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [-1, 0]
+    state_indices = [-1, 0]
+    action_indices = list(range(16))
+    num_hand = 1
+    rot_type="axis_angle"
+    rel_action=True
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """
+        Backbone rotation config for equivariant frame averaging.
+
+        - num_images_per_sample=2: Eagle VL/LLM pass sees BOTH cameras (top + wrist).
+        - rotate_image_indices=[0]: Only the top/head camera (index 0) is rotated for FA.
+          The wrist camera (index 1) is skipped from equi_vision_embs entirely.
+
+        Result:
+          backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only (equivariant)
+          backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
+        """
+        return {
+            "num_images_per_sample": 4,
+            "rotate_image_indices": [0, 1],
+        }
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.x": "min_max",
+                    "state.y": "min_max",
+                    "state.z": "min_max",
+                    "state.gripper": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
+                },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.x": "min_max",
+                    "action.y": "min_max",
+                    "action.z": "min_max",
+                    "action.gripper": "min_max",
+                    # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
+                },
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+                num_hand=self.num_hand,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+##############################################################################################
+
 class EquiMimicgenConfig(BaseDataConfig):
     video_keys = ["video.image", "video.wrist_image"]
     # video.image (index 0) = top/head camera → equivariant FA
@@ -2516,4 +2651,5 @@ DATA_CONFIG_MAP = {
     "equi_aloha_1hand": EquiALOHA_1Hand_Config(),
     "equi_aloha_2hand": EquiALOHA_2Hand_Config(),
     "equi_mimicgen": EquiMimicgenConfig(),
+    "equi_rel_mimicgen_2step": EquiRelMimicgen2StepConfig(),
 }
