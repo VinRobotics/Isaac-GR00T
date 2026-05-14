@@ -180,7 +180,7 @@ class GR00TTransform(InvertibleModalityTransform):
         images = batch["images"]  # [V, T, C, H, W]
         images.shape[0]
 
-        np_images = rearrange(images, "v t c h w -> (t v) c h w")
+        np_images = rearrange(images, "v t c h w -> (v t) c h w")
         text_content = []
 
         # handle language
