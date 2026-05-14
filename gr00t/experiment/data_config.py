@@ -2807,6 +2807,5 @@ DATA_CONFIG_MAP = {
     "equi_aloha_1hand": EquiALOHA_1Hand_Config(),
     "equi_aloha_2hand": EquiALOHA_2Hand_Config(),
     "equi_aloha_1hand_rel": EquiALOHA_1Hand_rel_Config(),
-    "equi_mimicgen": EquiMimicgenConfig(),
-    "equi_rel_robocasa_1cam": EquiRelRobocasa_1cam_Config(),
+    "equi_aloha_1hand_quat": EquiALOHA_1Hand_Quat_Config(),
 }
