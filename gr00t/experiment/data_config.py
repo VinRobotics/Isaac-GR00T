@@ -2639,13 +2639,13 @@ class EquiALOHA_1Hand_rel_Config(BaseDataConfig):
         ]
 
         return ComposedModalityTransform(transforms=transforms)
+
 ##############################################################################################
 
-class EquiRelRobocasa_1cam_Config(BaseDataConfig):
-    video_keys = ["video.right_image", "video.left_image", "video.wrist_image"]
-    # video.right_image (index 0) = right camera → equivariant FA
-    # video.left_image (index 1) = left camera → equivariant FA
-    # video.wrist_image (index 2) = wrist camera → VL only, skipped from equi_vision_embs
+class EquiALOHA_1Hand_Quat_Config(BaseDataConfig):
+    video_keys = ["video.image", "video.wrist_image"]
+    # video.image (index 0) = top/head camera → equivariant FA
+    # video.wrist_image (index 1) = wrist camera → VL only, skipped from equi_vision_embs
     state_keys = [
         "state.x",
         "state.y",
@@ -2654,28 +2654,25 @@ class EquiRelRobocasa_1cam_Config(BaseDataConfig):
         "state.qy",
         "state.qz",
         "state.qw",
-        "state.gripper_left",
-        "state.gripper_right",
+        "state.gripper",
     ]
     action_keys = [
         "action.x",
         "action.y",
         "action.z",
-        "action.ax",
-        "action.ay",
-        "action.az",
+        "action.qx",
+        "action.qy",
+        "action.qz",
+        "action.qw",
         "action.gripper",
-        "action.base_control",
-        "action.mode",
     ]
     language_keys = ["annotation.human.action.task_description"]
     observation_indices = [0]
     state_indices = [0]
     action_indices = list(range(16))
     num_hand = 1
-    rot_type = "axis_angle"       # action rotation format
-    state_rot_type = "quaternion"  # state observations are quaternion, actions are axis_angle
-    rel_action = True
+    rot_type="quaternion"
+    rel_action=False
 
     def modality_config(self):
         video_modality = ModalityConfig(
@@ -2716,8 +2713,8 @@ class EquiRelRobocasa_1cam_Config(BaseDataConfig):
           backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
         """
         return {
-            "num_images_per_sample": 3,
-            "rotate_image_indices": [0],  # Only the top/head camera is rotated for FA
+            "num_images_per_sample": 2,
+            "rotate_image_indices": [0],
         }
 
     def transform(self):
@@ -2742,8 +2739,7 @@ class EquiRelRobocasa_1cam_Config(BaseDataConfig):
                     "state.x": "min_max",
                     "state.y": "min_max",
                     "state.z": "min_max",
-                    "state.gripper_left": "min_max",
-                    "state.gripper_right": "min_max",
+                    "state.gripper": "min_max",
                     # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
                 },
             ),
@@ -2756,8 +2752,6 @@ class EquiRelRobocasa_1cam_Config(BaseDataConfig):
                     "action.y": "min_max",
                     "action.z": "min_max",
                     "action.gripper": "min_max",
-                    "action.base_control": "min_max",
-                    "action.mode": "min_max",
                     # rx, ry, rz, rw are quaternion components (unit sphere) — not normalized
                 },
             ),
@@ -2777,6 +2771,10 @@ class EquiRelRobocasa_1cam_Config(BaseDataConfig):
         ]
 
         return ComposedModalityTransform(transforms=transforms)
+
+
+
+
 ##############################################################################################
     
 
