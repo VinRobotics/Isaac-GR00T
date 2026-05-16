@@ -168,6 +168,43 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+    # MimicGen in-training evaluation
+    mimicgen_task_eval: str = ""
+    """If set (e.g. 'square', 'stack', 'hammer_cleanup'), run a MimicGen rollout
+    on this task every `save_steps` steps and log the success rate. Mirrors
+    equidiff's rollout_every pattern. Empty string disables it."""
+
+    mimicgen_eval_num_trials: int = 50
+    """Total number of test episodes per eval cycle (parallelized across envs)."""
+
+    mimicgen_eval_n_envs: int = 0
+    """Number of parallel robosuite envs (CPU cap). 0 = auto = min(num_trials, batch_size).
+    Each env is single-threaded ≈ 1 CPU; set this to (allocated_cpus - 2) on the cluster.
+    Total trials still run; we chunk over n_envs (ceil(num_trials / n_envs) chunks)."""
+
+    mimicgen_eval_n_action_steps: int = 8
+    """Number of actions to execute per policy inference call (equidiff uses 8)."""
+
+    mimicgen_eval_denoising_steps: int = 4
+    """Denoising steps used by the action head during eval rollouts."""
+
+    mimicgen_eval_resolution: int = 84
+    """Camera resolution for the eval envs (matches MimicGen dataset default)."""
+
+    mimicgen_eval_seed: int = 100000
+    """Base seed for eval episodes. Default 100000 matches equidiff's
+    `test_start_seed` in mimicgen_rel.yaml — episode k uses seed (base + k),
+    so the 50 default trials run seeds 100000..100049 (identical to the
+    equidiff/MimicGen benchmark, success rates directly comparable)."""
+
+    mimicgen_eval_n_test_vis: int = 4
+    """Number of eval episodes to record as MP4 + upload to wandb.
+    Matches equidiff's `n_test_vis: 4`.  Records the first N episodes
+    (seeds 100000..100000+N-1).  Set 0 to disable video recording."""
+
+    mimicgen_eval_video_fps: int = 20
+    """FPS for the saved MP4 (robosuite control_freq = 20, so 20 = realtime)."""
+
 #####################################################################################
 # main training function
 #####################################################################################
@@ -401,7 +438,36 @@ def main(config: ArgsConfig):
         adapter_warmup_steps=config.adapter_warmup_steps,
     )
 
-    # 2.3 run experiment
+    # 2.3 optionally attach MimicGen in-training eval callback
+    if config.mimicgen_task_eval != "":
+        from gr00t.eval.mimicgen_eval import MimicgenEvalCallback
+
+        eval_cb = MimicgenEvalCallback(
+            task_name=config.mimicgen_task_eval,
+            modality_config=modality_configs,
+            modality_transform=transforms,
+            embodiment_tag=embodiment_tag,
+            exp_cfg_dir=experiment.exp_cfg_dir,
+            batch_size=config.batch_size,
+            num_trials=config.mimicgen_eval_num_trials,
+            n_envs_override=config.mimicgen_eval_n_envs,
+            n_action_steps=config.mimicgen_eval_n_action_steps,
+            denoising_steps=config.mimicgen_eval_denoising_steps,
+            resolution=config.mimicgen_eval_resolution,
+            seed=config.mimicgen_eval_seed,
+            n_test_vis=config.mimicgen_eval_n_test_vis,
+            video_fps=config.mimicgen_eval_video_fps,
+            output_dir=config.output_dir,
+        )
+        experiment.trainer.add_callback(eval_cb)
+        print(
+            f"Attached MimicgenEvalCallback for task='{config.mimicgen_task_eval}' "
+            f"(num_trials={config.mimicgen_eval_num_trials}, "
+            f"n_envs={eval_cb.n_envs}, "
+            f"every {config.save_steps} steps)"
+        )
+
+    # 2.4 run experiment
     experiment.train()
 
 
