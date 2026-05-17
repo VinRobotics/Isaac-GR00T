@@ -591,6 +591,8 @@ class MimicgenEvalCallback(TrainerCallback):
         # Only rank 0 runs eval (DDP).
         self._rank = int(os.environ.get("RANK", 0))
 
+        self._wandb_metrics_defined = False
+
     def _ensure_envs(self):
         if self._envs is None:
             print(
@@ -656,7 +658,19 @@ class MimicgenEvalCallback(TrainerCallback):
         try:
             import wandb  # type: ignore
             if getattr(wandb, "run", None) is not None:
+                # Bind mimicgen/eval/* metrics to the trainer's global_step axis.
+                # Passing step= to wandb.log() here would desync wandb's internal
+                # step counter from the HF Trainer's WandbCallback (which also
+                # logs with step=state.global_step), making train/* show up at
+                # wrong x positions.
+                if not self._wandb_metrics_defined:
+                    wandb.define_metric("train/global_step")
+                    wandb.define_metric(
+                        "mimicgen/eval/*", step_metric="train/global_step"
+                    )
+                    self._wandb_metrics_defined = True
                 payload: Dict[str, Any] = dict(metrics)
+                payload["train/global_step"] = global_step
                 for ep_idx, vid_path, ep_success in video_paths:
                     suffix = "success" if ep_success else "failure"
                     key = f"mimicgen/eval/{task_slug}/video_ep{ep_idx:02d}_{suffix}"
@@ -666,7 +680,7 @@ class MimicgenEvalCallback(TrainerCallback):
                         )
                     except Exception as ve:
                         print(f"[mimicgen_eval] wandb.Video failed for {vid_path}: {ve}")
-                wandb.log(payload, step=global_step)
+                wandb.log(payload)
         except Exception:
             pass
         # Also push the scalar into log_history so it shows up in trainer_state.json.
