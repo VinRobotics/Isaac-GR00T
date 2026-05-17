@@ -74,7 +74,12 @@ class ArgsConfig:
     """Whether to fine-tune the language model backbone."""
 
     tune_visual: bool = False
-    """Whether to fine-tune the vision tower."""
+    """Whether to tune the backbone's vision tower (SigLIP)."""
+
+    tune_visual_last_n_layers: int = 0
+    """If > 0 AND tune_visual=True, only the last N encoder layers of the
+    SigLIP vision tower (plus post-layernorm and mlp1) are trainable.
+    Use this to scale capacity without paying for full vision tower fine-tune."""
 
     tune_projector: bool = True
     """Whether to fine-tune the projector."""
@@ -300,6 +305,7 @@ def main(config: ArgsConfig):
         pretrained_model_name_or_path=config.base_model_path,
         tune_llm=config.tune_llm,  # backbone's LLM
         tune_visual=config.tune_visual,  # backbone's vision tower
+        tune_visual_last_n_layers=config.tune_visual_last_n_layers,
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
     )

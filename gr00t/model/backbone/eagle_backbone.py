@@ -38,11 +38,16 @@ class EagleBackbone(nn.Module):
         load_bf16: bool = False,
         eagle_path: str | None = None,
         project_to_dim: int = 1536,
+        tune_visual_last_n_layers: int = 0,
     ):
         """
         Args:
             tune_llm: whether to tune the LLM model (default: True)
             tune_visual: whether to tune the visual model (default: False)
+            tune_visual_last_n_layers: if > 0 AND tune_visual is True, only the
+                last N encoder layers of the SigLIP vision tower (plus the
+                post-encoder layernorm and the visual→LLM projector `mlp1`) are
+                trainable.  0 = full unfreeze (legacy behaviour).
         """
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
@@ -60,11 +65,17 @@ class EagleBackbone(nn.Module):
             self.eagle_model.language_model.model.layers.pop(-1)
 
         self.select_layer = select_layer
-        self.set_trainable_parameters(tune_llm, tune_visual)
+        self.set_trainable_parameters(tune_llm, tune_visual, tune_visual_last_n_layers)
 
-    def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
+    def set_trainable_parameters(
+        self,
+        tune_llm: bool,
+        tune_visual: bool,
+        tune_visual_last_n_layers: int = 0,
+    ):
         self.tune_llm = tune_llm
         self.tune_visual = tune_visual
+        self.tune_visual_last_n_layers = tune_visual_last_n_layers
         for p in self.parameters():
             p.requires_grad = True
         if not tune_llm:
@@ -72,6 +83,25 @@ class EagleBackbone(nn.Module):
         if not tune_visual:
             self.eagle_model.vision_model.requires_grad_(False)
             self.eagle_model.mlp1.requires_grad_(False)
+        elif tune_visual_last_n_layers > 0:
+            # Partial unfreeze: freeze everything in vision_model first, then
+            # re-enable just the last N encoder layers + post-encoder layernorm.
+            # mlp1 stays trainable (it's the bridge into the LLM).
+            self.eagle_model.vision_model.requires_grad_(False)
+            encoder_layers = self._get_vision_encoder_layers()
+            n_total = len(encoder_layers)
+            n_unfreeze = min(tune_visual_last_n_layers, n_total)
+            for layer in encoder_layers[-n_unfreeze:]:
+                layer.requires_grad_(True)
+            # post-encoder layernorm sits between the last encoder block and
+            # the projector; train it so the new features can be re-normalised.
+            post_ln = self._get_vision_post_layernorm()
+            if post_ln is not None:
+                post_ln.requires_grad_(True)
+            print(
+                f"Partial vision tune: last {n_unfreeze}/{n_total} encoder "
+                f"layers + post-layernorm + mlp1 are trainable."
+            )
         print(f"Tune backbone llm: {self.tune_llm}")
         print(f"Tune backbone visual: {self.tune_visual}")
         # Check if any parameters are still trainable. If not, print a warning.
@@ -81,6 +111,28 @@ class EagleBackbone(nn.Module):
                     print(f"Backbone trainable parameter: {name}")
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No backbone trainable parameters found.")
+
+    def _get_vision_encoder_layers(self):
+        """Return the ModuleList of transformer blocks inside the vision tower.
+
+        SigLIP layout: SiglipVisionModel.vision_model.encoder.layers
+        RADIO layout falls back to whatever .encoder.layers exposes.
+        """
+        vm = self.eagle_model.vision_model
+        # SiglipVisionModel wraps a SiglipVisionTransformer under `.vision_model`.
+        inner = getattr(vm, "vision_model", vm)
+        encoder = getattr(inner, "encoder", None)
+        if encoder is None or not hasattr(encoder, "layers"):
+            raise RuntimeError(
+                "Cannot find vision encoder layers for partial unfreeze; "
+                f"vision_model type={type(vm).__name__}"
+            )
+        return encoder.layers
+
+    def _get_vision_post_layernorm(self):
+        vm = self.eagle_model.vision_model
+        inner = getattr(vm, "vision_model", vm)
+        return getattr(inner, "post_layernorm", None)
 
     def set_frozen_modules_to_eval_mode(self):
         """
