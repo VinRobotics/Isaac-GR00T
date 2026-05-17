@@ -282,6 +282,7 @@ class EagleBackboneFATokens(nn.Module):
         load_bf16: bool = False,
         eagle_path: str | None = None,
         project_to_dim: int = 1536,
+        tune_visual_last_n_layers: int = 0,
         # Late FA specific parameters
         n_group: int = 8,  # Number of rotations (C4 = 4, C8 = 8)
         num_images_per_sample: int = 1,
@@ -380,7 +381,7 @@ class EagleBackboneFATokens(nn.Module):
         # Token grid size: 16x16 = 256 tokens (typical for Eagle after pixel shuffle)
         self._init_token_permutation_indices(grid_size=16)
 
-        self.set_trainable_parameters(tune_llm, tune_visual)
+        self.set_trainable_parameters(tune_llm, tune_visual, tune_visual_last_n_layers)
 
         print(f"EagleBackboneFATokens initialized:")
         print(f"  n_group (CN): {self.n_group}")
@@ -571,16 +572,25 @@ class EagleBackboneFATokens(nn.Module):
         "equi_adapter.",
     )
 
-    def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
+    def set_trainable_parameters(
+        self,
+        tune_llm: bool,
+        tune_visual: bool,
+        tune_visual_last_n_layers: int = 0,
+    ):
         """
         Freeze the entire eagle_model (VLM) and train only the new equivariant layers.
 
-        tune_llm / tune_visual are kept as arguments for API compatibility but
-        the VLM is always frozen here — only vision_proj, eagle_linear,
-        inv_projector and equi_adapter are trained.
+        tune_llm / tune_visual are kept as arguments for API compatibility; the
+        VLM is always frozen here EXCEPT when `tune_visual_last_n_layers > 0`,
+        in which case the last N SigLIP encoder layers + post-layernorm + mlp1
+        are also unfrozen on top of the new equi layers.
         """
         self.tune_llm = False
-        self.tune_visual = False
+        # Reflect partial-unfreeze in `tune_visual` so the DDP dummy-term hack
+        # in forward() runs and the SigLIP layers are kept in train() mode.
+        self.tune_visual = tune_visual_last_n_layers > 0
+        self.tune_visual_last_n_layers = tune_visual_last_n_layers
 
         # Freeze entire VLM
         self.eagle_model.requires_grad_(False)
@@ -592,12 +602,51 @@ class EagleBackboneFATokens(nn.Module):
             else:
                 p.requires_grad_(False)
 
+        # Partial vision-tower unfreeze on top of the equi layers.
+        if tune_visual_last_n_layers > 0:
+            encoder_layers = self._get_vision_encoder_layers()
+            n_total = len(encoder_layers)
+            n_unfreeze = min(tune_visual_last_n_layers, n_total)
+            for layer in encoder_layers[-n_unfreeze:]:
+                layer.requires_grad_(True)
+            post_ln = self._get_vision_post_layernorm()
+            if post_ln is not None:
+                post_ln.requires_grad_(True)
+            # mlp1 bridges vision tokens → LLM hidden; unfreeze with the tower.
+            if hasattr(self.eagle_model, "mlp1"):
+                self.eagle_model.mlp1.requires_grad_(True)
+            print(
+                f"Partial vision tune: last {n_unfreeze}/{n_total} SigLIP "
+                f"encoder layers + post-layernorm + mlp1 are trainable."
+            )
+
         trainable = [n for n, p in self.named_parameters() if p.requires_grad]
         print(f"Backbone trainable parameters ({len(trainable)}):")
-        for n in trainable:
-            print(f"  {n}")
+        if len(trainable) <= 40:
+            for n in trainable:
+                print(f"  {n}")
+        else:
+            for n in trainable[:20]:
+                print(f"  {n}")
+            print(f"  ... ({len(trainable) - 20} more)")
         if not trainable:
             print("  Warning: no trainable parameters found.")
+
+    def _get_vision_encoder_layers(self):
+        vm = self.eagle_model.vision_model
+        inner = getattr(vm, "vision_model", vm)
+        encoder = getattr(inner, "encoder", None)
+        if encoder is None or not hasattr(encoder, "layers"):
+            raise RuntimeError(
+                "Cannot find vision encoder layers for partial unfreeze; "
+                f"vision_model type={type(vm).__name__}"
+            )
+        return encoder.layers
+
+    def _get_vision_post_layernorm(self):
+        vm = self.eagle_model.vision_model
+        inner = getattr(vm, "vision_model", vm)
+        return getattr(inner, "post_layernorm", None)
 
     def load_pretrained_vlm(self, checkpoint_path: str) -> None:
         """
