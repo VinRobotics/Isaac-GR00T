@@ -262,10 +262,15 @@ class GR00T_N1_5(PreTrainedModel):
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
         load_backbone_only = kwargs.pop("load_backbone_only", False)
         rot_aug = kwargs.pop("rot_aug", None)
+        tune_visual_last_n_layers = kwargs.pop("tune_visual_last_n_layers", 0)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Load backbone only: {load_backbone_only}")
         print(f"Tune backbone vision tower: {tune_visual}")
+        if tune_visual and tune_visual_last_n_layers > 0:
+            print(
+                f"  (partial: last {tune_visual_last_n_layers} encoder layers + mlp1)"
+            )
         print(f"Tune backbone LLM: {tune_llm}")
         print(f"Tune action head projector: {tune_projector}")
         print(f"Tune action head DiT: {tune_diffusion_model}")
@@ -335,7 +340,9 @@ class GR00T_N1_5(PreTrainedModel):
             )
 
         pretrained_model.backbone.set_trainable_parameters(
-            tune_visual=tune_visual, tune_llm=tune_llm
+            tune_visual=tune_visual,
+            tune_llm=tune_llm,
+            tune_visual_last_n_layers=tune_visual_last_n_layers,
         )
         pretrained_model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
