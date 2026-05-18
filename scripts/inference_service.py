@@ -167,7 +167,8 @@ def main(args: ArgsConfig):
             modality_transform=modality_transform,
             embodiment_tag=args.embodiment_tag,
             denoising_steps=args.denoising_steps,
-            smooth_option=args.smooth_option
+            smooth_option=args.smooth_option,
+            action_segments=getattr(data_config, "action_segments", None),
         )
 
         # Start the server

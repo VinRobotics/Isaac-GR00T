@@ -2520,6 +2520,13 @@ class EquiALOHA_1Hand_Quat_Config(BaseDataConfig):
     num_hand = 1
     rot_type="quaternion"
     rel_action=False
+    # Concatenated-action layout used by te_eef_quat smoothing
+    # (matches action_keys order: x,y,z | qx,qy,qz,qw | gripper).
+    action_segments = [
+        {"kind": "pos", "dim": 3},
+        {"kind": "quat", "dim": 4},
+        {"kind": "scalar", "dim": 1},
+    ]
 
     def modality_config(self):
         video_modality = ModalityConfig(
@@ -2647,6 +2654,16 @@ class EquiALOHA_2Hand_Quat_Config(BaseDataConfig):
     num_hand = 2
     rot_type="quaternion"
     rel_action=False
+    # Concatenated-action layout used by te_eef_quat smoothing
+    # (matches action_keys order: l_xyz | l_quat | r_xyz | r_quat | l_grip | r_grip).
+    action_segments = [
+        {"kind": "pos", "dim": 3},
+        {"kind": "quat", "dim": 4},
+        {"kind": "pos", "dim": 3},
+        {"kind": "quat", "dim": 4},
+        {"kind": "scalar", "dim": 1},
+        {"kind": "scalar", "dim": 1},
+    ]
 
     def modality_config(self):
         video_modality = ModalityConfig(
