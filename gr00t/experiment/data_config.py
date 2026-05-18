@@ -2207,14 +2207,18 @@ class EquiFractalDataConfig(BaseDataConfig):
         "state.x",
         "state.y",
         "state.z",
-        "state.rotation",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "state.roll",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "state.pitch",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "state.yaw",  # Combined [roll, pitch, yaw] -> converted to quaternion
         "state.gripper",
     ]
     action_keys = [
         "action.x",
         "action.y",
         "action.z",
-        "action.rotation",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "action.roll",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "action.pitch",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "action.yaw",  # Combined [roll, pitch, yaw] -> converted to quaternion
         "action.gripper",
     ]
     language_keys = ["annotation.human.action.task_description"]
@@ -2222,6 +2226,25 @@ class EquiFractalDataConfig(BaseDataConfig):
     action_indices = list(range(16))
     num_hand=1
     rot_type="euler_angles"
+    rel_action=True
+
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """
+        Backbone rotation config for equivariant frame averaging.
+
+        - num_images_per_sample=2: Eagle VL/LLM pass sees BOTH cameras (top + wrist).
+        - rotate_image_indices=[0]: Only the top/head camera (index 0) is rotated for FA.
+          The wrist camera (index 1) is skipped from equi_vision_embs entirely.
+
+        Result:
+          backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only (equivariant)
+          backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
+        """
+        return {
+            "num_images_per_sample": 1,
+            "rotate_image_indices": [0],
+        }
 
     def transform(self) -> ModalityTransform:
         transforms = [
@@ -2247,9 +2270,6 @@ class EquiFractalDataConfig(BaseDataConfig):
                     "state.z": "min_max",
                     "state.gripper": "min_max",
                 },
-                target_rotations={
-                    "state.rotation": "quaternion",  # euler_angles_rpy -> quaternion (xyzw)
-                },
             ),
             # action transforms - convert euler_angles_rpy to quaternion
             StateActionToTensor(apply_to=self.action_keys),
@@ -2260,9 +2280,6 @@ class EquiFractalDataConfig(BaseDataConfig):
                     "action.y": "min_max",
                     "action.z": "min_max",
                     "action.gripper": "min_max",
-                },
-                target_rotations={
-                    "action.rotation": "quaternion",  # euler_angles_rpy -> quaternion (xyzw)
                 },
             ),
             # concat transforms
@@ -2282,25 +2299,26 @@ class EquiFractalDataConfig(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 
 
-# NOTE: BridgeDataConfig converts euler angles (roll/pitch/yaw) to quaternion (xyzw)
-#       Your modality.json should combine roll/pitch/yaw into a single "state.rotation" key
-#       and "action.rotation" key with shape [3] containing [roll, pitch, yaw] in radians
-class BridgeDataConfig(BaseDataConfig):
+class EquiBridgeDataConfig(BaseDataConfig):
     video_keys = [
-        "video.image_0",
+        "video.image",
     ]
     state_keys = [
         "state.x",
         "state.y",
         "state.z",
-        "state.rotation",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "state.roll",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "state.pitch",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "state.yaw",  # Combined [roll, pitch, yaw] -> converted to quaternion
         "state.gripper",
     ]
     action_keys = [
         "action.x",
         "action.y",
         "action.z",
-        "action.rotation",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "action.roll",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "action.pitch",  # Combined [roll, pitch, yaw] -> converted to quaternion
+        "action.yaw",  # Combined [roll, pitch, yaw] -> converted to quaternion
         "action.gripper",
     ]
     language_keys = ["annotation.human.action.task_description"]
@@ -2308,6 +2326,25 @@ class BridgeDataConfig(BaseDataConfig):
     action_indices = list(range(16))
     num_hand=1
     rot_type="euler_angles"
+    rel_action=True
+
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """
+        Backbone rotation config for equivariant frame averaging.
+
+        - num_images_per_sample=2: Eagle VL/LLM pass sees BOTH cameras (top + wrist).
+        - rotate_image_indices=[0]: Only the top/head camera (index 0) is rotated for FA.
+          The wrist camera (index 1) is skipped from equi_vision_embs entirely.
+
+        Result:
+          backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only (equivariant)
+          backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
+        """
+        return {
+            "num_images_per_sample": 1,
+            "rotate_image_indices": [0],
+        }
 
     def transform(self) -> ModalityTransform:
         transforms = [
@@ -2360,8 +2397,6 @@ class BridgeDataConfig(BaseDataConfig):
             ),
         ]
         return ComposedModalityTransform(transforms=transforms)
-
-
 ###########################################################################################
 
 class EquiALOHA_1Hand_Config(BaseDataConfig):
@@ -2645,7 +2680,7 @@ DATA_CONFIG_MAP = {
     "vrh3_two_hand_1_cam_equi": VRH3TwotHand1CamEquiConfig(),
     "equi_libero": EquiLiberoConfig(),
     "equi_rel_libero": EquiRelLiberoConfig(),
-    "equi_bridge": BridgeDataConfig(),
+    "equi_bridge": EquiBridgeDataConfig(),
     "equi_fractal": EquiFractalDataConfig(),
     "equi_rel_mimicgen": EquiRelMimicgenConfig(),
     "equi_aloha_1hand": EquiALOHA_1Hand_Config(),
