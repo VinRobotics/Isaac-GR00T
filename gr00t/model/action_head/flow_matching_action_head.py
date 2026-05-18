@@ -359,26 +359,27 @@ class FlowmatchingActionHead(nn.Module):
         self.state_out_type = enn.FieldType(self.group, int(config.input_embedding_dim / self.n_group) * [self.group.regular_repr])
         self.quaternion_to_sixd = RotationTransformer('quaternion', 'rotation_6d')
         self.axisangle_to_sixd = RotationTransformer('axis_angle', 'rotation_6d')
-        
+        self.eulerangle_to_sixd = RotationTransformer('euler_angles', 'rotation_6d', from_convention="ZYX")
+
         self.quaternion_to_matrix = RotationTransformer('quaternion', 'matrix')
         self.axisangle_to_matrix = RotationTransformer('axis_angle', 'matrix')
-        
+        self.eulerangle_to_matrix = RotationTransformer('euler_angles', 'matrix', from_convention="ZYX")
         self.state_encoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
             in_type=self.state_in_type,
             hidden_type=self.state_hidden_type,
             out_type=self.state_out_type,
         )
-        
+
         self.action_type = self.getJointFieldType(is_action=True) if not self.rel_action else self.getActionRelFieldType(is_action=True)
         self.action_out_type = enn.FieldType(self.group, int(self.input_embedding_dim / self.n_group) * [self.group.regular_repr])
-        
+
         self.action_encoder = MultiEmbodimentActionEncoder(
             in_type=self.action_type,
             out_type=self.action_out_type,
             num_embodiments=config.max_num_embodiments,
         )
-        
+
         self.action_decoder = EquiCategorySpecificMLP(
             num_categories=config.max_num_embodiments,
             in_type=self.state_hidden_type,
@@ -606,28 +607,42 @@ class FlowmatchingActionHead(nn.Module):
     
     def getMatrixRotation(self, quat):
         if quat.shape[-1] == 4:
-            return self.quaternion_to_matrix.forward(quat[:, :, [3, 0, 1, 2]]) 
+            return self.quaternion_to_matrix.forward(quat[:, :, [3, 0, 1, 2]])
+        elif self.config.rot_type == 'euler_angles':
+            # eef_pose_node stores [roll,pitch,yaw]; "ZYX" convention needs [yaw,pitch,roll]
+            return self.eulerangle_to_matrix.forward(quat[:, :, [2, 1, 0]])
         else:
             return self.axisangle_to_matrix.forward(quat)
-    
+
     def getQuaternionFromMatrix(self, matrix):
         if self.ee_dim == 7:
             quat = self.quaternion_to_matrix.inverse(matrix)
             return quat[:, :, [1, 2, 3, 0]]  # xyzw
+        elif self.config.rot_type == 'euler_angles':
+            # "ZYX" inverse returns [yaw,pitch,roll]; convert back to [roll,pitch,yaw]
+            angles_zyx = self.eulerangle_to_matrix.inverse(matrix)
+            return angles_zyx[:, :, [2, 1, 0]]
         else:
             return self.axisangle_to_matrix.inverse(matrix)
 
     def get6DRotation(self, quat):
         # data is in xyzw, but rotation transformer takes wxyz
         if quat.shape[-1] == 4:
-            return self.quaternion_to_sixd.forward(quat[:, :, [3, 0, 1, 2]]) 
+            return self.quaternion_to_sixd.forward(quat[:, :, [3, 0, 1, 2]])
+        elif self.config.rot_type == 'euler_angles':
+            # eef_pose_node stores [roll,pitch,yaw]; "ZYX" convention needs [yaw,pitch,roll]
+            return self.eulerangle_to_sixd.forward(quat[:, :, [2, 1, 0]])
         else:
             return self.axisangle_to_sixd.forward(quat)
-    
+
     def getQuaternionFrom6D(self, rot_6d):
         if self.ee_dim == 7:
             quat = self.quaternion_to_sixd.inverse(rot_6d)
             return quat[:, :, [1, 2, 3, 0]]  # xyzw
+        elif self.config.rot_type == 'euler_angles':
+            # "ZYX" inverse returns [yaw,pitch,roll]; convert back to [roll,pitch,yaw]
+            angles_zyx = self.eulerangle_to_sixd.inverse(rot_6d)
+            return angles_zyx[:, :, [2, 1, 0]]
         else:
             return self.axisangle_to_sixd.inverse(rot_6d)
 
