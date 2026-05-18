@@ -3075,7 +3075,107 @@ class EquiALOHA_2Hand_Quat_Config(BaseDataConfig):
         ]
 
         return ComposedModalityTransform(transforms=transforms)
+    
+##############################################################################################
+class EquiBridgeDataConfig(BaseDataConfig):
+    video_keys = [
+        "video.image_0",
+    ]
+    state_keys = [
+        "state.x",
+        "state.y",
+        "state.z",
+        "state.roll",
+        "state.pitch",
+        "state.yaw",
+        "state.pad",
+        "state.gripper",
+    ]
+    action_keys = [
+        "action.x",
+        "action.y",
+        "action.z",
+        "action.roll",
+        "action.pitch",
+        "action.yaw",
+        "action.gripper",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    action_indices = list(range(16))
+    num_hand=1
+    rot_type="euler_angles"
+    rel_action=True
 
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """
+        Backbone rotation config for equivariant frame averaging.
+
+        - num_images_per_sample=2: Eagle VL/LLM pass sees BOTH cameras (top + wrist).
+        - rotate_image_indices=[0]: Only the top/head camera (index 0) is rotated for FA.
+          The wrist camera (index 1) is skipped from equi_vision_embs entirely.
+
+        Result:
+          backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only (equivariant)
+          backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
+        """
+        return {
+            "num_images_per_sample": 1,
+            "rotate_image_indices": [0],
+        }
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms - convert euler_angles_rpy to quaternion
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.x": "min_max",
+                    "state.y": "min_max",
+                    "state.z": "min_max",
+                    "state.gripper": "min_max",
+                },
+            ),
+            # action transforms - convert euler_angles_rpy to quaternion
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.x": "min_max",
+                    "action.y": "min_max",
+                    "action.z": "min_max",
+                    "action.gripper": "min_max",
+                },
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            # model-specific transform
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
 
 ##############################################################################################
     
@@ -3112,4 +3212,5 @@ DATA_CONFIG_MAP = {
     "equi_aloha_1hand_quat": EquiALOHA_1Hand_Quat_Config(),
     "equi_aloha_2hand_quat": EquiALOHA_2Hand_Quat_Config(),
     "equi_rel_mimicgen_2step": EquiRelMimicgen2StepConfig(),
+    "equi_bridge": EquiBridgeDataConfig(),
 }
