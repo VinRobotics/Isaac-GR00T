@@ -75,6 +75,7 @@ class Gr00tPolicy(BasePolicy):
         modality_transform: ComposedModalityTransform,
         denoising_steps: Optional[int] = None,
         smooth_option: Optional[str] = "",
+        action_segments: Optional[list] = None,
         device: Union[int, str] = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         """
@@ -86,6 +87,11 @@ class Gr00tPolicy(BasePolicy):
             modality_transform (ComposedModalityTransform): The modality transform for the model.
             embodiment_tag (Union[str, EmbodimentTag]): The embodiment tag for the model.
             denoising_steps: Number of denoising steps to use for the action head.
+            action_segments: Optional ordered description of the concatenated action layout
+                used by te_eef / te_eef_quat smoothing. Each entry is a dict
+                ``{"kind": "pos"|"quat"|"rpy"|"scalar", "dim": int}``. Sum of dims must equal
+                total action dim. When None, the legacy single-arm split is used
+                (pos=3, rot=3-or-4, scalar=rest).
             device (Union[int, str]): Device to run the model on.
         """
         try:
@@ -125,6 +131,7 @@ class Gr00tPolicy(BasePolicy):
                 print(f"Set action denoising steps to {denoising_steps}")
             
         self.smooth_option = smooth_option
+        self.action_segments = self._normalize_action_segments(action_segments)
         if self.smooth_option == "te":
             self.temporal_agg = True
             self.num_queries = 16
@@ -191,6 +198,30 @@ class Gr00tPolicy(BasePolicy):
         self.ensembled_actions_pos = None
         self.ensembled_actions_quat = None
         self.ensembled_actions_grip = None
+        # te_eef segmented-mode buffers (one tensor per segment, same temporal length)
+        self.ensembled_seg_buffers = None
+
+    @staticmethod
+    def _normalize_action_segments(action_segments):
+        if action_segments is None:
+            return None
+        valid_kinds = {"pos", "quat", "rpy", "scalar"}
+        normalized = []
+        for seg in action_segments:
+            kind = seg["kind"]
+            dim = int(seg["dim"])
+            if kind not in valid_kinds:
+                raise ValueError(
+                    f"Unknown action_segments kind '{kind}'. Expected one of {valid_kinds}."
+                )
+            if kind == "quat" and dim != 4:
+                raise ValueError(f"'quat' segment must have dim=4, got {dim}.")
+            if kind == "rpy" and dim != 3:
+                raise ValueError(f"'rpy' segment must have dim=3, got {dim}.")
+            if dim <= 0:
+                raise ValueError(f"action_segments dim must be > 0, got {dim}.")
+            normalized.append({"kind": kind, "dim": dim})
+        return normalized
 
     def process_output(self, actions):
         """
@@ -429,6 +460,101 @@ class Gr00tPolicy(BasePolicy):
 
         return torch.cat([out_pos, out_quat, out_grip], dim=-1)  # (B, 1, D)
 
+    def process_output_segmented(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Generalized temporal ensemble for arbitrary action layouts described by
+        ``self.action_segments``. Each segment is averaged according to its kind:
+
+          * ``pos`` / ``scalar`` : Euclidean weighted average
+          * ``quat``             : sign-consistent + unit-norm quaternion average
+          * ``rpy``              : convert to quaternion, average, convert back
+
+        Multi-arm layouts (e.g. ``[pos, quat, pos, quat, scalar, scalar]``) work as
+        long as each rotation segment is contiguous on the action dim.
+        """
+        from scipy.spatial.transform import Rotation as ScipyR  # type: ignore[import-untyped]
+
+        assert self.action_segments is not None
+        B, T, D_total = actions.shape
+        dev = actions.device
+
+        dims = [seg["dim"] for seg in self.action_segments]
+        if sum(dims) != D_total:
+            raise ValueError(
+                f"action_segments dims {dims} sum to {sum(dims)} but action dim is {D_total}."
+            )
+
+        # Slice into per-segment tensors. Clone quat/rpy because we mutate (sign flip / norm).
+        seg_views = []
+        offset = 0
+        for seg in self.action_segments:
+            d = seg["dim"]
+            x = actions[:, :, offset:offset + d]
+            kind = seg["kind"]
+            if kind == "rpy":
+                rpy_np = x.cpu().float().numpy().reshape(-1, 3)
+                quat_np = ScipyR.from_euler("xyz", rpy_np).as_quat()  # xyzw
+                x = torch.from_numpy(quat_np).float().to(dev).reshape(B, T, 4)
+            elif kind == "quat":
+                x = x.clone()
+                x = x / x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            seg_views.append((kind, x))
+            offset += d
+
+        # Sign-consistency along time for quaternion segments (incl. converted rpy).
+        for kind, x in seg_views:
+            if kind in ("quat", "rpy"):
+                for t in range(1, T):
+                    dot = (x[:, t] * x[:, t - 1]).sum(dim=-1, keepdim=True)
+                    x[:, t] = torch.where(dot < 0, -x[:, t], x[:, t])
+
+        ew = self.ensemble_weights.to(dev)
+        ew_cs = self.ensemble_weights_cumsum.to(dev)
+
+        if self.ensembled_seg_buffers is None:
+            self.ensembled_seg_buffers = [x.clone() for _, x in seg_views]
+            self.ensembled_actions_count = torch.ones((T, 1), dtype=torch.long, device=dev)
+        else:
+            assert self.ensembled_actions_count is not None
+            cnt = self.ensembled_actions_count  # (T_existing, 1)
+            w_old = ew_cs[cnt - 1]
+            w_new = ew[cnt]
+            w_total = ew_cs[cnt]
+
+            new_buffers = []
+            for (kind, x), buf in zip(seg_views, self.ensembled_seg_buffers):
+                if kind in ("quat", "rpy"):
+                    incoming = x[:, :-1].clone()
+                    dot = (incoming * buf).sum(dim=-1, keepdim=True)
+                    incoming = torch.where(dot < 0, -incoming, incoming)
+                    merged = buf * w_old + incoming * w_new
+                    merged = merged / merged.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    new_buffers.append(torch.cat([merged, x[:, -1:]], dim=1))
+                else:
+                    merged = (buf * w_old + x[:, :-1] * w_new) / w_total
+                    new_buffers.append(torch.cat([merged, x[:, -1:]], dim=1))
+            self.ensembled_seg_buffers = new_buffers
+            self.ensembled_actions_count = torch.cat([
+                torch.clamp(cnt + 1, max=self.num_queries),
+                torch.ones_like(cnt[-1:]),
+            ])
+
+        # Pop the current timestep from each segment buffer.
+        outs = []
+        new_buffers = []
+        for (kind, _), buf in zip(seg_views, self.ensembled_seg_buffers):
+            head = buf[:, :1]
+            new_buffers.append(buf[:, 1:])
+            if kind == "rpy":
+                head_np = head.cpu().float().numpy().reshape(-1, 4)
+                rpy_np = ScipyR.from_quat(head_np).as_euler("xyz")
+                head = torch.from_numpy(rpy_np).float().to(dev).reshape(B, 1, 3)
+            outs.append(head)
+        self.ensembled_seg_buffers = new_buffers
+        self.ensembled_actions_count = self.ensembled_actions_count[1:]
+
+        return torch.cat(outs, dim=-1)  # (B, 1, D_total)
+
     def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """
         Make a prediction with the model.
@@ -533,7 +659,9 @@ class Gr00tPolicy(BasePolicy):
 
             if tensors_3d:
                 full_action = torch.cat(tensors_3d, dim=-1)  # (B, T, sum_D)
-                if self.smooth_option == "te_eef":
+                if self.action_segments is not None:
+                    ensembled = self.process_output_segmented(full_action)
+                elif self.smooth_option == "te_eef":
                     ensembled = self.process_output_eef(full_action)
                 else:
                     ensembled = self.process_output_eef_quat(full_action)
