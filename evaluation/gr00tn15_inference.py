@@ -33,7 +33,7 @@ class Gr00tn15_inference():
                 embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
                 modality_config=data_config.modality_config(),
                 modality_transform=data_config.transform(),
-                denoising_steps=4, # 8
+                denoising_steps=8, # 8
                 device="cuda",
             )
 
