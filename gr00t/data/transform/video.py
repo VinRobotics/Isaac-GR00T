@@ -341,6 +341,29 @@ class VideoResize(VideoTransform):
             raise ValueError(f"Backend {self.backend} not supported")
 
 
+class VideoSharpen(VideoTransform):
+    """Deterministic unsharp-mask style sharpening, applied identically in train and eval.
+
+    Helpful when low-resolution sources (e.g. 84x84) are upsampled to a larger
+    target (e.g. 224x224) and lose high-frequency detail. sharpness_factor=1.0
+    is a no-op; >1.0 sharpens, <1.0 blurs.
+    """
+
+    sharpness_factor: float = Field(
+        default=1.5, description="Sharpness factor. 1.0 is identity, >1.0 sharpens, <1.0 blurs."
+    )
+
+    def get_transform(self, mode: Literal["train", "eval"] = "train") -> Callable:
+        factor = self.sharpness_factor
+        if self.backend == "torchvision":
+            return T.RandomAdjustSharpness(sharpness_factor=factor, p=1.0)
+        elif self.backend == "albumentations":
+            # Approximate adjust_sharpness with full-strength blend
+            return A.Sharpen(alpha=(1.0, 1.0), lightness=(factor, factor), p=1.0)
+        else:
+            raise ValueError(f"Backend {self.backend} not supported")
+
+
 class VideoRandomRotation(VideoTransform):
     degrees: float | tuple[float, float] = Field(
         ..., description="The degrees of the random rotation"

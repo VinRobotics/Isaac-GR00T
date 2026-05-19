@@ -29,6 +29,7 @@ from gr00t.data.transform.video import (
     VideoColorJitter,
     VideoCrop,
     VideoResize,
+    VideoSharpen,
     VideoToNumpy,
     VideoToTensor,
 )
@@ -1888,9 +1889,14 @@ class EquiRelMimicgenConfig(BaseDataConfig):
     def transform(self):
         transforms = [
             # video transforms
+            # NOTE: VideoCrop forced to center_only=True so train and eval see the
+            # same crop (random crop jitters spatial positions, which fights FA
+            # equivariance on 84x84 sources). VideoSharpen after the cubic upsample
+            # recovers high-frequency detail lost going 84 -> 224.
             VideoToTensor(apply_to=self.video_keys),
             VideoCrop(apply_to=self.video_keys, scale=0.95),
             VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="cubic"),
+            VideoSharpen(apply_to=self.video_keys, sharpness_factor=20.0),
             VideoToNumpy(apply_to=self.video_keys),
             # state transforms
             StateActionToTensor(apply_to=self.state_keys),
