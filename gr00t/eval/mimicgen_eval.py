@@ -315,19 +315,34 @@ def _to_hwc_uint8(img: np.ndarray) -> np.ndarray:
     return img
 
 
-def _extract_state(obs: dict) -> dict:
+def _extract_state(obs: dict, state_keys: List[str]) -> dict:
+    """
+    Build the state dict from a robosuite obs, populating only the keys the
+    data config declares. Rotation representation is inferred from state_keys:
+      - quaternion if state.qx/qy/qz/qw are present (uses robot0_eef_quat directly, xyzw)
+      - axis-angle (rotvec) if state.roll/pitch/yaw are present
+    """
     xyz = obs["robot0_eef_pos"]
-    rpy = _quat2axisangle(obs["robot0_eef_quat"])
+    quat = obs["robot0_eef_quat"]  # xyzw
     gripper = obs["robot0_gripper_qpos"].astype(np.float32)
-    return {
+
+    out = {
         "state.x": np.array([xyz[0]], dtype=np.float32),
         "state.y": np.array([xyz[1]], dtype=np.float32),
         "state.z": np.array([xyz[2]], dtype=np.float32),
-        "state.roll": np.array([rpy[0]], dtype=np.float32),
-        "state.pitch": np.array([rpy[1]], dtype=np.float32),
-        "state.yaw": np.array([rpy[2]], dtype=np.float32),
         "state.gripper": gripper,
     }
+    if "state.qx" in state_keys or "state.qw" in state_keys:
+        out["state.qx"] = np.array([quat[0]], dtype=np.float32)
+        out["state.qy"] = np.array([quat[1]], dtype=np.float32)
+        out["state.qz"] = np.array([quat[2]], dtype=np.float32)
+        out["state.qw"] = np.array([quat[3]], dtype=np.float32)
+    else:
+        rpy = _quat2axisangle(quat)
+        out["state.roll"] = np.array([rpy[0]], dtype=np.float32)
+        out["state.pitch"] = np.array([rpy[1]], dtype=np.float32)
+        out["state.yaw"] = np.array([rpy[2]], dtype=np.float32)
+    return out
 
 
 def _extract_images(obs: dict) -> Dict[str, np.ndarray]:
@@ -342,6 +357,7 @@ def _build_batched_input(
     frame_buffers: List[Dict[str, list]],
     n_obs_steps: int,
     task_instruction: str,
+    state_keys: List[str],
 ) -> Dict[str, Any]:
     """
     Build the GR00T model input dict for B envs.
@@ -357,15 +373,10 @@ def _build_batched_input(
         annotation.human.action.task_description: tuple of B strings
     """
     B = len(env_obs_list)
-    state_keys = [
-        "state.x", "state.y", "state.z",
-        "state.roll", "state.pitch", "state.yaw",
-        "state.gripper",
-    ]
 
     for i, obs in enumerate(env_obs_list):
         imgs = _extract_images(obs)
-        st = _extract_state(obs)
+        st = _extract_state(obs, state_keys)
         buf = frame_buffers[i]
         if "video.image" not in buf:
             # seed buffer with n_obs_steps copies of the current frame
@@ -408,20 +419,23 @@ def _build_batched_input(
 # ── Action conversion (model output ⇒ env action) ────────────────────────────
 
 
-_ACTION_KEYS = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
-
-
-def _convert_action_chunk(action_chunk: dict, batch_size: int, n_action_steps: int) -> np.ndarray:
+def _convert_action_chunk(
+    action_chunk: dict,
+    batch_size: int,
+    n_action_steps: int,
+    action_keys: List[str],
+) -> np.ndarray:
     """
-    action_chunk[f"action.{k}"] has shape (B, action_horizon) or (B, action_horizon, 1).
-    Returns (B, n_action_steps, 7) with last channel = signed gripper {-1, +1} (inverted).
+    action_chunk[k] (for k in action_keys) has shape (B, action_horizon) or
+    (B, action_horizon, 1). Returns (B, n_action_steps, len(action_keys)) with
+    the last channel (gripper) converted to signed {-1, +1} and inverted.
     """
-    out = np.zeros((batch_size, n_action_steps, 7), dtype=np.float32)
-    for ci, k in enumerate(_ACTION_KEYS):
-        v = np.asarray(action_chunk[f"action.{k}"])  # (B, H) or (B, H, 1)
+    n_dim = len(action_keys)
+    out = np.zeros((batch_size, n_action_steps, n_dim), dtype=np.float32)
+    for ci, k in enumerate(action_keys):
+        v = np.asarray(action_chunk[k])  # (B, H) or (B, H, 1)
         if v.ndim == 3 and v.shape[-1] == 1:
             v = v[..., 0]
-        # v shape: (B, action_horizon)
         out[:, :, ci] = v[:, :n_action_steps]
     # gripper: [0,1] → [-1,+1] → binarize → invert (matches gr00tn15_inference)
     out[..., -1] = 2.0 * out[..., -1] - 1.0
@@ -441,6 +455,8 @@ def run_rollout(
     n_obs_steps: int,
     n_action_steps: int,
     seeds: List[int],
+    state_keys: List[str],
+    action_keys: List[str],
     record_video_mask: Optional[List[bool]] = None,
 ) -> Tuple[List[bool], List[Optional[List[np.ndarray]]]]:
     """
@@ -486,7 +502,7 @@ def run_rollout(
     t = 0
     while t < max_steps and not all(done_flags):
         model_input = _build_batched_input(
-            env_obs_list, frame_buffers, n_obs_steps, task_instruction
+            env_obs_list, frame_buffers, n_obs_steps, task_instruction, state_keys
         )
         try:
             action_chunk = policy.get_action(model_input)
@@ -494,7 +510,7 @@ def run_rollout(
             print(f"[mimicgen_eval] policy.get_action failed: {e}")
             break
 
-        actions = _convert_action_chunk(action_chunk, n_active, n_action_steps)
+        actions = _convert_action_chunk(action_chunk, n_active, n_action_steps, action_keys)
 
         for step_idx in range(n_action_steps):
             if t >= max_steps:
@@ -762,6 +778,8 @@ class MimicgenEvalCallback(TrainerCallback):
                     n_obs_steps=self.n_obs_steps,
                     n_action_steps=self.n_action_steps,
                     seeds=seeds,
+                    state_keys=list(self.modality_config["state"].modality_keys),
+                    action_keys=list(self.modality_config["action"].modality_keys),
                     record_video_mask=record_video_mask,
                 )
                 all_successes.extend(chunk_successes)
