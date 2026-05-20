@@ -471,26 +471,34 @@ def eval_calvin_all(args: Args):
 
     # Split the 1000 eval sequences across parallel workers. Tune n_workers
     # to the number of GPUs available; each worker spawns its own policy.
-    n_workers = 2
+    n_workers = 1
     total = args.num_sequences
     chunks = np.array_split(np.arange(total), n_workers)
     sequence_splits = [list(map(int, c)) for c in chunks if len(c) > 0]
 
-    ctx = mp.get_context("spawn")
     per_worker = dict()
-    with ProcessPoolExecutor(max_workers=len(sequence_splits), mp_context=ctx) as pool:
-        futures = {
-            pool.submit(eval_calvin, args, ids): ids for ids in sequence_splits
-        }
-        for fut in as_completed(futures):
-            ids = futures[fut]
-            label = f"seq_{ids[0]}-{ids[-1]}"
-            try:
-                per_worker[label] = fut.result() or []
-                print(f"[DONE] {label} ({len(per_worker[label])} sequences)")
-            except Exception as e:
-                print(f"[ERROR] {label} failed: {e}")
-                per_worker[label] = []
+    if n_workers == 1:
+        # Single-worker: run in-process so tracebacks surface and we don't
+        # pay the cost of re-importing GR00T/TF in a spawned child.
+        ids = sequence_splits[0]
+        label = f"seq_{ids[0]}-{ids[-1]}"
+        per_worker[label] = eval_calvin(args, ids) or []
+        print(f"[DONE] {label} ({len(per_worker[label])} sequences)")
+    else:
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=len(sequence_splits), mp_context=ctx) as pool:
+            futures = {
+                pool.submit(eval_calvin, args, ids): ids for ids in sequence_splits
+            }
+            for fut in as_completed(futures):
+                ids = futures[fut]
+                label = f"seq_{ids[0]}-{ids[-1]}"
+                try:
+                    per_worker[label] = fut.result() or []
+                    print(f"[DONE] {label} ({len(per_worker[label])} sequences)")
+                except Exception as e:
+                    print(f"[ERROR] {label} failed: {e}")
+                    per_worker[label] = []
 
     # Aggregate across all workers
     all_results = [r for lst in per_worker.values() for r in lst]
