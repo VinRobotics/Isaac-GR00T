@@ -2683,6 +2683,24 @@ class EquiRelCalvinConfig(BaseDataConfig):
     num_hand = 1
     rot_type="euler_angles"
     rel_action=True
+    
+    @classmethod
+    def get_rotation_config(cls) -> dict:
+        """
+        Backbone rotation config for equivariant frame averaging.
+
+        - num_images_per_sample=2: Eagle VL/LLM pass sees BOTH cameras (top + wrist).
+        - rotate_image_indices=[0]: Only the top/head camera (index 0) is rotated for FA.
+          The wrist camera (index 1) is skipped from equi_vision_embs entirely.
+
+        Result:
+          backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only (equivariant)
+          backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
+        """
+        return {
+            "num_images_per_sample": 2,
+            "rotate_image_indices": [0],
+        }
 
     def modality_config(self):
         video_modality = ModalityConfig(
