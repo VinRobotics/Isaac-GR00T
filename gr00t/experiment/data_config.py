@@ -1619,6 +1619,7 @@ class EquiLiberoConfig(BaseDataConfig):
         return {
             "num_images_per_sample": 2,
             "rotate_image_indices": [0],
+            "n_group": 16,
         }
 
     def transform(self):
@@ -1747,6 +1748,7 @@ class EquiRelLiberoConfig(BaseDataConfig):
         return {
             "num_images_per_sample": 2,
             "rotate_image_indices": [0],
+            "n_group": 16,
         }
 
     def transform(self):
@@ -1877,6 +1879,7 @@ class EquiRelMimicgenConfig(BaseDataConfig):
         return {
             "num_images_per_sample": 2,
             "rotate_image_indices": [0],
+            "n_group": 16,
         }
 
     def transform(self):
@@ -2006,6 +2009,7 @@ class EquiMimicgenConfig(BaseDataConfig):
         return {
             "num_images_per_sample": 2,
             "rotate_image_indices": [0],
+            "n_group": 16,
         }
 
     def transform(self):
@@ -2300,6 +2304,7 @@ class EquiALOHA_1Hand_Config(BaseDataConfig):
         return {
             "num_images_per_sample": 2,
             "rotate_image_indices": [0],
+            "n_group": 16,
         }
 
     def transform(self):

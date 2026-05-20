@@ -1042,9 +1042,23 @@ class EagleBackboneFATokens(nn.Module):
         n_equi = len(self.rotate_image_indices)
 
         # [B*N*n_equi, T, vision_dim]
-        vis_tokens_raw, _ = self.eagle_model.extract_feature(equi_pixels)
-        num_vision_tokens = vis_tokens_raw.shape[1]
-        vision_dim        = vis_tokens_raw.shape[2]
+        # Split along N (n_group) to halve peak memory — important for large N (e.g. C16).
+        # Layout is (B, N, n_equi) row-major, so we reshape, split N in half, run each,
+        # then re-stitch along N to preserve original ordering.
+        N = self.n_group
+        N_half = N // 2
+        C_img, H_img, W_img = equi_pixels.shape[1], equi_pixels.shape[2], equi_pixels.shape[3]
+        equi_pixels_5d = equi_pixels.reshape(B, N, n_equi, C_img, H_img, W_img)
+        chunk1 = equi_pixels_5d[:, :N_half].reshape(B * N_half * n_equi, C_img, H_img, W_img)
+        chunk2 = equi_pixels_5d[:, N_half:].reshape(B * (N - N_half) * n_equi, C_img, H_img, W_img)
+        vis1, _ = self.eagle_model.extract_feature(chunk1)
+        vis2, _ = self.eagle_model.extract_feature(chunk2)
+        num_vision_tokens = vis1.shape[1]
+        vision_dim        = vis1.shape[2]
+        vis_tokens_raw = torch.cat([
+            vis1.reshape(B, N_half, n_equi, num_vision_tokens, vision_dim),
+            vis2.reshape(B, N - N_half, n_equi, num_vision_tokens, vision_dim),
+        ], dim=1).reshape(B * N * n_equi, num_vision_tokens, vision_dim)
 
         # Reshape to [B*n_equi, N, T, vision_dim] — group rotations together per camera
         vis_by_rotation = (
