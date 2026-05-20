@@ -30,13 +30,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
 
+import cv2
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field, ValidationError
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from gr00t.utils.video import get_all_frames, get_frames_by_timestamps
+from gr00t.utils.video import decode_image_cell, get_all_frames, get_frames_by_timestamps
 
 from .embodiment_tags import EmbodimentTag
 from .schema import (
@@ -178,6 +179,7 @@ class LeRobotSingleDataset(Dataset):
         self._video_path_pattern = self._get_video_path_pattern()
         self._chunk_size = self._get_chunk_size()
         self._tasks = self._get_tasks()
+        self._image_in_parquet = self._get_image_in_parquet_map()
         self.curr_traj_data = None
         self.curr_traj_id = None
 
@@ -340,16 +342,56 @@ class LeRobotSingleDataset(Dataset):
             if original_key is None:
                 original_key = new_key
             le_video_meta = le_info["features"][original_key]
-            height = le_video_meta["shape"][le_video_meta["names"].index("height")]
-            width = le_video_meta["shape"][le_video_meta["names"].index("width")]
-            # NOTE(FH): different lerobot dataset versions have different keys for the number of channels and fps
-            try:
-                channels = le_video_meta["shape"][le_video_meta["names"].index("channel")]
-                fps = le_video_meta["video_info"]["video.fps"]
-            except (ValueError, KeyError):
-                # channels = le_video_meta["shape"][le_video_meta["names"].index("channels")]
-                channels = le_video_meta["info"]["video.channels"]
-                fps = le_video_meta["info"]["video.fps"]
+            # When images are stored inline in parquet (dtype="image"), there is no
+            # video_info / info block — fall back to the dataset-level fps and infer
+            # the channel dim by value (HF Calvin-style info.json sometimes has
+            # shape in CHW order while names says ["height","width","channels"],
+            # so a names-based index lookup would mis-resolve dims).
+            if le_video_meta.get("dtype") == "image":
+                shape = list(le_video_meta["shape"])
+                assert len(shape) == 3, (
+                    f"Image feature {original_key} must have a 3D shape, got {shape}"
+                )
+                channel_candidates = [i for i, d in enumerate(shape) if d in (1, 3, 4)]
+                assert channel_candidates, (
+                    f"Cannot infer channel dim from shape {shape} for {original_key}; "
+                    "expected one dim in (1, 3, 4)."
+                )
+                ch_idx = channel_candidates[0]
+                channels = shape[ch_idx]
+                other = [shape[i] for i in range(3) if i != ch_idx]
+                # Use names to disambiguate H vs W when possible; otherwise H first.
+                names = le_video_meta.get("names") or []
+                non_ch_names = [n for n in names if n not in ("channel", "channels")]
+                if (
+                    len(non_ch_names) == 2
+                    and non_ch_names[0] in ("height", "h")
+                    and non_ch_names[1] in ("width", "w")
+                ):
+                    height, width = other[0], other[1]
+                elif (
+                    len(non_ch_names) == 2
+                    and non_ch_names[0] in ("width", "w")
+                    and non_ch_names[1] in ("height", "h")
+                ):
+                    width, height = other[0], other[1]
+                else:
+                    height, width = other[0], other[1]
+                fps = le_info.get("fps")
+                assert fps is not None, (
+                    f"Image-in-parquet feature {original_key} requires top-level 'fps' in info.json"
+                )
+            else:
+                height = le_video_meta["shape"][le_video_meta["names"].index("height")]
+                width = le_video_meta["shape"][le_video_meta["names"].index("width")]
+                # NOTE(FH): different lerobot dataset versions have different keys for the number of channels and fps
+                try:
+                    channels = le_video_meta["shape"][le_video_meta["names"].index("channel")]
+                    fps = le_video_meta["video_info"]["video.fps"]
+                except (ValueError, KeyError):
+                    # channels = le_video_meta["shape"][le_video_meta["names"].index("channels")]
+                    channels = le_video_meta["info"]["video.channels"]
+                    fps = le_video_meta["info"]["video.fps"]
             simplified_modality_meta["video"][new_key] = {
                 "resolution": [width, height],
                 "channels": channels,
@@ -470,8 +512,29 @@ class LeRobotSingleDataset(Dataset):
         return self.lerobot_info_meta["data_path"]
 
     def _get_video_path_pattern(self) -> str:
-        """Get the video path pattern for the LeRobot dataset."""
-        return self.lerobot_info_meta["video_path"]
+        """Get the video path pattern for the LeRobot dataset.
+
+        Returns an empty string when the dataset has no on-disk MP4s (e.g. all
+        image keys are stored inline in the parquet files). Handles both the
+        missing-key case and an explicit ``"video_path": null`` in info.json.
+        """
+        return self.lerobot_info_meta.get("video_path") or ""
+
+    def _get_image_in_parquet_map(self) -> dict[str, str]:
+        """Map video new_keys to parquet column names for image-in-parquet features.
+
+        A feature is treated as image-in-parquet when its info.json entry has
+        dtype=="image" (as opposed to dtype=="video"). The MP4-based path is
+        used for everything else.
+        """
+        image_keys: dict[str, str] = {}
+        features = self.lerobot_info_meta.get("features", {})
+        for new_key, field in self.lerobot_modality_meta.video.items():
+            original_key = field.original_key if field.original_key is not None else new_key
+            feat = features.get(original_key)
+            if feat is not None and feat.get("dtype") == "image":
+                image_keys[new_key] = original_key
+        return image_keys
 
     def _get_chunk_size(self) -> int:
         """Get the chunk size for the LeRobot dataset."""
@@ -694,6 +757,10 @@ class LeRobotSingleDataset(Dataset):
         assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
         # Get the sub-key
         key = key.replace("video.", "")
+
+        if key in self._image_in_parquet:
+            return self._get_images_from_parquet(trajectory_id, key, step_indices)
+
         video_path = self.get_video_path(trajectory_id, key)
         # Get the action/state timestamps for each frame in the video
         assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
@@ -708,6 +775,26 @@ class LeRobotSingleDataset(Dataset):
             video_backend=self.video_backend,
             video_backend_kwargs=self.video_backend_kwargs,
         )
+
+    def _get_images_from_parquet(
+        self,
+        trajectory_id: int,
+        key: str,
+        step_indices: np.ndarray,
+    ) -> np.ndarray:
+        """Read frames for an image-in-parquet key at the given step indices.
+
+        Returns:
+            np.ndarray: Frames with shape (T, H, W, C), uint8, RGB.
+        """
+        column = self._image_in_parquet[key]
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        assert (
+            column in self.curr_traj_data.columns
+        ), f"Image column '{column}' not found in parquet for trajectory {trajectory_id}"
+        series = self.curr_traj_data[column].to_numpy()
+        frames = [decode_image_cell(series[int(i)]) for i in step_indices]
+        return np.stack(frames, axis=0)
 
     def get_state_or_action(
         self,
@@ -885,18 +972,33 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         for key in self.modality_keys["video"]:
             all_frames = []
             key = key.replace("video.", "")
+            is_parquet_image = key in self._image_in_parquet
             for trajectory_id, trajectory_length in tqdm(
                 zip(self.trajectory_ids, self.trajectory_lengths),
                 total=len(self.trajectory_ids),
                 desc=f"Caching {key} frames",
             ):
-                video_path = self.get_video_path(trajectory_id, key)
-                frames = get_all_frames(
-                    video_path.as_posix(),
-                    video_backend=self.video_backend,
-                    video_backend_kwargs=self.video_backend_kwargs,
-                    resize_size=img_resize,
-                )
+                if is_parquet_image:
+                    traj_data = self.get_trajectory_data(trajectory_id)
+                    column = self._image_in_parquet[key]
+                    assert (
+                        column in traj_data.columns
+                    ), f"Image column '{column}' not found in parquet for trajectory {trajectory_id}"
+                    series = traj_data[column].to_numpy()
+                    decoded = [decode_image_cell(cell) for cell in series]
+                    frames = np.stack(decoded, axis=0)
+                    if img_resize is not None:
+                        frames = np.stack(
+                            [cv2.resize(f, img_resize) for f in frames], axis=0
+                        )
+                else:
+                    video_path = self.get_video_path(trajectory_id, key)
+                    frames = get_all_frames(
+                        video_path.as_posix(),
+                        video_backend=self.video_backend,
+                        video_backend_kwargs=self.video_backend_kwargs,
+                        resize_size=img_resize,
+                    )
                 assert frames.ndim == 4, f"Expected 4D array, got {frames.shape} array"
                 assert frames.shape[3] == 3, f"Expected 3 channels, got {frames.shape[3]} channels"
                 # assert (
