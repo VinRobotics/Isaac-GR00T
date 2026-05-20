@@ -37,6 +37,35 @@ except (ImportError, RuntimeError):
     TORCHCODEC_AVAILABLE = False
 
 
+def decode_image_cell(cell) -> np.ndarray:
+    """Decode a single image cell from a parquet column into an (H, W, C) uint8 RGB array.
+
+    Supports the value shapes used by HF LeRobot when images are stored inside parquet:
+    - dict {"bytes": <encoded>, "path": <str|None>} (the standard HF datasets.Image feature)
+    - raw PNG/JPEG bytes
+    - numpy array already shaped (H, W, C) uint8 (assumed RGB)
+    - filesystem path string
+    """
+    if isinstance(cell, np.ndarray):
+        if cell.dtype != np.uint8:
+            cell = cell.astype(np.uint8)
+        return cell
+    if isinstance(cell, dict):
+        cell = cell.get("bytes") if cell.get("bytes") is not None else cell.get("path")
+    if isinstance(cell, (bytes, bytearray, memoryview)):
+        buf = np.frombuffer(cell, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Failed to decode image bytes from parquet cell")
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if isinstance(cell, str):
+        img = cv2.imread(cell, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError(f"Failed to read image at path: {cell}")
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    raise TypeError(f"Unsupported parquet image cell type: {type(cell)}")
+
+
 def get_frames_by_indices(
     video_path: str,
     indices: list[int] | np.ndarray,
