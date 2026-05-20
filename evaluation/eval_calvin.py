@@ -243,15 +243,17 @@ def _load_task_oracle_and_annotations(calvin_models_root: str):
     return task_oracle, val_annotations
 
 
-def _get_eval_sequences(calvin_models_root: str, num_sequences: int):
-    sys.path.insert(0, str(pathlib.Path(calvin_models_root) / "calvin_agent"))
-    from calvin_agent.evaluation.multistep_sequences import get_sequences
+def _get_eval_sequences(num_sequences: int):
+    """Use local copy to avoid pulling in calvin_agent.evaluation.utils, which
+    transitively imports MCIL → pytorch_lightning. See calvin_sequences.py."""
+    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    from calvin_sequences import get_sequences
     return get_sequences(num_sequences)
 
 
 def _get_env_state_for_initial_condition(initial_condition):
-    sys.path.insert(0, str(pathlib.Path(__file__).parents[0]))
-    from calvin_agent.evaluation.utils import get_env_state_for_initial_condition
+    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    from calvin_sequences import get_env_state_for_initial_condition
     return get_env_state_for_initial_condition(initial_condition)
 
 
@@ -354,7 +356,7 @@ def eval_calvin(args: Args, sequence_ids: Optional[list] = None) -> list:
     # Load env + oracle
     env = _load_calvin_env(args.dataset_path or None, scene=args.scene)
     task_oracle, val_annotations = _load_task_oracle_and_annotations(args.calvin_models_root)
-    eval_sequences = _get_eval_sequences(args.calvin_models_root, args.num_sequences)
+    eval_sequences = _get_eval_sequences(args.num_sequences)
     if sequence_ids is not None:
         eval_sequences = [eval_sequences[i] for i in sequence_ids]
 
