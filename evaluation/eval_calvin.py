@@ -353,14 +353,8 @@ def eval_calvin(args: Args, sequence_ids: Optional[list] = None) -> list:
     video_root = pathlib.Path(f"{args.save_videos_root}/{args.exp_name}/videos/{args.task_suite_name}")
     video_root.mkdir(parents=True, exist_ok=True)
 
-    # Load env + oracle
-    env = _load_calvin_env(args.dataset_path or None, scene=args.scene)
-    task_oracle, val_annotations = _load_task_oracle_and_annotations(args.calvin_models_root)
-    eval_sequences = _get_eval_sequences(args.num_sequences)
-    if sequence_ids is not None:
-        eval_sequences = [eval_sequences[i] for i in sequence_ids]
-
-    # Load policy
+    # Load policy FIRST — HF from_pretrained peaks at ~2x model size in CPU RAM
+    # during load, so we want the env (pybullet + Mesa) RAM footprint absent here.
     try:
         if args.model_type == "gr00tn15":
             policy = Gr00tCalvinInference(args.pretrained_model_path, args.infer_chunk)
@@ -370,6 +364,13 @@ def eval_calvin(args: Args, sequence_ids: Optional[list] = None) -> list:
     except Exception as e:
         logging.error(f"Failed to load policy: {e}")
         return []
+
+    # Load env + oracle after the policy is on the GPU
+    env = _load_calvin_env(args.dataset_path or None, scene=args.scene)
+    task_oracle, val_annotations = _load_task_oracle_and_annotations(args.calvin_models_root)
+    eval_sequences = _get_eval_sequences(args.num_sequences)
+    if sequence_ids is not None:
+        eval_sequences = [eval_sequences[i] for i in sequence_ids]
 
     results = []
     for seq_idx, (initial_state, eval_sequence) in enumerate(tqdm.tqdm(eval_sequences)):
