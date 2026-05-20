@@ -16,7 +16,7 @@ import sys
 
 # Match the eval_libero.py pattern so the cluster install of GR00T / CALVIN
 # is on sys.path even when this script is run from arbitrary cwd.
-sys.path.insert(0, "/mnt/data/sftp/data/locht1/workspace/gr00t_equi_fa_simpler_fuse")  # for gr00t.model.policy
+sys.path.insert(0, "/mnt/data/sftp/data/locht1/workspace/gr00t_equi_fa_robocasa")  # for gr00t.model.policy
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/calvin")
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/calvin/calvin_env")
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/calvin/calvin_models")
