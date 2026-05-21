@@ -20,7 +20,7 @@ EQUIDIT_CKPT=${EQUIDIT_CKPT:-"/mnt/data/sftp/data/locht1/vr_checkpoints/gr00t_ed
 EQUIVLA_CKPT=${EQUIVLA_CKPT:-"/mnt/data/sftp/data/locht1/vr_checkpoints/gr00t_fa_fuse_reg_rel_libero_10_no_noops_abs_s30k_bs64/checkpoint-30000"}
 # -----------------------------------------------------------------------------
 
-source /home/locht1/miniconda3/bin/activate gr00t
+source /home/locht1/miniconda3/bin/activate gr00t_equi_dit
 
 run_one() {
     local label="$1"
@@ -44,4 +44,4 @@ run_one() {
         --args.exp_name "$EXP_NAME"
 }
 
-run_one "Gr00t Baseline"   "$GR00TN15_CKPT"
+run_one "Gr00t + Equi Actor"   "$EQUIDIT_CKPT"
