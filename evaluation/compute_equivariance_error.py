@@ -26,6 +26,7 @@ import multiprocessing as mp
 import os
 import pathlib
 import sys
+import time
 from typing import Optional
 
 import numpy as np
@@ -88,6 +89,13 @@ class Args:
 
     infer_chunk: int = 10
     """Length of action chunk to compare (action.x, .y, ... are sliced to this)."""
+
+    measure_flops: bool = True
+    """If True, run a single fvcore FLOPs analysis on policy.model forward.
+    Falls back gracefully if fvcore is unavailable or unsupported ops are hit."""
+
+    latency_warmup: int = 5
+    """Warm-up policy calls discarded before timing (CUDA kernel compile, lazy loads)."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -192,6 +200,62 @@ def rotate_action_array(action: np.ndarray, angle_rad: float) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Inference cost: parameters + FLOPs
+# ─────────────────────────────────────────────────────────────────────────────
+
+def count_parameters(model: torch.nn.Module) -> dict:
+    """Total / trainable parameter counts and a breakdown by top-level submodule."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    by_module = {
+        name: sum(p.numel() for p in child.parameters())
+        for name, child in model.named_children()
+    }
+    return {
+        "total": int(total),
+        "trainable": int(trainable),
+        "by_module": {k: int(v) for k, v in by_module.items()},
+    }
+
+
+def measure_flops(policy, sample_normalized_input) -> Optional[dict]:
+    """Best-effort FLOPs count for one policy.model.get_action call.
+
+    Tries fvcore first.  Returns None (with a logged warning) if neither backend works.
+    """
+    # fvcore
+    try:
+        from fvcore.nn import FlopCountAnalysis  # type: ignore
+    except Exception as e:
+        logging.warning(f"fvcore unavailable ({e}); skipping FLOPs.")
+        return None
+
+    class _Wrap(torch.nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+            self._ref_input = None
+
+        def forward(self, *_):
+            return self.m.get_action(self._ref_input)["action_pred"]
+
+    wrap = _Wrap(policy.model).eval()
+    wrap._ref_input = sample_normalized_input
+    try:
+        with torch.inference_mode():
+            # fvcore needs at least one tensor arg — pass a 1-element dummy
+            dummy = torch.zeros(1, device=policy.device)
+            fca = FlopCountAnalysis(wrap, (dummy,))
+            fca.unsupported_ops_warnings(False)
+            fca.uncalled_modules_warnings(False)
+            total = int(fca.total())
+        return {"backend": "fvcore", "total_flops": total}
+    except Exception as e:
+        logging.warning(f"fvcore FLOPs analysis failed: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Observation collection (with noisy-init settling)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -215,6 +279,7 @@ def collect_observations(args: Args, M: int):
     descriptions = []
     samples_remaining = M
 
+    pbar = tqdm.tqdm(total=M, desc="collect obs (LIBERO settle)")
     for task_id in range(num_tasks):
         if samples_remaining <= 0:
             break
@@ -225,6 +290,7 @@ def collect_observations(args: Args, M: int):
             continue
 
         n_for_task = min(per_task, samples_remaining)
+        pbar.set_postfix(task_id=task_id, task=task_description[:40])
         for ep_idx in range(n_for_task):
             env.reset()
             obs = env.set_init_state(init_states[ep_idx % len(init_states)])
@@ -241,6 +307,7 @@ def collect_observations(args: Args, M: int):
             })
             descriptions.append(task_description)
             samples_remaining -= 1
+            pbar.update(1)
             if samples_remaining <= 0:
                 break
 
@@ -248,6 +315,7 @@ def collect_observations(args: Args, M: int):
             env.env.close()
         except Exception:
             pass
+    pbar.close()
 
     return observations, descriptions
 
@@ -279,6 +347,13 @@ def compute_equivariance_error(args: Args) -> None:
     policy_wrapper = Gr00tn15_inference(args.pretrained_model_path, args.infer_chunk)
     policy = policy_wrapper.policy
 
+    # ── Inference cost: parameter counts ────────────────────────────────────
+    params = count_parameters(policy.model)
+    logging.info(f"Params total      : {params['total']:,}")
+    logging.info(f"Params trainable  : {params['trainable']:,}")
+    for name, n in params["by_module"].items():
+        logging.info(f"  - {name:30s} {n:>15,}")
+
     # Collect observations
     logging.info("Collecting observations (noisy-init settling applied)...")
     observations, descriptions = collect_observations(args, args.num_samples)
@@ -293,31 +368,61 @@ def compute_equivariance_error(args: Args) -> None:
     flat_errors = []
     # Also collect ||a(o)|| to provide an empirical estimate of B for the bound check
     action_norms = []
+    # Per-call wall-clock latencies (ms) — populated after warm-up
+    latencies_ms: list = []
+    timing_enabled = [False]  # mutable flag toggled after warm-up
 
     def call_policy(obs_dict):
         torch.manual_seed(args.noise_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.noise_seed)
-        return action_dict_to_array(policy.get_action(obs_dict), args.infer_chunk)
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out = policy.get_action(obs_dict)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        if timing_enabled[0]:
+            latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+        return action_dict_to_array(out, args.infer_chunk)
 
-    for sample_idx in tqdm.tqdm(range(M), desc="equivariance"):
+    # ── Latency warm-up (kernel compile, lazy module init, etc.) ────────────
+    if M > 0 and args.latency_warmup > 0:
+        warm_obs = build_obs_dict(observations[0], descriptions[0], angle_rad=0.0)
+        for _ in tqdm.tqdm(range(args.latency_warmup), desc="warmup", leave=False):
+            call_policy(warm_obs)
+    timing_enabled[0] = True  # everything that follows is timed
+
+    total_calls = M * args.n_group  # one a(o) call + (|G|-1) a(g.o) calls per sample
+    pbar = tqdm.tqdm(total=total_calls, desc="equivariance", dynamic_ncols=True)
+    for sample_idx in range(M):
         raw_obs = observations[sample_idx]
         task_description = descriptions[sample_idx]
 
         obs_dict_orig = build_obs_dict(raw_obs, task_description, angle_rad=0.0)
         a_orig = call_policy(obs_dict_orig)
         action_norms.append(float(np.linalg.norm(a_orig)))
+        # account for the a(o) call (g_0 is the identity slot)
+        per_g_errors[0].append(0.0)
+        flat_errors.append(0.0)
+        pbar.update(1)
 
-        for r, angle in enumerate(angles):
-            if r == 0:
-                err = 0.0  # identity: f(e.o) = f(o), rho_a(e) = I
-            else:
-                obs_dict_rot = build_obs_dict(raw_obs, task_description, angle_rad=angle)
-                a_rot = call_policy(obs_dict_rot)
-                a_expected = rotate_action_array(a_orig, angle)
-                err = float(np.linalg.norm(a_rot - a_expected))
+        for r in range(1, args.n_group):
+            angle = angles[r]
+            obs_dict_rot = build_obs_dict(raw_obs, task_description, angle_rad=angle)
+            a_rot = call_policy(obs_dict_rot)
+            a_expected = rotate_action_array(a_orig, angle)
+            err = float(np.linalg.norm(a_rot - a_expected))
             per_g_errors[r].append(err)
             flat_errors.append(err)
+            pbar.update(1)
+
+        # Running mean (skip the g_0 zeros so the postfix reflects real error)
+        if flat_errors:
+            running = np.asarray(flat_errors, dtype=np.float64)
+            nz = running[running > 0]
+            running_mean = float(nz.mean()) if nz.size > 0 else 0.0
+            pbar.set_postfix(eps_eq=f"{running_mean:.4f}", sample=f"{sample_idx + 1}/{M}")
+    pbar.close()
 
     flat = np.asarray(flat_errors, dtype=np.float64)
     mean_eq = float(flat.mean())
@@ -335,6 +440,42 @@ def compute_equivariance_error(args: Args) -> None:
             f"mean={arr.mean():.6f}  std={arr.std():.6f}"
         )
 
+    # ── Inference cost: wall-clock latency ──────────────────────────────────
+    if latencies_ms:
+        lat = np.asarray(latencies_ms, dtype=np.float64)
+        ms_per_call = float(lat.mean())
+        ms_per_call_std = float(lat.std())
+        ms_per_step = ms_per_call / max(1, args.infer_chunk)
+        logging.info("-" * 70)
+        logging.info(f"Latency per get_action() call : {ms_per_call:8.2f} ms "
+                     f"(+/- {ms_per_call_std:.2f}, n={len(lat)})")
+        logging.info(f"Latency per action step       : {ms_per_step:8.2f} ms "
+                     f"(call / infer_chunk={args.infer_chunk})")
+    else:
+        ms_per_call = ms_per_call_std = ms_per_step = float("nan")
+        logging.info("No latency samples recorded.")
+
+    # ── Inference cost: FLOPs (best-effort, fvcore) ─────────────────────────
+    flops_info = None
+    if args.measure_flops and M > 0:
+        try:
+            sample_obs = build_obs_dict(observations[0], descriptions[0], angle_rad=0.0)
+            from gr00t.model.policy import unsqueeze_dict_values  # local import to avoid cycle
+            obs_copy = sample_obs.copy()
+            obs_copy = unsqueeze_dict_values(obs_copy)
+            for k, v in obs_copy.items():
+                if not isinstance(v, np.ndarray):
+                    obs_copy[k] = np.array(v)
+            normalized_input = policy.apply_transforms(obs_copy)
+            flops_info = measure_flops(policy, normalized_input)
+        except Exception as e:
+            logging.warning(f"FLOPs sample prep failed: {e}")
+        if flops_info is not None:
+            logging.info(f"FLOPs per get_action()  : {flops_info['total_flops']:,} "
+                         f"(backend={flops_info['backend']})")
+        else:
+            logging.info("FLOPs : skipped / unavailable")
+
     results = {
         "model_label": args.model_label,
         "task_suite_name": args.task_suite_name,
@@ -349,6 +490,14 @@ def compute_equivariance_error(args: Args) -> None:
         "per_group_mean": [float(np.mean(per_g_errors[r])) for r in range(args.n_group)],
         "per_group_std":  [float(np.std(per_g_errors[r])) for r in range(args.n_group)],
         "angles_deg":     [math.degrees(a) for a in angles],
+        # inference cost
+        "params": params,
+        "latency_ms_per_call_mean": ms_per_call,
+        "latency_ms_per_call_std":  ms_per_call_std,
+        "latency_ms_per_action_step": ms_per_step,
+        "latency_num_samples": len(latencies_ms),
+        "infer_chunk": args.infer_chunk,
+        "flops": flops_info,
     }
     out_json = log_dir / f"{args.task_suite_name}_{args.model_label}.json"
     with open(out_json, "w") as fh:
@@ -370,10 +519,16 @@ if __name__ == "__main__":
 Example:
 
 python evaluation/compute_equivariance_error.py \
-    --pretrained_model_path /path/to/checkpoints/060000/pretrained_model \
-    --model_label EquiVLA \
-    --task_suite_name libero_goal \
-    --num_samples 500 \
-    --n_group 8 \
-    --num_steps_wait 10
+    --args.pretrained_model_path /path/to/checkpoints/060000/pretrained_model \
+    --args.model_label EquiVLA \
+    --args.task_suite_name libero_goal \
+    --args.num_samples 500 \
+    --args.n_group 8 \
+    --args.num_steps_wait 10
+
+Outputs (in $save_dir/log/$exp_name/<task_suite>_<model_label>.{log,json}):
+  - epsilon_eq (mean ± std) and per-group breakdown
+  - param counts (total / trainable / by submodule)
+  - wall-clock latency: ms per get_action() call and ms per action step
+  - FLOPs per get_action() call (best-effort via fvcore; may be None)
 '''
