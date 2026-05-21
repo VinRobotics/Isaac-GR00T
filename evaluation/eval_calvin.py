@@ -277,6 +277,7 @@ class Args:
     task_suite_name: str = "calvin_abcd_d"   # used only as a label / log tag
     num_sequences: int = NUM_SEQUENCES
     ep_len: int = EP_LEN
+    n_workers: int = 1   # parallel eval workers; 1 = in-process (lowest RAM)
 
     # Output
     save_videos_root: str = "/mnt/data/sftp/data/locht1/calvin_eval_results"
@@ -470,9 +471,9 @@ def eval_calvin_all(args: Args):
     print("CALVIN LH-MTLC Evaluation (ABCD-D)")
     print("=" * 80)
 
-    # Split the 1000 eval sequences across parallel workers. Tune n_workers
-    # to the number of GPUs available; each worker spawns its own policy.
-    n_workers = 1
+    # Split the 1000 eval sequences across parallel workers. Tune via
+    # --args.n_workers; each worker spawns its own policy + env.
+    n_workers = max(1, args.n_workers)
     total = args.num_sequences
     chunks = np.array_split(np.arange(total), n_workers)
     sequence_splits = [list(map(int, c)) for c in chunks if len(c) > 0]
