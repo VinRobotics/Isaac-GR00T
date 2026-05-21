@@ -123,7 +123,15 @@ class CalvinParallelEnvs:
             self.processes.append(p)
 
         for i, pipe in enumerate(self.parent_pipes):
-            status, payload = pipe.recv()
+            try:
+                status, payload = pipe.recv()
+            except (EOFError, ConnectionResetError, OSError) as e:
+                self.close()
+                raise RuntimeError(
+                    f"env worker {i} died during init "
+                    f"(pipe {type(e).__name__}: {e}); "
+                    f"check stderr above for the worker's traceback"
+                ) from e
             if status != "ok":
                 self.close()
                 raise RuntimeError(f"env worker {i} failed to init: {payload}")
@@ -157,7 +165,11 @@ class CalvinParallelEnvs:
             try:
                 pipe.send(("close", None))
                 pipe.recv()
-            except (BrokenPipeError, EOFError):
+            except (BrokenPipeError, EOFError, ConnectionResetError, OSError):
+                pass
+            try:
+                pipe.close()
+            except Exception:
                 pass
         for p in self.processes:
             p.join(timeout=5)
