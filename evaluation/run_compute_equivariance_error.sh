@@ -34,14 +34,14 @@ run_one() {
     echo "  ckpt = $ckpt"
     echo "===================================================================="
     python evaluation/compute_equivariance_error.py \
-        --pretrained_model_path "$ckpt" \
-        --model_label "$label" \
-        --task_suite_name "$TASK_SUITE" \
-        --num_samples "$NUM_SAMPLES" \
-        --n_group "$N_GROUP" \
-        --num_steps_wait "$NUM_STEPS_WAIT" \
-        --save_dir "$SAVE_DIR" \
-        --exp_name "$EXP_NAME"
+        --args.pretrained_model_path "$ckpt" \
+        --args.model_label "$label" \
+        --args.task_suite_name "$TASK_SUITE" \
+        --args.num_samples "$NUM_SAMPLES" \
+        --args.n_group "$N_GROUP" \
+        --args.num_steps_wait "$NUM_STEPS_WAIT" \
+        --args.save_dir "$SAVE_DIR" \
+        --args.exp_name "$EXP_NAME"
 }
 
 run_one "Gr00t Baseline"   "$GR00TN15_CKPT"
