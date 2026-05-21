@@ -19,6 +19,7 @@ import sys
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/workspace/gr00t_equi_fa_simpler_fuse")  # for gr00t.model.policy
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/calvin/calvin_env")
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/calvin/calvin_models")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))  # for sibling _calvin_subproc
 
 import dataclasses
 import logging
@@ -233,50 +234,9 @@ class Gr00tCalvinInference:
 # ---------------------------------------------------------------------------
 # CALVIN env / oracle helpers
 # ---------------------------------------------------------------------------
-def _load_calvin_env(dataset_path: Optional[str] = None, scene: str = "calvin_scene_D"):
-    """
-    Build the CALVIN env.
-
-    If `dataset_path` is given and contains `validation/.hydra/merged_config.yaml`,
-    we use the canonical config shipped with the dataset (most reproducible).
-
-    Otherwise we compose the env directly from `calvin_env`'s own hydra configs —
-    no dataset download required. For ABCD-D eval, use scene='calvin_scene_D'
-    (the held-out env that ABCD-D is evaluated on).
-    """
-    import hydra
-    from hydra import compose, initialize_config_dir
-    from hydra.core.global_hydra import GlobalHydra
-    from omegaconf import OmegaConf
-    import calvin_env
-    from calvin_env.envs.play_table_env import get_env
-
-    # Path A: canonical config from a downloaded dataset folder
-    if dataset_path is not None:
-        cfg_path = pathlib.Path(dataset_path) / "validation" / ".hydra" / "merged_config.yaml"
-        if cfg_path.is_file():
-            return get_env(pathlib.Path(dataset_path) / "validation", show_gui=False)
-
-    # Path B: no dataset — compose from calvin_env's installed configs
-    conf_dir = (pathlib.Path(calvin_env.__file__).parents[1] / "conf").resolve()
-    if not GlobalHydra.instance().is_initialized():
-        initialize_config_dir(config_dir=str(conf_dir), version_base=None)
-
-    cfg = compose(
-        config_name="config_data_collection",
-        overrides=[
-            f"scene={scene}",
-            "cameras=static_and_gripper",
-            "robot=panda_longer_finger",
-        ],
-    )
-    env = hydra.utils.instantiate(
-        cfg.env,
-        show_gui=False,
-        use_vr=False,
-        use_scene_info=True,
-    )
-    return env
+# `_load_calvin_env` lives in _calvin_subproc so env subprocesses can import it
+# without dragging in gr00t / TensorFlow.
+from _calvin_subproc import _load_calvin_env, CalvinParallelEnvs  # noqa: E402
 
 
 def _load_task_oracle_and_annotations(calvin_models_root: str):
@@ -481,9 +441,10 @@ def eval_calvin(args: Args, sequence_ids: Optional[list] = None) -> list:
 
 def eval_calvin_batched(args: Args, sequence_ids: Optional[list] = None) -> list:
     """
-    Single-process, N parallel envs with batched policy inference.
-    Each env independently runs its sequence; slots are refilled from the
-    pool as they finish, so the batch size stays at N until the tail.
+    N CALVIN envs in N subprocesses, batched policy inference in the parent.
+    Env stepping is wall-clock parallel (mimics MimicgenParallelEnvs); the
+    policy is the only thing batched on the GPU. Slots are refilled from the
+    sequence queue as each sequence finishes.
     """
     np.random.seed(args.seed)
 
@@ -515,124 +476,159 @@ def eval_calvin_batched(args: Args, sequence_ids: Optional[list] = None) -> list
         return []
 
     n_envs = max(1, args.n_envs)
-    logging.info(f"Building {n_envs} parallel envs (scene={args.scene})")
-    envs = []
-    for i in range(n_envs):
-        envs.append(_load_calvin_env(args.dataset_path or None, scene=args.scene))
-        logging.info(f"  Env {i+1}/{n_envs} ready")
+    logging.info(f"Spawning {n_envs} env subprocesses (scene={args.scene})")
+    pool = CalvinParallelEnvs(n_envs, scene=args.scene,
+                              dataset_path=args.dataset_path or None)
 
-    task_oracle, val_annotations = _load_task_oracle_and_annotations(args.calvin_models_root)
-    eval_sequences = _get_eval_sequences(args.num_sequences)
-    if sequence_ids is not None:
-        eval_sequences = [eval_sequences[i] for i in sequence_ids]
-    n_total = len(eval_sequences)
+    try:
+        task_oracle, val_annotations = _load_task_oracle_and_annotations(args.calvin_models_root)
+        eval_sequences = _get_eval_sequences(args.num_sequences)
+        if sequence_ids is not None:
+            eval_sequences = [eval_sequences[i] for i in sequence_ids]
+        n_total = len(eval_sequences)
 
-    # Per-slot rollout state
-    slot_state = [None] * n_envs
-    pending_results = {}     # local_seq_idx -> success_count
-    next_seq_idx = [0]       # boxed so the closure can mutate
+        # Per-slot rollout state. `current_obs` is updated on every reset/step
+        # so the policy call doesn't need a separate get_obs() RPC.
+        slot_state = [None] * n_envs
+        pending_results = {}
+        next_seq_idx = [0]
 
-    def assign_next_to_slot(slot_idx: int) -> bool:
-        if next_seq_idx[0] >= n_total:
-            return False
-        seq_idx = next_seq_idx[0]
-        next_seq_idx[0] += 1
-        initial_state, eval_sequence = eval_sequences[seq_idx]
-        robot_obs, scene_obs = _get_env_state_for_initial_condition(initial_state)
-        envs[slot_idx].reset(robot_obs=robot_obs, scene_obs=scene_obs)
-        slot_state[slot_idx] = {
-            "seq_idx": seq_idx,
-            "eval_sequence": eval_sequence,
-            "subtask_idx": 0,
-            "start_info": envs[slot_idx].get_info(),
-            "success_count": 0,
-            "subtask_step": 0,
-            "static_frames": [],
-            "gripper_frames": [],
-            "action_chunk": None,
-            "chunk_idx": args.infer_chunk,   # forces fresh policy call on first tick
-            "save_this": (seq_idx % max(args.save_video_every, 1) == 0),
-        }
-        return True
+        def _build_state(slot_idx, seq_idx, eval_sequence, obs, info):
+            slot_state[slot_idx] = {
+                "seq_idx": seq_idx,
+                "eval_sequence": eval_sequence,
+                "subtask_idx": 0,
+                "start_info": info,
+                "current_obs": obs,
+                "success_count": 0,
+                "subtask_step": 0,
+                "static_frames": [to_video_frame(obs["rgb_obs"]["rgb_static"])],
+                "gripper_frames": [to_video_frame(obs["rgb_obs"]["rgb_gripper"])],
+                "action_chunk": None,
+                "chunk_idx": args.infer_chunk,
+                "save_this": (seq_idx % max(args.save_video_every, 1) == 0),
+            }
 
-    for i in range(n_envs):
-        assign_next_to_slot(i)
-
-    pbar = tqdm.tqdm(total=n_total, desc=f"seqs (B={n_envs})")
-
-    while any(s is not None for s in slot_state):
-        # Phase 1: refill action chunks for slots that need a new one (batched).
-        need_chunk = [i for i in range(n_envs)
-                      if slot_state[i] is not None
-                      and slot_state[i]["chunk_idx"] >= args.infer_chunk]
-        if need_chunk:
-            obs_list = [envs[i].get_obs() for i in need_chunk]
-            lang_list = [
-                val_annotations[
-                    slot_state[i]["eval_sequence"][slot_state[i]["subtask_idx"]]
-                ][0]
-                for i in need_chunk
-            ]
-            action_chunks = policy.get_calvin_actions_batched(obs_list, lang_list)
-            for k, i in enumerate(need_chunk):
-                slot_state[i]["action_chunk"] = action_chunks[k]
-                slot_state[i]["chunk_idx"] = 0
-
-        # Phase 2: step every active slot once.
+        # Initial fill — batched reset across all slots
+        init_indices, init_robot, init_scene, init_meta = [], [], [], []
         for i in range(n_envs):
-            s = slot_state[i]
-            if s is None:
-                continue
-            act = s["action_chunk"][s["chunk_idx"]]
-            s["chunk_idx"] += 1
-            obs, _, _, info = envs[i].step(act)
-            s["subtask_step"] += 1
-            s["static_frames"].append(to_video_frame(obs["rgb_obs"]["rgb_static"]))
-            s["gripper_frames"].append(to_video_frame(obs["rgb_obs"]["rgb_gripper"]))
+            if next_seq_idx[0] >= n_total:
+                break
+            seq_idx = next_seq_idx[0]
+            next_seq_idx[0] += 1
+            initial_state, eval_sequence = eval_sequences[seq_idx]
+            r, s = _get_env_state_for_initial_condition(initial_state)
+            init_indices.append(i)
+            init_robot.append(r)
+            init_scene.append(s)
+            init_meta.append((seq_idx, eval_sequence))
 
-            subtask = s["eval_sequence"][s["subtask_idx"]]
-            completed = task_oracle.get_task_info_for_set(s["start_info"], info, {subtask})
+        if init_indices:
+            results = pool.reset(init_indices, init_robot, init_scene)
+            for idx, (obs, info), (seq_idx, eval_sequence) in zip(init_indices, results, init_meta):
+                _build_state(idx, seq_idx, eval_sequence, obs, info)
 
-            slot_done = False
-            if len(completed) > 0:
-                s["success_count"] += 1
-                s["subtask_idx"] += 1
-                if s["subtask_idx"] >= 5:
+        def _refill_slot(slot_idx: int) -> bool:
+            if next_seq_idx[0] >= n_total:
+                slot_state[slot_idx] = None
+                return False
+            seq_idx = next_seq_idx[0]
+            next_seq_idx[0] += 1
+            initial_state, eval_sequence = eval_sequences[seq_idx]
+            r, s = _get_env_state_for_initial_condition(initial_state)
+            (obs, info), = pool.reset([slot_idx], [r], [s])
+            _build_state(slot_idx, seq_idx, eval_sequence, obs, info)
+            return True
+
+        pbar = tqdm.tqdm(total=n_total, desc=f"seqs (B={n_envs})")
+
+        while any(s is not None for s in slot_state):
+            # Phase 1: refill action chunks for slots that need a new one (batched policy call).
+            need_chunk = [i for i in range(n_envs)
+                          if slot_state[i] is not None
+                          and slot_state[i]["chunk_idx"] >= args.infer_chunk]
+            if need_chunk:
+                obs_list = [slot_state[i]["current_obs"] for i in need_chunk]
+                lang_list = [
+                    val_annotations[
+                        slot_state[i]["eval_sequence"][slot_state[i]["subtask_idx"]]
+                    ][0]
+                    for i in need_chunk
+                ]
+                action_chunks = policy.get_calvin_actions_batched(obs_list, lang_list)
+                for k, i in enumerate(need_chunk):
+                    slot_state[i]["action_chunk"] = action_chunks[k]
+                    slot_state[i]["chunk_idx"] = 0
+
+            # Phase 2: collect one action per active slot, step pool in parallel.
+            step_indices, step_actions = [], []
+            for i in range(n_envs):
+                s = slot_state[i]
+                if s is None:
+                    continue
+                step_indices.append(i)
+                step_actions.append(s["action_chunk"][s["chunk_idx"]])
+                s["chunk_idx"] += 1
+
+            if not step_indices:
+                break
+
+            step_results = pool.step(step_indices, step_actions)
+
+            # Phase 3: process results, mark done, refill finished slots.
+            finished_slots = []
+            for idx, (obs, info) in zip(step_indices, step_results):
+                s = slot_state[idx]
+                s["current_obs"] = obs
+                s["subtask_step"] += 1
+                s["static_frames"].append(to_video_frame(obs["rgb_obs"]["rgb_static"]))
+                s["gripper_frames"].append(to_video_frame(obs["rgb_obs"]["rgb_gripper"]))
+
+                subtask = s["eval_sequence"][s["subtask_idx"]]
+                completed = task_oracle.get_task_info_for_set(s["start_info"], info, {subtask})
+
+                slot_done = False
+                if len(completed) > 0:
+                    s["success_count"] += 1
+                    s["subtask_idx"] += 1
+                    if s["subtask_idx"] >= 5:
+                        slot_done = True
+                    else:
+                        s["subtask_step"] = 0
+                        s["start_info"] = info
+                        s["chunk_idx"] = args.infer_chunk  # fresh policy call with new lang
+                elif s["subtask_step"] >= args.ep_len:
                     slot_done = True
-                else:
-                    # Move on to next subtask in the same sequence
-                    s["subtask_step"] = 0
-                    s["start_info"] = info
-                    s["chunk_idx"] = args.infer_chunk  # fresh policy call with new lang
-            elif s["subtask_step"] >= args.ep_len:
-                slot_done = True   # subtask timed out → whole sequence ends here
 
-            if slot_done:
-                pending_results[s["seq_idx"]] = s["success_count"]
-                pbar.update(1)
-                running_avg = float(np.mean(list(pending_results.values())))
-                pbar.set_postfix(avg=f"{running_avg:.2f}")
+                if slot_done:
+                    pending_results[s["seq_idx"]] = s["success_count"]
+                    pbar.update(1)
+                    running_avg = float(np.mean(list(pending_results.values())))
+                    pbar.set_postfix(avg=f"{running_avg:.2f}")
 
-                if s["save_this"] and s["static_frames"]:
-                    vtag = f"seq{s['seq_idx']:04d}_solved{s['success_count']}"
-                    imageio.mimwrite(
-                        video_root / f"{vtag}_static.mp4",
-                        [np.asarray(x) for x in s["static_frames"]],
-                        fps=30, codec="libx264",
-                    )
-                    imageio.mimwrite(
-                        video_root / f"{vtag}_gripper.mp4",
-                        [np.asarray(x) for x in s["gripper_frames"]],
-                        fps=30, codec="libx264",
-                    )
+                    if s["save_this"] and s["static_frames"]:
+                        vtag = f"seq{s['seq_idx']:04d}_solved{s['success_count']}"
+                        imageio.mimwrite(
+                            video_root / f"{vtag}_static.mp4",
+                            [np.asarray(x) for x in s["static_frames"]],
+                            fps=30, codec="libx264",
+                        )
+                        imageio.mimwrite(
+                            video_root / f"{vtag}_gripper.mp4",
+                            [np.asarray(x) for x in s["gripper_frames"]],
+                            fps=30, codec="libx264",
+                        )
+                    finished_slots.append(idx)
 
-                if not assign_next_to_slot(i):
-                    slot_state[i] = None
+            for idx in finished_slots:
+                _refill_slot(idx)
 
-    pbar.close()
+        pbar.close()
 
-    # Return in submission order
-    results = [pending_results[i] for i in range(n_total)]
+        results = [pending_results[i] for i in range(n_total)]
+
+    finally:
+        pool.close()
 
     avg = float(np.mean(results)) if results else 0.0
     chain = _count_success(results)
