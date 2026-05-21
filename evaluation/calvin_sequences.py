@@ -25,10 +25,23 @@ from copy import deepcopy
 from itertools import product
 
 import numpy as np
-import pyhash
 from numpy import pi
 
-hasher = pyhash.fnv1_32()
+
+def _fnv1_32(s: str) -> int:
+    """Pure-Python FNV-1 32-bit hash. Matches pyhash.fnv1_32() output exactly,
+    so we can drop the pyhash dependency without changing CALVIN eval seeds."""
+    FNV_PRIME = 0x01000193
+    FNV_OFFSET = 0x811C9DC5
+    MASK = 0xFFFFFFFF
+    h = FNV_OFFSET
+    for b in s.encode("utf-8"):
+        h = (h * FNV_PRIME) & MASK
+        h ^= b
+    return h
+
+
+hasher = _fnv1_32
 logger = logging.getLogger(__name__)
 
 
