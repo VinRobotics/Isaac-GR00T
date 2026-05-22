@@ -223,6 +223,54 @@ def _rotate_axisangle_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
     return new_rpy.reshape(rpy.shape).astype(np.asarray(rpy).dtype)
 
 
+def _rotate_quat_world_z(quat: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Apply world rotation R_z(angle_rad) to quaternion orientations.
+
+    q_new = q_z(angle) · q_old   (quaternion composition / left-multiply
+    by the world rotation), expressed via rotation matrices.
+
+    Args:
+        quat: [..., 4] float array of quaternions in xyzw order
+              (the convention used by EquiLiberoConfig / scipy from_quat).
+        angle_rad: world rotation angle about z-axis (radians).
+    """
+    from scipy.spatial.transform import Rotation as _Rsc
+    flat = np.asarray(quat, dtype=np.float64).reshape(-1, 4)
+    R_old = _Rsc.from_quat(flat).as_matrix()
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    R_z = np.array(
+        [[cos_a, -sin_a, 0.0],
+         [sin_a,  cos_a, 0.0],
+         [0.0,    0.0,   1.0]],
+        dtype=np.float64,
+    )
+    R_new = np.einsum("ij,njk->nik", R_z, R_old)
+    new_quat = _Rsc.from_matrix(R_new).as_quat()        # xyzw
+    return new_quat.reshape(np.asarray(quat).shape).astype(np.asarray(quat).dtype)
+
+
+def _quat_to_6d(quat: np.ndarray) -> np.ndarray:
+    """Convert quaternion [..., 4] (xyzw) to 6D rotation rep [..., 6]
+    (first two columns of R(quat), row-stacked).  Same target form as
+    _axisangle_to_6d so the comparison metric stays consistent across
+    EquiRelLibero (axis-angle) and EquiLibero (quaternion) configs.
+    """
+    from scipy.spatial.transform import Rotation as _Rsc
+    flat = np.asarray(quat, dtype=np.float64).reshape(-1, 4)
+    R_mat = _Rsc.from_quat(flat).as_matrix()
+    six = R_mat[:, :, :2].transpose(0, 2, 1).reshape(-1, 6)
+    out_shape = list(np.asarray(quat).shape)
+    out_shape[-1] = 6
+    return six.reshape(out_shape).astype(np.asarray(quat).dtype)
+
+
+def _data_config_name() -> str:
+    """Read the active data config name (defaults to EquiRelLibero).  Set via
+    EQUI_DATA_CONFIG=EquiLibero env var (see gr00tn15_inference.py)."""
+    return os.environ.get("EQUI_DATA_CONFIG", "EquiRelLibero")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Observation / action transformation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,10 +311,37 @@ def build_obs_dict(
         img = rotate_image(img, angle_rad)
 
     pos = np.asarray(raw_obs["robot0_eef_pos"], dtype=np.float32).copy()
-    rpy = _quat2axisangle(np.asarray(raw_obs["robot0_eef_quat"], dtype=np.float32).copy())
-    rpy = rpy.astype(np.float32)
+    quat_xyzw = np.asarray(raw_obs["robot0_eef_quat"], dtype=np.float32).copy()
     gripper = np.asarray(raw_obs["robot0_gripper_qpos"], dtype=np.float32).copy()
 
+    use_quat_cfg = _data_config_name() == "EquiLibero"
+
+    if use_quat_cfg:
+        # EquiLiberoConfig: keep orientation as quaternion (xyzw, 4 dims).
+        if angle_rad != 0.0 and rotate_state:
+            cos_a = math.cos(angle_rad)
+            sin_a = math.sin(angle_rad)
+            x_new = cos_a * pos[0] - sin_a * pos[1]
+            y_new = sin_a * pos[0] + cos_a * pos[1]
+            pos = np.array([x_new, y_new, pos[2]], dtype=np.float32)
+            # Quaternion under R_z(θ): q_new = q_z(θ) · q_old.
+            quat_xyzw = _rotate_quat_world_z(quat_xyzw, angle_rad).astype(np.float32)
+        return {
+            "video.image": img[np.newaxis, np.newaxis, ...],
+            "video.wrist_image": wrist_img[np.newaxis, np.newaxis, ...],
+            "state.x": np.array([[[pos[0]]]], dtype=np.float32),
+            "state.y": np.array([[[pos[1]]]], dtype=np.float32),
+            "state.z": np.array([[[pos[2]]]], dtype=np.float32),
+            "state.rx": np.array([[[quat_xyzw[0]]]], dtype=np.float32),
+            "state.ry": np.array([[[quat_xyzw[1]]]], dtype=np.float32),
+            "state.rz": np.array([[[quat_xyzw[2]]]], dtype=np.float32),
+            "state.rw": np.array([[[quat_xyzw[3]]]], dtype=np.float32),
+            "state.gripper": gripper[np.newaxis, np.newaxis, ...],
+            "annotation.human.action.task_description": (str(task_description),),
+        }
+
+    # ── Default: EquiRelLiberoConfig with axis-angle orientation ────────────
+    rpy = _quat2axisangle(quat_xyzw).astype(np.float32)
     if angle_rad != 0.0 and rotate_state:
         # Position is a 3D vector: (x, y) rotates linearly, z invariant.
         cos_a = math.cos(angle_rad)
@@ -400,27 +475,57 @@ def _rotate_axisangle_slice_inplace(tensor, sl: slice, angle_rad: float):
         tensor[..., sl] = new_rpy.astype(tensor.dtype)
 
 
+def _rotate_quat_slice_inplace(tensor, sl: slice, angle_rad: float):
+    """In-place: apply world-rotation R_z(θ) to quaternion slice (4 dims, xyzw)."""
+    is_torch = isinstance(tensor, torch.Tensor)
+    if is_torch:
+        q_np = tensor[..., sl].detach().cpu().numpy()
+    else:
+        q_np = np.asarray(tensor[..., sl])
+    new_q = _rotate_quat_world_z(q_np, angle_rad)
+    if is_torch:
+        tensor[..., sl] = torch.from_numpy(new_q).to(
+            dtype=tensor.dtype, device=tensor.device
+        )
+    else:
+        tensor[..., sl] = new_q.astype(tensor.dtype)
+
+
+# ── EquiLibero (quaternion) layout ──────────────────────────────────────────
+# After ConcatTransform: [state.x, state.y, state.z, state.rx, state.ry,
+#                         state.rz, state.rw, state.gripper(2 dims), 0-padding]
+# Same for action_keys = [x, y, z, rx, ry, rz, rw, gripper].
+STATE_QUAT_SLICE  = slice(3, 7)
+ACTION_QUAT_SLICE = slice(3, 7)
+
+
 def rotate_normalized_state(state, angle_rad: float):
     """Return a copy of the normalized state with the correct group action applied.
 
-    Position (x, y): irrep(1).
-    Orientation (axis-angle ω_x, ω_y, ω_z): rotation-matrix composition.
+    Position (x, y): irrep(1).  Orientation rule depends on the active data
+    config:
+      • EquiRelLibero (axis-angle, 3 dims) — rotation-matrix composition
+        applied to slice [3:6].
+      • EquiLibero (quaternion, 4 dims xyzw) — left-multiply by q_z(θ) on
+        slice [3:7].
     """
     out = state.clone() if isinstance(state, torch.Tensor) else state.copy()
     _rotate_xy_pair_inplace(out, STATE_XY_PAIR, angle_rad)
-    _rotate_axisangle_slice_inplace(out, STATE_ROT_SLICE, angle_rad)
+    if _data_config_name() == "EquiLibero":
+        _rotate_quat_slice_inplace(out, STATE_QUAT_SLICE, angle_rad)
+    else:
+        _rotate_axisangle_slice_inplace(out, STATE_ROT_SLICE, angle_rad)
     return out
 
 
 def rotate_normalized_action(action, angle_rad: float):
-    """Return a copy of the normalized action with the correct group action applied.
-
-    Same rule as state: (x, y) irrep(1), (ω_x, ω_y, ω_z) nonlinear axis-angle
-    rotation, z/gripper/padding invariant.
-    """
+    """Return a copy of the normalized action with the correct group action applied."""
     out = action.clone() if isinstance(action, torch.Tensor) else action.copy()
     _rotate_xy_pair_inplace(out, ACTION_XY_PAIR, angle_rad)
-    _rotate_axisangle_slice_inplace(out, ACTION_ROT_SLICE, angle_rad)
+    if _data_config_name() == "EquiLibero":
+        _rotate_quat_slice_inplace(out, ACTION_QUAT_SLICE, angle_rad)
+    else:
+        _rotate_axisangle_slice_inplace(out, ACTION_ROT_SLICE, angle_rad)
     return out
 
 
@@ -465,21 +570,24 @@ def _axisangle_to_6d(rpy: np.ndarray) -> np.ndarray:
 
 
 def action_to_comparison_form(action_real: np.ndarray) -> np.ndarray:
-    """Replace the axis-angle orientation slice [..., 3:6] with its 6D form.
+    """Replace the orientation slice with its 6D rotation rep.
 
-    Input  shape: [..., 7]  layout [x, y, z, ω_x, ω_y, ω_z, gripper]
-    Output shape: [..., 10] layout [x, y, z, c1_x, c1_y, c1_z, c2_x, c2_y, c2_z, gripper]
+    EquiRelLibero (axis-angle, slice [3:6]) input shape [..., 7]:
+        output shape [..., 10] = [pos(3), 6D(6), gripper(1)]
+    EquiLibero    (quaternion, slice [3:7]) input shape [..., 8]:
+        output shape [..., 10] = [pos(3), 6D(6), gripper(1)]
 
-    This is the space we should take L2 norm in: the comparison is faithful
-    to the model's internal rotation representation and is free of the
-    axis-angle wraparound at |ω| = π.
+    Both target the same 10-dim comparison space so L2 error is faithful
+    and free of the axis-angle / quaternion sign ambiguity.
     """
     a = np.asarray(action_real)
-    rot_6d = _axisangle_to_6d(a[..., 3:6])              # [..., 6]
-    return np.concatenate(
-        [a[..., :3], rot_6d, a[..., 6:7]],
-        axis=-1,
-    )
+    if _data_config_name() == "EquiLibero":
+        # a[..., :3] = pos, a[..., 3:7] = quat, a[..., 7:8] = gripper
+        rot_6d = _quat_to_6d(a[..., 3:7])
+        return np.concatenate([a[..., :3], rot_6d, a[..., 7:8]], axis=-1)
+    # Default: axis-angle layout
+    rot_6d = _axisangle_to_6d(a[..., 3:6])
+    return np.concatenate([a[..., :3], rot_6d, a[..., 6:7]], axis=-1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -805,10 +913,13 @@ def compute_equivariance_error(args: Args) -> None:
             # fixed z_0 silently breaks equivariance even for an exactly
             # equi model (see sample_init_noise docstring).
             init_noise_0 = sample_init_noise(batch_size=1)
+            # Real action-dim count: 7 for EquiRelLibero (axis-angle), 8 for
+            # EquiLibero (quaternion).
+            n_real = 8 if _data_config_name() == "EquiLibero" else 7
 
             norm_input_orig = build_normalized_input(raw_obs, task_description, angle_rad=0.0)
             a_orig_full = call_model_normalized(norm_input_orig, init_noise=init_noise_0)
-            a_orig_real = a_orig_full[..., :7]
+            a_orig_real = a_orig_full[..., :n_real]
             action_norms.append(float(np.linalg.norm(a_orig_real)))
             per_g_errors[0].append(0.0)
             flat_errors.append(0.0)
@@ -828,10 +939,11 @@ def compute_equivariance_error(args: Args) -> None:
 
                 a_rot_full = call_model_normalized(norm_input_rot, init_noise=init_noise_r)
                 a_expected_full = rotate_normalized_action(a_orig_full, angle)
-                # Compare in 6D rotation space (not axis-angle) — see
-                # action_to_comparison_form docstring for the wraparound problem.
-                a_rot_cmp      = action_to_comparison_form(a_rot_full[..., :7])
-                a_expected_cmp = action_to_comparison_form(a_expected_full[..., :7])
+                # Compare in 6D rotation space (not axis-angle / quaternion) —
+                # see action_to_comparison_form docstring for the wraparound /
+                # sign-ambiguity problem.
+                a_rot_cmp      = action_to_comparison_form(a_rot_full[..., :n_real])
+                a_expected_cmp = action_to_comparison_form(a_expected_full[..., :n_real])
                 err = float(np.linalg.norm(a_rot_cmp - a_expected_cmp))
                 per_g_errors[r].append(err)
                 flat_errors.append(err)
@@ -866,9 +978,9 @@ def compute_equivariance_error(args: Args) -> None:
                         if (init_noise_0 is not None and init_noise_r is not None)
                         else float("nan")
                     )
-                    a_rot7      = a_rot_full[..., :7]
-                    a_orig7     = a_orig_full[..., :7]
-                    a_expected7 = a_expected_full[..., :7]
+                    a_rot7      = a_rot_full[..., :n_real]
+                    a_orig7     = a_orig_full[..., :n_real]
+                    a_expected7 = a_expected_full[..., :n_real]
                     out_diff      = _norm(a_rot7 - a_orig7)
                     equi_gap      = _norm(a_rot7 - a_expected7)
                     baseline_diff = _norm(a_orig7 - a_expected7)
