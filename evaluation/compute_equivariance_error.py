@@ -134,6 +134,12 @@ class Args:
     This isolates the model's architectural equivariance (the object of cor:e2e),
     free of the I/O denormalization artefacts that dominate the unnormalized score."""
 
+    debug_first_sample: bool = False
+    """Print per-stage diff diagnostics (image / state / noise / model output)
+    for the first observation only.  Use this when the aggregate epsilon_eq
+    refuses to drop — it tells you whether each piece (image rotation, state
+    rotation, noise rotation, model response) is actually doing what's intended."""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Image rotation
@@ -823,6 +829,39 @@ def compute_equivariance_error(args: Args) -> None:
                 err = float(np.linalg.norm(a_rot_cmp - a_expected_cmp))
                 per_g_errors[r].append(err)
                 flat_errors.append(err)
+
+                # ── Debug diagnostic on the first sample ────────────────────
+                # See the equillm branch for full layout.  Reads:
+                #   state_diff  > 0  ⇒  state rotation reaches the model
+                #   noise_diff  > 0  ⇒  noise rotation is applied
+                #                       (NaN on baseline — no equi head)
+                #   out_diff    > 0  ⇒  model output responds to input change
+                #   equi_gap    ≈ 0  ⇒  response is equivariant
+                #   baseline_diff   ⇒  pure rotation of a_orig — model-indep
+                if args.debug_first_sample and sample_idx == 0:
+                    def _norm(x):
+                        if isinstance(x, torch.Tensor):
+                            return float(x.float().detach().cpu().norm())
+                        return float(np.linalg.norm(np.asarray(x)))
+                    state_diff = _norm(norm_input_rot["state"] - state_orig)
+                    noise_diff = (
+                        _norm(init_noise_r - init_noise_0)
+                        if (init_noise_0 is not None and init_noise_r is not None)
+                        else float("nan")
+                    )
+                    a_rot7      = a_rot_full[..., :7]
+                    a_orig7     = a_orig_full[..., :7]
+                    a_expected7 = a_expected_full[..., :7]
+                    out_diff      = _norm(a_rot7 - a_orig7)
+                    equi_gap      = _norm(a_rot7 - a_expected7)
+                    baseline_diff = _norm(a_orig7 - a_expected7)
+                    print(
+                        f"[DEBUG g_{r} ({math.degrees(angle):6.1f}°)]  "
+                        f"state_diff={state_diff:7.4f}  noise_diff={noise_diff:7.4f}  "
+                        f"out_diff={out_diff:7.4f}  equi_gap={equi_gap:7.4f}  "
+                        f"baseline_diff={baseline_diff:7.4f}",
+                        flush=True,
+                    )
                 pbar.update(1)
         else:
             # ── Raw-space path (kept for comparison) ──
