@@ -98,7 +98,7 @@ class Gr00tCalvinInference:
             embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
             modality_config=data_config.modality_config(),
             modality_transform=data_config.transform(),
-            denoising_steps=4,
+            denoising_steps=8,
             device="cuda",
         )
         print("Number of parameters:", sum(p.numel() for p in policy.model.parameters()))
@@ -275,7 +275,7 @@ def _get_env_state_for_initial_condition(initial_condition):
 class Args:
     # Model
     pretrained_model_path: str = ""
-    infer_chunk: int = 10
+    infer_chunk: int = 1
 
     # CALVIN dataset / repo paths.
     # `dataset_path` is OPTIONAL — if empty, env is built from calvin_env's
