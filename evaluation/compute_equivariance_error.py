@@ -6,17 +6,21 @@
 #     epsilon_eq = (1 / (M|G|)) * sum_{g,o} || a_hat(g.o) - rho_a(g) * a_hat(o) ||
 #
 # Group action (rotation about world z-axis by 2 pi r / N):
-#   - state / action xy : rotate as a 2D vector            (irrep(1))
-#   - state / action z  : invariant                        (trivial)
-#   - state / action axis-angle (roll, pitch, yaw):
-#         (roll, pitch) rotates as a 2D vector            (irrep(1))
-#         yaw stays the same                              (trivial)
-#   - gripper           : invariant                        (trivial)
-#   - agentview image  : rotate about its centre
-#   - wrist image      : invariant (camera is mounted on the gripper, so the
-#                        wrist view co-rotates with the world about z; the
-#                        equivariant vision pathway also skips wrist — see
-#                        EquiRelLiberoConfig.get_rotation_config)
+#   - state / action xy             : irrep(1) — 2D rotation
+#   - state / action z              : trivial — invariant
+#   - state / action axis-angle ω   : NONLINEAR — ω → axis_angle(R_z(θ) · R(ω)).
+#                                      All three components (ω_x, ω_y, ω_z) may
+#                                      change; treating (ω_x, ω_y) as a simple
+#                                      irrep(1) pair is only valid in the
+#                                      first-order ω ≈ 0 limit and is wrong for
+#                                      finite world rotations.
+#   - gripper                       : trivial — invariant
+#   - agentview image               : rotate about its centre
+#   - wrist image                   : invariant (camera mounted on the gripper,
+#                                      so the wrist view co-rotates with the
+#                                      world about z; the equivariant vision
+#                                      pathway also skips wrist — see
+#                                      EquiRelLiberoConfig.get_rotation_config)
 #
 # Noisy init: LIBERO simulator drops objects on reset.  We step `num_steps_wait`
 # dummy actions BEFORE collecting any observation so dynamics have settled and
@@ -152,6 +156,50 @@ def rotate_image(img: np.ndarray, angle_rad: float) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Axis-angle rotation under world rotation about z
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# CRITICAL: An axis-angle vector ω = θ·n (representing orientation R(ω))
+# DOES NOT rotate linearly under world rotation R_z(θ_w).  The correct
+# transformation is
+#       R_new = R_z(θ_w) · R(ω_old),        ω_new = axis_angle(R_new)
+# which is nonlinear in ω_old.  Treating (ω_x, ω_y) as a 2D vector that
+# rotates by R_z(θ_w) (i.e. simple irrep(1)) is only a first-order
+# approximation around ω ≈ 0 and is wrong for finite rotations — in
+# particular it leaves ω_z (yaw) invariant, whereas the correct rule
+# generally produces a non-zero shift in ω_z.
+#
+# This helper applies the correct world-rotation transformation to a
+# batch of axis-angle vectors.
+
+def _rotate_axisangle_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Apply world rotation R_z(angle_rad) to axis-angle orientations.
+
+    Args:
+        rpy: [..., 3] float array of axis-angle vectors (ω_x, ω_y, ω_z).
+        angle_rad: world rotation angle about z-axis (radians).
+
+    Returns:
+        [..., 3] float array of new axis-angle vectors representing
+        R_z(angle_rad) ∘ R(rpy).
+    """
+    from scipy.spatial.transform import Rotation as _Rsc
+    flat = np.asarray(rpy, dtype=np.float64).reshape(-1, 3)
+    R_old = _Rsc.from_rotvec(flat).as_matrix()          # [N, 3, 3]
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    R_z = np.array(
+        [[cos_a, -sin_a, 0.0],
+         [sin_a,  cos_a, 0.0],
+         [0.0,    0.0,   1.0]],
+        dtype=np.float64,
+    )
+    R_new = np.einsum("ij,njk->nik", R_z, R_old)         # R_z @ R_old, batched
+    new_rpy = _Rsc.from_matrix(R_new).as_rotvec()        # [N, 3]
+    return new_rpy.reshape(rpy.shape).astype(np.asarray(rpy).dtype)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Observation / action transformation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -167,8 +215,9 @@ def build_obs_dict(
     then we rotate the IMAGE by angle_rad about its centre.
 
     If rotate_state=True (default — raw-space mode):
-        Raw state (x, y) and (roll, pitch) axis-angle components are rotated by
-        the same angle about z before being packed into the obs dict.
+        Raw state (x, y) is rotated linearly; the axis-angle orientation is
+        rotated via R_z(θ) · R(ω) (NOT linear in (ω_x, ω_y); see
+        _rotate_axisangle_world_z).
 
     If rotate_state=False (Option A — normalized-space mode):
         Raw state is kept un-rotated.  The caller will rotate the normalized
@@ -195,14 +244,15 @@ def build_obs_dict(
     gripper = np.asarray(raw_obs["robot0_gripper_qpos"], dtype=np.float32).copy()
 
     if angle_rad != 0.0 and rotate_state:
+        # Position is a 3D vector: (x, y) rotates linearly, z invariant.
         cos_a = math.cos(angle_rad)
         sin_a = math.sin(angle_rad)
         x_new = cos_a * pos[0] - sin_a * pos[1]
         y_new = sin_a * pos[0] + cos_a * pos[1]
         pos = np.array([x_new, y_new, pos[2]], dtype=np.float32)
-        roll_new = cos_a * rpy[0] - sin_a * rpy[1]
-        pitch_new = sin_a * rpy[0] + cos_a * rpy[1]
-        rpy = np.array([roll_new, pitch_new, rpy[2]], dtype=np.float32)
+        # Orientation is axis-angle: ω_new = axis_angle(R_z(θ) · R(ω_old))
+        # — NOT a linear 2D rotation on (ω_x, ω_y).
+        rpy = _rotate_axisangle_world_z(rpy, angle_rad).astype(np.float32)
 
     return {
         "video.image": img[np.newaxis, np.newaxis, ...],
@@ -236,15 +286,22 @@ def action_dict_to_array(action_dict: dict, infer_chunk: int) -> np.ndarray:
 
 
 def rotate_action_array(action: np.ndarray, angle_rad: float) -> np.ndarray:
-    """Apply rho_a(g) to the predicted action chunk [T, 7]."""
+    """Apply rho_a(g) to the predicted action chunk [T, 7].
+
+    Layout: [x, y, z, roll, pitch, yaw, gripper] where (roll, pitch, yaw) is
+    axis-angle.  Position rotates linearly; orientation rotates via rotation
+    matrix composition (axis-angle is not a linear irrep under finite world
+    rotation — see _rotate_axisangle_world_z).
+    """
     out = action.copy()
     cos_a = math.cos(angle_rad)
     sin_a = math.sin(angle_rad)
+    # Position: irrep(1) on (x, y); z invariant.
     out[:, 0] = cos_a * action[:, 0] - sin_a * action[:, 1]
     out[:, 1] = sin_a * action[:, 0] + cos_a * action[:, 1]
-    out[:, 3] = cos_a * action[:, 3] - sin_a * action[:, 4]
-    out[:, 4] = sin_a * action[:, 3] + cos_a * action[:, 4]
-    # z, yaw, gripper unchanged
+    # Orientation: rotation-matrix composition (nonlinear in axis-angle).
+    out[:, 3:6] = _rotate_axisangle_world_z(action[:, 3:6], angle_rad)
+    # gripper unchanged
     return out
 
 
@@ -254,57 +311,92 @@ def rotate_action_array(action: np.ndarray, angle_rad: float) -> np.ndarray:
 #
 # After ConcatTransform + GR00TTransform, the normalized state tensor has shape
 # [1, max_state_dim] with the EquiRelLiberoConfig layout:
-#     state[..., 0] : state.x  (normalized) ── irrep(1) x with state[..., 1]
-#     state[..., 1] : state.y  (normalized) ── irrep(1) y
-#     state[..., 2] : state.z  (normalized) ── trivial
-#     state[..., 3] : state.roll  (normalized) ── irrep(1) x with state[..., 4]
-#     state[..., 4] : state.pitch (normalized) ── irrep(1) y
-#     state[..., 5] : state.yaw   (normalized) ── trivial
+#     state[..., 0] : state.x  (normalized)
+#     state[..., 1] : state.y  (normalized)
+#     state[..., 2] : state.z  (normalized)
+#     state[..., 3] : state.roll  (raw axis-angle ω_x — not normalized)
+#     state[..., 4] : state.pitch (raw axis-angle ω_y — not normalized)
+#     state[..., 5] : state.yaw   (raw axis-angle ω_z — not normalized)
 #     state[..., 6:8] : state.gripper (2 dims) ── trivial
 #     state[..., 8:]  : zero padding
 #
-# model.get_action(normalized_input)["action_pred"] returns a tensor of shape
-# [B, action_horizon, max_action_dim] with action keys in the same order:
-#     action[..., 0,1,2,3,4,5,6] = x, y, z, roll, pitch, yaw, gripper
+# Group action of world rotation R_z(θ) on this state:
+#   • (norm_x, norm_y)         : 2D rotation (irrep(1)) — min_max normalisation
+#                                 is symmetric in [-1, 1] and equivariant
+#                                 enough that this is the model's expected
+#                                 input transformation in normalized space.
+#   • norm_z                    : invariant.
+#   • (ω_x, ω_y, ω_z)           : axis-angle ω → axis_angle(R_z(θ) · R(ω)).
+#                                 NONLINEAR — all 3 components may change.
+#   • gripper / padding         : invariant.
 #
-# These constants must stay in sync with EquiRelLiberoConfig.state_keys and
-# .action_keys (see gr00t/experiment/data_config.py).
+# model.get_action(normalized_input)["action_pred"] returns the predicted
+# action in the same per-key layout
+#     action[..., 0,1,2,3,4,5,6] = x, y, z, roll, pitch, yaw, gripper
+# where (roll, pitch, yaw) are axis-angle (see getActionOutput in
+# flow_matching_action_head.py — getQuaternionFromMatrix for ee_dim=6 returns
+# axis-angle).  Same nonlinear rule applies to action orientation.
 
-STATE_IRREP_PAIRS = [(0, 1), (3, 4)]   # (x, y) and (roll, pitch)
-ACTION_IRREP_PAIRS = [(0, 1), (3, 4)]  # (x, y) and (roll, pitch)
+# Position pairs are still simple irrep(1); orientation is handled separately.
+STATE_XY_PAIR  = (0, 1)
+ACTION_XY_PAIR = (0, 1)
+STATE_ROT_SLICE  = slice(3, 6)   # state.roll, .pitch, .yaw  (axis-angle)
+ACTION_ROT_SLICE = slice(3, 6)   # action.roll, .pitch, .yaw (axis-angle)
 
 
-def _rotate_irrep1_inplace(tensor, pairs, angle_rad: float):
-    """In-place: for each (i, j) pair, rotate (tensor[..., i], tensor[..., j]) by angle_rad."""
+def _rotate_xy_pair_inplace(tensor, pair, angle_rad: float):
+    """In-place: rotate (tensor[..., i], tensor[..., j]) by angle_rad (irrep(1))."""
     cos_a = math.cos(angle_rad)
     sin_a = math.sin(angle_rad)
+    i, j = pair
     is_torch = isinstance(tensor, torch.Tensor)
-    for i, j in pairs:
-        if is_torch:
-            xi = tensor[..., i].clone()
-            xj = tensor[..., j].clone()
-        else:
-            xi = tensor[..., i].copy()
-            xj = tensor[..., j].copy()
-        tensor[..., i] = cos_a * xi - sin_a * xj
-        tensor[..., j] = sin_a * xi + cos_a * xj
+    if is_torch:
+        xi = tensor[..., i].clone()
+        xj = tensor[..., j].clone()
+    else:
+        xi = tensor[..., i].copy()
+        xj = tensor[..., j].copy()
+    tensor[..., i] = cos_a * xi - sin_a * xj
+    tensor[..., j] = sin_a * xi + cos_a * xj
+
+
+def _rotate_axisangle_slice_inplace(tensor, sl: slice, angle_rad: float):
+    """In-place: apply world-rotation R_z(θ) to axis-angle slice (3 dims)."""
+    is_torch = isinstance(tensor, torch.Tensor)
+    if is_torch:
+        rpy_np = tensor[..., sl].detach().cpu().numpy()
+    else:
+        rpy_np = np.asarray(tensor[..., sl])
+    new_rpy = _rotate_axisangle_world_z(rpy_np, angle_rad)
+    if is_torch:
+        tensor[..., sl] = torch.from_numpy(new_rpy).to(
+            dtype=tensor.dtype, device=tensor.device
+        )
+    else:
+        tensor[..., sl] = new_rpy.astype(tensor.dtype)
 
 
 def rotate_normalized_state(state, angle_rad: float):
-    """Return a copy of the normalized state tensor with irrep(1) pairs rotated."""
+    """Return a copy of the normalized state with the correct group action applied.
+
+    Position (x, y): irrep(1).
+    Orientation (axis-angle ω_x, ω_y, ω_z): rotation-matrix composition.
+    """
     out = state.clone() if isinstance(state, torch.Tensor) else state.copy()
-    _rotate_irrep1_inplace(out, STATE_IRREP_PAIRS, angle_rad)
+    _rotate_xy_pair_inplace(out, STATE_XY_PAIR, angle_rad)
+    _rotate_axisangle_slice_inplace(out, STATE_ROT_SLICE, angle_rad)
     return out
 
 
 def rotate_normalized_action(action, angle_rad: float):
-    """Return a copy of the normalized action tensor with irrep(1) pairs rotated.
+    """Return a copy of the normalized action with the correct group action applied.
 
-    Works on either a [T, max_action_dim] numpy array or a [B, T, max_action_dim]
-    torch tensor — only the last dim is indexed.
+    Same rule as state: (x, y) irrep(1), (ω_x, ω_y, ω_z) nonlinear axis-angle
+    rotation, z/gripper/padding invariant.
     """
     out = action.clone() if isinstance(action, torch.Tensor) else action.copy()
-    _rotate_irrep1_inplace(out, ACTION_IRREP_PAIRS, angle_rad)
+    _rotate_xy_pair_inplace(out, ACTION_XY_PAIR, angle_rad)
+    _rotate_axisangle_slice_inplace(out, ACTION_ROT_SLICE, angle_rad)
     return out
 
 
