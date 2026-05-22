@@ -35,6 +35,20 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 
+# Redirect robosuite's hard-coded /tmp/robosuite.log to a user-writable path on
+# shared clusters where /tmp/robosuite.log is owned by another user.
+_ROBOSUITE_LOG_DIR = os.environ.get(
+    "ROBOSUITE_LOG_DIR", os.path.expanduser("~/.robosuite_logs")
+)
+os.makedirs(_ROBOSUITE_LOG_DIR, exist_ok=True)
+_OrigFileHandler = logging.FileHandler
+class _PatchedFileHandler(_OrigFileHandler):
+    def __init__(self, filename, *a, **kw):
+        if str(filename) == "/tmp/robosuite.log":
+            filename = os.path.join(_ROBOSUITE_LOG_DIR, "robosuite.log")
+        super().__init__(filename, *a, **kw)
+logging.FileHandler = _PatchedFileHandler
+
 sys.path.insert(0, "/home/locht1/gr00t_equi_dit")
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/LIBERO_benchmark")
 
