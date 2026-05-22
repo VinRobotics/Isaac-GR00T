@@ -696,8 +696,17 @@ def compute_equivariance_error(args: Args) -> None:
                 obs_copy[k] = np.array(v)
         return policy.apply_transforms(obs_copy)
 
-    def call_model_normalized(normalized_input):
-        """NORMALIZED-space path: call policy.model.get_action directly, skip unapply.
+    def call_model_normalized(normalized_input, init_noise=None):
+        """NORMALIZED-space path: call policy.model directly, skip unapply.
+
+        If init_noise is provided, run flow-matching denoising from it
+        (via model.get_action_with_noise) instead of letting the action
+        head sample fresh noise.  This is the Option-1 fix that breaks the
+        otherwise-broken "fixed-seed" equivariance: the noise must
+        transform under ρ_action(g) when the conditioning is rotated.
+        Falls back to plain get_action when init_noise is None — which is
+        what happens on the baseline branch whose non-equivariant action
+        head doesn't expose sample_init_noise.
 
         Returns the normalized action_pred as a numpy array of shape
         [B, action_horizon, max_action_dim].
@@ -708,13 +717,50 @@ def compute_equivariance_error(args: Args) -> None:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-            model_pred = policy.model.get_action(normalized_input)
+            if init_noise is None:
+                model_pred = policy.model.get_action(normalized_input)
+            else:
+                model_pred = policy.model.get_action_with_noise(
+                    normalized_input, init_noise=init_noise
+                )
         action_pred = model_pred["action_pred"].float().cpu().numpy()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         if timing_enabled[0]:
             latencies_ms.append((time.perf_counter() - t0) * 1000.0)
         return action_pred
+
+    def sample_init_noise(batch_size: int = 1):
+        """Draw the flow-matching head's initial noise z_0 with the script's
+        deterministic seed.  Lives in the action head's internal geometric
+        tensor space (size = action_type.size, including all irrep blocks
+        + trivial padding); use rotate_init_noise to push it through
+        ρ_action(g) for a rotated input.
+
+        Returns None if the action head doesn't expose sample_init_noise
+        (e.g. the baseline non-equivariant head) — caller will then fall
+        back to torch-seed-based fresh noise inside get_action.
+        """
+        head = policy.model.action_head
+        if not hasattr(head, "sample_init_noise"):
+            return None
+        torch.manual_seed(args.noise_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.noise_seed)
+        return head.sample_init_noise(
+            batch_size=batch_size,
+            device=policy.device,
+            dtype=COMPUTE_DTYPE,
+        )
+
+    def rotate_init_noise(noise, group_idx: int):
+        """Apply ρ_action(g_r) to z_0 using the action head's FieldType.
+
+        Returns None if `noise` is None (baseline branch without an
+        equivariant action head)."""
+        if noise is None:
+            return None
+        return policy.model.action_head.apply_group_action_to_noise(noise, group_idx)
 
     # ── Latency warm-up (kernel compile, lazy module init, etc.) ────────────
     if M > 0 and args.latency_warmup > 0:
@@ -739,9 +785,17 @@ def compute_equivariance_error(args: Args) -> None:
 
         if args.bypass_normalization:
             # ── Option A: rotate normalized state, compare normalized action ──
+            # Sample the flow-matching head's initial noise z_0 ONCE.  For the
+            # rotated input we pass ρ_action(g_r)·z_0 so that BOTH the
+            # conditioning and the noise rotate together — without this the
+            # fixed z_0 silently breaks equivariance even for an exactly
+            # equi model (see sample_init_noise docstring).  On baseline
+            # (non-equi action head) sample_init_noise returns None and
+            # we fall back to the previous behavior.
+            init_noise_0 = sample_init_noise(batch_size=1)
+
             norm_input_orig = build_normalized_input(raw_obs, task_description, angle_rad=0.0)
-            a_orig_full = call_model_normalized(norm_input_orig)  # [B, T, max_action_dim]
-            # Real-dim slice for the norm: x, y, z, roll, pitch, yaw, gripper = first 7 dims
+            a_orig_full = call_model_normalized(norm_input_orig, init_noise=init_noise_0)
             a_orig_real = a_orig_full[..., :7]
             action_norms.append(float(np.linalg.norm(a_orig_real)))
             per_g_errors[0].append(0.0)
@@ -755,9 +809,12 @@ def compute_equivariance_error(args: Args) -> None:
                 # OVERWRITE state with rho_state(g) applied to the original normalized state
                 state_orig = norm_input_orig["state"]
                 norm_input_rot["state"] = rotate_normalized_state(state_orig, angle)
-                # state_mask is bool and depends only on real-dim count → keep as-is from norm_input_rot
+                # Rotate the initial noise by ρ_action(g_r) — same group element
+                # as the conditioning so the denoising trajectory transforms
+                # consistently.
+                init_noise_r = rotate_init_noise(init_noise_0, r)
 
-                a_rot_full = call_model_normalized(norm_input_rot)
+                a_rot_full = call_model_normalized(norm_input_rot, init_noise=init_noise_r)
                 a_expected_full = rotate_normalized_action(a_orig_full, angle)
                 # Compare in 6D rotation space (not axis-angle) — see
                 # action_to_comparison_form docstring for the wraparound problem.
