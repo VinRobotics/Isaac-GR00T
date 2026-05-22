@@ -140,6 +140,24 @@ class Args:
     refuses to drop — it tells you whether each piece (image rotation, state
     rotation, noise rotation, model response) is actually doing what's intended."""
 
+    random_init: bool = False
+    """Architectural-equivariance diagnostic: after loading the checkpoint,
+    re-initialise every learnable parameter via its module's reset_parameters
+    (random weights, but SAME architecture and SAME init seed as a freshly
+    constructed model).
+
+    Equivariance is a STRUCTURAL property of the architecture — it does NOT
+    depend on the values of the trained weights.  So a correctly-equivariant
+    architecture must give ε_eq ≈ 0 even with random weights.
+
+      • If random_init gives ε_eq ≈ 0  →  architecture IS equivariant; the
+        trained checkpoint's weights have somehow collapsed the equivariant
+        response (training-data / loss issue, not script bug).
+      • If random_init still gives ε_eq large  →  architecture is NOT
+        end-to-end equivariant; some module (often the cross-attention DiT
+        between vl_features and state/action features) silently breaks the
+        group action despite individual component tests passing."""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Image rotation
@@ -613,6 +631,30 @@ def compute_equivariance_error(args: Args) -> None:
     # Load policy
     policy_wrapper = Gr00tn15_inference(args.pretrained_model_path, args.infer_chunk)
     policy = policy_wrapper.policy
+
+    # ── Optional: re-initialise weights for the architectural-equivariance
+    #              diagnostic.  Equivariance is structural and must hold for
+    #              ANY weights of an equivariant architecture, so this run
+    #              tells us whether the FA backbone + Equi action head
+    #              pipeline is actually end-to-end equivariant.
+    if args.random_init:
+        logging.info("=" * 70)
+        logging.info("RANDOM-INIT diagnostic: re-initialising all learnable "
+                     "weights via reset_parameters().  Equivariance must "
+                     "still hold structurally — ε_eq ≈ 0 expected.")
+        logging.info("=" * 70)
+        torch.manual_seed(0)
+        n_reinit = 0
+        for m in policy.model.modules():
+            if hasattr(m, "reset_parameters"):
+                try:
+                    m.reset_parameters()
+                    n_reinit += 1
+                except Exception as e:
+                    logging.warning(f"  reset_parameters failed on {type(m).__name__}: {e}")
+        logging.info(f"Re-initialised {n_reinit} modules.")
+        # Make sure the model stays on its original device + dtype.
+        policy.model.eval()
 
     # ── Inference cost: parameter counts ────────────────────────────────────
     params = count_parameters(policy.model)
