@@ -131,20 +131,52 @@ class Args:
 # Image rotation
 # ─────────────────────────────────────────────────────────────────────────────
 
+_GRID_CACHE: dict = {}
+
+
+def _get_rotation_grid(H: int, W: int, angle_rad: float) -> torch.Tensor:
+    """Cached F.affine_grid for a given image size and rotation angle.
+
+    Channels are irrelevant to affine_grid output; we use C=1.
+    """
+    key = (H, W, round(angle_rad, 8))
+    grid = _GRID_CACHE.get(key)
+    if grid is None:
+        cos_a = math.cos(-angle_rad)
+        sin_a = math.sin(-angle_rad)
+        mat = torch.tensor(
+            [[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0]], dtype=torch.float32
+        ).unsqueeze(0)
+        grid = F.affine_grid(mat, [1, 1, H, W], align_corners=True).contiguous()
+        _GRID_CACHE[key] = grid
+    return grid
+
+
 def rotate_image(img: np.ndarray, angle_rad: float) -> np.ndarray:
     """Rotate uint8 HxWxC image counter-clockwise by angle_rad about its centre."""
     if angle_rad == 0.0:
         return img.copy()
-    H, W, C = img.shape
-    t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-    cos_a = math.cos(-angle_rad)
-    sin_a = math.sin(-angle_rad)
-    mat = torch.tensor(
-        [[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0]], dtype=torch.float32
-    ).unsqueeze(0)
-    grid = F.affine_grid(mat, [1, C, H, W], align_corners=True)
+    H, W, _ = img.shape
+    t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0)
+    grid = _get_rotation_grid(H, W, angle_rad)
     out = F.grid_sample(t, grid, align_corners=True, padding_mode="zeros")
-    return (out.squeeze(0).permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    return out.squeeze(0).permute(1, 2, 0).mul_(255.0).clamp_(0, 255).to(torch.uint8).numpy()
+
+
+def rotate_images(imgs: list, angle_rad: float) -> list:
+    """Batch-rotate a list of identically-shaped uint8 HxWxC images by angle_rad.
+
+    One grid_sample call for all of them; grid is cached across calls.
+    """
+    if angle_rad == 0.0:
+        return [img.copy() for img in imgs]
+    H, W, _ = imgs[0].shape
+    stacked = np.stack(imgs)  # [N, H, W, C]
+    t = torch.from_numpy(stacked).permute(0, 3, 1, 2).to(torch.float32).div_(255.0)
+    grid = _get_rotation_grid(H, W, angle_rad).expand(len(imgs), -1, -1, -1)
+    out = F.grid_sample(t, grid, align_corners=True, padding_mode="zeros")
+    out = out.permute(0, 2, 3, 1).mul_(255.0).clamp_(0, 255).to(torch.uint8).numpy()
+    return [np.ascontiguousarray(out[i]) for i in range(len(imgs))]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,17 +206,15 @@ def build_obs_dict(
     wrist_img = _to_hwc_uint8(raw_obs["robot0_eye_in_hand_image"])
 
     # LIBERO -> training orientation (matches gr00tn15_inference.get_libero_action)
-    img = img[::-1, ::-1].copy()
-    wrist_img = wrist_img[::-1, ::-1].copy()
+    img = np.ascontiguousarray(img[::-1, ::-1])
+    wrist_img = np.ascontiguousarray(wrist_img[::-1, ::-1])
 
     if angle_rad != 0.0:
-        img = rotate_image(img, angle_rad)
-        wrist_img = rotate_image(wrist_img, angle_rad)
+        img, wrist_img = rotate_images([img, wrist_img], angle_rad)
 
-    pos = np.asarray(raw_obs["robot0_eef_pos"], dtype=np.float32).copy()
-    rpy = _quat2axisangle(np.asarray(raw_obs["robot0_eef_quat"], dtype=np.float32).copy())
-    rpy = rpy.astype(np.float32)
-    gripper = np.asarray(raw_obs["robot0_gripper_qpos"], dtype=np.float32).copy()
+    pos = np.asarray(raw_obs["robot0_eef_pos"], dtype=np.float32)
+    rpy = _quat2axisangle(np.asarray(raw_obs["robot0_eef_quat"], dtype=np.float32)).astype(np.float32)
+    gripper = np.asarray(raw_obs["robot0_gripper_qpos"], dtype=np.float32)
 
     if angle_rad != 0.0 and rotate_state:
         cos_a = math.cos(angle_rad)
