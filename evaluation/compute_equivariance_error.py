@@ -432,6 +432,64 @@ def rotate_normalized_action(action, angle_rad: float):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 6D-rotation comparison form
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# IMPORTANT: do NOT take L2 norm of two axis-angle vectors directly.
+#
+# Axis-angle is a 3-valued chart of SO(3) with a discontinuity near |ω| = π
+# (the antipodal pair  +ω  and  −ω  for |ω| = π represent the same rotation
+# but differ by 2π in L2).  LIBERO's default EEF pose has the gripper
+# pointing down, i.e. ω ≈ (0, π, 0) — RIGHT at this boundary — so even when
+# the model is exactly equivariant the L2 difference between its
+# axis-angle output  ω_model = axis_angle(R_z(θ)·R_internal)  and the
+# reference  ω_ref = axis_angle(R_z(θ)·R(ω_orig))  can be ≫ 0 simply
+# because the two libraries (model's axisangle_to_matrix.inverse vs scipy
+# Rotation.as_rotvec) may pick different branches.
+#
+# Fix: convert the axis-angle slice into the model's INTERNAL rotation
+# representation — the 6D form (first two columns of R(ω), flattened).
+# 6D is a smooth, injective image of SO(3) and the world rotation
+# acts on it LINEARLY as
+#       6D(R_z(θ)·R) = R_z(θ) · 6D(R)        (block-wise on 2 columns)
+# so the L2 norm in 6D faithfully measures rotation distance and matches
+# the model's geometric tensor space.
+
+def _axisangle_to_6d(rpy: np.ndarray) -> np.ndarray:
+    """Convert axis-angle [..., 3] to 6D rotation rep [..., 6].
+
+    6D layout follows the same convention used by the model's
+    `axisangle_to_sixd` (RotationTransformer): the first two columns of the
+    rotation matrix, row-stacked → (c1_x, c1_y, c1_z, c2_x, c2_y, c2_z).
+    """
+    from scipy.spatial.transform import Rotation as _Rsc
+    flat = np.asarray(rpy, dtype=np.float64).reshape(-1, 3)
+    R_mat = _Rsc.from_rotvec(flat).as_matrix()                  # [N, 3, 3]
+    six = R_mat[:, :, :2].transpose(0, 2, 1).reshape(-1, 6)     # row-stack cols
+    out_shape = list(np.asarray(rpy).shape)
+    out_shape[-1] = 6
+    return six.reshape(out_shape).astype(np.asarray(rpy).dtype)
+
+
+def action_to_comparison_form(action_real: np.ndarray) -> np.ndarray:
+    """Replace the axis-angle orientation slice [..., 3:6] with its 6D form.
+
+    Input  shape: [..., 7]  layout [x, y, z, ω_x, ω_y, ω_z, gripper]
+    Output shape: [..., 10] layout [x, y, z, c1_x, c1_y, c1_z, c2_x, c2_y, c2_z, gripper]
+
+    This is the space we should take L2 norm in: the comparison is faithful
+    to the model's internal rotation representation and is free of the
+    axis-angle wraparound at |ω| = π.
+    """
+    a = np.asarray(action_real)
+    rot_6d = _axisangle_to_6d(a[..., 3:6])              # [..., 6]
+    return np.concatenate(
+        [a[..., :3], rot_6d, a[..., 6:7]],
+        axis=-1,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Inference cost: parameters + FLOPs
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -701,8 +759,11 @@ def compute_equivariance_error(args: Args) -> None:
 
                 a_rot_full = call_model_normalized(norm_input_rot)
                 a_expected_full = rotate_normalized_action(a_orig_full, angle)
-                # Compare on real action dims only (padding stays zero → doesn't matter, but cleaner)
-                err = float(np.linalg.norm(a_rot_full[..., :7] - a_expected_full[..., :7]))
+                # Compare in 6D rotation space (not axis-angle) — see
+                # action_to_comparison_form docstring for the wraparound problem.
+                a_rot_cmp      = action_to_comparison_form(a_rot_full[..., :7])
+                a_expected_cmp = action_to_comparison_form(a_expected_full[..., :7])
+                err = float(np.linalg.norm(a_rot_cmp - a_expected_cmp))
                 per_g_errors[r].append(err)
                 flat_errors.append(err)
                 pbar.update(1)
@@ -720,7 +781,10 @@ def compute_equivariance_error(args: Args) -> None:
                 obs_dict_rot = build_obs_dict(raw_obs, task_description, angle_rad=angle)
                 a_rot = call_policy(obs_dict_rot)
                 a_expected = rotate_action_array(a_orig, angle)
-                err = float(np.linalg.norm(a_rot - a_expected))
+                # Compare in 6D rotation space — see action_to_comparison_form.
+                err = float(np.linalg.norm(
+                    action_to_comparison_form(a_rot) - action_to_comparison_form(a_expected)
+                ))
                 per_g_errors[r].append(err)
                 flat_errors.append(err)
                 pbar.update(1)
