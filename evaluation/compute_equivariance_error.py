@@ -498,7 +498,10 @@ def compute_equivariance_error(args: Args) -> None:
         obs_dict = build_obs_dict(raw_obs, task_description,
                                   angle_rad=angle_rad, rotate_state=False)
         obs_copy = obs_dict.copy()
-        obs_copy = unsqueeze_dict_values(obs_copy)
+        # build_obs_dict already returns batched arrays (state is [1,1,1], video is
+        # [1,1,H,W,C]); mirror policy.get_action and only unsqueeze if not batched.
+        if not policy._check_state_is_batched(obs_copy):
+            obs_copy = unsqueeze_dict_values(obs_copy)
         for k, v in obs_copy.items():
             if not isinstance(v, np.ndarray):
                 obs_copy[k] = np.array(v)
@@ -637,7 +640,8 @@ def compute_equivariance_error(args: Args) -> None:
             sample_obs = build_obs_dict(observations[0], descriptions[0], angle_rad=0.0)
             from gr00t.model.policy import unsqueeze_dict_values  # local import to avoid cycle
             obs_copy = sample_obs.copy()
-            obs_copy = unsqueeze_dict_values(obs_copy)
+            if not policy._check_state_is_batched(obs_copy):
+                obs_copy = unsqueeze_dict_values(obs_copy)
             for k, v in obs_copy.items():
                 if not isinstance(v, np.ndarray):
                     obs_copy[k] = np.array(v)
