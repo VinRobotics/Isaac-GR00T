@@ -140,6 +140,12 @@ class Args:
     refuses to drop — it tells you whether each piece (image rotation, state
     rotation, noise rotation, model response) is actually doing what's intended."""
 
+    random_init: bool = False
+    """Architectural-equivariance diagnostic: after loading the checkpoint,
+    re-initialise every learnable parameter via its module's reset_parameters.
+    Equivariance is a STRUCTURAL property — it must hold for ANY weights of
+    an equivariant architecture.  See the equillm branch for full notes."""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Image rotation
@@ -644,6 +650,26 @@ def compute_equivariance_error(args: Args) -> None:
     # Load policy
     policy_wrapper = Gr00tn15_inference(args.pretrained_model_path, args.infer_chunk)
     policy = policy_wrapper.policy
+
+    # ── Optional architectural-equivariance diagnostic: re-randomise all
+    #              learnable weights.  See --random_init docstring.
+    if args.random_init:
+        logging.info("=" * 70)
+        logging.info("RANDOM-INIT diagnostic: re-initialising all learnable "
+                     "weights via reset_parameters().  Equivariance must "
+                     "still hold structurally — ε_eq ≈ 0 expected.")
+        logging.info("=" * 70)
+        torch.manual_seed(0)
+        n_reinit = 0
+        for m in policy.model.modules():
+            if hasattr(m, "reset_parameters"):
+                try:
+                    m.reset_parameters()
+                    n_reinit += 1
+                except Exception as e:
+                    logging.warning(f"  reset_parameters failed on {type(m).__name__}: {e}")
+        logging.info(f"Re-initialised {n_reinit} modules.")
+        policy.model.eval()
 
     # ── Inference cost: parameter counts ────────────────────────────────────
     params = count_parameters(policy.model)
