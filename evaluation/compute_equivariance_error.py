@@ -41,12 +41,13 @@ _ROBOSUITE_LOG_DIR = os.environ.get(
     "ROBOSUITE_LOG_DIR", os.path.expanduser("~/.robosuite_logs")
 )
 os.makedirs(_ROBOSUITE_LOG_DIR, exist_ok=True)
-_orig_file_handler = logging.FileHandler
-def _patched_file_handler(filename, *a, **kw):
-    if str(filename) == "/tmp/robosuite.log":
-        filename = os.path.join(_ROBOSUITE_LOG_DIR, "robosuite.log")
-    return _orig_file_handler(filename, *a, **kw)
-logging.FileHandler = _patched_file_handler
+_OrigFileHandler = logging.FileHandler
+class _PatchedFileHandler(_OrigFileHandler):
+    def __init__(self, filename, *a, **kw):
+        if str(filename) == "/tmp/robosuite.log":
+            filename = os.path.join(_ROBOSUITE_LOG_DIR, "robosuite.log")
+        super().__init__(filename, *a, **kw)
+logging.FileHandler = _PatchedFileHandler
 
 sys.path.insert(0, "/home/locht1/gr00t_rtc")
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/LIBERO_benchmark")
