@@ -97,6 +97,21 @@ class Args:
     latency_warmup: int = 5
     """Warm-up policy calls discarded before timing (CUDA kernel compile, lazy loads)."""
 
+    bypass_normalization: bool = True
+    """Option A: measure epsilon_eq in NORMALIZED space.
+
+    When True:
+      • State rotation is applied to the normalized state vector (irrep(1) pairs on
+        [n_x, n_y] and [n_roll, n_pitch]) instead of to raw values — bypasses the
+        non-equivariant per-key min/max normalization on the input side.
+      • Image is rotated as raw pixels, then re-fed through apply_transforms
+        (image preprocessing is per-channel & per-pixel, so it commutes with rotation).
+      • Action error is computed on the model's normalized action_pred directly,
+        skipping unapply_transforms on the output side.
+
+    This isolates the model's architectural equivariance (the object of cor:e2e),
+    free of the I/O denormalization artefacts that dominate the unnormalized score."""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Image rotation
@@ -122,12 +137,24 @@ def rotate_image(img: np.ndarray, angle_rad: float) -> np.ndarray:
 # Observation / action transformation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_obs_dict(raw_obs: dict, task_description: str, angle_rad: float = 0.0) -> dict:
+def build_obs_dict(
+    raw_obs: dict,
+    task_description: str,
+    angle_rad: float = 0.0,
+    rotate_state: bool = True,
+) -> dict:
     """Build the observation dict the policy expects, optionally rotated by angle_rad.
 
     The 180-degree image flip (LIBERO -> training orientation) is applied first,
-    then we rotate by angle_rad about the image centre.  State (x, y) and
-    (roll, pitch) axis-angle components are rotated by the same angle about z.
+    then we rotate the IMAGE by angle_rad about its centre.
+
+    If rotate_state=True (default — raw-space mode):
+        Raw state (x, y) and (roll, pitch) axis-angle components are rotated by
+        the same angle about z before being packed into the obs dict.
+
+    If rotate_state=False (Option A — normalized-space mode):
+        Raw state is kept un-rotated.  The caller will rotate the normalized
+        state vector after policy.apply_transforms.
     """
     img = _to_hwc_uint8(raw_obs["agentview_image"])
     wrist_img = _to_hwc_uint8(raw_obs["robot0_eye_in_hand_image"])
@@ -145,7 +172,7 @@ def build_obs_dict(raw_obs: dict, task_description: str, angle_rad: float = 0.0)
     rpy = rpy.astype(np.float32)
     gripper = np.asarray(raw_obs["robot0_gripper_qpos"], dtype=np.float32).copy()
 
-    if angle_rad != 0.0:
+    if angle_rad != 0.0 and rotate_state:
         cos_a = math.cos(angle_rad)
         sin_a = math.sin(angle_rad)
         x_new = cos_a * pos[0] - sin_a * pos[1]
@@ -196,6 +223,66 @@ def rotate_action_array(action: np.ndarray, angle_rad: float) -> np.ndarray:
     out[:, 3] = cos_a * action[:, 3] - sin_a * action[:, 4]
     out[:, 4] = sin_a * action[:, 3] + cos_a * action[:, 4]
     # z, yaw, gripper unchanged
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Option A: normalized-space group action
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# After ConcatTransform + GR00TTransform, the normalized state tensor has shape
+# [1, max_state_dim] with the EquiRelLiberoConfig layout:
+#     state[..., 0] : state.x  (normalized) ── irrep(1) x with state[..., 1]
+#     state[..., 1] : state.y  (normalized) ── irrep(1) y
+#     state[..., 2] : state.z  (normalized) ── trivial
+#     state[..., 3] : state.roll  (normalized) ── irrep(1) x with state[..., 4]
+#     state[..., 4] : state.pitch (normalized) ── irrep(1) y
+#     state[..., 5] : state.yaw   (normalized) ── trivial
+#     state[..., 6:8] : state.gripper (2 dims) ── trivial
+#     state[..., 8:]  : zero padding
+#
+# model.get_action(normalized_input)["action_pred"] returns a tensor of shape
+# [B, action_horizon, max_action_dim] with action keys in the same order:
+#     action[..., 0,1,2,3,4,5,6] = x, y, z, roll, pitch, yaw, gripper
+#
+# These constants must stay in sync with EquiRelLiberoConfig.state_keys and
+# .action_keys (see gr00t/experiment/data_config.py).
+
+STATE_IRREP_PAIRS = [(0, 1), (3, 4)]   # (x, y) and (roll, pitch)
+ACTION_IRREP_PAIRS = [(0, 1), (3, 4)]  # (x, y) and (roll, pitch)
+
+
+def _rotate_irrep1_inplace(tensor, pairs, angle_rad: float):
+    """In-place: for each (i, j) pair, rotate (tensor[..., i], tensor[..., j]) by angle_rad."""
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    is_torch = isinstance(tensor, torch.Tensor)
+    for i, j in pairs:
+        if is_torch:
+            xi = tensor[..., i].clone()
+            xj = tensor[..., j].clone()
+        else:
+            xi = tensor[..., i].copy()
+            xj = tensor[..., j].copy()
+        tensor[..., i] = cos_a * xi - sin_a * xj
+        tensor[..., j] = sin_a * xi + cos_a * xj
+
+
+def rotate_normalized_state(state, angle_rad: float):
+    """Return a copy of the normalized state tensor with irrep(1) pairs rotated."""
+    out = state.clone() if isinstance(state, torch.Tensor) else state.copy()
+    _rotate_irrep1_inplace(out, STATE_IRREP_PAIRS, angle_rad)
+    return out
+
+
+def rotate_normalized_action(action, angle_rad: float):
+    """Return a copy of the normalized action tensor with irrep(1) pairs rotated.
+
+    Works on either a [T, max_action_dim] numpy array or a [B, T, max_action_dim]
+    torch tensor — only the last dim is indexed.
+    """
+    out = action.clone() if isinstance(action, torch.Tensor) else action.copy()
+    _rotate_irrep1_inplace(out, ACTION_IRREP_PAIRS, angle_rad)
     return out
 
 
@@ -336,11 +423,13 @@ def compute_equivariance_error(args: Args) -> None:
 
     logging.info("=" * 70)
     logging.info(f"Computing equivariance error for {args.model_label}")
-    logging.info(f"  task_suite_name : {args.task_suite_name}")
-    logging.info(f"  num_samples (M) : {args.num_samples}")
-    logging.info(f"  n_group   (|G|) : {args.n_group}")
-    logging.info(f"  num_steps_wait  : {args.num_steps_wait}")
-    logging.info(f"  pretrained      : {args.pretrained_model_path}")
+    logging.info(f"  task_suite_name      : {args.task_suite_name}")
+    logging.info(f"  num_samples (M)      : {args.num_samples}")
+    logging.info(f"  n_group   (|G|)      : {args.n_group}")
+    logging.info(f"  num_steps_wait       : {args.num_steps_wait}")
+    logging.info(f"  bypass_normalization : {args.bypass_normalization}  "
+                 f"({'NORMALIZED-space (Option A)' if args.bypass_normalization else 'RAW-space (end-to-end)'})")
+    logging.info(f"  pretrained           : {args.pretrained_model_path}")
     logging.info("=" * 70)
 
     # Load policy
@@ -373,6 +462,7 @@ def compute_equivariance_error(args: Args) -> None:
     timing_enabled = [False]  # mutable flag toggled after warm-up
 
     def call_policy(obs_dict):
+        """RAW-space path: full policy.get_action (apply + model + unapply)."""
         torch.manual_seed(args.noise_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.noise_seed)
@@ -385,36 +475,107 @@ def compute_equivariance_error(args: Args) -> None:
             latencies_ms.append((time.perf_counter() - t0) * 1000.0)
         return action_dict_to_array(out, args.infer_chunk)
 
+    # ── Normalized-space helpers (Option A) ─────────────────────────────────
+    from gr00t.model.policy import unsqueeze_dict_values, COMPUTE_DTYPE
+
+    def build_normalized_input(raw_obs, task_description, angle_rad):
+        """Build raw obs (image rotated by angle_rad, STATE NOT rotated) and apply
+        policy transforms to land in normalized model-input space."""
+        obs_dict = build_obs_dict(raw_obs, task_description,
+                                  angle_rad=angle_rad, rotate_state=False)
+        obs_copy = obs_dict.copy()
+        obs_copy = unsqueeze_dict_values(obs_copy)
+        for k, v in obs_copy.items():
+            if not isinstance(v, np.ndarray):
+                obs_copy[k] = np.array(v)
+        return policy.apply_transforms(obs_copy)
+
+    def call_model_normalized(normalized_input):
+        """NORMALIZED-space path: call policy.model.get_action directly, skip unapply.
+
+        Returns the normalized action_pred as a numpy array of shape
+        [B, action_horizon, max_action_dim].
+        """
+        torch.manual_seed(args.noise_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.noise_seed)
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+            model_pred = policy.model.get_action(normalized_input)
+        action_pred = model_pred["action_pred"].float().cpu().numpy()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        if timing_enabled[0]:
+            latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+        return action_pred
+
     # ── Latency warm-up (kernel compile, lazy module init, etc.) ────────────
     if M > 0 and args.latency_warmup > 0:
-        warm_obs = build_obs_dict(observations[0], descriptions[0], angle_rad=0.0)
-        for _ in tqdm.tqdm(range(args.latency_warmup), desc="warmup", leave=False):
-            call_policy(warm_obs)
-    timing_enabled[0] = True  # everything that follows is timed
+        if args.bypass_normalization:
+            warm_inp = build_normalized_input(observations[0], descriptions[0], angle_rad=0.0)
+            for _ in tqdm.tqdm(range(args.latency_warmup), desc="warmup", leave=False):
+                call_model_normalized(warm_inp)
+        else:
+            warm_obs = build_obs_dict(observations[0], descriptions[0], angle_rad=0.0)
+            for _ in tqdm.tqdm(range(args.latency_warmup), desc="warmup", leave=False):
+                call_policy(warm_obs)
+    timing_enabled[0] = True
 
-    total_calls = M * args.n_group  # one a(o) call + (|G|-1) a(g.o) calls per sample
-    pbar = tqdm.tqdm(total=total_calls, desc="equivariance", dynamic_ncols=True)
+    # ── Equivariance main loop ──────────────────────────────────────────────
+    total_calls = M * args.n_group
+    pbar_desc = "equivariance (normalized)" if args.bypass_normalization else "equivariance (raw)"
+    pbar = tqdm.tqdm(total=total_calls, desc=pbar_desc, dynamic_ncols=True)
+
     for sample_idx in range(M):
         raw_obs = observations[sample_idx]
         task_description = descriptions[sample_idx]
 
-        obs_dict_orig = build_obs_dict(raw_obs, task_description, angle_rad=0.0)
-        a_orig = call_policy(obs_dict_orig)
-        action_norms.append(float(np.linalg.norm(a_orig)))
-        # account for the a(o) call (g_0 is the identity slot)
-        per_g_errors[0].append(0.0)
-        flat_errors.append(0.0)
-        pbar.update(1)
-
-        for r in range(1, args.n_group):
-            angle = angles[r]
-            obs_dict_rot = build_obs_dict(raw_obs, task_description, angle_rad=angle)
-            a_rot = call_policy(obs_dict_rot)
-            a_expected = rotate_action_array(a_orig, angle)
-            err = float(np.linalg.norm(a_rot - a_expected))
-            per_g_errors[r].append(err)
-            flat_errors.append(err)
+        if args.bypass_normalization:
+            # ── Option A: rotate normalized state, compare normalized action ──
+            norm_input_orig = build_normalized_input(raw_obs, task_description, angle_rad=0.0)
+            a_orig_full = call_model_normalized(norm_input_orig)  # [B, T, max_action_dim]
+            # Real-dim slice for the norm: x, y, z, roll, pitch, yaw, gripper = first 7 dims
+            a_orig_real = a_orig_full[..., :7]
+            action_norms.append(float(np.linalg.norm(a_orig_real)))
+            per_g_errors[0].append(0.0)
+            flat_errors.append(0.0)
             pbar.update(1)
+
+            for r in range(1, args.n_group):
+                angle = angles[r]
+                # Rotate image in raw pixel space, re-apply transforms → image features rotated
+                norm_input_rot = build_normalized_input(raw_obs, task_description, angle_rad=angle)
+                # OVERWRITE state with rho_state(g) applied to the original normalized state
+                state_orig = norm_input_orig["state"]
+                norm_input_rot["state"] = rotate_normalized_state(state_orig, angle)
+                # state_mask is bool and depends only on real-dim count → keep as-is from norm_input_rot
+
+                a_rot_full = call_model_normalized(norm_input_rot)
+                a_expected_full = rotate_normalized_action(a_orig_full, angle)
+                # Compare on real action dims only (padding stays zero → doesn't matter, but cleaner)
+                err = float(np.linalg.norm(a_rot_full[..., :7] - a_expected_full[..., :7]))
+                per_g_errors[r].append(err)
+                flat_errors.append(err)
+                pbar.update(1)
+        else:
+            # ── Raw-space path (kept for comparison) ──
+            obs_dict_orig = build_obs_dict(raw_obs, task_description, angle_rad=0.0)
+            a_orig = call_policy(obs_dict_orig)
+            action_norms.append(float(np.linalg.norm(a_orig)))
+            per_g_errors[0].append(0.0)
+            flat_errors.append(0.0)
+            pbar.update(1)
+
+            for r in range(1, args.n_group):
+                angle = angles[r]
+                obs_dict_rot = build_obs_dict(raw_obs, task_description, angle_rad=angle)
+                a_rot = call_policy(obs_dict_rot)
+                a_expected = rotate_action_array(a_orig, angle)
+                err = float(np.linalg.norm(a_rot - a_expected))
+                per_g_errors[r].append(err)
+                flat_errors.append(err)
+                pbar.update(1)
 
         # Running mean (skip the g_0 zeros so the postfix reflects real error)
         if flat_errors:
@@ -483,6 +644,8 @@ def compute_equivariance_error(args: Args) -> None:
         "n_group": args.n_group,
         "noise_seed": args.noise_seed,
         "num_steps_wait": args.num_steps_wait,
+        "bypass_normalization": args.bypass_normalization,
+        "measurement_space": "normalized" if args.bypass_normalization else "raw",
         "epsilon_eq_mean": mean_eq,
         "epsilon_eq_std": std_eq,
         "empirical_B_mean_action_norm": float(np.mean(action_norms)),
