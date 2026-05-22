@@ -205,6 +205,26 @@ class GR00T_N1_5(PreTrainedModel):
         action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
+
+    def get_action_with_noise(
+        self,
+        inputs: dict,
+        init_noise,
+    ) -> BatchFeature:
+        """Equivariance-test variant: runs the action head with a supplied
+        initial noise tensor instead of an internally-sampled torch.randn.
+
+        See flow_matching_action_head.get_action_with_noise for the rationale
+        and shape contract.  This is intended for compute_equivariance_error,
+        not for production inference.
+        """
+        backbone_inputs, action_inputs = self.prepare_input(inputs)
+        backbone_outputs = self.backbone(backbone_inputs)
+        action_head_outputs = self.action_head.get_action_with_noise(
+            backbone_outputs, action_inputs, init_noise=init_noise
+        )
+        self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
+        return action_head_outputs
     
     def get_realtime_action(
         self,
