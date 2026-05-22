@@ -7,7 +7,7 @@ import torch
 
 from gr00t.model.policy import Gr00tPolicy
 # Import config
-from gr00t.experiment.data_config import EquiRelLiberoConfig
+from gr00t.experiment.data_config import EquiRelLiberoConfig, EquiLiberoConfig
 from gr00t.data.schema import EmbodimentTag
 from scipy.spatial.transform import Rotation
 
@@ -15,19 +15,30 @@ from scipy.spatial.transform import Rotation
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 
 class Gr00tn15_inference():
+    # Env-var override for the equivariance-test architectural diagnostic.
+    # Set EQUI_DATA_CONFIG=EquiLibero to swap to the quaternion + 6D pathway.
+    # Note: baseline branch's action head is NOT equivariant, so this flag
+    # is mainly here for ABI parity with the equi branches.
     def __init__(self, model_dir="", infer_chunk=10):
-        self.model_dir = model_dir 
+        self.model_dir = model_dir
         self.device = 'cuda'
         self.infer_chunk=infer_chunk
+        cfg_name = os.environ.get("EQUI_DATA_CONFIG", "EquiRelLibero")
+        if cfg_name == "EquiLibero":
+            self.data_config_cls = EquiLiberoConfig
+            self.action_keys = ["x", "y", "z", "rx", "ry", "rz", "rw", "gripper"]
+        else:
+            self.data_config_cls = EquiRelLiberoConfig
+            self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
+        self.data_config_name = cfg_name
         self.policy = self.create_policy()
-        self.action_keys = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
 
 
     def create_policy(self):
-        try: 
+        try:
 
-            data_config = EquiRelLiberoConfig()
-            print(data_config)
+            data_config = self.data_config_cls()
+            print(f"Using data config: {self.data_config_name}  ({type(data_config).__name__})")
             policy = Gr00tPolicy(
                 model_path=self.model_dir,
                 embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
