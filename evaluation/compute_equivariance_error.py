@@ -12,7 +12,11 @@
 #         (roll, pitch) rotates as a 2D vector            (irrep(1))
 #         yaw stays the same                              (trivial)
 #   - gripper           : invariant                        (trivial)
-#   - agentview / wrist image : rotate about its centre
+#   - agentview image  : rotate about its centre
+#   - wrist image      : invariant (camera is mounted on the gripper, so the
+#                        wrist view co-rotates with the world about z; the
+#                        equivariant vision pathway also skips wrist — see
+#                        EquiRelLiberoConfig.get_rotation_config)
 #
 # Noisy init: LIBERO simulator drops objects on reset.  We step `num_steps_wait`
 # dummy actions BEFORE collecting any observation so dynamics have settled and
@@ -210,7 +214,12 @@ def build_obs_dict(
     wrist_img = np.ascontiguousarray(wrist_img[::-1, ::-1])
 
     if angle_rad != 0.0:
-        img, wrist_img = rotate_images([img, wrist_img], angle_rad)
+        # Only rotate the top/agentview camera. The wrist camera is mounted on
+        # the gripper and rotates with the world, so its image is invariant
+        # under world rotation about z. EquiRelLiberoConfig.get_rotation_config
+        # confirms this: rotate_image_indices=[0] (top only); wrist is skipped
+        # from the equivariant vision pathway.
+        img = rotate_image(img, angle_rad)
 
     pos = np.asarray(raw_obs["robot0_eef_pos"], dtype=np.float32)
     rpy = _quat2axisangle(np.asarray(raw_obs["robot0_eef_quat"], dtype=np.float32)).astype(np.float32)
