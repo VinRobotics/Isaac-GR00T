@@ -8,12 +8,13 @@
 # Group action (rotation about world z-axis by 2 pi r / N):
 #   - state / action xy             : irrep(1) — 2D rotation
 #   - state / action z              : trivial — invariant
-#   - state / action axis-angle ω   : NONLINEAR — ω → axis_angle(R_z(θ) · R(ω)).
-#                                      All three components (ω_x, ω_y, ω_z) may
-#                                      change; treating (ω_x, ω_y) as a simple
-#                                      irrep(1) pair is only valid in the
-#                                      first-order ω ≈ 0 limit and is wrong for
-#                                      finite world rotations.
+#   - state axis-angle ω (absolute) : NONLINEAR — ω → axis_angle(R_z(θ) · R(ω))
+#                                      (left multiplication for absolute pose)
+#   - action axis-angle ω (relative): NONLINEAR — ω → axis_angle(R_z(θ)·R(ω)·R_z(-θ))
+#                                      (CONJUGATION for relative rotation
+#                                       R_rel = R_tgt·R_curr^{-1}; matches the
+#                                       model's irrep(2) for ee_rho2 in
+#                                       getActionRelFieldType)
 #   - gripper                       : trivial — invariant
 #   - agentview image               : rotate about its centre
 #   - wrist image                   : invariant (camera mounted on the gripper,
@@ -183,29 +184,36 @@ def rotate_image(img: np.ndarray, angle_rad: float) -> np.ndarray:
 # Axis-angle rotation under world rotation about z
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# CRITICAL: An axis-angle vector ω = θ·n (representing orientation R(ω))
-# DOES NOT rotate linearly under world rotation R_z(θ_w).  The correct
-# transformation is
-#       R_new = R_z(θ_w) · R(ω_old),        ω_new = axis_angle(R_new)
-# which is nonlinear in ω_old.  Treating (ω_x, ω_y) as a 2D vector that
-# rotates by R_z(θ_w) (i.e. simple irrep(1)) is only a first-order
-# approximation around ω ≈ 0 and is wrong for finite rotations — in
-# particular it leaves ω_z (yaw) invariant, whereas the correct rule
-# generally produces a non-zero shift in ω_z.
+# Two distinct rules depending on whether the orientation is ABSOLUTE or RELATIVE:
 #
-# This helper applies the correct world-rotation transformation to a
-# batch of axis-angle vectors.
+# ABSOLUTE (end-effector pose in world frame, used in the STATE):
+#     R_new = R_z(θ) · R(ω),    ω_new = axis_angle(R_new)   — LEFT MULTIPLY
+#
+# RELATIVE (delta rotation R_rel = R_tgt · R_curr^{-1}, used in EquiRel ACTIONS):
+#     R_new = R_z(θ) · R(ω) · R_z(-θ),  ω_new = axis_angle(R_new)  — CONJUGATION
+#     Reason: (R_z·R_tgt)·(R_z·R_curr)^{-1} = R_z·R_rel·R_z^T
+#     The model's getActionRelFieldType uses irrep(2) for ee_rho2 = (R01+R10, -R00+R11),
+#     which transforms exactly as irrep(2) under conjugation (double-angle),
+#     NOT as irrep(1) which left-multiplication would produce.
+#
+# Both rules are nonlinear in the axis-angle representation.  Treating (ω_x, ω_y)
+# as a simple 2D irrep(1) pair is only valid to first order around ω ≈ 0.
+#
+# See _rotate_axisangle_world_z (absolute/left-mult) and
+#     _rotate_axisangle_conjugate_world_z (relative/conjugation) below.
 
 def _rotate_axisangle_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
-    """Apply world rotation R_z(angle_rad) to axis-angle orientations.
+    """Apply world rotation R_z(angle_rad) to ABSOLUTE axis-angle orientations.
+
+    Correct transformation for ABSOLUTE end-effector orientation R_abs:
+        R_new = R_z(θ) · R_abs   (left multiplication)
 
     Args:
         rpy: [..., 3] float array of axis-angle vectors (ω_x, ω_y, ω_z).
         angle_rad: world rotation angle about z-axis (radians).
 
     Returns:
-        [..., 3] float array of new axis-angle vectors representing
-        R_z(angle_rad) ∘ R(rpy).
+        [..., 3] float array of new axis-angle vectors.
     """
     from scipy.spatial.transform import Rotation as _Rsc
     flat = np.asarray(rpy, dtype=np.float64).reshape(-1, 3)
@@ -220,6 +228,43 @@ def _rotate_axisangle_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
     )
     R_new = np.einsum("ij,njk->nik", R_z, R_old)         # R_z @ R_old, batched
     new_rpy = _Rsc.from_matrix(R_new).as_rotvec()        # [N, 3]
+    return new_rpy.reshape(rpy.shape).astype(np.asarray(rpy).dtype)
+
+
+def _rotate_axisangle_conjugate_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Apply world rotation R_z(angle_rad) to RELATIVE axis-angle orientations via
+    CONJUGATION.
+
+    Correct transformation for RELATIVE rotation R_rel = R_target · R_curr^{-1}:
+        Under world rotation g: g·R_rel·g^{-1} = R_z(θ)·R_rel·R_z(-θ)
+
+    This differs from left-multiplication _rotate_axisangle_world_z for any
+    rotation whose axis is not purely along z.  The model's action FieldType
+    (getActionRelFieldType) uses irrep(2) for ee_rho2 = (R01+R10, -R00+R11),
+    which is exactly the irrep for conjugation by R_z (double-angle), NOT the
+    irrep(1) that left-multiplication produces.
+
+    Args:
+        rpy: [..., 3] float array of axis-angle vectors (ω_x, ω_y, ω_z).
+        angle_rad: world rotation angle about z-axis (radians).
+
+    Returns:
+        [..., 3] float array of new axis-angle vectors.
+    """
+    from scipy.spatial.transform import Rotation as _Rsc
+    flat = np.asarray(rpy, dtype=np.float64).reshape(-1, 3)
+    R_old = _Rsc.from_rotvec(flat).as_matrix()          # [N, 3, 3]
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    R_z = np.array(
+        [[cos_a, -sin_a, 0.0],
+         [sin_a,  cos_a, 0.0],
+         [0.0,    0.0,   1.0]],
+        dtype=np.float64,
+    )
+    # Conjugation: R_z @ R_old @ R_z^{-1} = R_z @ R_old @ R_z^T (R_z orthogonal)
+    R_new = np.einsum("ij,njk,lk->nil", R_z, R_old, R_z)   # R_z @ R_old @ R_z^T
+    new_rpy = _Rsc.from_matrix(R_new).as_rotvec()           # [N, 3]
     return new_rpy.reshape(rpy.shape).astype(np.asarray(rpy).dtype)
 
 
@@ -388,9 +433,9 @@ def rotate_action_array(action: np.ndarray, angle_rad: float) -> np.ndarray:
     """Apply rho_a(g) to the predicted action chunk [T, 7].
 
     Layout: [x, y, z, roll, pitch, yaw, gripper] where (roll, pitch, yaw) is
-    axis-angle.  Position rotates linearly; orientation rotates via rotation
-    matrix composition (axis-angle is not a linear irrep under finite world
-    rotation — see _rotate_axisangle_world_z).
+    axis-angle.  Position rotates linearly; orientation rule depends on config:
+      • EquiRelLibero (default): CONJUGATION R_z·R·R_z^T for relative rotation.
+      • EquiLibero: left-multiply R_z·R for absolute rotation.
     """
     out = action.copy()
     cos_a = math.cos(angle_rad)
@@ -398,8 +443,11 @@ def rotate_action_array(action: np.ndarray, angle_rad: float) -> np.ndarray:
     # Position: irrep(1) on (x, y); z invariant.
     out[:, 0] = cos_a * action[:, 0] - sin_a * action[:, 1]
     out[:, 1] = sin_a * action[:, 0] + cos_a * action[:, 1]
-    # Orientation: rotation-matrix composition (nonlinear in axis-angle).
-    out[:, 3:6] = _rotate_axisangle_world_z(action[:, 3:6], angle_rad)
+    # Orientation: depends on whether action is relative or absolute.
+    if _data_config_name() == "EquiRelLibero":
+        out[:, 3:6] = _rotate_axisangle_conjugate_world_z(action[:, 3:6], angle_rad)
+    else:
+        out[:, 3:6] = _rotate_axisangle_world_z(action[:, 3:6], angle_rad)
     # gripper unchanged
     return out
 
@@ -425,8 +473,10 @@ def rotate_action_array(action: np.ndarray, angle_rad: float) -> np.ndarray:
 #                                 enough that this is the model's expected
 #                                 input transformation in normalized space.
 #   • norm_z                    : invariant.
-#   • (ω_x, ω_y, ω_z)           : axis-angle ω → axis_angle(R_z(θ) · R(ω)).
-#                                 NONLINEAR — all 3 components may change.
+#   • (ω_x, ω_y, ω_z) [STATE]   : axis-angle ω → axis_angle(R_z(θ) · R(ω)).
+#                                 NONLINEAR — left-multiply, absolute pose.
+#   • (ω_x, ω_y, ω_z) [ACTION]  : axis-angle ω → axis_angle(R_z(θ)·R(ω)·R_z(-θ)).
+#                                 NONLINEAR — conjugation, relative rotation.
 #   • gripper / padding         : invariant.
 #
 # model.get_action(normalized_input)["action_pred"] returns the predicted
@@ -459,14 +509,22 @@ def _rotate_xy_pair_inplace(tensor, pair, angle_rad: float):
     tensor[..., j] = sin_a * xi + cos_a * xj
 
 
-def _rotate_axisangle_slice_inplace(tensor, sl: slice, angle_rad: float):
-    """In-place: apply world-rotation R_z(θ) to axis-angle slice (3 dims)."""
+def _rotate_axisangle_slice_inplace(tensor, sl: slice, angle_rad: float,
+                                    conjugation: bool = False):
+    """In-place: apply world-rotation R_z(θ) to axis-angle slice (3 dims).
+
+    conjugation=False (default): left-multiply R_z @ R   — for ABSOLUTE orientation.
+    conjugation=True:             conjugation  R_z @ R @ R_z^T — for RELATIVE orientation.
+    """
     is_torch = isinstance(tensor, torch.Tensor)
     if is_torch:
         rpy_np = tensor[..., sl].detach().cpu().numpy()
     else:
         rpy_np = np.asarray(tensor[..., sl])
-    new_rpy = _rotate_axisangle_world_z(rpy_np, angle_rad)
+    if conjugation:
+        new_rpy = _rotate_axisangle_conjugate_world_z(rpy_np, angle_rad)
+    else:
+        new_rpy = _rotate_axisangle_world_z(rpy_np, angle_rad)
     if is_torch:
         tensor[..., sl] = torch.from_numpy(new_rpy).to(
             dtype=tensor.dtype, device=tensor.device
@@ -519,13 +577,23 @@ def rotate_normalized_state(state, angle_rad: float):
 
 
 def rotate_normalized_action(action, angle_rad: float):
-    """Return a copy of the normalized action with the correct group action applied."""
+    """Return a copy of the normalized action with the correct group action applied.
+
+    Position (x, y): irrep(1) — standard 2D rotation.
+    Orientation rule depends on the active data config:
+      • EquiRelLibero (axis-angle, relative rotation): CONJUGATION R_z·R·R_z^T
+        — relative rotation R_rel = R_target·R_curr^{-1} transforms under
+        conjugation by the world rotation, matching the model's irrep(2) for
+        ee_rho2 = (R01+R10, -R00+R11) in getActionRelFieldType.
+      • EquiLibero (quaternion, absolute rotation): left-multiply q_z·q_old.
+    """
     out = action.clone() if isinstance(action, torch.Tensor) else action.copy()
     _rotate_xy_pair_inplace(out, ACTION_XY_PAIR, angle_rad)
     if _data_config_name() == "EquiLibero":
         _rotate_quat_slice_inplace(out, ACTION_QUAT_SLICE, angle_rad)
     else:
-        _rotate_axisangle_slice_inplace(out, ACTION_ROT_SLICE, angle_rad)
+        # EquiRelLibero: relative orientation — use CONJUGATION (not left-multiply)
+        _rotate_axisangle_slice_inplace(out, ACTION_ROT_SLICE, angle_rad, conjugation=True)
     return out
 
 
