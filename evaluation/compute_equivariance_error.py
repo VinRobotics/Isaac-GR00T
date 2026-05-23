@@ -203,10 +203,10 @@ def rotate_image(img: np.ndarray, angle_rad: float) -> np.ndarray:
 #     _rotate_axisangle_conjugate_world_z (relative/conjugation) below.
 
 def _rotate_axisangle_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
-    """Apply world rotation R_z(angle_rad) to ABSOLUTE axis-angle orientations.
+    """Apply world rotation R_z(angle_rad) to axis-angle via LEFT-MULTIPLY.
 
-    Correct transformation for ABSOLUTE end-effector orientation R_abs:
-        R_new = R_z(θ) · R_abs   (left multiplication)
+    R_new = R_z(θ) · R_abs  — NOT used for the model's state encoding;
+    kept for the raw-space path (build_obs_dict rotate_state=True).
 
     Args:
         rpy: [..., 3] float array of axis-angle vectors (ω_x, ω_y, ω_z).
@@ -228,6 +228,35 @@ def _rotate_axisangle_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
     )
     R_new = np.einsum("ij,njk->nik", R_z, R_old)         # R_z @ R_old, batched
     new_rpy = _Rsc.from_matrix(R_new).as_rotvec()        # [N, 3]
+    return new_rpy.reshape(rpy.shape).astype(np.asarray(rpy).dtype)
+
+
+def _rotate_axisangle_right_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Apply world rotation by RIGHT-MULTIPLY: R_new = R_abs · R_z(-θ) = R_abs · R_z^T.
+
+    This is the correct state transformation for getJointFieldType's 4×irrep(1)
+    pairing: features (col1_x, col2_x), (col1_y, col2_y), (col1_z, col2_z) each
+    transform as irrep(1) under this rule.
+
+    Why right-multiply: if quat is in world-to-EEF convention (robosuite default),
+    then under world rotation R_z the new quat = R_old @ R_z^{-1} = R_old @ R_z^T.
+    Under left-multiply (R_z @ R_old), the column pairs would mix x with y and
+    NOT be genuine irrep(1) pairs.
+    """
+    from scipy.spatial.transform import Rotation as _Rsc
+    flat = np.asarray(rpy, dtype=np.float64).reshape(-1, 3)
+    R_old = _Rsc.from_rotvec(flat).as_matrix()
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    # R_z^T = R_z(-θ)
+    R_z_T = np.array(
+        [[cos_a,  sin_a, 0.0],
+         [-sin_a, cos_a, 0.0],
+         [0.0,    0.0,   1.0]],
+        dtype=np.float64,
+    )
+    R_new = np.einsum("nij,jk->nik", R_old, R_z_T)     # R_old @ R_z^T, batched
+    new_rpy = _Rsc.from_matrix(R_new).as_rotvec()
     return new_rpy.reshape(rpy.shape).astype(np.asarray(rpy).dtype)
 
 
@@ -510,19 +539,23 @@ def _rotate_xy_pair_inplace(tensor, pair, angle_rad: float):
 
 
 def _rotate_axisangle_slice_inplace(tensor, sl: slice, angle_rad: float,
-                                    conjugation: bool = False):
+                                    mode: str = "left"):
     """In-place: apply world-rotation R_z(θ) to axis-angle slice (3 dims).
 
-    conjugation=False (default): left-multiply R_z @ R   — for ABSOLUTE orientation.
-    conjugation=True:             conjugation  R_z @ R @ R_z^T — for RELATIVE orientation.
+    mode="left"        : R_new = R_z @ R        — left-multiply (raw-space state)
+    mode="right"       : R_new = R @ R_z^T      — right-multiply (normalized state,
+                                                   matches getJointFieldType 4×irrep(1))
+    mode="conjugation" : R_new = R_z @ R @ R_z^T — conjugation (relative action)
     """
     is_torch = isinstance(tensor, torch.Tensor)
     if is_torch:
         rpy_np = tensor[..., sl].detach().cpu().numpy()
     else:
         rpy_np = np.asarray(tensor[..., sl])
-    if conjugation:
+    if mode == "conjugation":
         new_rpy = _rotate_axisangle_conjugate_world_z(rpy_np, angle_rad)
+    elif mode == "right":
+        new_rpy = _rotate_axisangle_right_world_z(rpy_np, angle_rad)
     else:
         new_rpy = _rotate_axisangle_world_z(rpy_np, angle_rad)
     if is_torch:
@@ -560,19 +593,22 @@ ACTION_QUAT_SLICE = slice(3, 7)
 def rotate_normalized_state(state, angle_rad: float):
     """Return a copy of the normalized state with the correct group action applied.
 
-    Position (x, y): irrep(1).  Orientation rule depends on the active data
-    config:
-      • EquiRelLibero (axis-angle, 3 dims) — rotation-matrix composition
-        applied to slice [3:6].
-      • EquiLibero (quaternion, 4 dims xyzw) — left-multiply by q_z(θ) on
-        slice [3:7].
+    Position (x, y): irrep(1) — standard 2D rotation.
+    Orientation rule: RIGHT-MULTIPLY R_abs @ R_z^T.
+
+    Why right-multiply: getJointGeometricTensor builds 6D features with pairs
+    (col1_x, col2_x), (col1_y, col2_y), (col1_z, col2_z).  These pairs transform
+    as irrep(1) ONLY under right-multiply (R → R @ R_z^T), not under left-multiply.
+    Under left-multiply R_z @ R, col1_x mixes with col1_y (not col2_x), breaking
+    the pairing.  getJointFieldType declares 4×irrep(1) assuming right-multiply.
     """
     out = state.clone() if isinstance(state, torch.Tensor) else state.copy()
     _rotate_xy_pair_inplace(out, STATE_XY_PAIR, angle_rad)
     if _data_config_name() == "EquiLibero":
+        # TODO: quaternion right-multiply q_old ⊗ q_z(-θ) if needed
         _rotate_quat_slice_inplace(out, STATE_QUAT_SLICE, angle_rad)
     else:
-        _rotate_axisangle_slice_inplace(out, STATE_ROT_SLICE, angle_rad)
+        _rotate_axisangle_slice_inplace(out, STATE_ROT_SLICE, angle_rad, mode="right")
     return out
 
 
@@ -593,7 +629,7 @@ def rotate_normalized_action(action, angle_rad: float):
         _rotate_quat_slice_inplace(out, ACTION_QUAT_SLICE, angle_rad)
     else:
         # EquiRelLibero: relative orientation — use CONJUGATION (not left-multiply)
-        _rotate_axisangle_slice_inplace(out, ACTION_ROT_SLICE, angle_rad, conjugation=True)
+        _rotate_axisangle_slice_inplace(out, ACTION_ROT_SLICE, angle_rad, mode="conjugation")
     return out
 
 
