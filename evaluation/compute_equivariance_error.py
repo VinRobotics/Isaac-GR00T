@@ -196,6 +196,13 @@ def rotate_image(img: np.ndarray, angle_rad: float) -> np.ndarray:
 # This helper applies the correct world-rotation transformation to a
 # batch of axis-angle vectors.
 
+# --- orientation helpers ---
+# raw-space state orientation: LEFT-MULTIPLY  R_new = R_z @ R_abs
+# normalized-space state orientation: RIGHT-MULTIPLY  R_new = R_abs @ R_z^T
+#   (matches getJointFieldType 4×irrep(1) pairing)
+# relative action orientation: CONJUGATION  R_new = R_z @ R_rel @ R_z^T
+#   (world-frame relative rot: (R_z·R_tgt)·(R_z·R_curr)^-1 = R_z·R_rel·R_z^T)
+
 def _rotate_axisangle_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
     """Apply world rotation R_z(angle_rad) to axis-angle orientations.
 
@@ -220,6 +227,32 @@ def _rotate_axisangle_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
     )
     R_new = np.einsum("ij,njk->nik", R_z, R_old)         # R_z @ R_old, batched
     new_rpy = _Rsc.from_matrix(R_new).as_rotvec()        # [N, 3]
+    return new_rpy.reshape(rpy.shape).astype(np.asarray(rpy).dtype)
+
+
+def _rotate_axisangle_right_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Right-multiply: R_new = R_old @ R_z^T  (normalized-state convention)."""
+    from scipy.spatial.transform import Rotation as _Rsc
+    flat = np.asarray(rpy, dtype=np.float64).reshape(-1, 3)
+    R_old = _Rsc.from_rotvec(flat).as_matrix()
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    R_z_T = np.array([[cos_a, sin_a, 0.0], [-sin_a, cos_a, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    R_new = np.einsum("nij,jk->nik", R_old, R_z_T)     # R_old @ R_z^T, batched
+    new_rpy = _Rsc.from_matrix(R_new).as_rotvec()
+    return new_rpy.reshape(rpy.shape).astype(np.asarray(rpy).dtype)
+
+
+def _rotate_axisangle_conjugate_world_z(rpy: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Conjugation: R_new = R_z @ R_old @ R_z^T  (relative-action convention)."""
+    from scipy.spatial.transform import Rotation as _Rsc
+    flat = np.asarray(rpy, dtype=np.float64).reshape(-1, 3)
+    R_old = _Rsc.from_rotvec(flat).as_matrix()
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    R_z = np.array([[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    R_new = np.einsum("ij,njk,lk->nil", R_z, R_old, R_z)   # R_z @ R_old @ R_z^T
+    new_rpy = _Rsc.from_matrix(R_new).as_rotvec()
     return new_rpy.reshape(rpy.shape).astype(np.asarray(rpy).dtype)
 
 
@@ -384,7 +417,10 @@ def rotate_action_array(action: np.ndarray, angle_rad: float) -> np.ndarray:
     out[:, 0] = cos_a * action[:, 0] - sin_a * action[:, 1]
     out[:, 1] = sin_a * action[:, 0] + cos_a * action[:, 1]
     # Orientation: rotation-matrix composition (nonlinear in axis-angle).
-    out[:, 3:6] = _rotate_axisangle_world_z(action[:, 3:6], angle_rad)
+    if _data_config_name() == "EquiRelLibero":
+        out[:, 3:6] = _rotate_axisangle_conjugate_world_z(action[:, 3:6], angle_rad)
+    else:
+        out[:, 3:6] = _rotate_axisangle_world_z(action[:, 3:6], angle_rad)
     # gripper unchanged
     return out
 
@@ -444,14 +480,22 @@ def _rotate_xy_pair_inplace(tensor, pair, angle_rad: float):
     tensor[..., j] = sin_a * xi + cos_a * xj
 
 
-def _rotate_axisangle_slice_inplace(tensor, sl: slice, angle_rad: float):
+def _rotate_axisangle_slice_inplace(tensor, sl: slice, angle_rad: float, mode: str = "left"):
     """In-place: apply world-rotation R_z(θ) to axis-angle slice (3 dims)."""
+    # mode="left":        R_z @ R          (raw-space state)
+    # mode="right":       R @ R_z^T        (normalized state, getJointFieldType 4×irrep(1))
+    # mode="conjugation": R_z @ R @ R_z^T  (relative action)
     is_torch = isinstance(tensor, torch.Tensor)
     if is_torch:
         rpy_np = tensor[..., sl].detach().cpu().numpy()
     else:
         rpy_np = np.asarray(tensor[..., sl])
-    new_rpy = _rotate_axisangle_world_z(rpy_np, angle_rad)
+    if mode == "conjugation":
+        new_rpy = _rotate_axisangle_conjugate_world_z(rpy_np, angle_rad)
+    elif mode == "right":
+        new_rpy = _rotate_axisangle_right_world_z(rpy_np, angle_rad)
+    else:
+        new_rpy = _rotate_axisangle_world_z(rpy_np, angle_rad)
     if is_torch:
         tensor[..., sl] = torch.from_numpy(new_rpy).to(
             dtype=tensor.dtype, device=tensor.device
@@ -493,7 +537,7 @@ def rotate_normalized_state(state, angle_rad: float):
     if _data_config_name() == "EquiLibero":
         _rotate_quat_slice_inplace(out, STATE_QUAT_SLICE, angle_rad)
     else:
-        _rotate_axisangle_slice_inplace(out, STATE_ROT_SLICE, angle_rad)
+        _rotate_axisangle_slice_inplace(out, STATE_ROT_SLICE, angle_rad, mode="right")
     return out
 
 
@@ -504,7 +548,7 @@ def rotate_normalized_action(action, angle_rad: float):
     if _data_config_name() == "EquiLibero":
         _rotate_quat_slice_inplace(out, ACTION_QUAT_SLICE, angle_rad)
     else:
-        _rotate_axisangle_slice_inplace(out, ACTION_ROT_SLICE, angle_rad)
+        _rotate_axisangle_slice_inplace(out, ACTION_ROT_SLICE, angle_rad, mode="conjugation")
     return out
 
 
