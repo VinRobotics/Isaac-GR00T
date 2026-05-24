@@ -305,6 +305,16 @@ def main(config: ArgsConfig):
             model.config.backbone_cfg["num_images_per_sample"] = num_images_per_sample
             model.config.backbone_cfg["rotate_image_indices"] = rotate_image_indices
 
+            # Sync rot_randomizer so it reshapes with the correct num_images_per_sample
+            if model.rot_randomizer is not None:
+                effective_indices = (
+                    rotate_image_indices
+                    if rotate_image_indices is not None
+                    else list(range(num_images_per_sample))
+                )
+                model.rot_randomizer.num_images_per_sample = num_images_per_sample
+                model.rot_randomizer.rotate_image_indices = effective_indices
+
     # Update action_horizon and num_hand to match data config
     # Need to recreate action head with correct config since it was initialized with old config
     action_horizon_changed = data_action_horizon != model.action_head.config.action_horizon
