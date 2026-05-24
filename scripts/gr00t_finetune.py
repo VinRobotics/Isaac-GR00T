@@ -179,6 +179,11 @@ class ArgsConfig:
     mimicgen_eval_video_fps: int = 20
     """FPS for the saved MP4 (robosuite control_freq = 20, so 20 = realtime)."""
 
+    # Rotation augmentation
+    rot_aug: bool = False
+    """If True, apply random Z-axis rotation augmentation during training (requires the data config
+    to expose rot_type, num_hand, ee_dim, and get_rotation_config())."""
+
 
 #####################################################################################
 # Helper functions
@@ -402,6 +407,29 @@ def main(config: ArgsConfig):
     # Set the model's compute_dtype to bfloat16
     model.compute_dtype = "bfloat16"
     model.config.compute_dtype = "bfloat16"
+
+    if config.rot_aug:
+        from gr00t.model.common.rot_randomizer import RotRandomizer
+
+        rot_cfg = data_config_cls.get_rotation_config()
+        rot_type = getattr(data_config_cls, "rot_type", "axis_angle")
+        num_hand = getattr(data_config_cls, "num_hand", 1)
+        # ee_dim = 3 (pos) + rotation dims per hand; gripper (and extras) lie beyond ee_dim
+        _rot_dims = {"quaternion": 4, "euler_angles": 3, "axis_angle": 3}
+        ee_dim = 3 + _rot_dims.get(rot_type, 3)
+        randomizer = RotRandomizer(
+            rot_type=rot_type,
+            num_hand=num_hand,
+            ee_dim=ee_dim,
+            rotate_image_indices=rot_cfg["rotate_image_indices"],
+            num_images_per_sample=rot_cfg["num_images_per_sample"],
+        )
+        model.attach_rot_randomizer(randomizer)
+        print(
+            f"RotRandomizer attached: rot_type={rot_type}, num_hand={num_hand}, "
+            f"ee_dim={ee_dim}, rotate_image_indices={rot_cfg['rotate_image_indices']}, "
+            f"num_images_per_sample={rot_cfg['num_images_per_sample']}"
+        )
 
     if config.lora_rank > 0:
         model = get_lora_model(

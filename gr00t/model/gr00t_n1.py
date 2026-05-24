@@ -86,6 +86,7 @@ class GR00T_N1_5(PreTrainedModel):
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+        self.rot_randomizer = None  # set externally via attach_rot_randomizer()
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -159,11 +160,17 @@ class GR00T_N1_5(PreTrainedModel):
             error_msg += f"\n{self.action_dim=}"
             raise ValueError(error_msg)
 
+    def attach_rot_randomizer(self, rot_randomizer) -> None:
+        """Attach a RotRandomizer for Z-axis rotation augmentation during training."""
+        self.rot_randomizer = rot_randomizer
+
     def forward(
         self,
         inputs: dict,
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
+        if self.rot_randomizer is not None:
+            backbone_inputs, action_inputs = self.rot_randomizer(backbone_inputs, action_inputs)
         backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=True)
