@@ -25,7 +25,7 @@ class RotRandomizer(nn.Module):
     ):
         """
         Args:
-            rot_type: Rotation representation in state/action ("quaternion" or "euler_angles").
+            rot_type: Rotation representation in state/action ("quaternion", "euler_angles", or "axis_angle").
             num_hand: Number of end-effectors (1 or 2).
             ee_dim: Dimension per EE entry (7 for quaternion, 6 for euler_angles).
             rotate_image_indices: Which image slots (within each sample) to rotate.
@@ -90,6 +90,11 @@ class RotRandomizer(nn.Module):
                 new_wxyz = self.tf.inverse(composed)  # [B, T, 4]
                 result[:, :, offset + 3 : offset + self.ee_dim] = new_wxyz[:, :, [1, 2, 3, 0]]  # → (x,y,z,w)
             elif self.rot_type == "euler_angles":
+                rot_mats = self.tf.forward(rot_slice)  # [B, T, 3, 3]
+                composed = rot_mat.unsqueeze(1).to(rot_mats.dtype) @ rot_mats
+                result[:, :, offset + 3 : offset + self.ee_dim] = self.tf.inverse(composed)
+            elif self.rot_type == "axis_angle":
+                # axis_angle: 3-dim vector, stored as [B, T, 3]
                 rot_mats = self.tf.forward(rot_slice)  # [B, T, 3, 3]
                 composed = rot_mat.unsqueeze(1).to(rot_mats.dtype) @ rot_mats
                 result[:, :, offset + 3 : offset + self.ee_dim] = self.tf.inverse(composed)
