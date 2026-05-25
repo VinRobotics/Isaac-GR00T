@@ -239,13 +239,13 @@ def eval_libero(args: Args, task_suite_name: Optional[str]=None, task_ids: Optio
             imageio.mimwrite(
                 pathlib.Path(f"{str(save_video_dir)}") / f"rollout_seed_{args.seed}_trial_{episode_idx}_wrist_{str(task_description)}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images_wrist],
-                fps=10,
+                fps=20,
                 codec="libx264",
             )
             imageio.mimwrite(
                 pathlib.Path(f"{str(save_video_dir)}") / f"rollout_seed_{args.seed}_trial_{episode_idx}_static_{str(task_description)}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images],
-                fps=10,
+                fps=20,
                 codec="libx264"
             )
 
