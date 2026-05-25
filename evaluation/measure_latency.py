@@ -39,7 +39,7 @@ class _PatchedFileHandler(_OrigFileHandler):
 
 logging.FileHandler = _PatchedFileHandler
 
-sys.path.insert(0, "/mnt/data/sftp/data/locht1/workspace/gr00t_equi_fa_c4")
+sys.path.insert(0, "/home/locht1/gr00t_rtc")
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/LIBERO_benchmark")
 
 from evaluation.gr00tn15_inference import (
