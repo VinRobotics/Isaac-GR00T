@@ -268,8 +268,11 @@ def eval_libero_all(args:Args):
     print("=" * 80)
 
     task_splits = [
-        list(range(0, 5)),   # pool 0: tasks [0..4]
-        list(range(5, 10)),  # pool 1: tasks [5..9]
+        [0, 1],   # pool 0: 
+        [2, 3],  # pool 1: 
+        [4, 5],  # pool 2: 
+        [6, 7],  # pool 3: 
+        [8, 9],  # pool 4:
     ]
 
     ctx = mp.get_context("spawn")
