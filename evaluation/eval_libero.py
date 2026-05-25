@@ -6,12 +6,24 @@ import sys
 sys.path.insert(0, "/home/locht1/gr00t_equi_dit")
 sys.path.insert(0, "/mnt/data/sftp/data/locht1/LIBERO_benchmark")
 
+import builtins
+import pathlib
+
+_rs_log = pathlib.Path.home() / ".cache" / "robosuite.log"
+_rs_log.parent.mkdir(parents=True, exist_ok=True)
+_orig_open = builtins.open
+
+def _open_shim(f, *args, **kwargs):
+    if str(f) == "/tmp/robosuite.log":
+        f = str(_rs_log)
+    return _orig_open(f, *args, **kwargs)
+
+builtins.open = _open_shim
 
 import collections
 import dataclasses
 import logging
 import math
-import pathlib
 import multiprocessing as mp  # added for parallel workers
 from typing import Optional
 
