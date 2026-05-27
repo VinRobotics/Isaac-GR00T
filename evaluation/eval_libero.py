@@ -279,13 +279,7 @@ def eval_libero_all(args:Args):
     print("LIBERO Simulation Evaluation")
     print("=" * 80)
 
-    task_splits = [
-        [0, 1],   # pool 0: 
-        [2, 3],  # pool 1: 
-        [4, 5],  # pool 2: 
-        [6, 7],  # pool 3: 
-        [8, 9],  # pool 4:
-    ]
+    task_splits = [[i] for i in range(10)]
 
     ctx = mp.get_context("spawn")
     results = dict()
