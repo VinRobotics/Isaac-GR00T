@@ -238,12 +238,15 @@ class GR00T_N1_5(PreTrainedModel):
         tune_llm = kwargs.pop("tune_llm", False)
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
+        tune_n_last_layers_vision = kwargs.pop("tune_n_last_layers_vision", 0)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Tune backbone vision tower: {tune_visual}")
         print(f"Tune backbone LLM: {tune_llm}")
         print(f"Tune action head projector: {tune_projector}")
         print(f"Tune action head DiT: {tune_diffusion_model}")
+        if tune_n_last_layers_vision > 0:
+            print(f"Tune last {tune_n_last_layers_vision} SigLIP encoder layers")
 
         # get the current model path being downloaded
         try:
@@ -262,7 +265,7 @@ class GR00T_N1_5(PreTrainedModel):
         )
 
         pretrained_model.backbone.set_trainable_parameters(
-            tune_visual=tune_visual, tune_llm=tune_llm
+            tune_visual=tune_visual, tune_llm=tune_llm, tune_n_last_layers_vision=tune_n_last_layers_vision
         )
         pretrained_model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
