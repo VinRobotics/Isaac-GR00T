@@ -32,6 +32,7 @@ class EagleBackbone(nn.Module):
         self,
         tune_llm: bool = False,
         tune_visual: bool = False,
+        tune_n_last_layers_vision: int = 0,
         select_layer: int = -1,
         reproject_vision: bool = False,
         use_flash_attention: bool = False,
@@ -43,6 +44,7 @@ class EagleBackbone(nn.Module):
         Args:
             tune_llm: whether to tune the LLM model (default: True)
             tune_visual: whether to tune the visual model (default: False)
+            tune_n_last_layers_vision: number of last SigLIP encoder layers to fine-tune (0 = disabled)
         """
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
@@ -60,11 +62,12 @@ class EagleBackbone(nn.Module):
             self.eagle_model.language_model.model.layers.pop(-1)
 
         self.select_layer = select_layer
-        self.set_trainable_parameters(tune_llm, tune_visual)
+        self.set_trainable_parameters(tune_llm, tune_visual, tune_n_last_layers_vision)
 
-    def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
+    def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool, tune_n_last_layers_vision: int = 0):
         self.tune_llm = tune_llm
         self.tune_visual = tune_visual
+        self.tune_n_last_layers_vision = tune_n_last_layers_vision
         for p in self.parameters():
             p.requires_grad = True
         if not tune_llm:
@@ -72,6 +75,14 @@ class EagleBackbone(nn.Module):
         if not tune_visual:
             self.eagle_model.vision_model.requires_grad_(False)
             self.eagle_model.mlp1.requires_grad_(False)
+            if tune_n_last_layers_vision > 0:
+                # Unfreeze the last N layers of the SigLIP vision encoder
+                encoder_layers = self.eagle_model.vision_model.vision_model.encoder.layers
+                n_total = len(encoder_layers)
+                n_unfreeze = min(tune_n_last_layers_vision, n_total)
+                for layer in encoder_layers[n_total - n_unfreeze:]:
+                    layer.requires_grad_(True)
+                print(f"Tune last {n_unfreeze}/{n_total} SigLIP encoder layers")
         print(f"Tune backbone llm: {self.tune_llm}")
         print(f"Tune backbone visual: {self.tune_visual}")
         # Check if any parameters are still trainable. If not, print a warning.
@@ -92,7 +103,16 @@ class EagleBackbone(nn.Module):
             if self.eagle_model.language_model and not self.tune_llm:
                 self.eagle_model.language_model.eval()
             if self.eagle_model.vision_model and not self.tune_visual:
-                self.eagle_model.vision_model.eval()
+                if self.tune_n_last_layers_vision > 0:
+                    # Freeze the whole vision model first, then restore train mode on last N layers
+                    self.eagle_model.vision_model.eval()
+                    encoder_layers = self.eagle_model.vision_model.vision_model.encoder.layers
+                    n_total = len(encoder_layers)
+                    n_unfreeze = min(self.tune_n_last_layers_vision, n_total)
+                    for layer in encoder_layers[n_total - n_unfreeze:]:
+                        layer.train()
+                else:
+                    self.eagle_model.vision_model.eval()
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
@@ -117,9 +137,9 @@ class EagleBackbone(nn.Module):
 
         eagle_embeds, eagle_mask = self.forward_eagle(vl_input)
 
-        # YL (TODO HACK): to resolve DDP issue when tune_visual=True
+        # YL (TODO HACK): to resolve DDP issue when tune_visual=True or tune_n_last_layers_vision>0
         # Ensure all trainable parameters in vision_model are used in the forward pass for DDP compatibility
-        if self.training and self.tune_visual:
+        if self.training and (self.tune_visual or self.tune_n_last_layers_vision > 0):
             dummy_term = torch.tensor(
                 0.0, device=eagle_embeds.device, dtype=eagle_embeds.dtype, requires_grad=True
             )

@@ -76,6 +76,12 @@ class ArgsConfig:
     tune_visual: bool = False
     """Whether to fine-tune the vision tower."""
 
+    tune_n_last_layers_vision: int = 0
+    """Number of last SigLIP encoder layers to fine-tune (0 = disabled). Requires tune_visual=False."""
+
+    vision_lr: float = 0.0
+    """Separate learning rate for SigLIP vision layers (0.0 = use same learning_rate as everything else)."""
+
     tune_projector: bool = True
     """Whether to fine-tune the projector."""
 
@@ -289,6 +295,7 @@ def main(config: ArgsConfig):
         tune_visual=config.tune_visual,  # backbone's vision tower
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
+        tune_n_last_layers_vision=config.tune_n_last_layers_vision,  # last N SigLIP encoder layers
     )
 
     if config.use_action_conditioning:
@@ -466,6 +473,7 @@ def main(config: ArgsConfig):
         model=model,
         training_args=training_args,
         resume_from_checkpoint=config.resume,
+        vision_lr=config.vision_lr,
     )
 
     # 2.3 run experiment

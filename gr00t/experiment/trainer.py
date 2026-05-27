@@ -64,6 +64,7 @@ class BaseSampler(Sampler):
 class DualBrainTrainer(transformers.Trainer):
     def __init__(self, **kwargs):
         self.compute_dtype = kwargs.pop("compute_dtype")
+        self.vision_lr = kwargs.pop("vision_lr", 0.0)
         super().__init__(**kwargs)
         # Allowlist numpy globals for safe RNG state unpickling in PyTorch 2.1+
         torch.serialization.add_safe_globals(
@@ -96,12 +97,18 @@ class DualBrainTrainer(transformers.Trainer):
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
+
+            def is_vision_param(name):
+                return "backbone.eagle_model.vision_model" in name
+
+            use_vision_lr = self.vision_lr > 0.0
+
             optimizer_grouped_parameters = [
                 {
                     "params": [
                         p
                         for n, p in opt_model.named_parameters()
-                        if (n in decay_parameters and p.requires_grad)
+                        if (n in decay_parameters and p.requires_grad and not (use_vision_lr and is_vision_param(n)))
                     ],
                     "weight_decay": self.args.weight_decay,
                 },
@@ -109,11 +116,34 @@ class DualBrainTrainer(transformers.Trainer):
                     "params": [
                         p
                         for n, p in opt_model.named_parameters()
-                        if (n not in decay_parameters and p.requires_grad)
+                        if (n not in decay_parameters and p.requires_grad and not (use_vision_lr and is_vision_param(n)))
                     ],
                     "weight_decay": 0.0,
                 },
             ]
+
+            if use_vision_lr:
+                optimizer_grouped_parameters += [
+                    {
+                        "params": [
+                            p
+                            for n, p in opt_model.named_parameters()
+                            if (n in decay_parameters and p.requires_grad and is_vision_param(n))
+                        ],
+                        "weight_decay": self.args.weight_decay,
+                        "lr": self.vision_lr,
+                    },
+                    {
+                        "params": [
+                            p
+                            for n, p in opt_model.named_parameters()
+                            if (n not in decay_parameters and p.requires_grad and is_vision_param(n))
+                        ],
+                        "weight_decay": 0.0,
+                        "lr": self.vision_lr,
+                    },
+                ]
+                print(f"Using separate vision LR: {self.vision_lr} (others: {self.args.learning_rate})")
 
             optimizer_cls, optimizer_kwargs = transformers.Trainer.get_optimizer_cls_and_kwargs(
                 self.args
