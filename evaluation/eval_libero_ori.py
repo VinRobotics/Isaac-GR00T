@@ -135,7 +135,7 @@ def eval_libero(args: Args, task_suite_name: Optional[str] = None, task_ids: Opt
 
     max_steps_map = {
         "libero_spatial": 220,
-        "libero_object": 280,
+        "libero_object": 280*2,
         "libero_goal": 600,
         "libero_10": 1000,
         "libero_90": 400,
@@ -258,12 +258,12 @@ def eval_libero(args: Args, task_suite_name: Optional[str] = None, task_ids: Opt
                 imageio.mimwrite(
                     save_video_dir / f"rollout_seed_{args.seed}_trial_{episode_idx}_{angle_tag}_wrist_{task_description}_{suffix}.mp4",
                     [np.asarray(x) for x in replay_images_wrist],
-                    fps=10, codec="libx264",
+                    fps=20, codec="libx264",
                 )
                 imageio.mimwrite(
                     save_video_dir / f"rollout_seed_{args.seed}_trial_{episode_idx}_{angle_tag}_static_{task_description}_{suffix}.mp4",
                     [np.asarray(x) for x in replay_images],
-                    fps=10, codec="libx264",
+                    fps=20, codec="libx264",
                 )
 
         logging.info(f"# episodes so far: {total_episodes}")
