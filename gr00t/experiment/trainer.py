@@ -20,6 +20,7 @@ from typing import Optional
 import numpy as np
 import torch
 import transformers
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import Dataset, Sampler
 from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
@@ -132,6 +133,7 @@ class DualBrainTrainer(transformers.Trainer):
                         ],
                         "weight_decay": self.args.weight_decay,
                         "lr": self.vision_lr,
+                        "_is_vision": True,
                     },
                     {
                         "params": [
@@ -141,6 +143,7 @@ class DualBrainTrainer(transformers.Trainer):
                         ],
                         "weight_decay": 0.0,
                         "lr": self.vision_lr,
+                        "_is_vision": True,
                     },
                 ]
                 print(f"Using separate vision LR: {self.vision_lr} (others: {self.args.learning_rate})")
@@ -151,6 +154,28 @@ class DualBrainTrainer(transformers.Trainer):
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
         return self.optimizer
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        super().create_scheduler(num_training_steps=num_training_steps, optimizer=optimizer)
+
+        if self.vision_lr <= 0.0:
+            return self.lr_scheduler
+
+        base_lr = self.args.learning_rate
+        vision_lr = self.vision_lr
+        base_scheduler = self.lr_scheduler
+        original_step = base_scheduler.step
+
+        def patched_step(*args, **kwargs):
+            original_step(*args, **kwargs)
+            # compute the multiplier the scheduler applied to the base lr
+            multiplier = base_scheduler.get_last_lr()[0] / base_lr if base_lr > 0 else 1.0
+            for pg in self.optimizer.param_groups:
+                if pg.get("_is_vision", False):
+                    pg["lr"] = vision_lr * multiplier
+
+        base_scheduler.step = patched_step
+        return self.lr_scheduler
 
     def save_model(self, output_dir: Optional[str], _internal_call: bool):
         ## save tuned model separately
