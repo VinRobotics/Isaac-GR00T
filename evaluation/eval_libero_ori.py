@@ -210,6 +210,7 @@ def eval_libero(args: Args, task_suite_name: Optional[str] = None, task_ids: Opt
                     mode=args.rotation_mode,
                     mount_body_name=mount_body_name,
                     pivot_xy=pivot,
+                    camera_names=()
                 )
 
                 init_png = (save_video_dir
