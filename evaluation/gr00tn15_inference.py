@@ -1,9 +1,10 @@
 # gr00tn15_inference.py
-import os 
-import sys 
+import os
+import sys
 import math
-import numpy as np 
+import numpy as np
 import torch
+from scipy.ndimage import rotate as _nd_rotate
 
 from gr00t.model.policy import Gr00tPolicy
 # Import config
@@ -87,8 +88,8 @@ class Gr00tn15_inference():
             return np.array(LIBERO_DUMMY_ACTION, dtype=np.float32)
         return self.convert_to_mimicgen_action_chunk(action_chunk)
 
-    def get_libero_action(self, obs, task_description):
-        data = self._process_observation(obs, task_description, flip_mode="both")
+    def get_libero_action(self, obs, task_description, theta_rad: float = 0.0):
+        data = self._process_observation(obs, task_description, flip_mode="both", theta_rad=theta_rad)
         try:
             action_chunk = self.policy.get_action(data)
         except Exception as e:
@@ -161,7 +162,7 @@ class Gr00tn15_inference():
         return np.stack(actions, axis=0)  # shape: (10, D)
 
 
-    def _process_observation(self, obs, task_description, flip_mode=None):
+    def _process_observation(self, obs, task_description, flip_mode=None, theta_rad: float = 0.0):
 
         xyz = obs["robot0_eef_pos"]
         rpy = _mimicgen_quat2axisangle(obs["robot0_eef_quat"]) if flip_mode == "vertical" else _quat2axisangle(obs["robot0_eef_quat"])
@@ -179,6 +180,12 @@ class Gr00tn15_inference():
         elif flip_mode == "both":
             img = img[::-1, ::-1]
             wrist_img = wrist_img[::-1, ::-1]
+
+        # 2D-rotate agentview image to simulate equivariant camera frame.
+        # Wrist camera co-rotates with EE (physically rotated with robot mount),
+        # so it does NOT need an additional 2D rotation.
+        if theta_rad != 0.0:
+            img = _rotate_image_2d(img, theta_rad)
 
         # GR00T N1.6 expects:
         # - video: shape (B, T, H, W, C) - add batch and temporal dims
@@ -211,6 +218,20 @@ class Gr00tn15_inference():
             action[..., -1] = np.sign(action[..., -1])
 
         return action
+
+def _rotate_image_2d(img: np.ndarray, theta_rad: float) -> np.ndarray:
+    """Rotate HWC uint8 image CCW by theta_rad in the image plane.
+
+    Scene is rotated CCW by theta_rad (scene_rotation.py convention).
+    A top-down camera would see the image content rotate CCW by the same angle.
+    We apply the same 2D rotation here to approximate that effect for a
+    front-facing camera, making the visual input consistent with what an
+    equivariant model (FA) expects.
+    """
+    angle_deg = math.degrees(theta_rad)
+    rotated = _nd_rotate(img, angle_deg, axes=(0, 1), reshape=False, order=1, mode="nearest")
+    return rotated.astype(np.uint8)
+
 
 def _to_hwc_uint8(img: np.ndarray) -> np.ndarray:
     """Convert a robomimic image (float32 CHW [0,1]) to uint8 HWC [0,255]."""

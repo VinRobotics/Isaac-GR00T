@@ -210,6 +210,7 @@ def eval_libero(args: Args, task_suite_name: Optional[str] = None, task_ids: Opt
                     mode=args.rotation_mode,
                     mount_body_name=mount_body_name,
                     pivot_xy=pivot,
+                    camera_names=(),  # camera fixed; image rotated at model input
                 )
 
                 init_png = (save_video_dir
@@ -233,7 +234,7 @@ def eval_libero(args: Args, task_suite_name: Optional[str] = None, task_ids: Opt
                             t += 1
                             continue
 
-                        action_chunk = mypolicy.get_libero_action(obs, task_description)
+                        action_chunk = mypolicy.get_libero_action(obs, task_description, theta_rad=theta_rad)
 
                         for act in action_chunk:
                             obs, reward, done, info = env.step(act.tolist())
