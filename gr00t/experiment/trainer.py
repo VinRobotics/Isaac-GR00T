@@ -20,7 +20,6 @@ from typing import Optional
 import numpy as np
 import torch
 import transformers
-from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import Dataset, Sampler
 from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
@@ -30,6 +29,35 @@ from transformers.trainer import (
     get_parameter_names,
     is_sagemaker_mp_enabled,
 )
+
+
+class VisionLRSchedulerWrapper:
+    """Wraps a base scheduler and keeps vision param groups scaled to vision_lr."""
+
+    def __init__(self, base_scheduler, optimizer, base_lr: float, vision_lr: float):
+        self.base_scheduler = base_scheduler
+        self.optimizer = optimizer
+        self.base_lr = base_lr
+        self.vision_lr = vision_lr
+
+    def step(self, *args, **kwargs):
+        self.base_scheduler.step(*args, **kwargs)
+        multiplier = self.base_scheduler.get_last_lr()[0] / self.base_lr if self.base_lr > 0 else 1.0
+        for pg in self.optimizer.param_groups:
+            if pg.get("_is_vision", False):
+                pg["lr"] = self.vision_lr * multiplier
+
+    def get_last_lr(self):
+        return self.base_scheduler.get_last_lr()
+
+    def state_dict(self):
+        return self.base_scheduler.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.base_scheduler.load_state_dict(state_dict)
+
+    def __getattr__(self, name):
+        return getattr(self.base_scheduler, name)
 
 
 class BaseSampler(Sampler):
@@ -161,20 +189,12 @@ class DualBrainTrainer(transformers.Trainer):
         if self.vision_lr <= 0.0:
             return self.lr_scheduler
 
-        base_lr = self.args.learning_rate
-        vision_lr = self.vision_lr
-        base_scheduler = self.lr_scheduler
-        original_step = base_scheduler.step
-
-        def patched_step(*args, **kwargs):
-            original_step(*args, **kwargs)
-            # compute the multiplier the scheduler applied to the base lr
-            multiplier = base_scheduler.get_last_lr()[0] / base_lr if base_lr > 0 else 1.0
-            for pg in self.optimizer.param_groups:
-                if pg.get("_is_vision", False):
-                    pg["lr"] = vision_lr * multiplier
-
-        base_scheduler.step = patched_step
+        self.lr_scheduler = VisionLRSchedulerWrapper(
+            base_scheduler=self.lr_scheduler,
+            optimizer=self.optimizer,
+            base_lr=self.args.learning_rate,
+            vision_lr=self.vision_lr,
+        )
         return self.lr_scheduler
 
     def save_model(self, output_dir: Optional[str], _internal_call: bool):
