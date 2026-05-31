@@ -290,6 +290,85 @@ def rotate_body_in_xml(
     return ET.tostring(root, encoding="unicode")
 
 
+def rotate_camera_in_xml(
+    xml_str: str,
+    camera_name: str,
+    theta_rad: float,
+    pivot_xy=(0.0, 0.0),
+) -> str:
+    """Return XML with camera `camera_name` position and orientation rotated by
+    theta_rad around world +Z about pivot_xy. Searches the full XML tree (not
+    restricted to worldbody direct children). Handles quat, euler, axisangle,
+    zaxis, xyaxes, and no-rotation-attr cases.
+    """
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_str)
+    pivot = np.asarray(pivot_xy, dtype=float)
+
+    target = None
+    for cam in root.iter("camera"):
+        if cam.get("name") == camera_name:
+            target = cam
+            break
+    if target is None:
+        raise RuntimeError(f"camera {camera_name!r} not found in XML")
+
+    # Rotate position xy around pivot; preserve z.
+    pos = _parse_xml_vec(target.get("pos"), [0.0, 0.0, 0.0])
+    new_xy = rotate_xy_about_z(pos[:2], theta_rad, pivot)
+    target.set("pos", _fmt_xml_vec(np.array([new_xy[0], new_xy[1], pos[2]])))
+
+    # Rotate orientation: left-multiply by Z-rotation.
+    dq = quat_from_axis_angle_z(theta_rad)  # [w,x,y,z]
+    Rz = np.array([
+        [math.cos(theta_rad), -math.sin(theta_rad), 0.0],
+        [math.sin(theta_rad),  math.cos(theta_rad), 0.0],
+        [0.0,                  0.0,                 1.0],
+    ])
+
+    if target.get("quat") is not None:
+        q = _parse_xml_vec(target.get("quat"), [1.0, 0.0, 0.0, 0.0])
+        target.set("quat", _fmt_xml_vec(quat_normalize(quat_mul_wxyz(dq, q))))
+
+    elif target.get("euler") is not None:
+        # MuJoCo default euler sequence is XYZ (intrinsic).
+        from scipy.spatial.transform import Rotation
+        euler = _parse_xml_vec(target.get("euler"), [0.0, 0.0, 0.0])
+        R_new = Rz @ Rotation.from_euler("xyz", euler).as_matrix()
+        target.set("euler", _fmt_xml_vec(Rotation.from_matrix(R_new).as_euler("xyz")))
+
+    elif target.get("axisangle") is not None:
+        # MuJoCo axisangle = "ax ay az angle" (4 values).
+        from scipy.spatial.transform import Rotation
+        v = _parse_xml_vec(target.get("axisangle"), [0.0, 0.0, 1.0, 0.0])
+        R_new = Rz @ Rotation.from_rotvec(v[:3] * v[3]).as_matrix()
+        rv = Rotation.from_matrix(R_new).as_rotvec()
+        angle = float(np.linalg.norm(rv))
+        axis = rv / angle if angle > 1e-12 else np.array([0.0, 0.0, 1.0])
+        target.set("axisangle", _fmt_xml_vec(np.append(axis, angle)))
+
+    elif target.get("zaxis") is not None:
+        z = _parse_xml_vec(target.get("zaxis"), [0.0, 0.0, -1.0])
+        target.set("zaxis", _fmt_xml_vec(Rz @ z))
+        if target.get("xyaxes") is not None:
+            xy = _parse_xml_vec(target.get("xyaxes"), [1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+            x_new = Rz @ xy[:3]
+            y_new = Rz @ xy[3:]
+            target.set("xyaxes", _fmt_xml_vec(np.concatenate([x_new, y_new])))
+
+    elif target.get("xyaxes") is not None:
+        xy = _parse_xml_vec(target.get("xyaxes"), [1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+        target.set("xyaxes", _fmt_xml_vec(
+            np.concatenate([Rz @ xy[:3], Rz @ xy[3:]])
+        ))
+
+    else:
+        # No rotation attribute — camera default orientation = identity. Add quat.
+        target.set("quat", _fmt_xml_vec(dq))
+
+    return ET.tostring(root, encoding="unicode")
+
+
 def rotate_init_state_qpos(
     init_state: np.ndarray,
     free_joint_qpos_addrs,
@@ -539,8 +618,8 @@ def find_robot_wrist_joint(
 
 
 # Supported rotation modes for reset_env_rotated. Both bake the rotation into
-# the freshly-set init_state (no post-hoc qpos mutation), keeping the camera
-# untouched.
+# the freshly-set init_state (no post-hoc qpos mutation). Named cameras
+# (default: "agentview") are co-rotated with the scene via XML edit.
 ROTATION_MODE_FULL = "full"          # rotate robot mount body + object qpos
 ROTATION_MODE_EE_YAW = "ee_yaw"      # rotate object qpos + twist wrist joint
 _VALID_ROTATION_MODES = (ROTATION_MODE_FULL, ROTATION_MODE_EE_YAW)
@@ -582,8 +661,9 @@ def reset_env_rotated(
     pivot_xy=None,
     exclude_substrings: tuple = ("robot", "gripper", "mount", "hand"),
     ee_body_name: str = "gripper0_eef",
+    camera_names: tuple = ("agentview",),
 ) -> dict:
-    """Reset env into a rotated scene; camera fixed; rotation baked into init_state.
+    """Reset env into a rotated scene; rotation baked into init_state.
 
     Modes:
       "full"    — rewrite XML so the robot mount body is rotated around world
@@ -598,6 +678,11 @@ def reset_env_rotated(
                   theta (EE target unreachable from fixed mount) — an
                   `[IK-WARN]` is printed if joints get clamped.
 
+    camera_names: cameras to co-rotate with the scene (default: ("agentview",)).
+        Pass an empty tuple to keep all cameras fixed (old behaviour).
+        Wrist / eye-in-hand cameras should NOT be listed here — they are
+        attached to the robot and co-rotate automatically when the mount rotates.
+
     Both modes call env.set_init_state(rotated_state) so the model sees a
     physically-valid initial configuration, not a post-hoc perturbation.
 
@@ -610,7 +695,8 @@ def reset_env_rotated(
              else np.asarray(pivot_xy, dtype=float))
 
     # Build XML and reset:
-    #   - mode=full + |theta|>0   -> rotate mount body in XML, then reset_from_xml_string
+    #   - mode=full + |theta|>0   -> rotate mount body + cameras in XML,
+    #                                 then reset_from_xml_string
     #   - else                     -> XML unchanged, plain env.reset() (avoids
     #                                 the costly sim recreate from reset_from_xml_string)
     inner = getattr(env, "env", env)
@@ -618,6 +704,11 @@ def reset_env_rotated(
         if mount_body_name is None:
             mount_body_name = discover_robot_mount_body(env.sim)
         xml = rotate_body_in_xml(base_xml, mount_body_name, theta_rad, pivot_xy=pivot)
+        for cam_name in camera_names:
+            try:
+                xml = rotate_camera_in_xml(xml, cam_name, theta_rad, pivot_xy=pivot)
+            except RuntimeError as exc:
+                print(f"  [WARN] rotate_camera_in_xml skipped {cam_name!r}: {exc}")
         inner.reset_from_xml_string(xml)
     else:
         env.reset()
