@@ -107,6 +107,7 @@ class Args:
     rotation_mode: str = "full"
     pivot_xy: Optional[tuple[float, float]] = None
     pilot_task_ids: Optional[tuple[int, ...]] = None
+    post_rot: bool = True
 
 
 def _resolve_angles(args: Args) -> tuple[float, ...]:
@@ -233,9 +234,10 @@ def eval_libero(args: Args, task_suite_name: Optional[str] = None, task_ids: Opt
                             obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                             t += 1
                             continue
-
-                        action_chunk = mypolicy.get_libero_action(obs, task_description, theta_rad=theta_rad)
-
+                        if args.post_rot:
+                            action_chunk = mypolicy.get_libero_action(obs, task_description, theta_rad=theta_rad)
+                        else:
+                            action_chunk = mypolicy.get_libero_action(obs, task_description)
                         for act in action_chunk:
                             obs, reward, done, info = env.step(act.tolist())
                             t += 1
