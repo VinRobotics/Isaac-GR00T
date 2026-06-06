@@ -2026,24 +2026,6 @@ class EquiMimicgenConfig(BaseDataConfig):
         }
         return modality_configs
 
-    @classmethod
-    def get_rotation_config(cls) -> dict:
-        """
-        Backbone rotation config for equivariant frame averaging.
-
-        - num_images_per_sample=2: Eagle VL/LLM pass sees BOTH cameras (top + wrist).
-        - rotate_image_indices=[0]: Only the top/head camera (index 0) is rotated for FA.
-          The wrist camera (index 1) is skipped from equi_vision_embs entirely.
-
-        Result:
-          backbone_equi_vision_features: [B, 1, T_vis, D_vis]  — top camera only (equivariant)
-          backbone_vision_language_features: [B, T_text, D]     — informed by both cameras
-        """
-        return {
-            "num_images_per_sample": 2,
-            "rotate_image_indices": [0],
-        }
-
     def transform(self):
         transforms = [
             # video transforms
@@ -2222,105 +2204,6 @@ class EquiRelMimicgen2StepConfig(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 ##############################################################################################
 
-class EquiMimicgenConfig(BaseDataConfig):
-    video_keys = ["video.image", "video.wrist_image"]
-    # video.image (index 0) = top/head camera → equivariant FA
-    # video.wrist_image (index 1) = wrist camera → VL only, skipped from equi_vision_embs
-    state_keys = [
-        "state.left_arm",
-        "state.right_arm",
-        "state.left_hand",
-        "state.right_hand",
-        "state.effort_left_arm",
-        "state.effort_right_arm",
-        "state.effort_left_hand",
-        "state.effort_right_hand",
-    ]
-    action_keys = [
-        "action.left_arm",
-        "action.right_arm",
-        "action.left_hand",
-        "action.right_hand",
-    ]
-    language_keys = ["annotation.human.task_description"]
-    observation_indices = [0]
-    state_indices = [0]
-    action_indices = list(range(16))
-
-    def modality_config(self):
-        video_modality = ModalityConfig(
-            delta_indices=self.observation_indices,
-            modality_keys=self.video_keys,
-        )
-        state_modality = ModalityConfig(
-            delta_indices=self.observation_indices,
-            modality_keys=self.state_keys,
-        )
-        action_modality = ModalityConfig(
-            delta_indices=self.action_indices,
-            modality_keys=self.action_keys,
-        )
-        language_modality = ModalityConfig(
-            delta_indices=self.observation_indices,
-            modality_keys=self.language_keys,
-        )
-        modality_configs = {
-            "video": video_modality,
-            "state": state_modality,
-            "action": action_modality,
-            "language": language_modality,
-        }
-        return modality_configs
-
-    def transform(self):
-        transforms = [
-            # video transforms
-            VideoToTensor(apply_to=self.video_keys),
-            VideoCrop(apply_to=self.video_keys, scale=0.95),
-            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
-            VideoColorJitter(
-                apply_to=self.video_keys,
-                brightness=0.3,
-                contrast=0.4,
-                saturation=0.5,
-                hue=0.08,
-            ),
-            VideoToNumpy(apply_to=self.video_keys),
-            # state transforms
-            StateActionToTensor(apply_to=self.state_keys),
-            StateActionTransform(
-                apply_to=self.state_keys,
-                normalization_modes={key: "min_max" for key in self.state_keys},
-                # target_rotations={
-                #     "state.end_effector_rotation_relative": "rotation_6d",
-                #     "state.base_rotation": "rotation_6d",
-                # },
-            ),
-            # action transforms
-            StateActionToTensor(apply_to=self.action_keys),
-            StateActionTransform(
-                apply_to=self.action_keys,
-                normalization_modes={key: "min_max" for key in self.action_keys},
-            ),
-            # concat transforms
-            ConcatTransform(
-                video_concat_order=self.video_keys,
-                state_concat_order=self.state_keys,
-                action_concat_order=self.action_keys,
-            ),
-            GR00TTransform(
-                state_horizon=len(self.observation_indices),
-                action_horizon=len(self.action_indices),
-                max_state_dim=64,
-                max_action_dim=32,
-            ),
-        ]
-
-        return ComposedModalityTransform(transforms=transforms)
-
-###########################################################################################
-
-    
 class VRH3LeftHandConfig(BaseDataConfig):
     video_keys = ["video.cam_head", "video.cam_left", "video.cam_right"]
     state_keys = [
@@ -3313,4 +3196,5 @@ DATA_CONFIG_MAP = {
     "equi_rel_mimicgen_2step": EquiRelMimicgen2StepConfig(),
     "equi_bridge": EquiBridgeDataConfig(),
     "equi_rel_mimicgen_mix": EquiRelMimicgenMixConfig(),
+    "equi_mimicgen": EquiMimicgenConfig(),
 }
