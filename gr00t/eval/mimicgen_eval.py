@@ -475,7 +475,10 @@ def _convert_action_chunk(
         if v.ndim == 3 and v.shape[-1] == 1:
             v = v[..., 0]
         out[:, :, ci] = v[:, :n_action_steps]
-    if not use_abs_action:
+    if use_abs_action:
+        # invert dataset transform (1-raw)/2 → raw = 1 - 2*model, restoring [-1,+1]
+        out[..., -1] = 1.0 - 2.0 * np.clip(out[..., -1], 0.0, 1.0)
+    else:
         # gripper: [0,1] → [-1,+1] → binarize → invert (matches gr00tn15_inference)
         out[..., -1] = 2.0 * out[..., -1] - 1.0
         out[..., -1] = np.sign(out[..., -1])
