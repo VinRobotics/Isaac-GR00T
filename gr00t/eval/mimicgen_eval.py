@@ -132,12 +132,27 @@ def _make_env(env_name: str, resolution: int, robot: str):
     return env
 
 
-def _env_worker(pipe, env_name: str, resolution: int, robot: str, sys_path_extra: List[str]):
+_DUMMY_DELTA_ACTION = [0.0] * 6 + [-1.0]  # zero-pose delta, gripper open
+
+
+def _env_worker(
+    pipe,
+    env_name: str,
+    resolution: int,
+    robot: str,
+    sys_path_extra: List[str],
+    use_abs_action: bool = False,
+    num_steps_wait: int = 5,
+):
     """One subprocess = one robosuite env.  Commands: reset / step / close.
 
     `sys_path_extra` propagates the parent's sys.path entries (the spawn
     context starts a fresh interpreter and would otherwise drop user-added
     paths like the mimicgen_envs install dir).
+
+    When `use_abs_action=True`, each reset runs `num_steps_wait` dummy delta
+    steps to let the robot settle, then switches the controller to absolute
+    mode (use_delta=False) before returning the obs.
     """
     for p in sys_path_extra:
         if p and p not in sys.path:
@@ -153,6 +168,15 @@ def _env_worker(pipe, env_name: str, resolution: int, robot: str, sys_path_extra
                 if seed is not None:
                     np.random.seed(seed)
                 obs = env.reset()
+                if use_abs_action:
+                    # Ensure delta mode is active for the wait phase.
+                    for robot_obj in env.robots:
+                        robot_obj.controller.use_delta = True
+                    for _ in range(num_steps_wait):
+                        obs, _, _, _ = env.step(_DUMMY_DELTA_ACTION)
+                    # Switch to absolute mode for the policy phase.
+                    for robot_obj in env.robots:
+                        robot_obj.controller.use_delta = False
                 pipe.send(("ok", obs))
             elif cmd == "step":
                 obs, reward, done, info = env.step(data)
@@ -183,7 +207,15 @@ class MimicgenParallelEnvs:
     auto-reset (matches equidiff's modified AsyncVectorEnv).
     """
 
-    def __init__(self, env_name: str, n_envs: int, resolution: int, robot: str):
+    def __init__(
+        self,
+        env_name: str,
+        n_envs: int,
+        resolution: int,
+        robot: str,
+        use_abs_action: bool = False,
+        num_steps_wait: int = 5,
+    ):
         self.env_name = env_name
         self.n_envs = n_envs
         self.resolution = resolution
@@ -203,6 +235,7 @@ class MimicgenParallelEnvs:
             p = ctx.Process(
                 target=_env_worker,
                 args=(child, env_name, resolution, robot, sys_path_extra),
+                kwargs={"use_abs_action": use_abs_action, "num_steps_wait": num_steps_wait},
                 daemon=True,
             )
             p.start()
@@ -424,11 +457,16 @@ def _convert_action_chunk(
     batch_size: int,
     n_action_steps: int,
     action_keys: List[str],
+    use_abs_action: bool = False,
 ) -> np.ndarray:
     """
     action_chunk[k] (for k in action_keys) has shape (B, action_horizon) or
-    (B, action_horizon, 1). Returns (B, n_action_steps, len(action_keys)) with
-    the last channel (gripper) converted to signed {-1, +1} and inverted.
+    (B, action_horizon, 1). Returns (B, n_action_steps, len(action_keys)).
+
+    For relative actions the last channel (gripper) is converted from [0,1]
+    to signed {-1, +1} and inverted.  For absolute actions the policy output
+    is passed through unchanged (the model is trained to output the raw
+    robosuite gripper signal directly).
     """
     n_dim = len(action_keys)
     out = np.zeros((batch_size, n_action_steps, n_dim), dtype=np.float32)
@@ -437,10 +475,11 @@ def _convert_action_chunk(
         if v.ndim == 3 and v.shape[-1] == 1:
             v = v[..., 0]
         out[:, :, ci] = v[:, :n_action_steps]
-    # gripper: [0,1] → [-1,+1] → binarize → invert (matches gr00tn15_inference)
-    out[..., -1] = 2.0 * out[..., -1] - 1.0
-    out[..., -1] = np.sign(out[..., -1])
-    out[..., -1] *= -1.0
+    if not use_abs_action:
+        # gripper: [0,1] → [-1,+1] → binarize → invert (matches gr00tn15_inference)
+        out[..., -1] = 2.0 * out[..., -1] - 1.0
+        out[..., -1] = np.sign(out[..., -1])
+        out[..., -1] *= -1.0
     return out
 
 
@@ -458,6 +497,7 @@ def run_rollout(
     state_keys: List[str],
     action_keys: List[str],
     record_video_mask: Optional[List[bool]] = None,
+    use_abs_action: bool = False,
 ) -> Tuple[List[bool], List[Optional[List[np.ndarray]]]]:
     """
     Run one synchronous chunk of `len(seeds)` episodes in parallel.  The chunk
@@ -510,7 +550,7 @@ def run_rollout(
             print(f"[mimicgen_eval] policy.get_action failed: {e}")
             break
 
-        actions = _convert_action_chunk(action_chunk, n_active, n_action_steps, action_keys)
+        actions = _convert_action_chunk(action_chunk, n_active, n_action_steps, action_keys, use_abs_action)
 
         for step_idx in range(n_action_steps):
             if t >= max_steps:
@@ -569,6 +609,8 @@ class MimicgenEvalCallback(TrainerCallback):
         video_fps: int = 20,
         output_dir: Optional[str] = None,
         device: str = "cuda",
+        use_abs_action: bool = False,
+        num_steps_wait: int = 5,
     ):
         super().__init__()
         self.task_name = _normalize_task_name(task_name)
@@ -596,6 +638,8 @@ class MimicgenEvalCallback(TrainerCallback):
         self.video_fps = video_fps
         self.output_dir = Path(output_dir) if output_dir else None
         self.device = device
+        self.use_abs_action = use_abs_action
+        self.num_steps_wait = num_steps_wait
 
         # n_obs_steps derived from modality_config (observation_indices)
         self.n_obs_steps = len(modality_config["video"].delta_indices)
@@ -620,6 +664,8 @@ class MimicgenEvalCallback(TrainerCallback):
                 n_envs=self.n_envs,
                 resolution=self.resolution,
                 robot=self.robot,
+                use_abs_action=self.use_abs_action,
+                num_steps_wait=self.num_steps_wait,
             )
 
     def on_save(self, args, state, control, **kwargs):
@@ -781,6 +827,7 @@ class MimicgenEvalCallback(TrainerCallback):
                     state_keys=list(self.modality_config["state"].modality_keys),
                     action_keys=list(self.modality_config["action"].modality_keys),
                     record_video_mask=record_video_mask,
+                    use_abs_action=self.use_abs_action,
                 )
                 all_successes.extend(chunk_successes)
 

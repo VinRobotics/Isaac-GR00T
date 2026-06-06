@@ -179,6 +179,14 @@ class ArgsConfig:
     mimicgen_eval_video_fps: int = 20
     """FPS for the saved MP4 (robosuite control_freq = 20, so 20 = realtime)."""
 
+    mimicgen_eval_use_abs_action: bool = False
+    """Set True when using a data config with rel_action=False (e.g. EquiMimicgenConfig).
+    Switches the eval env to absolute OSC_POSE control after a short wait phase."""
+
+    mimicgen_eval_num_steps_wait: int = 5
+    """Number of dummy delta-mode steps at episode start before switching to absolute
+    control. Only used when mimicgen_eval_use_abs_action=True."""
+
     # Rotation augmentation
     rot_aug: bool = False
     """If True, apply random Z-axis rotation augmentation during training (requires the data config
@@ -506,6 +514,8 @@ def main(config: ArgsConfig):
             n_test_vis=config.mimicgen_eval_n_test_vis,
             video_fps=config.mimicgen_eval_video_fps,
             output_dir=config.output_dir,
+            use_abs_action=config.mimicgen_eval_use_abs_action,
+            num_steps_wait=config.mimicgen_eval_num_steps_wait,
         )
         experiment.trainer.add_callback(eval_cb)
         print(
