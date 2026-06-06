@@ -200,32 +200,45 @@ class EquivariantAttention(nn.Module):
         self._equivariant_qkv = both_regular
 
         if both_regular:
-            # GeoQK + EquiV attention (geometric inner-product attention):
-            #
-            #   Q, K  ← enn.Linear(regular → regular)  equivariant, circulant
-            #   V     ← enn.Linear(regular → regular)  equivariant, circulant
-            #   o_proj← enn.Linear(regular → regular)  equivariant, circulant
-            #
-            # Equivariance proof:
-            #   score(g·x, g·y) = ⟨ρ(g)Q, ρ(g)K⟩ = ⟨Q, K⟩   [ρ(g) orthogonal] → invariant ✓
-            #   out(g·x)        = Σ_k score_k · ρ(g)·V_k = ρ(g)·out(x)           → equivariant ✓
-            #
-            # Why this is better than regular → trivial (group-mean) Q/K:
-            #   - Trivial Q/K collapse the entire G-orbit to its mean, discarding ALL directional info.
-            #   - Regular Q/K preserve the full orientation structure; the geometric inner product
-            #     ⟨Q, K⟩ = Σ_g Q[g]·K[g] measures how Q and K *co-align across each group element*,
-            #     giving attention patterns sensitive to shared orientation, not just invariant norms.
-            #   - Still exactly G-invariant: no equivariance is broken.
-            #
             n_regular = self.scalar_dim // self.G
             self.qkv_type = enn.FieldType(gspace, [gspace.regular_repr] * n_regular)
 
-            # Q, K: regular → regular (equivariant; geometric inner product ⟨Q,K⟩ is G-invariant)
+            # Cross-attention: geometric inner-product attention (equivariant Q, K, V).
+            # Used when encoder_hidden_states is provided (VL features).
+            # score(g·x, g·y) = ⟨ρ(g)Q, ρ(g)K⟩ = ⟨Q, K⟩  [G-invariant] ✓
+            # out(g·x)        = ρ(g)·out(x)                  [G-equivariant] ✓
             self.q_proj = enn.Linear(in_type,         self.qkv_type, bias=bias)
             self.k_proj = enn.Linear(self.cross_type, self.qkv_type, bias=bias)
-            # V, o_proj: equivariant (circulant) to preserve equivariant values
             self.v_proj = enn.Linear(self.cross_type, self.qkv_type, bias=bias)
             self.o_proj = enn.Linear(self.qkv_type,   in_type,       bias=out_bias)
+
+            # Self-attention: orbit-lifted standard attention.
+            # Used when encoder_hidden_states is None (action/state self-attention).
+            #
+            # Equivariance via orbit lifting (same principle as equidiff):
+            #   1. Lift:    (B, T, k*G) → (B*G, T, k)   each group element is its own batch
+            #   2. Attend:  standard unconstrained Q/K/V attention on k-dim features
+            #               weight sharing across all B*G copies → group convolution → equivariant
+            #   3. Contract:(B*G, T, k) → (B, T, k*G)
+            #   4. Project: enn.Linear(in_type → in_type)  equivariant output mix
+            #
+            # k = in_type.size // G  (per-group-element channel count)
+            # orbit_H = H // G, orbit_Dh = Dh  → orbit_H * orbit_Dh = k  ✓
+            self.k_per_group = in_type.size // self.G
+            # Choose orbit heads: H // G heads, each with Dh dims = k_per_group total
+            self.orbit_H = max(1, self.H // self.G)
+            self.orbit_Dh = self.k_per_group // self.orbit_H
+            assert self.orbit_H * self.orbit_Dh == self.k_per_group, (
+                f"orbit_H ({self.orbit_H}) * orbit_Dh ({self.orbit_Dh}) "
+                f"!= k_per_group ({self.k_per_group})"
+            )
+            self.orbit_scale = self.orbit_Dh ** -0.5
+
+            self.orbit_q = nn.Linear(self.k_per_group, self.k_per_group, bias=bias)
+            self.orbit_k = nn.Linear(self.k_per_group, self.k_per_group, bias=bias)
+            self.orbit_v = nn.Linear(self.k_per_group, self.k_per_group, bias=bias)
+            # Equivariant output projection: mixes group elements after contracting orbits
+            self.orbit_o_proj = enn.Linear(in_type, in_type, bias=out_bias)
         else:
             # Scalar FieldType for Q, K, V (cross-attention with trivial VL features)
             self.qkv_type = enn.FieldType(gspace, [gspace.trivial_repr] * self.scalar_dim)
@@ -236,7 +249,7 @@ class EquivariantAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
         self.scale = (dim_head) ** -0.5
-        
+
         # Relative position bias (equivariant because it's based on relative distances)
         self.use_relative_position_bias = use_relative_position_bias
         if use_relative_position_bias:
@@ -251,13 +264,13 @@ class EquivariantAttention(nn.Module):
         """
         Compute relative position bias matrix.
         This is equivariant because it only depends on relative distances.
-        
+
         Returns: (H, Tq, Tk) bias tensor
         """
         # Create position indices
         q_pos = torch.arange(Tq, device=device).unsqueeze(1)  # (Tq, 1)
         k_pos = torch.arange(Tk, device=device).unsqueeze(0)  # (1, Tk)
-        
+
         # Compute relative positions and clip
         relative_position = q_pos - k_pos  # (Tq, Tk)
         relative_position = torch.clamp(
@@ -265,22 +278,93 @@ class EquivariantAttention(nn.Module):
             -self.max_relative_position,
             self.max_relative_position
         )
-        
+
         # Shift to make all indices positive
         relative_position_index = relative_position + self.max_relative_position  # (Tq, Tk)
-        
+
         # Index into learned bias
         # relative_position_bias: (H, 2*max_relative_position + 1)
         # Output: (H, Tq, Tk)
         bias = self.relative_position_bias[:, relative_position_index]  # (H, Tq, Tk)
-        
+
         return bias
-    
+
+    def _orbit_lifted_self_attn(self, hidden_states: torch.Tensor, attention_mask=None) -> torch.Tensor:
+        """
+        Self-attention via orbit lifting (equidiff-style).
+
+        Equivariance: regular-repr features are naturally arranged as G independent orbits.
+        Lifting folds the group dimension into the batch, runs unconstrained attention on
+        k = in_type.size // G per-element features, then contracts back.  Weight sharing
+        across all G copies of the batch guarantees equivariance (= group convolution).
+
+        ESCNN regular_repr layout for FieldType([regular_repr]*k_copies):
+          [..., rep_i * G + g, ...]  →  feature k_copies=i for group element g
+        Orbit lift: rearrange "b t (k g) -> (b g) t k"  extracts all k_copies for each g.
+        """
+        B, T, _ = hidden_states.shape
+        G = self.G
+        k = self.k_per_group  # feature dim per group element
+
+        # Orbit lift: (B, T, k*G) → (B*G, T, k)
+        x = einops.rearrange(hidden_states, "b t (k g) -> (b g) t k", k=k, g=G)
+
+        # Standard unconstrained Q, K, V on k-dim features
+        Q = self.orbit_q(x)  # (B*G, T, k)
+        K = self.orbit_k(x)  # (B*G, T, k)
+        V = self.orbit_v(x)  # (B*G, T, k)
+
+        # Split heads: (B*G, T, orbit_H, orbit_Dh)
+        Q = einops.rearrange(Q, "b t (h d) -> b t h d", h=self.orbit_H)
+        K = einops.rearrange(K, "b t (h d) -> b t h d", h=self.orbit_H)
+        V = einops.rearrange(V, "b t (h d) -> b t h d", h=self.orbit_H)
+
+        # Scaled dot-product — standard, no equivariance constraint
+        attn = torch.einsum("b t h d, b s h d -> b h t s", Q, K) * self.orbit_scale
+
+        if self.use_relative_position_bias:
+            # Relative position bias uses orbit_H heads
+            q_pos = torch.arange(T, device=attn.device).unsqueeze(1)
+            k_pos = torch.arange(T, device=attn.device).unsqueeze(0)
+            rel_idx = torch.clamp(q_pos - k_pos, -self.max_relative_position, self.max_relative_position)
+            rel_idx = rel_idx + self.max_relative_position
+            # Use first orbit_H entries of relative_position_bias (may differ from H)
+            n_bias_heads = min(self.orbit_H, self.relative_position_bias.shape[0])
+            bias = self.relative_position_bias[:n_bias_heads, rel_idx]  # (n_bias_heads, T, T)
+            attn[:, :n_bias_heads] = attn[:, :n_bias_heads] + bias.unsqueeze(0)
+
+        if attention_mask is not None:
+            # attention_mask is (B, T, T); expand for B*G batch
+            mask_expanded = einops.repeat(attention_mask, "b t s -> (b g) t s", g=G)
+            attn = attn + mask_expanded[:, None, :, :]
+
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+
+        # Weighted sum of values: (B*G, T, k)
+        out = torch.einsum("b h t s, b s h d -> b h t d", attn, V)
+        out = einops.rearrange(out, "b h t d -> b t (h d)")  # (B*G, T, k)
+
+        # Contract orbits: (B*G, T, k) → (B, T, k*G)  [restores ESCNN regular_repr layout]
+        out = einops.rearrange(out, "(b g) t k -> b t (k g)", b=B, g=G)
+
+        # Equivariant output projection: mixes information across group elements
+        out_flat = einops.rearrange(out, "b t d -> (b t) d")
+        out_geo = enn.GeometricTensor(out_flat, self.in_type)
+        out = self.orbit_o_proj(out_geo).tensor        # (B*T, k*G)
+        out = einops.rearrange(out, "(b t) d -> b t d", b=B)
+        return out
+
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
         """
         hidden_states         : (B, Tq, Cq*G)
-        encoder_hidden_states : (B, Tk, Ckv*G)
+        encoder_hidden_states : (B, Tk, Ckv*G)  — if None, runs self-attention
         """
+        # Self-attention: use orbit-lifted unconstrained attention for free temporal modeling.
+        # Cross-attention: use geometric inner-product attention (equivariant Q/K).
+        if encoder_hidden_states is None and self._equivariant_qkv:
+            return self._orbit_lifted_self_attn(hidden_states, attention_mask)
+
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
@@ -295,45 +379,36 @@ class EquivariantAttention(nn.Module):
         q_geo = enn.GeometricTensor(q_flat, self.in_type)
         k_geo = enn.GeometricTensor(k_flat, self.cross_type)
 
-        Q = self.q_proj(q_geo).tensor    # (B*Tq, scalar_dim)  — regular repr (equivariant, geo info)
-        K = self.k_proj(k_geo).tensor    # (B*Tk, scalar_dim)  — regular repr (equivariant, geo info)
-        V = self.v_proj(k_geo).tensor    # (B*Tk, scalar_dim)  — regular repr (equivariant)
+        Q = self.q_proj(q_geo).tensor    # (B*Tq, scalar_dim)
+        K = self.k_proj(k_geo).tensor    # (B*Tk, scalar_dim)
+        V = self.v_proj(k_geo).tensor    # (B*Tk, scalar_dim)
 
         # reshape back
         Q = einops.rearrange(Q, "(b t) d -> b t d", b=B)
         K = einops.rearrange(K, "(b t) d -> b t d", b=B)
         V = einops.rearrange(V, "(b t) d -> b t d", b=B)
 
-        # Split into heads using einops
-        # Q,K,V: (B, T, H, Dh)
+        # Split into heads: (B, T, H, Dh)
         Q = einops.rearrange(Q, "b t (h d) -> b t h d", h=self.H)
         K = einops.rearrange(K, "b t (h d) -> b t h d", h=self.H)
         V = einops.rearrange(V, "b t (h d) -> b t h d", h=self.H)
 
-        # Scaled dot-product attention using geometric inner product ⟨Q,K⟩
-        # G-invariant because ρ(g) is orthogonal: ⟨ρ(g)Q, ρ(g)K⟩ = ⟨Q, K⟩
-        # attn: (B, H, Tq, Tk)
+        # Geometric inner-product attention: ⟨ρ(g)Q, ρ(g)K⟩ = ⟨Q, K⟩  [G-invariant]
         attn = torch.einsum("b t h d, b k h d -> b h t k", Q, K) * self.scale
-        
-        # Add relative position bias (equivariant because it's translation-invariant)
+
         if self.use_relative_position_bias:
-            rel_pos_bias = self._get_relative_position_bias(Tq, Tk, attn.device)  # (H, Tq, Tk)
-            attn = attn + rel_pos_bias.unsqueeze(0)  # (B, H, Tq, Tk)
-        
+            rel_pos_bias = self._get_relative_position_bias(Tq, Tk, attn.device)
+            attn = attn + rel_pos_bias.unsqueeze(0)
+
         if attention_mask is not None:
             attn = attn + attention_mask[:, None, :, :]
 
         attn = torch.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
-        # Apply attention to V
-        # out: (B, H, Tq, Dh)
         out = torch.einsum("b h t k, b k h d -> b h t d", attn, V)
-
-        # merge heads
         out = einops.rearrange(out, "b h t d -> (b t) (h d)")
 
-        # Lift back to group representation with ESCNN (scalar or regular depending on mode)
         out_geo = enn.GeometricTensor(out, self.qkv_type)
         out = self.o_proj(out_geo).tensor          # (B*Tq, Cq*G)
         out = einops.rearrange(out, "(b t) d -> b t d", b=B)
