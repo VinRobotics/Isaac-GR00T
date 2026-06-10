@@ -61,6 +61,25 @@ class BaseDataConfig(ABC):
             "language": language_modality,
         }
 
+    @property
+    def num_frames(self) -> int:
+        """Number of temporal observation frames (= len(observation_indices))."""
+        return len(self.observation_indices)
+
+    @property
+    def num_views(self) -> int:
+        """Number of camera views (= len(video_keys))."""
+        return len(self.video_keys)
+
+    def temporal_backbone_kwargs(self) -> dict:
+        """
+        Returns the kwargs to add to backbone_cfg when enabling MEM-style
+        temporal attention.  Usage::
+
+            backbone_cfg = {**base_backbone_cfg, **data_cfg.temporal_backbone_kwargs()}
+        """
+        return {"num_frames": self.num_frames, "num_views": self.num_views}
+
     @abstractmethod
     def transform(self) -> ModalityTransform:
         pass
@@ -2211,6 +2230,179 @@ class VRH31GripperBothExcludeTaskProgress(BaseDataConfig):
 
 ###########################################################################################
 
+###########################################################################################
+# Temporal (MEM-style) data configs
+# observation_indices spans 4 past frames so the TemporalSiglipVisionModel in
+# EagleBackbone receives T=4 frames per camera view.
+# Set backbone_cfg: num_frames=4, num_views=<len(video_keys)>, temporal_stride=4
+###########################################################################################
+
+
+class So100TemporalDataConfig(So100DataConfig):
+    """So100 with 4-frame temporal history for MEM-style attention (single camera)."""
+    observation_indices = [-3, -2, -1, 0]
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+
+class So100DualCamTemporalDataConfig(So100DualCamDataConfig):
+    """So100 dual-cam with 4-frame temporal history (two camera views)."""
+    observation_indices = [-3, -2, -1, 0]
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+
+class FourierGr1ArmsOnlyTemporalDataConfig(FourierGr1ArmsOnlyDataConfig):
+    """Fourier GR1 arms-only with 4-frame temporal history."""
+    observation_indices = [-3, -2, -1, 0]
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionSinCosTransform(apply_to=self.state_keys),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+
+class UnitreeG1TemporalDataConfig(UnitreeG1DataConfig):
+    """Unitree G1 with 4-frame temporal history."""
+    observation_indices = [-3, -2, -1, 0]
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys},
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={key: "min_max" for key in self.action_keys},
+            ),
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+
 DATA_CONFIG_MAP = {
     "fourier_gr1_arms_waist": FourierGr1ArmsWaistDataConfig(),
     "fourier_gr1_arms_only": FourierGr1ArmsOnlyDataConfig(),
@@ -2238,5 +2430,10 @@ DATA_CONFIG_MAP = {
     "vrh31_gripper_both": VRH31GripperBoth(),
     "vrh31_gripper_both_exclude_task_progress": VRH31GripperBothExcludeTaskProgress(),
     "vrh31_left_arm_2cam": VRH31LeftArm2Cam(),
-    "vrh31_left_arm_left_hand_3cam": VRH31LeftArmLeftHand3Cam()
+    "vrh31_left_arm_left_hand_3cam": VRH31LeftArmLeftHand3Cam(),
+    # --- MEM-style temporal configs (4 observation frames) ---
+    "so100_temporal": So100TemporalDataConfig(),
+    "so100_dualcam_temporal": So100DualCamTemporalDataConfig(),
+    "fourier_gr1_arms_only_temporal": FourierGr1ArmsOnlyTemporalDataConfig(),
+    "unitree_g1_temporal": UnitreeG1TemporalDataConfig(),
 }

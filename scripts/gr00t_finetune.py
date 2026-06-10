@@ -135,6 +135,14 @@ class ArgsConfig:
     video_backend: Literal["torchcodec", "decord", "torchvision_av"] = "torchcodec"
     """Video backend to use for training. [torchcodec, decord, torchvision_av]"""
 
+    # Temporal memory (MEM-style) parameters
+    enable_temporal_memory: bool = False
+    """Enable MEM-style causal temporal attention in SigLIP. Requires a temporal data config
+    (e.g. 'so100_temporal') with observation_indices covering multiple past frames."""
+
+    temporal_stride: int = 4
+    """Insert temporal attention after every N-th SigLIP encoder layer (default 4)."""
+
     # Mixture dataset parameters
     balance_dataset_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, we will balance the dataset weights, by multiplying the total trajectory to each dataset"""
@@ -272,6 +280,34 @@ def main(config: ArgsConfig):
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
     )
+
+    # --- MEM-style temporal attention injection ---
+    if config.enable_temporal_memory:
+        num_frames = data_config_cls.num_frames
+        num_views = data_config_cls.num_views
+        if num_frames <= 1:
+            print(
+                f"WARNING: enable_temporal_memory=True but data config has num_frames={num_frames}. "
+                "Use a temporal data config (e.g. 'so100_temporal') with multiple observation frames."
+            )
+        else:
+            from gr00t.model.backbone.temporal_siglip import TemporalSiglipVisionModel
+            backbone = model.backbone
+            base_vision_model = backbone.eagle_model.vision_model
+            backbone.eagle_model.vision_model = TemporalSiglipVisionModel(
+                base_vision_model=base_vision_model,
+                num_frames=num_frames,
+                num_views=num_views,
+                temporal_stride=config.temporal_stride,
+            )
+            # Re-apply trainable parameter settings so temporal layers stay trainable
+            backbone.set_trainable_parameters(
+                tune_llm=config.tune_llm, tune_visual=config.tune_visual
+            )
+            print(
+                f"Temporal SigLIP enabled: num_frames={num_frames}, num_views={num_views}, "
+                f"temporal_stride={config.temporal_stride}"
+            )
 
     if config.use_action_conditioning:
         # Import the FlowmatchingActionHeadActionCondition class

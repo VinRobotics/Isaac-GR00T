@@ -38,11 +38,17 @@ class EagleBackbone(nn.Module):
         load_bf16: bool = False,
         eagle_path: str | None = None,
         project_to_dim: int = 1536,
+        num_frames: int = 1,
+        num_views: int = 1,
+        temporal_stride: int = 4,
     ):
         """
         Args:
             tune_llm: whether to tune the LLM model (default: True)
             tune_visual: whether to tune the visual model (default: False)
+            num_frames: temporal frames per view; >1 enables MEM-style temporal attention
+            num_views: number of camera views
+            temporal_stride: insert temporal attention after every N-th SigLIP layer
         """
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
@@ -60,6 +66,17 @@ class EagleBackbone(nn.Module):
             self.eagle_model.language_model.model.layers.pop(-1)
 
         self.select_layer = select_layer
+
+        # Wrap SigLIP with MEM-style temporal attention when num_frames > 1
+        if num_frames > 1:
+            from gr00t.model.backbone.temporal_siglip import TemporalSiglipVisionModel
+            self.eagle_model.vision_model = TemporalSiglipVisionModel(
+                base_vision_model=self.eagle_model.vision_model,
+                num_frames=num_frames,
+                num_views=num_views,
+                temporal_stride=temporal_stride,
+            )
+
         self.set_trainable_parameters(tune_llm, tune_visual)
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
@@ -72,6 +89,11 @@ class EagleBackbone(nn.Module):
         if not tune_visual:
             self.eagle_model.vision_model.requires_grad_(False)
             self.eagle_model.mlp1.requires_grad_(False)
+            # Temporal attention layers are new parameters — keep them trainable
+            # even when the base SigLIP spatial weights are frozen.
+            from gr00t.model.backbone.temporal_siglip import TemporalSiglipVisionModel
+            if isinstance(self.eagle_model.vision_model, TemporalSiglipVisionModel):
+                self.eagle_model.vision_model.temporal_layers.requires_grad_(True)
         print(f"Tune backbone llm: {self.tune_llm}")
         print(f"Tune backbone visual: {self.tune_visual}")
         # Check if any parameters are still trainable. If not, print a warning.
@@ -93,6 +115,10 @@ class EagleBackbone(nn.Module):
                 self.eagle_model.language_model.eval()
             if self.eagle_model.vision_model and not self.tune_visual:
                 self.eagle_model.vision_model.eval()
+                # Temporal attention layers are trainable — restore train mode after eval()
+                from gr00t.model.backbone.temporal_siglip import TemporalSiglipVisionModel
+                if isinstance(self.eagle_model.vision_model, TemporalSiglipVisionModel):
+                    self.eagle_model.vision_model.temporal_layers.train()
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
