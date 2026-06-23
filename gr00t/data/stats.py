@@ -161,7 +161,7 @@ class RelativeActionLoader:
         self.loader = LeRobotEpisodeLoader(dataset_path, self.modality_configs)
 
     def load_relative_actions(self, trajectory_id: int) -> list[np.ndarray]:
-        df = self.loader[trajectory_id]
+        df, _, _, _, _ = self.loader[trajectory_id]
 
         # OPTIMIZATION: Extract columns once and convert to numpy arrays
         # This eliminates repeated DataFrame.__getitem__ and Series.__getitem__ calls
