@@ -36,6 +36,10 @@ vrc2_left_arm_eef_rel_config = {
         delta_indices=[0],
         modality_keys=["annotation.human.task_description"],
     ),
+    "reward": ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["reward", "reward.current_frame_idx", "reward.episode_lengths"],
+    ),
 }
 
 register_modality_config(vrc2_left_arm_eef_rel_config)
