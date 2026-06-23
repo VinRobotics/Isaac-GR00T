@@ -57,7 +57,7 @@ LEROBOT_MODALITY_FILENAME = "modality.json"
 LEROBOT_STATS_FILE_NAME = "stats.json"
 LEROBOT_RELATIVE_STATS_FILE_NAME = "relative_stats.json"
 
-ALLOWED_MODALITIES = ["video", "stereo", "state", "action", "language", "mask"]
+ALLOWED_MODALITIES = ["video", "stereo", "state", "action", "language", "mask", "reward"]
 DEFAULT_COLUMN_NAMES = {
     "state": "observation.state",
     "action": "action",
@@ -403,6 +403,20 @@ class LeRobotEpisodeLoader:
             )
             for joint_group in joint_groups_df.columns:
                 loaded_df[f"{modality_type}.{joint_group}"] = joint_groups_df[joint_group]
+
+        # Load reward columns from parquet when present (synthetic keys are handled later in
+        # extract_step_data; here we only load actual data columns).
+        if "reward" in self.modality_configs:
+            reward_meta = self.modality_meta.get("reward", {})
+            for key in self.modality_configs["reward"].modality_keys:
+                if key in ("reward.current_frame_idx", "reward.episode_lengths"):
+                    continue
+                subkey = key[len("reward."):] if key.startswith("reward.") else key
+                original_key = reward_meta.get(subkey, {}).get("original_key", subkey)
+                if original_key in original_df.columns:
+                    loaded_df[f"reward.{subkey}"] = original_df[original_key]
+                elif subkey in original_df.columns:
+                    loaded_df[f"reward.{subkey}"] = original_df[subkey]
 
         return loaded_df
 

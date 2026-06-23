@@ -598,6 +598,15 @@ class Gr00tN1d7Processor(BaseProcessor):
         if action_mask is not None:
             transformed_inputs["action_mask"] = action_mask
         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
+
+        # Pass through reward signals for RECAP / CFGRL training.
+        # Keys: "reward", "reward.current_frame_idx", "reward.episode_lengths"
+        reward_data = content.metadata.get("reward", {})
+        for key, value in reward_data.items():
+            transformed_inputs[key] = (
+                value if isinstance(value, np.ndarray) else np.asarray(value, dtype=np.float32)
+            )
+
         return transformed_inputs
 
     def _get_vlm_inputs(

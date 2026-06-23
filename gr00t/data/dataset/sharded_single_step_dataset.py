@@ -45,6 +45,32 @@ def extract_step_data(
         # TODO: support allow_padding=True
         if allow_padding:
             indices_to_load = [max(0, min(idx, len(episode_data) - 1)) for idx in indices_to_load]
+
+        # Reward modality: synthetic keys + optional parquet columns.
+        # Keys follow the N1.5 convention: "reward" (signal), "reward.current_frame_idx",
+        # "reward.episode_lengths".  None of these use the generic f"{modality}.{key}" lookup.
+        if modality == "reward":
+            episode_length = len(episode_data)
+            n = len(config.delta_indices)
+            for key in config.modality_keys:
+                if key == "reward.current_frame_idx":
+                    step_data[modality][key] = np.array(
+                        [max(0, min(step_index + d, episode_length - 1)) for d in config.delta_indices],
+                        dtype=np.float32,
+                    )
+                elif key == "reward.episode_lengths":
+                    step_data[modality][key] = np.full(n, episode_length, dtype=np.float32)
+                else:
+                    # Resolve column name: "reward" → "reward.reward"; "reward.foo" → "reward.foo"
+                    col = key if key.startswith("reward.") else f"reward.{key}"
+                    if col in episode_data.columns:
+                        modality_data = episode_data[col].iloc[indices_to_load]
+                        step_data[modality][key] = np.asarray(modality_data.tolist(), dtype=np.float32)
+                    else:
+                        # Column absent → assume all-success (0.0) for curated demo datasets
+                        step_data[modality][key] = np.zeros(n, dtype=np.float32)
+            continue
+
         for key in config.modality_keys:
             if f"{modality}.{key}" in episode_data.columns:
                 modality_data = episode_data[f"{modality}.{key}"].iloc[indices_to_load]
@@ -83,6 +109,8 @@ def extract_step_data(
     assert len(language_data) == 1, f"Expected 1 language, got {len(language_data)}"
     text = language_data[list(language_data.keys())[0]][0]
 
+    reward_data = step_data.get("reward", {})
+
     vla_step_data = VLAStepData(
         images=video_data,
         masks=mask_data if mask_data else None,
@@ -90,6 +118,7 @@ def extract_step_data(
         actions=action_data,
         text=text,
         embodiment=embodiment_tag,
+        metadata={"reward": reward_data} if reward_data else {},
     )
     return vla_step_data
 
