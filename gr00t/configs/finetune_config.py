@@ -32,7 +32,8 @@ class FinetuneConfig:
     base_model_path: str
     """Path to the pretrained base model checkpoint (e.g., Hugging Face model hub or local directory)."""
 
-    dataset_path: str
+    # dataset_path: str
+    dataset_path: list[str]
     """Path to the dataset root directory containing trajectory data for fine-tuning."""
 
     embodiment_tag: str
@@ -153,6 +154,11 @@ class FinetuneConfig:
 
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""
+
+    shard_load_workers: int = 1
+    video_decode_workers: int = 1
+    num_ffmpeg_threads: int = 0
+    overlap_episode_io: bool = False
 
     save_only_model: bool = False
     """If True, save only model weights (skip optimizer/scheduler/RNG states). Cannot resume training from these checkpoints."""

@@ -71,6 +71,10 @@ class DatasetFactory:
                     episode_sampling_rate=self.config.data.episode_sampling_rate,
                     seed=self.config.data.seed,
                     allow_padding=self.config.data.allow_padding,
+                    shard_load_workers=self.config.data.shard_load_workers,
+                    video_decode_workers=self.config.data.video_decode_workers,
+                    num_ffmpeg_threads=self.config.data.num_ffmpeg_threads,
+                    overlap_episode_io=self.config.data.overlap_episode_io,
                 )
                 datasets.append(dataset)
             dataset_lengths = np.array([len(dataset) for dataset in datasets])

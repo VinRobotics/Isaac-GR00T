@@ -62,10 +62,12 @@ if __name__ == "__main__":
                 "download_cache": False,
                 "datasets": [
                     {
-                        "dataset_paths": [ft_config.dataset_path],
+                        # "dataset_paths": [ft_config.dataset_path],
+                        "dataset_paths": [dataset_path],
                         "mix_ratio": 1.0,
                         "embodiment_tag": embodiment_tag,
                     }
+                    for dataset_path in ft_config.dataset_path
                 ],
             }
         }
@@ -111,6 +113,10 @@ if __name__ == "__main__":
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
+    config.data.shard_load_workers = ft_config.shard_load_workers
+    config.data.video_decode_workers = ft_config.video_decode_workers
+    config.data.num_ffmpeg_threads = ft_config.num_ffmpeg_threads
+    config.data.overlap_episode_io = ft_config.overlap_episode_io
 
     config.training.save_only_model = ft_config.save_only_model
     config.training.skip_weight_loading = ft_config.skip_weight_loading
