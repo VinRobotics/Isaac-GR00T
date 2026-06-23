@@ -121,6 +121,16 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Multi-embodiment parameters
     max_num_embodiments: int = 32
 
+    # RECAP / CFGRL parameters (arXiv:2511.14759, arXiv:2505.23458)
+    use_recap: bool = False  # Enable RECAP advantage-conditioned training
+    advantage_cfg_dropout_prob: float = 0.3  # Prob of replacing advantage token with null
+    cfg_guidance_weight: float = 1.0  # w=1: sample from advantage-conditioned policy; w>1: amplify
+    value_head_hidden_dim: int = 2048  # Hidden dim for value head MLP
+    num_bins: int = 201  # Distributional value head bins (B=201 as in π*0.6)
+    value_loss_coeff: float = 1.0  # Weight on value head cross-entropy loss
+    recap_alpha: float = 1.0  # α in RECAP Eq. 3 (weight of conditional term)
+    advantage_threshold_percentile: float = 0.30  # ε_l percentile (0.30 pre-train, 0.40 fine-tune)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():

@@ -30,6 +30,12 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
+from gr00t.model.modules.recap import (
+    AdvantageEmbedding,
+    DistributionalValueHead,
+    DistributionalValueHeadConfig,
+    compute_normalised_returns,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -100,6 +106,14 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
+
+        # RECAP components — initialised only when use_recap=True
+        self._phase = "action_head"
+        self.advantage_embedding: AdvantageEmbedding | None = None
+        self.value_head: DistributionalValueHead | None = None
+        if getattr(config, "use_recap", False):
+            self._init_recap()
+
         self.set_trainable_parameters(
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
         )
@@ -153,6 +167,336 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.vlln.eval()
                 self.vl_self_attention.eval()
 
+    # ------------------------------------------------------------------
+    # RECAP helpers
+    # ------------------------------------------------------------------
+
+    def _init_recap(self):
+        """Initialise advantage embedding and distributional value head."""
+        emb_dim = self.config.backbone_embedding_dim
+        self.advantage_embedding = AdvantageEmbedding(emb_dim)
+        logger.info(
+            f"[RECAP] Advantage embedding ENABLED  "
+            f"(cfg_dropout={self.config.advantage_cfg_dropout_prob}, "
+            f"cfg_guidance_weight={self.config.cfg_guidance_weight})"
+        )
+
+        state_dim = self.config.max_state_dim * self.config.state_history_length
+        vh_config = DistributionalValueHeadConfig(
+            seq_dim=emb_dim,
+            state_dim=state_dim,
+            hidden_dim=self.config.value_head_hidden_dim,
+            num_bins=self.config.num_bins,
+            value_loss_coeff=self.config.value_loss_coeff,
+        )
+        self.value_head = DistributionalValueHead(vh_config)
+        logger.info(
+            f"[RECAP] Distributional value head ENABLED  "
+            f"(num_bins={vh_config.num_bins}, hidden_dim={vh_config.hidden_dim})"
+        )
+
+    def set_phase_value_head(self):
+        """
+        Phase 1 — RECAP Alg 1 lines 1, 4, 8:
+            Train Vϕ on D using Eq. 1.  Policy frozen; value head trainable.
+        """
+        assert self.value_head is not None, "set use_recap=True in config before calling this"
+        for p in self.parameters():
+            p.requires_grad = False
+        for p in self.value_head.parameters():
+            p.requires_grad = True
+        self._phase = "value_head"
+        logger.info("[RECAP] ── Phase 1: VALUE_HEAD ──")
+        logger.info(
+            f"  Trainable params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}"
+        )
+
+    def set_phase_policy(self):
+        """
+        Phase 2 — RECAP Alg 1 lines 2, 5, 9:
+            Train πθ on D using Eq. 3 with frozen Vϕ.
+        """
+        assert self.value_head is not None, "set use_recap=True in config before calling this"
+        self.set_trainable_parameters(
+            self.config.tune_projector, self.config.tune_diffusion_model, self.config.tune_vlln
+        )
+        for p in self.value_head.parameters():
+            p.requires_grad = False
+        if self.advantage_embedding is not None:
+            for p in self.advantage_embedding.parameters():
+                p.requires_grad = True
+        self._phase = "action_head"
+        logger.info("[RECAP] ── Phase 2: POLICY ──")
+        logger.info(
+            f"  Trainable params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}"
+        )
+
+    def _apply_advantage_conditioning(
+        self,
+        vl_embs: torch.Tensor,
+        vl_attn_mask: torch.Tensor | None,
+        advantage_label: torch.Tensor | None,
+        *,
+        force_null: bool = False,
+    ):
+        """
+        Append a single advantage token to the cross-attention context.
+
+        During training, CFG dropout randomly replaces supplied labels with NULL_IDX.
+
+        Returns:
+            vl_embs_aug:      (B, S+1, D)
+            vl_attn_mask_aug: (B, S+1) or None
+        """
+        B = vl_embs.shape[0]
+        device = vl_embs.device
+
+        if advantage_label is None or force_null:
+            labels = torch.full((B,), AdvantageEmbedding.NULL_IDX, dtype=torch.long, device=device)
+        else:
+            labels = advantage_label.to(device=device)
+            if self.training:
+                drop = torch.rand(B, device=device) < self.config.advantage_cfg_dropout_prob
+                labels = labels.masked_fill(drop, AdvantageEmbedding.NULL_IDX)
+
+        adv_token = self.advantage_embedding(labels).to(dtype=vl_embs.dtype)  # (B, 1, D)
+        vl_embs_aug = torch.cat([vl_embs, adv_token], dim=1)                  # (B, S+1, D)
+
+        if vl_attn_mask is not None:
+            extra = torch.ones(B, 1, dtype=vl_attn_mask.dtype, device=device)
+            vl_attn_mask_aug = torch.cat([vl_attn_mask, extra], dim=1)
+        else:
+            vl_attn_mask_aug = None
+
+        return vl_embs_aug, vl_attn_mask_aug
+
+    def _run_model_forward(
+        self,
+        sa_embs: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None,
+        t_discretized: torch.Tensor,
+        backbone_output: BatchFeature,
+    ) -> torch.Tensor:
+        """
+        Single DiT forward pass dispatching to DiT or AlternateVLDiT.
+
+        For AlternateVLDiT, extends image_mask and backbone_attention_mask to
+        account for the appended advantage token (treated as non-image text).
+        """
+        S_aug = encoder_hidden_states.shape[1]
+
+        if self.config.use_alternate_vl_dit:
+            orig_S = backbone_output.image_mask.shape[1]
+            extra = S_aug - orig_S  # number of appended tokens (0 or 1)
+
+            image_mask = backbone_output.image_mask
+            backbone_attn = backbone_output.backbone_attention_mask
+
+            if extra > 0:
+                # Advantage token: not an image token; we do attend to it
+                B, device = image_mask.shape[0], image_mask.device
+                image_mask = torch.cat(
+                    [image_mask, torch.zeros(B, extra, dtype=image_mask.dtype, device=device)],
+                    dim=1,
+                )
+                backbone_attn = torch.cat(
+                    [
+                        backbone_attn,
+                        torch.ones(B, extra, dtype=backbone_attn.dtype, device=device),
+                    ],
+                    dim=1,
+                )
+
+            return self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                timestep=t_discretized,
+                image_mask=image_mask,
+                backbone_attention_mask=backbone_attn,
+            )
+        else:
+            return self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                timestep=t_discretized,
+            )
+
+    @torch.no_grad()
+    def compute_advantage_labels_from_value_head(
+        self,
+        backbone_feats: torch.Tensor,
+        state: torch.Tensor,
+        reward: torch.Tensor,
+        percentile: float = 0.30,
+    ) -> torch.Tensor:
+        """
+        Derive per-step advantage indicator I_t from the frozen value head.
+
+        RECAP App. F: ε_l is the 30th percentile of V for the current task,
+        so ~30% of steps get positive advantage.  Failure steps (reward < 0)
+        are always labelled NEG regardless of predicted value.
+
+        Returns: (B,) long tensor ∈ {NEG_IDX=1, POS_IDX=2}
+        """
+        V = self.value_head.predict_value(backbone_feats, state)
+        epsilon = torch.quantile(V, percentile)
+
+        is_failure = reward < 0
+        above_threshold = V > epsilon
+
+        return torch.where(
+            above_threshold & ~is_failure,
+            torch.full_like(V, AdvantageEmbedding.POS_IDX, dtype=torch.long),
+            torch.full_like(V, AdvantageEmbedding.NEG_IDX, dtype=torch.long),
+        )
+
+    def forward_value_head(
+        self, backbone_output: BatchFeature, action_input: BatchFeature
+    ) -> dict:
+        """
+        Phase 1 — RECAP §IV-A Eq. 1: train distributional value head Vϕ.
+
+        Required action_input keys:
+            reward                    : (B, 1) or (B,)   {-1=fail, 0=success}
+            reward.current_frame_idx  : (B, 1)   step index t
+            reward.episode_lengths    : (B, 1)   episode length T
+        """
+        self.set_frozen_modules_to_eval_mode()
+        backbone_output = self.process_backbone_output(backbone_output)
+
+        vl_embs = backbone_output.backbone_features
+
+        reward = torch.squeeze(action_input["reward"], dim=-1).float()
+        t_idx = action_input["reward.current_frame_idx"].squeeze(dim=-1).long()
+        ep_len = action_input["reward.episode_lengths"].squeeze(dim=-1).long()
+
+        max_ep = 520
+        c_fail = 260.0
+        empirical_return = compute_normalised_returns(
+            success=reward >= 0,
+            episode_lengths=ep_len,
+            t=t_idx,
+            max_episode_length=max_ep,
+            c_fail=c_fail,
+        )
+
+        state = action_input.state.float()
+        value_loss = self.value_head.compute_loss(vl_embs, state, empirical_return)
+
+        return {"loss": value_loss, "value_loss": value_loss.detach()}
+
+    def forward_action_head_recap(
+        self, backbone_output: BatchFeature, action_input: BatchFeature
+    ) -> dict:
+        """
+        Phase 2 — RECAP §IV-B Eq. 3: train policy πθ with advantage conditioning.
+
+        L = ||vθ(a_t,t,s,∅) − v||²  +  α * ||vθ(a_t,t,s,I_t) − v||²
+
+        I_t derived from frozen value head.  CFG dropout trains both branches.
+
+        Required action_input keys:
+            state          : (B, state_history_length, max_state_dim)
+            action         : (B, action_horizon, action_dim)
+            action_mask    : (B, action_horizon, action_dim)
+            embodiment_id  : (B,)
+            reward         : (B, 1) or (B,)
+        """
+        self.set_frozen_modules_to_eval_mode()
+        self.value_head.eval()
+
+        backbone_output = self.process_backbone_output(backbone_output)
+
+        vl_embs = backbone_output.backbone_features
+        vl_attn_mask = backbone_output.backbone_attention_mask
+        device = vl_embs.device
+        embodiment_id = action_input.embodiment_id
+
+        reward = torch.squeeze(action_input["reward"], dim=-1).float()
+
+        # Step 1: advantage labels from frozen value head
+        with torch.no_grad():
+            adv_labels = self.compute_advantage_labels_from_value_head(
+                backbone_feats=vl_embs,
+                state=action_input.state.float(),
+                reward=reward,
+                percentile=self.config.advantage_threshold_percentile,
+            )
+        pos_frac = (adv_labels == AdvantageEmbedding.POS_IDX).float().mean()
+
+        # Step 2: shared noised trajectory
+        # Reshape state: (B, H, max_state_dim) -> (B, 1, H*max_state_dim)
+        state = action_input.state.view(action_input.state.shape[0], 1, -1)
+        state_features = self.state_encoder(state, embodiment_id)
+
+        if self.training and self.state_dropout_prob > 0:
+            do_dropout = (
+                torch.rand(state_features.shape[0], device=device) < self.state_dropout_prob
+            )
+            state_features = state_features * (1 - do_dropout[:, None, None].to(state_features.dtype))
+
+        actions = action_input.action
+        noise = torch.randn_like(actions)
+        t = self.sample_time(actions.shape[0], device=device, dtype=actions.dtype)
+        t_bcast = t[:, None, None]
+
+        noisy_trajectory = (1 - t_bcast) * noise + t_bcast * actions
+        velocity = actions - noise
+
+        t_discretized = (t * self.num_timestep_buckets).long()
+        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+            action_features = action_features + self.position_embedding(pos_ids).unsqueeze(0)
+
+        sa_embs = torch.cat((state_features, action_features), dim=1)
+        action_mask = action_input.action_mask
+
+        # Step 3: unconditional term — null advantage token
+        vl_null, mask_null = self._apply_advantage_conditioning(
+            vl_embs, vl_attn_mask, advantage_label=None
+        )
+        out_null = self._run_model_forward(sa_embs, vl_null, mask_null, t_discretized, backbone_output)
+        pred_null = self.action_decoder(out_null, embodiment_id)[:, -actions.shape[1]:]
+        loss_uncond = (
+            F.mse_loss(pred_null, velocity, reduction="none") * action_mask
+        ).sum() / (action_mask.sum() + 1e-6)
+
+        # Step 4: conditional term — advantage-labelled token with CFG dropout
+        vl_cond, mask_cond = self._apply_advantage_conditioning(
+            vl_embs, vl_attn_mask, advantage_label=adv_labels
+        )
+        out_cond = self._run_model_forward(sa_embs, vl_cond, mask_cond, t_discretized, backbone_output)
+        pred_cond = self.action_decoder(out_cond, embodiment_id)[:, -actions.shape[1]:]
+        loss_cond = (
+            F.mse_loss(pred_cond, velocity, reduction="none") * action_mask
+        ).sum() / (action_mask.sum() + 1e-6)
+
+        # Step 5: total loss (Eq. 3)
+        total_loss = loss_uncond + self.config.recap_alpha * loss_cond
+
+        return {
+            "loss": total_loss,
+            "action_loss_uncond": loss_uncond.detach(),
+            "action_loss_cond": loss_cond.detach(),
+            "advantage_pos_frac": pos_frac.detach(),
+        }
+
+    @torch.no_grad()
+    def get_value(
+        self, backbone_output: BatchFeature, action_input: BatchFeature
+    ) -> BatchFeature:
+        """Predict scalar value V(o_t, l) from backbone features."""
+        assert self.value_head is not None, "use_recap must be True"
+        backbone_output = self.process_backbone_output(backbone_output)
+        vl_embs = backbone_output.backbone_features
+        value = self.value_head.predict_value(vl_embs, action_input.state.float())
+        return BatchFeature(data={"value_pred": value})
+
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         sample = (1 - sample) * self.config.noise_s
@@ -169,20 +513,28 @@ class Gr00tN1d7ActionHead(nn.Module):
         """
         Forward pass through the action head.
 
+        When use_recap=True, dispatches to value-head training (phase 1) or
+        advantage-conditioned policy training (phase 2) based on self._phase.
+
         Args:
             backbone_output: Output from the backbone model containing:
                 - backbone_features: [B, seq_len, backbone_embedding_dim]
                 - backbone_attention_mask: [B, seq_len]
             action_input: Input containing:
-                - state: [B, state_dim]
+                - state: [B, state_history_length, max_state_dim]
                 - action: [B, action_horizon, action_dim] (during training)
                 - embodiment_id: [B] (embodiment IDs)
                 - action_mask: [B, action_horizon, action_dim]
 
         Returns:
-            BatchFeature containing:
-                - loss: action prediction loss
+            dict containing loss and other outputs
         """
+        if getattr(self.config, "use_recap", False):
+            if self._phase == "value_head":
+                return self.forward_value_head(backbone_output, action_input)
+            else:
+                return self.forward_action_head_recap(backbone_output, action_input)
+
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
 
@@ -379,6 +731,24 @@ class Gr00tN1d7ActionHead(nn.Module):
                 :,
             ] = ramp[None, :, None].to(device)
 
+        # RECAP: pre-build advantage-conditioned and null encoder contexts when needed
+        use_recap = getattr(self.config, "use_recap", False)
+        w = getattr(self.config, "cfg_guidance_weight", 1.0) if use_recap else 1.0
+        recap_dual_pass = use_recap and (w != 1.0)
+        recap_cond_embs = recap_cond_mask = recap_null_embs = recap_null_mask = None
+
+        if use_recap and self.advantage_embedding is not None:
+            pos_labels = torch.full(
+                (batch_size,), AdvantageEmbedding.POS_IDX, dtype=torch.long, device=device
+            )
+            recap_cond_embs, recap_cond_mask = self._apply_advantage_conditioning(
+                vl_embeds, backbone_output.backbone_attention_mask, advantage_label=pos_labels
+            )
+            if recap_dual_pass:
+                recap_null_embs, recap_null_mask = self._apply_advantage_conditioning(
+                    vl_embeds, backbone_output.backbone_attention_mask, advantage_label=None
+                )
+
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
             t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
@@ -399,21 +769,46 @@ class Gr00tN1d7ActionHead(nn.Module):
             sa_embs = torch.cat((state_features, action_features), dim=1)
 
             # Run model forward.
-            if self.config.use_alternate_vl_dit:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                    image_mask=backbone_output.image_mask,
-                    backbone_attention_mask=backbone_output.backbone_attention_mask,
+            if use_recap and recap_cond_embs is not None:
+                # RECAP: use advantage-conditioned encoder context
+                pred = self.action_decoder(
+                    self._run_model_forward(
+                        sa_embs, recap_cond_embs, recap_cond_mask, timesteps_tensor, backbone_output
+                    ),
+                    embodiment_id,
+                )
+                if recap_dual_pass:
+                    pred_null = self.action_decoder(
+                        self._run_model_forward(
+                            sa_embs,
+                            recap_null_embs,
+                            recap_null_mask,
+                            timesteps_tensor,
+                            backbone_output,
+                        ),
+                        embodiment_id,
+                    )
+                    pred = pred_null + w * (pred - pred_null)
+            elif self.config.use_alternate_vl_dit:
+                pred = self.action_decoder(
+                    self.model(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embeds,
+                        timestep=timesteps_tensor,
+                        image_mask=backbone_output.image_mask,
+                        backbone_attention_mask=backbone_output.backbone_attention_mask,
+                    ),
+                    embodiment_id,
                 )
             else:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
+                pred = self.action_decoder(
+                    self.model(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embeds,
+                        timestep=timesteps_tensor,
+                    ),
+                    embodiment_id,
                 )
-            pred = self.action_decoder(model_output, embodiment_id)
 
             pred_velocity = pred[:, -self.action_horizon :]
 
