@@ -359,12 +359,16 @@ def get_frames_by_indices(
     indices: list[int] | np.ndarray,
     video_backend: str = "ffmpeg",
     video_backend_kwargs: dict = {},
+    num_ffmpeg_threads: int = 0,
 ) -> np.ndarray:
     video_backend = resolve_backend(video_path, video_backend)
     if video_backend == "torchcodec":
         torchcodec = _lazy_import_torchcodec()
         decoder = torchcodec.decoders.VideoDecoder(
-            video_path, device="cpu", dimension_order="NHWC", num_ffmpeg_threads=0
+            video_path,
+            device="cpu",
+            dimension_order="NHWC",
+            num_ffmpeg_threads=num_ffmpeg_threads,
         )
         return decoder.get_frames_at(indices=indices).data.numpy()
     elif video_backend == "decord":

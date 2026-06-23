@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -26,12 +28,13 @@ from .lerobot_episode_loader import LeRobotEpisodeLoader
 
 
 def extract_step_data(
-    episode_data: pd.DataFrame,
+    episode_data: tuple[pd.DataFrame, dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray, np.ndarray],
     step_index: int,
     modality_configs: dict[str, ModalityConfig],
     embodiment_tag: EmbodimentTag,
     allow_padding: bool = False,
 ) -> VLAStepData:
+    episode_data, video_data, mask_data, all_step_indices_video, all_step_indices_mask = episode_data
     step_data = {}
 
     # Extract data for each configured modality
@@ -39,23 +42,34 @@ def extract_step_data(
         step_data[modality] = {}
         # Sample timesteps according to delta indices configuration
         indices_to_load = [step_index + delta_index for delta_index in config.delta_indices]
+        # TODO: support allow_padding=True
         if allow_padding:
             indices_to_load = [max(0, min(idx, len(episode_data) - 1)) for idx in indices_to_load]
         for key in config.modality_keys:
             if f"{modality}.{key}" in episode_data.columns:
                 modality_data = episode_data[f"{modality}.{key}"].iloc[indices_to_load]
+            elif modality == "video" and key in video_data:
+                assert not np.in1d(indices_to_load, all_step_indices_video, invert=True).any()
+                modality_data = video_data[key][np.searchsorted(all_step_indices_video, indices_to_load)]
+            elif modality == "mask" and key in mask_data:
+                assert not np.in1d(indices_to_load, all_step_indices_mask, invert=True).any()
+                modality_data = mask_data[key][np.searchsorted(all_step_indices_mask, indices_to_load)]
             else:
                 raise KeyError(
                     f"{modality}.{key} not found in episode data, available keys: {episode_data.columns}"
                 )
             if modality in ["state", "action"]:
                 # Stack arrays for numerical modalities
-                step_data[modality][key] = np.vstack(
-                    [
-                        np.array(modality_data.iloc[i]).astype(np.float32)
-                        for i in range(len(modality_data))
-                    ]
-                )
+                # step_data[modality][key] = np.vstack(
+                #     [
+                #         np.array(modality_data.iloc[i]).astype(np.float32)
+                #         for i in range(len(modality_data))
+                #     ]
+                # )
+                # vectorize
+                step_data[modality][key] = np.asarray(modality_data.tolist(), dtype=np.float32)
+            elif modality in ["video", "mask"]:
+                step_data[modality][key] = modality_data
             else:
                 # Keep as lists for other modalities (video, language)
                 step_data[modality][key] = modality_data.tolist()
@@ -140,6 +154,10 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_sampling_rate: float = 0.1,
         seed: int = 42,
         allow_padding: bool = False,
+        shard_load_workers: int = 1,
+        video_decode_workers: int = 1,
+        num_ffmpeg_threads: int = 0,
+        overlap_episode_io: bool = False,
     ):
         """Initialize single-step dataset with sharding configuration."""
         super().__init__(dataset_path)
@@ -151,6 +169,10 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.episode_sampling_rate = episode_sampling_rate
         self.seed = seed
         self.allow_padding = allow_padding
+        self.shard_load_workers = max(1, shard_load_workers)
+        self.video_decode_workers = max(1, video_decode_workers)
+        self.num_ffmpeg_threads = num_ffmpeg_threads
+        self.overlap_episode_io = overlap_episode_io
         self.processor = None
         self.rng = np.random.default_rng(seed)
         action_delta_indices = modality_configs["action"].delta_indices
@@ -161,6 +183,9 @@ class ShardedSingleStepDataset(ShardedDataset):
             modality_configs=modality_configs,
             video_backend=video_backend,
             video_backend_kwargs=video_backend_kwargs,
+            video_decode_workers=self.video_decode_workers,
+            num_ffmpeg_threads=self.num_ffmpeg_threads,
+            overlap_episode_io=self.overlap_episode_io,
         )
 
         # Create balanced shards from episode timesteps
@@ -231,7 +256,11 @@ class ShardedSingleStepDataset(ShardedDataset):
         """Return the number of shards in the dataset."""
         return len(self.shard_lengths)
 
-    def get_datapoint(self, episode_data: pd.DataFrame, step_index: int) -> dict:
+    def get_datapoint(
+        self, 
+        episode_data: tuple[pd.DataFrame, dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray, np.ndarray], 
+        step_index: int,
+    ) -> dict:
         """
         Extract and process a single timestep from episode data.
 
@@ -279,9 +308,46 @@ class ShardedSingleStepDataset(ShardedDataset):
         """
         episodes = self.sharded_episodes[idx]
         datapoints = []
+
+        if self.shard_load_workers > 1:
+            with ThreadPoolExecutor(max_workers=self.shard_load_workers) as executor:
+                inflight = deque()
+                i = 0
+
+                while len(inflight) < self.shard_load_workers and i < len(episodes):
+                    inflight.append((
+                        episodes[i],
+                        executor.submit(
+                            self.episode_loader.__getitem__, 
+                            episodes[i][0], 
+                            episodes[i][1],
+                        ),
+                    ))
+                    i += 1
+
+                while inflight:
+                    (ep_idx, step_indices), fut = inflight.popleft()
+                    episode_data = fut.result()
+
+                    if i < len(episodes):
+                        inflight.append((
+                            episodes[i],
+                            executor.submit(
+                                self.episode_loader.__getitem__, 
+                                episodes[i][0], 
+                                episodes[i][1],
+                            ),
+                        ))
+                        i += 1
+
+                    for step_index in step_indices:
+                        datapoints.append(self.get_datapoint(episode_data, step_index))
+
+            return datapoints
+ 
         for ep_idx, step_indices in episodes:
             # Load episode data once per episode in shard
-            episode_data = self.episode_loader[ep_idx]
+            episode_data = self.episode_loader.__getitem__(ep_idx, step_indices)
             for step_index in step_indices:
                 datapoints.append(self.get_datapoint(episode_data, step_index))
         return datapoints

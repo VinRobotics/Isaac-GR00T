@@ -33,6 +33,7 @@ Returns messages with VLAStepData as defined in types.py.
 """
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 from pathlib import Path
@@ -56,7 +57,7 @@ LEROBOT_MODALITY_FILENAME = "modality.json"
 LEROBOT_STATS_FILE_NAME = "stats.json"
 LEROBOT_RELATIVE_STATS_FILE_NAME = "relative_stats.json"
 
-ALLOWED_MODALITIES = ["video", "state", "action", "language", "mask"]
+ALLOWED_MODALITIES = ["video", "stereo", "state", "action", "language", "mask"]
 DEFAULT_COLUMN_NAMES = {
     "state": "observation.state",
     "action": "action",
@@ -119,6 +120,9 @@ class LeRobotEpisodeLoader:
         modality_configs: dict[str, ModalityConfig],
         video_backend: str = "torchcodec",
         video_backend_kwargs: dict[str, Any] | None = None,
+        video_decode_workers: int = 1,
+        num_ffmpeg_threads: int = 0,
+        overlap_episode_io: bool = False,
     ) -> None:
         """
         Initialize LeRobot episode loader with dataset path and modality configurations.
@@ -131,6 +135,9 @@ class LeRobotEpisodeLoader:
         self.dataset_path = Path(dataset_path)
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs
+        self.video_decode_workers = max(1, video_decode_workers)
+        self.num_ffmpeg_threads = num_ffmpeg_threads
+        self.overlap_episode_io = overlap_episode_io
 
         if not self.dataset_path.is_dir():
             raise FileNotFoundError(f"Dataset path does not exist: {self.dataset_path}")
@@ -331,7 +338,10 @@ class LeRobotEpisodeLoader:
                 original_key = group_info.get("original_key", DEFAULT_COLUMN_NAMES[modality_type])
                 # Slice the array data for this joint group
                 if isinstance(df[original_key].iloc[0], np.ndarray):
-                    joint_data[group_name] = df[original_key].map(lambda x: x[start_idx:end_idx])
+                    # joint_data[group_name] = df[original_key].map(lambda x: x[start_idx:end_idx])
+                    # vectorize
+                    data = np.stack(df[original_key].to_numpy())
+                    joint_data[group_name] = list(data[:, start_idx:end_idx])
                 else:
                     joint_data[group_name] = df[original_key]  # for strings and scalars
             else:
@@ -377,9 +387,10 @@ class LeRobotEpisodeLoader:
                     f"Key {subkey} not found in language modality"
                 )
                 original_key = self.modality_meta["annotation"][subkey].get("original_key", key)
-                loaded_df[f"language.{key}"] = original_df[original_key].apply(
-                    lambda x: self.tasks_map[x]
-                )
+                # loaded_df[f"language.{key}"] = original_df[original_key].apply(
+                #     lambda x: self.tasks_map[x]
+                # )
+                loaded_df[f"language.{key}"] = original_df[original_key].map(self.tasks_map)
 
         # Extract joint groups for state and action modalities
         for modality_type in ["state", "action"]:
@@ -416,8 +427,11 @@ class LeRobotEpisodeLoader:
 
         chunk_idx = episode_index // self.chunk_size
         image_keys = self.modality_configs["video"].modality_keys
+        if "stereo" in self.modality_configs:
+            stereo_keys = set(self.modality_configs["stereo"].modality_keys)
+            image_keys = list(set(image_keys) | stereo_keys)
 
-        for image_key in image_keys:
+        def _decode_video(image_key: str) -> np.ndarray:
             # Resolve the original key used in video file naming.
             # Use the video key mapping if the config key differs from the dataset meta key.
             meta_key = self._video_key_mapping.get(image_key, image_key)
@@ -437,12 +451,22 @@ class LeRobotEpisodeLoader:
             video_path = self.dataset_path / video_filename
 
             # Decode video frames at specified timestamps
-            video_data[image_key] = get_frames_by_indices(
+            return get_frames_by_indices(
                 str(video_path),
                 indices,
                 video_backend=self.video_backend,
                 video_backend_kwargs=self.video_backend_kwargs or {},
+                num_ffmpeg_threads=self.num_ffmpeg_threads,
             )
+
+        if self.video_decode_workers > 1 and len(image_keys) > 1:
+            max_workers = min(self.video_decode_workers, len(image_keys))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for image_key, frames in zip(image_keys, executor.map(_decode_video, image_keys)):
+                    video_data[image_key] = frames
+        else:
+            for image_key in image_keys:
+                video_data[image_key] = _decode_video(image_key)
 
         return video_data
 
@@ -482,7 +506,7 @@ class LeRobotEpisodeLoader:
         chunk_idx = episode_index // self.chunk_size
         mask_keys = self.modality_configs["mask"].modality_keys
 
-        for mask_key in mask_keys:
+        def _load_masks(mask_key: str) -> np.ndarray:
             mask_meta = self.modality_meta.get("mask", {}).get(mask_key, {})
             original_key = mask_meta.get("original_key", mask_key)
             mask_filename = self.mask_path_pattern.format(
@@ -492,7 +516,16 @@ class LeRobotEpisodeLoader:
                 video_key=original_key,
             )
             mask_path = self.dataset_path / mask_filename
-            mask_data[mask_key] = self._load_mask_file(mask_path, indices)
+            return self._load_mask_file(mask_path, indices)
+
+        if self.video_decode_workers > 1 and len(mask_keys) > 1:
+            max_workers = min(self.video_decode_workers, len(mask_keys))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for mask_key, masks in zip(mask_keys, executor.map(_load_masks, mask_keys)):
+                    mask_data[mask_key] = masks
+        else:
+            for mask_key in mask_keys:
+                mask_data[mask_key] = _load_masks(mask_key)
 
         return mask_data
 
@@ -561,7 +594,26 @@ class LeRobotEpisodeLoader:
             raise ValueError(f"Language key {lang_key} not supported")
         return new_languages
 
-    def __getitem__(self, idx: int) -> pd.DataFrame:
+    def get_all_step_indices(self, modality: str, step_indices: np.ndarray) -> np.ndarray:
+        if modality not in self.modality_configs:
+            return np.sort(step_indices)
+        
+        modality_config = self.modality_configs[modality]
+
+        all_step_indices = np.concatenate([
+            step_indices + delta_index 
+            for delta_index in modality_config.delta_indices
+        ])
+        
+        all_step_indices = np.unique(all_step_indices)
+        
+        return all_step_indices
+
+    def __getitem__(
+        self, 
+        idx: int, 
+        step_indices: np.ndarray = None,
+    ) -> tuple[pd.DataFrame, dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray, np.ndarray]:
         """
         Load complete episode data as a processed DataFrame.
 
@@ -586,8 +638,31 @@ class LeRobotEpisodeLoader:
         episode_id = episode_meta["episode_index"]
         nominal_length = episode_meta["length"]
 
-        # Load and parse the parquet data
-        df = self._load_parquet_data(episode_id)
+        if step_indices is None:
+            all_step_indices_video = np.arange(nominal_length)
+            all_step_indices_mask = np.arange(nominal_length)
+        else:
+            all_step_indices_video = self.get_all_step_indices("video", step_indices)
+            all_step_indices_mask = self.get_all_step_indices("mask", step_indices)    
+
+        if not self.overlap_episode_io:
+            # Load and parse the parquet data
+            df = self._load_parquet_data(episode_id)
+        else:
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                df_future = executor.submit(self._load_parquet_data, episode_id)
+                video_data_future = executor.submit(
+                    self._load_video_data, 
+                    episode_id, 
+                    all_step_indices_video,
+                )
+                mask_data_future = executor.submit(
+                    self._load_mask_data, 
+                    episode_id, 
+                    all_step_indices_mask,
+                )
+
+            df = df_future.result()
 
         if "language" in self.modality_configs:
             lang_key = self.modality_configs["language"].modality_keys[0]
@@ -599,25 +674,41 @@ class LeRobotEpisodeLoader:
         actual_length = min(len(df), nominal_length)
         df = df.iloc[:actual_length]
 
-        # Load synchronized video data
-        video_data = self._load_video_data(episode_id, np.arange(actual_length))
+        if step_indices is None:
+            all_step_indices_video = all_step_indices_video[:actual_length]
+            all_step_indices_mask = all_step_indices_mask[:actual_length]
 
-        # Add video frames to dataframe as PIL Images
-        for key in video_data.keys():
-            assert len(video_data[key]) == len(df), (
-                f"Video data for {key} has length {len(video_data[key])} but dataframe has length {len(df)}"
-            )
-            df[f"video.{key}"] = [frame for frame in video_data[key]]
+        # Load synchronized video data
+        if not self.overlap_episode_io:
+            video_data = self._load_video_data(episode_id, all_step_indices_video)
+        else:
+            video_data = video_data_future.result()
+            if step_indices is None:
+                for key in video_data.keys():
+                    video_data[key] = video_data[key][:actual_length]
+
+        # # Add video frames to dataframe as PIL Images
+        # for key in video_data.keys():
+        #     assert len(video_data[key]) == len(df), (
+        #         f"Video data for {key} has length {len(video_data[key])} but dataframe has length {len(df)}"
+        #     )
+        #     df[f"video.{key}"] = [frame for frame in video_data[key]]
 
         # Load synchronized mask data
-        mask_data = self._load_mask_data(episode_id, np.arange(actual_length))
-        for key in mask_data.keys():
-            assert len(mask_data[key]) == len(df), (
-                f"Mask data for {key} has length {len(mask_data[key])} but dataframe has length {len(df)}"
-            )
-            df[f"mask.{key}"] = [mask for mask in mask_data[key]]
+        if not self.overlap_episode_io:
+            mask_data = self._load_mask_data(episode_id, all_step_indices_mask)
+        else:
+            mask_data = mask_data_future.result()
+            if step_indices is None:
+                for key in mask_data.keys():
+                    mask_data[key] = mask_data[key][:actual_length]
+        # for key in mask_data.keys():
+        #     assert len(mask_data[key]) == len(df), (
+        #         f"Mask data for {key} has length {len(mask_data[key])} but dataframe has length {len(df)}"
+        #     )
+        #     df[f"mask.{key}"] = [mask for mask in mask_data[key]]
 
-        return df
+        return df, video_data, mask_data, all_step_indices_video, all_step_indices_mask
 
     def get_initial_actions(self):
         """
