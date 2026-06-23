@@ -262,14 +262,40 @@ def run_recap(ft_config: RECAPFinetuneConfig):
         )
 
     # ----- model setup ---------------------------------------------------------
+    # NOTE: We do NOT set config.model.use_recap=True before pipeline.setup()
+    # because setup.py uses strict weight matching. The base model (GR00T-N1.7-3B)
+    # has no RECAP weights; if we pre-init RECAP components before loading, the
+    # missing value_head.* keys would raise a RuntimeError in _create_model().
+    # Instead: load the model first, then post-init RECAP components below.
     pipeline = MODEL_REGISTRY.get(type(config.model))(config, save_cfg_dir)
     pipeline.setup()
     model = pipeline.return_model()
 
+    # ── RECAP post-load initialisation ─────────────────────────────────────────
+    # Patch model config with RECAP hyperparameters so they are saved to
+    # config.json in every checkpoint (enabling correct Phase 2 loading).
+    model.config.use_recap = True
+    model.config.recap_alpha = ft_config.recap_alpha
+    model.config.advantage_cfg_dropout_prob = ft_config.advantage_cfg_dropout_prob
+    model.config.cfg_guidance_weight = ft_config.cfg_guidance_weight
+    model.config.advantage_threshold_percentile = ft_config.advantage_threshold_percentile
+    model.config.value_head_hidden_dim = ft_config.value_head_hidden_dim
+    model.config.num_bins = ft_config.num_bins
+    model.config.value_loss_coeff = ft_config.value_loss_coeff
+
+    action_head = model.action_head
+    if action_head.value_head is None:
+        # Phase 1 from a non-RECAP checkpoint (e.g. nvidia/GR00T-N1.7-3B):
+        # RECAP components are absent; initialise them fresh.
+        # Phase 2 from a Phase 1 checkpoint: the Phase 1 config.json has
+        # use_recap=True, so _init_recap() was already called during
+        # from_pretrained and the trained weights are already loaded — skip.
+        logging.info("[RECAP] RECAP components not found in checkpoint — initialising fresh.")
+        action_head._init_recap()
+
     # ── RECAP phase management ──────────────────────────────────────────────────
     # Must happen BEFORE HF Trainer creates the optimizer so that only the
     # parameters for the active phase are included in the optimizer.
-    action_head = model.action_head
     if ft_config.recap_phase == "value_head":
         logging.info("[RECAP] Activating Phase 1: VALUE_HEAD")
         action_head.set_phase_value_head()
