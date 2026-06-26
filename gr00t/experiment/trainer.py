@@ -36,10 +36,11 @@ import threading
 from typing import Any, Optional
 
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
-from transformers.trainer_utils import EvalPrediction
+from transformers.trainer_utils import EvalLoopOutput, EvalPrediction
 
 
 class _TqdmDataLoader:
@@ -274,9 +275,40 @@ class Gr00tTrainer(Trainer):
 
         return torch.utils.data.DataLoader(self.train_dataset, **dataloader_params)
 
-    def evaluation_loop(self, dataloader, description, **kwargs):
-        wrapped = _TqdmDataLoader(dataloader, desc=description)
-        return super().evaluation_loop(wrapped, description, **kwargs)
+    def evaluation_loop(
+        self,
+        dataloader,
+        description,
+        prediction_loss_only=None,
+        ignore_keys=None,
+        metric_key_prefix="eval",
+    ):
+        model = self._wrap_model(self.model, training=False, dataloader=dataloader)
+        model.eval()
+
+        total_loss = torch.tensor(0.0, device=self.args.device)
+        total_steps = torch.tensor(0, device=self.args.device)
+
+        for inputs in tqdm(dataloader, desc=description):
+            inputs = self._prepare_inputs(inputs)
+            with torch.inference_mode():
+                loss, _ = self.compute_loss(model, inputs, return_outputs=True)
+            total_loss += loss.detach()
+            total_steps += 1
+
+        # Single reduce at the end — avoids per-step all_gather deadlock
+        # when ranks process different numbers of batches.
+        if self.args.world_size > 1:
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_steps, op=dist.ReduceOp.SUM)
+
+        mean_loss = (total_loss / total_steps.clamp(min=1)).item()
+        num_samples = int(total_steps.item()) * self.args.per_device_eval_batch_size
+
+        metrics = {f"{metric_key_prefix}_loss": mean_loss}
+        return EvalLoopOutput(
+            predictions=None, label_ids=None, metrics=metrics, num_samples=num_samples
+        )
 
     def get_eval_dataloader(self, eval_dataset=None):
         """Return a plain DataLoader for eval to avoid accelerate's NCCL broadcast on CPU tensors."""
@@ -300,13 +332,6 @@ class Gr00tTrainer(Trainer):
             dataloader_params["multiprocessing_context"] = self.multiprocessing_context
 
         return torch.utils.data.DataLoader(dataset, **dataloader_params)
-
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):  # noqa: ARG002
-        inputs = self._prepare_inputs(inputs)
-        with torch.inference_mode():
-            loss, _ = self.compute_loss(model, inputs, return_outputs=True)
-            loss = loss.mean().detach()
-        return (loss, None, None)
 
     def train(
         self,
