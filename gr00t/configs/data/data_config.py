@@ -79,6 +79,9 @@ class DataConfig:
     # Override statistics from the pretrained checkpoint
     override_pretraining_statistics: bool = True
 
+    # Validation dataset paths (used when eval_strategy != "no")
+    val_dataset_paths: List[str] = field(default_factory=list)
+
     # General task / mode config (shared across datasets)
     mode: str = "single_turn"
     random_chop: float = 0.0

@@ -34,14 +34,35 @@ class DatasetFactory:
     def __init__(self, config: Config):
         self.config = config
 
+    def _build_single_step_dataset(self, dataset_path: str, embodiment_tag: str) -> ShardedSingleStepDataset:
+        assert self.config.data.mode == "single_turn", "Only single turn mode is supported"
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                generate_stats(dataset_path)
+                generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
+        else:
+            generate_stats(dataset_path)
+            generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
+        barrier()
+        return ShardedSingleStepDataset(
+            dataset_path=dataset_path,
+            embodiment_tag=EmbodimentTag(embodiment_tag),
+            modality_configs=self.config.data.modality_configs[embodiment_tag],
+            video_backend=self.config.data.video_backend,
+            shard_size=self.config.data.shard_size,
+            episode_sampling_rate=self.config.data.episode_sampling_rate,
+            seed=self.config.data.seed,
+            allow_padding=self.config.data.allow_padding,
+            shard_load_workers=self.config.data.shard_load_workers,
+            video_decode_workers=self.config.data.video_decode_workers,
+            num_ffmpeg_threads=self.config.data.num_ffmpeg_threads,
+            overlap_episode_io=self.config.data.overlap_episode_io,
+        )
+
     def build(
         self, processor: BaseProcessor
     ) -> tuple[ShardedMixtureDataset, ShardedMixtureDataset | None]:
         """Build the dataset. Returns a tuple of (train_dataset, eval_dataset)."""
-        assert self.config.training.eval_strategy == "no", (
-            "Sharded dataset does not support evaluation sets"
-        )
-
         all_datasets = []
         all_weights = []
         for dataset_spec in tqdm(
@@ -53,30 +74,7 @@ class DatasetFactory:
             for dataset_path in dataset_spec.dataset_paths:
                 embodiment_tag = dataset_spec.embodiment_tag
                 assert embodiment_tag is not None, "Embodiment tag is required"
-                assert self.config.data.mode == "single_turn", "Only single turn mode is supported"
-                if torch.distributed.is_initialized():
-                    if torch.distributed.get_rank() == 0:
-                        generate_stats(dataset_path)
-                        generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
-                else:
-                    generate_stats(dataset_path)
-                    generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
-                barrier()
-                dataset = ShardedSingleStepDataset(
-                    dataset_path=dataset_path,
-                    embodiment_tag=EmbodimentTag(embodiment_tag),
-                    modality_configs=self.config.data.modality_configs[embodiment_tag],
-                    video_backend=self.config.data.video_backend,
-                    shard_size=self.config.data.shard_size,
-                    episode_sampling_rate=self.config.data.episode_sampling_rate,
-                    seed=self.config.data.seed,
-                    allow_padding=self.config.data.allow_padding,
-                    shard_load_workers=self.config.data.shard_load_workers,
-                    video_decode_workers=self.config.data.video_decode_workers,
-                    num_ffmpeg_threads=self.config.data.num_ffmpeg_threads,
-                    overlap_episode_io=self.config.data.overlap_episode_io,
-                )
-                datasets.append(dataset)
+                datasets.append(self._build_single_step_dataset(dataset_path, embodiment_tag))
             dataset_lengths = np.array([len(dataset) for dataset in datasets])
             dataset_relative_lengths = dataset_lengths / dataset_lengths.sum()
             for dataset, relative_length in zip(datasets, dataset_relative_lengths):
@@ -84,15 +82,34 @@ class DatasetFactory:
                 all_datasets.append(dataset)
                 all_weights.append(weight)
 
-        return (
-            ShardedMixtureDataset(
-                datasets=all_datasets,
-                weights=all_weights,
+        train_dataset = ShardedMixtureDataset(
+            datasets=all_datasets,
+            weights=all_weights,
+            processor=processor,
+            seed=self.config.data.seed,
+            training=True,
+            num_shards_per_epoch=self.config.data.num_shards_per_epoch,
+            override_pretraining_statistics=self.config.data.override_pretraining_statistics,
+        )
+
+        eval_dataset = None
+        val_paths = getattr(self.config.data, "val_dataset_paths", [])
+        if self.config.training.eval_strategy != "no" and val_paths:
+            # Use the embodiment tag from the first training dataset spec
+            embodiment_tag = self.config.data.datasets[0].embodiment_tag
+            assert embodiment_tag is not None, "Embodiment tag is required for validation"
+            val_datasets = []
+            for val_path in tqdm(val_paths, desc="Initializing validation datasets"):
+                val_datasets.append(self._build_single_step_dataset(val_path, embodiment_tag))
+            val_weights = [1.0 / len(val_datasets)] * len(val_datasets)
+            eval_dataset = ShardedMixtureDataset(
+                datasets=val_datasets,
+                weights=val_weights,
                 processor=processor,
                 seed=self.config.data.seed,
-                training=True,
+                training=False,
                 num_shards_per_epoch=self.config.data.num_shards_per_epoch,
                 override_pretraining_statistics=self.config.data.override_pretraining_statistics,
-            ),
-            None,
-        )
+            )
+
+        return train_dataset, eval_dataset

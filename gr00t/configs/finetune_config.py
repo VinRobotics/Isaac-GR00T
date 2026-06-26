@@ -167,3 +167,10 @@ class FinetuneConfig:
     """If True, skip loading model weights from base_model_path (architecture only).
     The processor (tokenizer/config) is still loaded from base_model_path.
     Useful for CI/testing to skip the slow checkpoint shard loading."""
+
+    # --- Validation ---
+    validation_path: list[str] | None = None
+    """Optional path(s) to validation dataset(s). When set, eval loss is computed every eval_steps."""
+
+    eval_steps: int = 2000
+    """Number of training steps between validation loss evaluations (only used when validation_path is set)."""
