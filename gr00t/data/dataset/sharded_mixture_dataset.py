@@ -365,11 +365,13 @@ class ShardedMixtureDataset(IterableDataset):
 
         # Initialize worker-specific shard schedule
         self.worker_shard_sampling_schedule = self.filter_shard_sample_schedule()
+        total_shards = len(self.worker_shard_sampling_schedule)
         self.curr_shard_index = -1
         self.cache_next_shard()
         rng = np.random.default_rng(self.seed + self.epoch)
 
         # Continuous iteration with epoch management
+        processed_shards = 0
         while True:
             self.curr_shard_index += 1
 
@@ -395,6 +397,10 @@ class ShardedMixtureDataset(IterableDataset):
 
             # Clean up cached shard to free memory
             self.delete_cached_shard()
+
+            processed_shards += 1
+            if not self.training and processed_shards >= total_shards:
+                break
 
     def cache_next_shard(self):
         """
