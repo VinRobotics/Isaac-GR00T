@@ -256,6 +256,27 @@ class Gr00tTrainer(Trainer):
 
         return torch.utils.data.DataLoader(self.train_dataset, **dataloader_params)
 
+    def get_eval_dataloader(self, eval_dataset=None):
+        """Return a plain DataLoader for eval to avoid accelerate's NCCL broadcast on CPU tensors."""
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if dataset is None:
+            raise ValueError("No eval dataset provided")
+
+        data_collator = self.data_collator
+        data_collator = self._get_collator_with_removed_columns(data_collator, description="evaluation")
+
+        dataloader_params = {
+            "batch_size": self.args.per_device_eval_batch_size,
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+        }
+
+        if self.args.dataloader_num_workers > 0:
+            dataloader_params["multiprocessing_context"] = self.multiprocessing_context
+
+        return torch.utils.data.DataLoader(dataset, **dataloader_params)
+
     def train(
         self,
         resume_from_checkpoint=None,
