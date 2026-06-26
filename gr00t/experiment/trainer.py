@@ -36,9 +36,27 @@ import threading
 from typing import Any, Optional
 
 import torch
+from tqdm import tqdm
 from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalPrediction
+
+
+class _TqdmDataLoader:
+    """Wraps a DataLoader to show a tqdm progress bar during iteration."""
+
+    def __init__(self, dataloader, desc="Eval"):
+        self._dl = dataloader
+        self._desc = desc
+
+    def __len__(self):
+        return len(self._dl)
+
+    def __iter__(self):
+        return iter(tqdm(self._dl, desc=self._desc, leave=True))
+
+    def __getattr__(self, name):
+        return getattr(self._dl, name)
 
 
 class ProfCallback(TrainerCallback):
@@ -256,6 +274,10 @@ class Gr00tTrainer(Trainer):
 
         return torch.utils.data.DataLoader(self.train_dataset, **dataloader_params)
 
+    def evaluation_loop(self, dataloader, description, **kwargs):
+        wrapped = _TqdmDataLoader(dataloader, desc=description)
+        return super().evaluation_loop(wrapped, description, **kwargs)
+
     def get_eval_dataloader(self, eval_dataset=None):
         """Return a plain DataLoader for eval to avoid accelerate's NCCL broadcast on CPU tensors."""
         dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
@@ -265,17 +287,23 @@ class Gr00tTrainer(Trainer):
         data_collator = self.data_collator
         data_collator = self._get_collator_with_removed_columns(data_collator, description="evaluation")
 
+        persistent_workers = self.args.dataloader_num_workers > 0
         dataloader_params = {
             "batch_size": self.args.per_device_eval_batch_size,
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": persistent_workers,
         }
 
         if self.args.dataloader_num_workers > 0:
             dataloader_params["multiprocessing_context"] = self.multiprocessing_context
 
         return torch.utils.data.DataLoader(dataset, **dataloader_params)
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        with torch.inference_mode():
+            return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
 
     def train(
         self,

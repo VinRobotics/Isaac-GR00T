@@ -223,6 +223,7 @@ def run(config: Config):
         save_only_model=config.training.save_only_model,
         fp16=config.training.fp16,
         bf16=config.training.bf16,
+        bf16_full_eval=config.training.eval_bf16,
         tf32=config.training.tf32,
         gradient_checkpointing=config.training.gradient_checkpointing,
         optim=config.training.optim,
