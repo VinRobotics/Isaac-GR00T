@@ -301,9 +301,12 @@ class Gr00tTrainer(Trainer):
 
         return torch.utils.data.DataLoader(dataset, **dataloader_params)
 
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):  # noqa: ARG002
+        inputs = self._prepare_inputs(inputs)
         with torch.inference_mode():
-            return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
+            loss, _ = self.compute_loss(model, inputs, return_outputs=True)
+            loss = loss.mean().detach()
+        return (loss, None, None)
 
     def train(
         self,
