@@ -72,7 +72,7 @@ class TrainingConfig:
     eval_strategy: str = "no"  # no, steps, epoch
     eval_steps: int = 500
     eval_set_split_ratio: float = 0.1
-    eval_batch_size: int = 2
+    eval_batch_size: int = 64
     save_best_eval_metric_name: str = ""
     save_best_eval_metric_greater_is_better: bool = True
 
