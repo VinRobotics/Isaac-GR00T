@@ -56,6 +56,14 @@ if __name__ == "__main__":
     if ft_config.modality_config_path is not None:
         load_modality_config(ft_config.modality_config_path)
 
+    dataset_mix_ratios = ft_config.dataset_mix_ratio
+    if dataset_mix_ratios is None:
+        dataset_mix_ratios = [1.0] * len(ft_config.dataset_path)
+    assert len(dataset_mix_ratios) == len(ft_config.dataset_path), (
+        f"--dataset-mix-ratio has {len(dataset_mix_ratios)} entries but "
+        f"--dataset-path has {len(ft_config.dataset_path)}"
+    )
+
     config = get_default_config().load_dict(
         {
             "data": {
@@ -64,10 +72,10 @@ if __name__ == "__main__":
                     {
                         # "dataset_paths": [ft_config.dataset_path],
                         "dataset_paths": [dataset_path],
-                        "mix_ratio": 1.0,
+                        "mix_ratio": mix_ratio,
                         "embodiment_tag": embodiment_tag,
                     }
-                    for dataset_path in ft_config.dataset_path
+                    for dataset_path, mix_ratio in zip(ft_config.dataset_path, dataset_mix_ratios)
                 ],
             }
         }

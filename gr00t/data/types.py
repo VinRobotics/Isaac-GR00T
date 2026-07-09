@@ -98,6 +98,13 @@ class ModalityConfig:
     mean_std_embedding_keys: list[str] | None = None
     """Optional list of keys to apply mean/std normalization. If None or empty, use min/max normalization for all keys."""
     action_configs: list[ActionConfig] | None = None
+    camera_pose_key: str | None = None
+    """Optional state-modality group name holding the reference camera pose (pos + rotvec)
+    relative to the camera pose at episode start (egocentric/moving-camera datasets, e.g.
+    human VR demos). When set on the "state" ModalityConfig and the group exists in the
+    dataset's modality.json, EEF state/action groups are reprojected into the camera frame
+    at the sampled timestep (see gr00t/data/state_action/camera_projection.py). The camera
+    pose itself is only used for this reprojection and is never fed to the model."""
 
     def __post_init__(self):
         """Validate fields and set default values."""

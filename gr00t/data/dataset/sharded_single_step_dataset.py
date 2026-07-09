@@ -22,19 +22,24 @@ import numpy as np
 import pandas as pd
 
 from gr00t.data.interfaces import ShardedDataset
+from gr00t.data.state_action.camera_projection import apply_camera_projection
 from gr00t.data.types import EmbodimentTag, MessageType, ModalityConfig, VLAStepData
 
 from .lerobot_episode_loader import LeRobotEpisodeLoader
 
 
 def extract_step_data(
-    episode_data: tuple[pd.DataFrame, dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray, np.ndarray],
+    episode_data: tuple[
+        pd.DataFrame, dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray, np.ndarray
+    ],
     step_index: int,
     modality_configs: dict[str, ModalityConfig],
     embodiment_tag: EmbodimentTag,
     allow_padding: bool = False,
 ) -> VLAStepData:
-    episode_data, video_data, mask_data, all_step_indices_video, all_step_indices_mask = episode_data
+    episode_data, video_data, mask_data, all_step_indices_video, all_step_indices_mask = (
+        episode_data
+    )
     step_data = {}
 
     # Extract data for each configured modality
@@ -50,10 +55,14 @@ def extract_step_data(
                 modality_data = episode_data[f"{modality}.{key}"].iloc[indices_to_load]
             elif modality == "video" and key in video_data:
                 assert not np.in1d(indices_to_load, all_step_indices_video, invert=True).any()
-                modality_data = video_data[key][np.searchsorted(all_step_indices_video, indices_to_load)]
+                modality_data = video_data[key][
+                    np.searchsorted(all_step_indices_video, indices_to_load)
+                ]
             elif modality == "mask" and key in mask_data:
                 assert not np.in1d(indices_to_load, all_step_indices_mask, invert=True).any()
-                modality_data = mask_data[key][np.searchsorted(all_step_indices_mask, indices_to_load)]
+                modality_data = mask_data[key][
+                    np.searchsorted(all_step_indices_mask, indices_to_load)
+                ]
             else:
                 raise KeyError(
                     f"{modality}.{key} not found in episode data, available keys: {episode_data.columns}"
@@ -79,6 +88,25 @@ def extract_step_data(
     mask_data = step_data.get("mask", {})
     state_data = step_data.get("state", {})
     action_data = step_data.get("action", {})
+
+    # Egocentric (moving-camera) datasets: reproject EEF state/action groups from the
+    # episode-start camera frame into the frame of the camera at the current timestep,
+    # so the absolute state matches the image. The same projection is applied to the
+    # raw action chunk, where it cancels exactly in the relative EEF representation.
+    state_config = modality_configs.get("state")
+    camera_pose_key = getattr(state_config, "camera_pose_key", None) if state_config else None
+    if camera_pose_key is not None:
+        camera_pose_column = f"state.{camera_pose_key}"
+        if camera_pose_column in episode_data.columns:
+            # Camera pose at the reference timestep (the last state delta index, which is
+            # also the reference frame for relative actions).
+            reference_index = step_index + state_config.delta_indices[-1]
+            if allow_padding:
+                reference_index = max(0, min(reference_index, len(episode_data) - 1))
+            camera_pose = np.asarray(
+                episode_data[camera_pose_column].iloc[reference_index], dtype=np.float64
+            )
+            apply_camera_projection(state_data, action_data, camera_pose, modality_configs)
     language_data = step_data.get("language", {})
     assert len(language_data) == 1, f"Expected 1 language, got {len(language_data)}"
     text = language_data[list(language_data.keys())[0]][0]
@@ -257,8 +285,10 @@ class ShardedSingleStepDataset(ShardedDataset):
         return len(self.shard_lengths)
 
     def get_datapoint(
-        self, 
-        episode_data: tuple[pd.DataFrame, dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray, np.ndarray], 
+        self,
+        episode_data: tuple[
+            pd.DataFrame, dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray, np.ndarray
+        ],
         step_index: int,
     ) -> dict:
         """
@@ -315,14 +345,16 @@ class ShardedSingleStepDataset(ShardedDataset):
                 i = 0
 
                 while len(inflight) < self.shard_load_workers and i < len(episodes):
-                    inflight.append((
-                        episodes[i],
-                        executor.submit(
-                            self.episode_loader.__getitem__, 
-                            episodes[i][0], 
-                            episodes[i][1],
-                        ),
-                    ))
+                    inflight.append(
+                        (
+                            episodes[i],
+                            executor.submit(
+                                self.episode_loader.__getitem__,
+                                episodes[i][0],
+                                episodes[i][1],
+                            ),
+                        )
+                    )
                     i += 1
 
                 while inflight:
@@ -330,21 +362,23 @@ class ShardedSingleStepDataset(ShardedDataset):
                     episode_data = fut.result()
 
                     if i < len(episodes):
-                        inflight.append((
-                            episodes[i],
-                            executor.submit(
-                                self.episode_loader.__getitem__, 
-                                episodes[i][0], 
-                                episodes[i][1],
-                            ),
-                        ))
+                        inflight.append(
+                            (
+                                episodes[i],
+                                executor.submit(
+                                    self.episode_loader.__getitem__,
+                                    episodes[i][0],
+                                    episodes[i][1],
+                                ),
+                            )
+                        )
                         i += 1
 
                     for step_index in step_indices:
                         datapoints.append(self.get_datapoint(episode_data, step_index))
 
             return datapoints
- 
+
         for ep_idx, step_indices in episodes:
             # Load episode data once per episode in shard
             episode_data = self.episode_loader.__getitem__(ep_idx, step_indices)

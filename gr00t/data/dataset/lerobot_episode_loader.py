@@ -396,9 +396,20 @@ class LeRobotEpisodeLoader:
         for modality_type in ["state", "action"]:
             if modality_type not in self.modality_configs:
                 continue
+            joint_groups = list(self.modality_configs[modality_type].modality_keys)
+            # Egocentric datasets: additionally load the camera pose group (used only for
+            # EEF reprojection in extract_step_data, never fed to the model). Datasets
+            # with a static camera simply omit the group in modality.json.
+            camera_pose_key = getattr(self.modality_configs[modality_type], "camera_pose_key", None)
+            if (
+                camera_pose_key
+                and camera_pose_key not in joint_groups
+                and camera_pose_key in self.modality_meta.get(modality_type, {})
+            ):
+                joint_groups.append(camera_pose_key)
             joint_groups_df = self._extract_joint_groups(
                 original_df,
-                self.modality_configs[modality_type].modality_keys,
+                joint_groups,
                 modality_type,
             )
             for joint_group in joint_groups_df.columns:
@@ -597,21 +608,20 @@ class LeRobotEpisodeLoader:
     def get_all_step_indices(self, modality: str, step_indices: np.ndarray) -> np.ndarray:
         if modality not in self.modality_configs:
             return np.sort(step_indices)
-        
+
         modality_config = self.modality_configs[modality]
 
-        all_step_indices = np.concatenate([
-            step_indices + delta_index 
-            for delta_index in modality_config.delta_indices
-        ])
-        
+        all_step_indices = np.concatenate(
+            [step_indices + delta_index for delta_index in modality_config.delta_indices]
+        )
+
         all_step_indices = np.unique(all_step_indices)
-        
+
         return all_step_indices
 
     def __getitem__(
-        self, 
-        idx: int, 
+        self,
+        idx: int,
         step_indices: np.ndarray = None,
     ) -> tuple[pd.DataFrame, dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray, np.ndarray]:
         """
@@ -643,7 +653,7 @@ class LeRobotEpisodeLoader:
             all_step_indices_mask = np.arange(nominal_length)
         else:
             all_step_indices_video = self.get_all_step_indices("video", step_indices)
-            all_step_indices_mask = self.get_all_step_indices("mask", step_indices)    
+            all_step_indices_mask = self.get_all_step_indices("mask", step_indices)
 
         if not self.overlap_episode_io:
             # Load and parse the parquet data
@@ -652,13 +662,13 @@ class LeRobotEpisodeLoader:
             with ThreadPoolExecutor(max_workers=3) as executor:
                 df_future = executor.submit(self._load_parquet_data, episode_id)
                 video_data_future = executor.submit(
-                    self._load_video_data, 
-                    episode_id, 
+                    self._load_video_data,
+                    episode_id,
                     all_step_indices_video,
                 )
                 mask_data_future = executor.submit(
-                    self._load_mask_data, 
-                    episode_id, 
+                    self._load_mask_data,
+                    episode_id,
                     all_step_indices_mask,
                 )
 
