@@ -149,6 +149,13 @@ def convert_action_column(actions: np.ndarray, layout: Layout) -> np.ndarray:
     return np.concatenate(parts, axis=1)
 
 
+def _column_2d(df: pd.DataFrame, column: str) -> np.ndarray:
+    """Stack a per-row column to (N, D). Scalar-valued rows (e.g. a 1-DOF gripper stored
+    as plain floats instead of length-1 arrays) are reshaped to (N, 1)."""
+    stacked = np.stack(df[column].to_numpy())
+    return stacked.reshape(len(stacked), -1)
+
+
 def build_state_column(df: pd.DataFrame, layout: Layout) -> np.ndarray:
     """Synthesize the flat observation.state column from the per-key columns.
 
@@ -156,13 +163,13 @@ def build_state_column(df: pd.DataFrame, layout: Layout) -> np.ndarray:
     """
     parts = []
     for arm in range(layout.n_arms):
-        pos = np.stack(df[f"observation.robot{arm}_eef_pos"].to_numpy())
+        pos = _column_2d(df, f"observation.robot{arm}_eef_pos")
         if layout.per_key_rot_is_rot6d:
-            rot = np.stack(df[f"observation.robot{arm}_eef_rot6d"].to_numpy())
+            rot = _column_2d(df, f"observation.robot{arm}_eef_rot6d")
         else:
-            rotvec = np.stack(df[f"observation.robot{arm}_eef_rot_axis_angle"].to_numpy())
+            rotvec = _column_2d(df, f"observation.robot{arm}_eef_rot_axis_angle")
             rot = rotvec_to_rot6d(rotvec.astype(np.float64))
-        gripper = np.stack(df[f"observation.gripper{arm}_gripper_pose"].to_numpy())
+        gripper = _column_2d(df, f"observation.gripper{arm}_gripper_pose")
         parts += [pos, rot, gripper]
     return np.concatenate(parts, axis=1).astype(np.float32)
 
