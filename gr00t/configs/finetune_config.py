@@ -36,14 +36,14 @@ class FinetuneConfig:
     dataset_path: list[str]
     """Path to the dataset root directory containing trajectory data for fine-tuning."""
 
+    embodiment_tag: str
+    """Embodiment tag (name or value, case-insensitive). See EmbodimentTag for known tags."""
+
     dataset_mix_ratio: list[float] | None = None
     """Optional relative sampling weight per entry in dataset_path (normalized across the
     list). Used for co-training mixtures, e.g. human + robot data: with two datasets,
     `--dataset-mix-ratio 0.3 0.7` samples 30% human / 70% robot regardless of dataset
     sizes. If None, all datasets are weighted equally."""
-
-    embodiment_tag: str
-    """Embodiment tag (name or value, case-insensitive). See EmbodimentTag for known tags."""
 
     modality_config_path: str | None = None
     """
