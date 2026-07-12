@@ -45,6 +45,23 @@ class FinetuneConfig:
     `--dataset-mix-ratio 0.3 0.7` samples 30% human / 70% robot regardless of dataset
     sizes. If None, all datasets are weighted equally."""
 
+    dataset_loss_weight: list[float] | None = None
+    """Optional per-sample loss multiplier per entry in dataset_path (MotionTrans-style
+    human/robot alpha re-weighting, applied in the action loss as a weighted mean). With
+    equal mix ratios, `--dataset-loss-weight 0.3 0.7` (human first) reproduces
+    MotionTrans alpha=0.7: total gradient contribution human:robot = 0.3:0.7. If None,
+    all samples are weighted equally."""
+
+    alpha: float | None = None
+    """MotionTrans-style human/robot co-training alpha. When set, dataset_mix_ratio and
+    dataset_loss_weight are computed automatically to reproduce MotionTrans exactly:
+    sampling proportional to each dataset's total_frames (uniform over the concatenated
+    frames) and per-sample loss weights alpha/n_robot_frames (robot data) vs
+    (1-alpha)/n_human_frames (human data), so the total gradient contribution is
+    robot:human = alpha:(1-alpha) regardless of dataset sizes. Human datasets are
+    detected via the observation.is_human column (fallback: "human" in info.json
+    robot_type). Mutually exclusive with dataset_mix_ratio / dataset_loss_weight."""
+
     modality_config_path: str | None = None
     """
     Path to a Python file defining the modality configuration for the given embodiment. 

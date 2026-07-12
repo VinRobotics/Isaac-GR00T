@@ -40,6 +40,12 @@ class SingleDatasetConfig:
     # Relative sampling probability (will be normalised across the list)
     mix_ratio: float = 1.0
 
+    # Per-sample loss multiplier for this dataset (MotionTrans-style human/robot alpha
+    # re-weighting: with equal mix_ratios, loss_weight (1 - alpha) on the human dataset
+    # and alpha on the robot dataset makes their total gradient contribution
+    # (1 - alpha) : alpha). Applied as a weighted mean, so uniform weights are a no-op.
+    loss_weight: float = 1.0
+
     dataset_type: str = "physical_embodiment"
 
     # Optional validation dataset path for open-loop evaluation

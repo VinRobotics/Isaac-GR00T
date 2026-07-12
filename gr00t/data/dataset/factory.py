@@ -34,7 +34,9 @@ class DatasetFactory:
     def __init__(self, config: Config):
         self.config = config
 
-    def _build_single_step_dataset(self, dataset_path: str, embodiment_tag: str) -> ShardedSingleStepDataset:
+    def _build_single_step_dataset(
+        self, dataset_path: str, embodiment_tag: str, loss_weight: float = 1.0
+    ) -> ShardedSingleStepDataset:
         assert self.config.data.mode == "single_turn", "Only single turn mode is supported"
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
@@ -57,6 +59,7 @@ class DatasetFactory:
             video_decode_workers=self.config.data.video_decode_workers,
             num_ffmpeg_threads=self.config.data.num_ffmpeg_threads,
             overlap_episode_io=self.config.data.overlap_episode_io,
+            loss_weight=loss_weight,
         )
 
     def build(
@@ -74,7 +77,13 @@ class DatasetFactory:
             for dataset_path in dataset_spec.dataset_paths:
                 embodiment_tag = dataset_spec.embodiment_tag
                 assert embodiment_tag is not None, "Embodiment tag is required"
-                datasets.append(self._build_single_step_dataset(dataset_path, embodiment_tag))
+                datasets.append(
+                    self._build_single_step_dataset(
+                        dataset_path,
+                        embodiment_tag,
+                        loss_weight=getattr(dataset_spec, "loss_weight", 1.0),
+                    )
+                )
             dataset_lengths = np.array([len(dataset) for dataset in datasets])
             dataset_relative_lengths = dataset_lengths / dataset_lengths.sum()
             for dataset, relative_length in zip(datasets, dataset_relative_lengths):

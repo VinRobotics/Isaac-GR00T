@@ -67,9 +67,29 @@ bash examples/finetune.sh \
     -- --dataset-mix-ratio 0.5 0.5
 ```
 
-`--dataset-mix-ratio` sets the human : robot sampling ratio independent of dataset sizes
-(this plays the role of MotionTrans's human/robot α loss re-weighting, applied at the
-sampling level). Omit it to weight all datasets equally.
+### Balancing human vs robot data (α)
+
+Two independent knobs, both parallel to the `--dataset-path` list:
+
+- `--dataset-mix-ratio r1 r2` — **sampling** ratio: how often batches draw from each
+  dataset, independent of dataset sizes. Omit for equal sampling.
+- `--dataset-loss-weight w1 w2` — **loss** ratio: per-sample multiplier applied in the
+  action loss (weighted mean, so uniform weights are exactly a no-op). This is
+  MotionTrans's α: their pi0 co-training samples uniformly over the concatenated frames
+  and re-weights purely in the loss (`loss * alpha` in `pi0.py`), with α renormalized by
+  the human/robot frame counts so the *total* gradient contribution is (1−α) : α.
+
+To reproduce MotionTrans α = 0.7 (robot-dominant) here: keep mix ratios equal and set
+
+```bash
+--dataset-loss-weight 0.3 0.7   # human first, robot second
+```
+
+Total gradient contribution is then `mix_ratio × loss_weight` per dataset →
+0.5·0.3 : 0.5·0.7 = 0.3 : 0.7, matching MotionTrans's count-renormalized α exactly.
+Alternatively you can skip loss weighting and put the imbalance in `--dataset-mix-ratio
+0.3 0.7` instead — same expected gradient ratio, but via sampling frequency (robot
+samples seen more often) rather than per-sample scaling.
 
 ## Notes & caveats
 

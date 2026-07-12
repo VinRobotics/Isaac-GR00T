@@ -261,7 +261,16 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        # Optional per-sample loss weight (e.g. MotionTrans-style human/robot alpha
+        # co-training re-weighting, set per dataset via SingleDatasetConfig.loss_weight).
+        # Weighted mean: relative gradient contribution follows the weights while uniform
+        # weights reduce exactly to the unweighted loss.
+        loss_weight = action_input.get("loss_weight", None)
+        if loss_weight is not None:
+            loss_weight = loss_weight.to(action_loss.dtype)[:, None, None]
+            loss = (action_loss * loss_weight).sum() / ((action_mask * loss_weight).sum() + 1e-6)
+        else:
+            loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
         return {
             "loss": loss,

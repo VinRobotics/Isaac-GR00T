@@ -27,6 +27,67 @@ from gr00t.configs.finetune_config import FinetuneConfig
 from gr00t.experiment.experiment import run
 
 
+def dataset_frame_stats(dataset_path: str) -> tuple[int, bool]:
+    """Return (total_frames, is_human) for a LeRobot dataset.
+
+    Human data is detected from the observation.is_human column (first row of the first
+    parquet); if the column is absent, falls back to "human" appearing in info.json's
+    robot_type. Used by --alpha to compute MotionTrans-style co-training weights.
+    """
+    import numpy as np
+    import pandas as pd
+
+    dataset_path = Path(dataset_path)
+    with open(dataset_path / "meta" / "info.json") as f:
+        info = json.load(f)
+    total_frames = int(info["total_frames"])
+
+    if "observation.is_human" in info.get("features", {}):
+        first_parquet = sorted(dataset_path.glob("data/*/*.parquet"))[0]
+        column = pd.read_parquet(first_parquet, columns=["observation.is_human"])
+        is_human = bool(np.asarray(column.iloc[0, 0]).reshape(-1)[0] > 0.5)
+    else:
+        is_human = "human" in str(info.get("robot_type", "")).lower()
+    return total_frames, is_human
+
+
+def motiontrans_alpha_weights(
+    dataset_paths: list[str], alpha: float
+) -> tuple[list[float], list[float]]:
+    """Compute (mix_ratios, loss_weights) reproducing MotionTrans's alpha scheme.
+
+    Sampling is proportional to each dataset's frame count (uniform over the
+    concatenated frames, as MotionTransDataset does) and per-sample loss weights are
+    alpha/n_robot_frames for robot data vs (1-alpha)/n_human_frames for human data, so
+    the total gradient contribution is robot:human = alpha:(1-alpha).
+    """
+    stats = [dataset_frame_stats(path) for path in dataset_paths]
+    mix_ratios = [float(frames) for frames, _ in stats]
+    n_human = sum(frames for frames, is_human in stats if is_human)
+    n_robot = sum(frames for frames, is_human in stats if not is_human)
+    if n_human == 0 or n_robot == 0:
+        # Only one class present: alpha weighting degenerates to uniform weights,
+        # matching MotionTransDataset's n_human==0 / n_robot==0 branches.
+        loss_weights = [1.0] * len(stats)
+    else:
+        loss_weights = [
+            (1 - alpha) / n_human if is_human else alpha / n_robot for _, is_human in stats
+        ]
+        # Only the ratio matters (the action head applies a weighted mean); rescale to a
+        # sampling-weighted mean of 1 so per-sample weights stay O(1).
+        total_frames = sum(frames for frames, _ in stats)
+        mean_weight = (
+            sum(frames * weight for (frames, _), weight in zip(stats, loss_weights)) / total_frames
+        )
+        loss_weights = [weight / mean_weight for weight in loss_weights]
+    for path, (frames, is_human), weight in zip(dataset_paths, stats, loss_weights):
+        print(
+            f"[alpha={alpha}] {path}: {'human' if is_human else 'robot'}, "
+            f"{frames} frames, loss_weight={weight:.3e}"
+        )
+    return mix_ratios, loss_weights
+
+
 # Make sure the user provided modality config is registered.
 def load_modality_config(modality_config_path: str):
     import importlib
@@ -56,13 +117,29 @@ if __name__ == "__main__":
     if ft_config.modality_config_path is not None:
         load_modality_config(ft_config.modality_config_path)
 
-    dataset_mix_ratios = ft_config.dataset_mix_ratio
-    if dataset_mix_ratios is None:
-        dataset_mix_ratios = [1.0] * len(ft_config.dataset_path)
-    assert len(dataset_mix_ratios) == len(ft_config.dataset_path), (
-        f"--dataset-mix-ratio has {len(dataset_mix_ratios)} entries but "
-        f"--dataset-path has {len(ft_config.dataset_path)}"
-    )
+    def per_dataset_values(values: list[float] | None, default: float, flag: str) -> list[float]:
+        if values is None:
+            return [default] * len(ft_config.dataset_path)
+        assert len(values) == len(ft_config.dataset_path), (
+            f"{flag} has {len(values)} entries but --dataset-path has {len(ft_config.dataset_path)}"
+        )
+        return values
+
+    if ft_config.alpha is not None:
+        assert ft_config.dataset_mix_ratio is None and ft_config.dataset_loss_weight is None, (
+            "--alpha computes dataset mix ratios and loss weights automatically; "
+            "do not combine it with --dataset-mix-ratio / --dataset-loss-weight"
+        )
+        dataset_mix_ratios, dataset_loss_weights = motiontrans_alpha_weights(
+            ft_config.dataset_path, ft_config.alpha
+        )
+    else:
+        dataset_mix_ratios = per_dataset_values(
+            ft_config.dataset_mix_ratio, 1.0, "--dataset-mix-ratio"
+        )
+        dataset_loss_weights = per_dataset_values(
+            ft_config.dataset_loss_weight, 1.0, "--dataset-loss-weight"
+        )
 
     config = get_default_config().load_dict(
         {
@@ -73,9 +150,12 @@ if __name__ == "__main__":
                         # "dataset_paths": [ft_config.dataset_path],
                         "dataset_paths": [dataset_path],
                         "mix_ratio": mix_ratio,
+                        "loss_weight": loss_weight,
                         "embodiment_tag": embodiment_tag,
                     }
-                    for dataset_path, mix_ratio in zip(ft_config.dataset_path, dataset_mix_ratios)
+                    for dataset_path, mix_ratio, loss_weight in zip(
+                        ft_config.dataset_path, dataset_mix_ratios, dataset_loss_weights
+                    )
                 ],
             }
         }

@@ -186,6 +186,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         video_decode_workers: int = 1,
         num_ffmpeg_threads: int = 0,
         overlap_episode_io: bool = False,
+        loss_weight: float = 1.0,
     ):
         """Initialize single-step dataset with sharding configuration."""
         super().__init__(dataset_path)
@@ -197,6 +198,9 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.episode_sampling_rate = episode_sampling_rate
         self.seed = seed
         self.allow_padding = allow_padding
+        # Per-sample loss multiplier for this dataset (e.g. MotionTrans-style human/robot
+        # alpha re-weighting); attached to every datapoint and consumed by the action head.
+        self.loss_weight = loss_weight
         self.shard_load_workers = max(1, shard_load_workers)
         self.video_decode_workers = max(1, video_decode_workers)
         self.num_ffmpeg_threads = num_ffmpeg_threads
@@ -317,7 +321,11 @@ class ShardedSingleStepDataset(ShardedDataset):
         )
         # Apply processor to convert to model inputs
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
-        return self.processor(messages)
+        datapoint = self.processor(messages)
+        # Per-dataset loss weight (stacked to (B,) by the collator, consumed by the
+        # action head as a per-sample loss multiplier).
+        datapoint["loss_weight"] = np.float32(self.loss_weight)
+        return datapoint
 
     def get_shard_length(self, idx: int) -> int:
         """Get the number of timesteps in a specific shard."""
