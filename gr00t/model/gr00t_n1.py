@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Optional, Tuple
 import copy
 
 import numpy as np
@@ -82,6 +82,9 @@ class GR00T_N1_5(PreTrainedModel):
         self.backbone = EagleBackbone(**config.backbone_cfg)
         action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
         self.action_head = FlowmatchingActionHead(action_head_cfg)
+
+        # Optional RotRandomizer; only active in training mode when set
+        self.rot_randomizer: Optional[torch.nn.Module] = None
 
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
@@ -164,6 +167,8 @@ class GR00T_N1_5(PreTrainedModel):
         inputs: dict,
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
+        if self.rot_randomizer is not None:
+            backbone_inputs, action_inputs = self.rot_randomizer(backbone_inputs, action_inputs)
         backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=True)

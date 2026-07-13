@@ -88,6 +88,12 @@ class ArgsConfig:
     use_action_conditioning: bool = False
     """Whether to use action conditioning in the flow matching action head."""
 
+    rotation_augment: bool = False
+    """Whether to apply random Z-axis rotation augmentation during training.
+    Rotates only the camera slots listed in the data config's rotate_image_indices,
+    plus the end-effector part of state and action, by the same per-sample angle.
+    Requires a data config that defines rot_type/num_hand and get_rotation_config()."""
+
     # Advanced training parameters
     learning_rate: float = 1e-4
     """Learning rate for training."""
@@ -359,6 +365,25 @@ def main(config: ArgsConfig):
     # Set the model's compute_dtype to bfloat16
     model.compute_dtype = "bfloat16"
     model.config.compute_dtype = "bfloat16"
+
+    if config.rotation_augment:
+        from gr00t.model.common import RotRandomizer
+
+        rot_type = getattr(data_config_cls, "rot_type", None)
+        assert rot_type is not None, (
+            f"Data config '{config.data_config}' does not define 'rot_type'; "
+            "rotation augmentation is only supported for data configs with an "
+            "EE-pose state/action layout (e.g. the equi_* configs)"
+        )
+        rotation_config = data_config_cls.get_rotation_config()
+        model.rot_randomizer = RotRandomizer(
+            rot_type=rot_type,
+            num_hand=getattr(data_config_cls, "num_hand", 1),
+            ee_dim=7 if rot_type == "quaternion" else 6,
+            rotate_image_indices=rotation_config["rotate_image_indices"],
+            num_images_per_sample=rotation_config["num_images_per_sample"],
+        )
+        print(f"Rotation augmentation enabled: {model.rot_randomizer}")
 
     if config.lora_rank > 0:
         model = get_lora_model(
