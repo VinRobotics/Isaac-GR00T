@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import random
 import threading
 from typing import Any, Optional
 
@@ -295,13 +296,17 @@ class Gr00tTrainer(Trainer):
         total_steps = torch.tensor(0, device=self.args.device)
 
         # Object-centric keypoint aux head: aggregate its losses separately and, on
-        # rank 0, collect a handful of GT-vs-predicted keypoint overlay images to log
-        # to W&B (debug/eval only — action_pred is unaffected either way).
+        # rank 0, reservoir-sample a handful of GT-vs-predicted keypoint overlay
+        # images across the WHOLE eval pass to log to W&B (debug/eval only —
+        # action_pred is unaffected either way). Reservoir sampling means each
+        # evaluate() call independently draws a fresh random subset instead of
+        # always showing the same first-N samples encountered.
         enable_keypoint_head = getattr(self.model.config, "enable_keypoint_head", False)
         total_kp_loss = torch.tensor(0.0, device=self.args.device)
         total_kp_active_loss = torch.tensor(0.0, device=self.args.device)
         viz_images_gt: list = []
         viz_images_pred: list = []
+        viz_candidates_seen = 0
 
         for inputs in tqdm(dataloader, desc=description):
             inputs = self._prepare_inputs(inputs)
@@ -320,11 +325,13 @@ class Gr00tTrainer(Trainer):
             # live one level down, not on the outer dict compute_loss receives).
             batch = inputs["inputs"]
 
+            has_keypoint_batch = batch.get("has_keypoint")
             if (
                 enable_keypoint_head
                 and self.args.local_rank in (-1, 0)
                 and "viz_image" in batch
-                and len(viz_images_gt) < self.keypoint_viz_max_images
+                and has_keypoint_batch is not None
+                and bool((has_keypoint_batch >= 0.5).any())
             ):
                 with torch.inference_mode():
                     # Real (non-teacher-forced) rollout: strip "action" so get_action
@@ -333,7 +340,9 @@ class Gr00tTrainer(Trainer):
                     action_out = unwrapped_model.get_action(
                         viz_inputs, options={"return_keypoints": True}
                     )
-                self._collect_keypoint_viz(batch, action_out, viz_images_gt, viz_images_pred)
+                viz_candidates_seen = self._collect_keypoint_viz(
+                    batch, action_out, viz_images_gt, viz_images_pred, viz_candidates_seen
+                )
 
         # Single reduce at the end — avoids per-step all_gather deadlock
         # when ranks process different numbers of batches.
@@ -357,8 +366,9 @@ class Gr00tTrainer(Trainer):
 
         if enable_keypoint_head and self.args.local_rank in (-1, 0):
             logging.info(
-                f"Keypoint viz: collected {len(viz_images_gt)}/{self.keypoint_viz_max_images} "
-                f"image pairs for {metric_key_prefix}."
+                f"Keypoint viz: reservoir-sampled {len(viz_images_gt)}/"
+                f"{self.keypoint_viz_max_images} image pairs from {viz_candidates_seen} "
+                f"candidates for {metric_key_prefix}."
             )
             if viz_images_gt:
                 self._log_keypoint_viz(viz_images_gt, viz_images_pred, metric_key_prefix)
@@ -373,18 +383,23 @@ class Gr00tTrainer(Trainer):
         action_out: dict,
         gt_images: list,
         pred_images: list,
-    ) -> None:
-        """Render up to keypoint_viz_max_images GT-vs-predicted overlay pairs.
+        num_seen: int,
+    ) -> int:
+        """Reservoir-sample (Algorithm R) up to keypoint_viz_max_images GT-vs-
+        predicted overlay pairs, uniformly over every has_keypoint candidate seen
+        across the eval pass so far — not just the first ones encountered, so a
+        long eval set isn't dominated by whichever shard happens to load first.
 
         `inputs` carries the GT keypoint targets and the raw-frame thumbnail (see
         ShardedSingleStepDataset._render_viz_thumbnail); `action_out` carries the
         model's own flow-matching rollout keypoint prediction (get_action with
-        options={"return_keypoints": True}).
+        options={"return_keypoints": True}). `num_seen` is the running candidate
+        count from prior batches this eval pass; returns the updated count.
         """
         has_keypoint = inputs.get("has_keypoint")
         viz_image = inputs.get("viz_image")
         if has_keypoint is None or viz_image is None or "keypoint_pred" not in action_out:
-            return
+            return num_seen
 
         kp_target = inputs["keypoint_target"]
         active_target = inputs["keypoint_active_target"]
@@ -393,8 +408,6 @@ class Gr00tTrainer(Trainer):
         num_objects = kp_pred.shape[2]
 
         for i in range(viz_image.shape[0]):
-            if len(gt_images) >= self.keypoint_viz_max_images:
-                break
             if has_keypoint[i].item() < 0.5:
                 continue
             img = viz_image[i].detach().cpu().numpy()
@@ -402,9 +415,19 @@ class Gr00tTrainer(Trainer):
             gt_active = active_target[i].detach().float().cpu().numpy()
             pred_kp = kp_pred[i].detach().float().cpu().numpy()
             pred_active = active_pred[i].detach().float().cpu().numpy()
+            gt_img = render_keypoint_overlay(img, gt_kp, gt_active)
+            pred_img = render_keypoint_overlay(img, pred_kp, pred_active)
 
-            gt_images.append(render_keypoint_overlay(img, gt_kp, gt_active))
-            pred_images.append(render_keypoint_overlay(img, pred_kp, pred_active))
+            if num_seen < self.keypoint_viz_max_images:
+                gt_images.append(gt_img)
+                pred_images.append(pred_img)
+            else:
+                j = random.randint(0, num_seen)
+                if j < self.keypoint_viz_max_images:
+                    gt_images[j] = gt_img
+                    pred_images[j] = pred_img
+            num_seen += 1
+        return num_seen
 
     def _log_keypoint_viz(self, gt_images: list, pred_images: list, metric_key_prefix: str) -> None:
         if wandb.run is None:
