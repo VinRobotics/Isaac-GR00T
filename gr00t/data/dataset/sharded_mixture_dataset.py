@@ -366,6 +366,13 @@ class ShardedMixtureDataset(IterableDataset):
         # Initialize worker-specific shard schedule
         self.worker_shard_sampling_schedule = self.filter_shard_sample_schedule()
         total_shards = len(self.worker_shard_sampling_schedule)
+        if total_shards == 0:
+            # Fewer total shards than world_size * num_workers (common for small
+            # eval/validation splits, e.g. auto-split held-out episodes with the
+            # keypoint head): this (rank, worker) slot has nothing assigned this
+            # pass. Yield nothing instead of crashing in cache_next_shard() on an
+            # empty schedule.
+            return
         self.curr_shard_index = -1
         self.cache_next_shard()
         rng = np.random.default_rng(self.seed + self.epoch)
