@@ -116,7 +116,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             keypoint_missing = [
                 k
                 for k in missing_keys
-                if "keypoint_decoder" in k or "keypoint_query_embedding" in k
+                if "keypoint_position_decoder" in k
+                or "keypoint_active_decoder" in k
+                or "keypoint_query_embedding" in k
             ]
             if keypoint_missing:
                 logging.info(
@@ -126,18 +128,37 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
+
+            # keypoint_decoder (single shared trunk for position + active) was
+            # replaced by two independent heads, keypoint_position_decoder and
+            # keypoint_active_decoder (shared trunk caused gradient interference:
+            # the active-flag BCE degraded over training under the dominant,
+            # active-only-masked position Chamfer loss). Resuming from a
+            # checkpoint saved with the old combined decoder is expected to drop
+            # its weights, not an architecture-mismatch error.
+            old_keypoint_decoder_unexpected = [k for k in unexpected_keys if "keypoint_decoder." in k]
+            if old_keypoint_decoder_unexpected:
+                logging.info(
+                    "Old combined keypoint_decoder found in checkpoint - discarding "
+                    f"({len(old_keypoint_decoder_unexpected)} tensors); replaced by "
+                    "separate keypoint_position_decoder / keypoint_active_decoder "
+                    "(fresh init)."
+                )
+
             other_missing = [
                 k
                 for k in missing_keys
                 if "mask_token" not in k
-                and "keypoint_decoder" not in k
+                and "keypoint_position_decoder" not in k
+                and "keypoint_active_decoder" not in k
                 and "keypoint_query_embedding" not in k
             ]
+            other_unexpected = [k for k in unexpected_keys if "keypoint_decoder." not in k]
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
-            if unexpected_keys:
-                errors.append(f"Unexpected keys ({len(unexpected_keys)}): {unexpected_keys}")
+            if other_unexpected:
+                errors.append(f"Unexpected keys ({len(other_unexpected)}): {other_unexpected}")
             if mismatched_keys:
                 errors.append(f"Mismatched keys ({len(mismatched_keys)}): {mismatched_keys}")
             if errors:

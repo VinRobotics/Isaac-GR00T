@@ -296,6 +296,7 @@ class DiT(ModelMixin, ConfigMixin):
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
+        self_attention_mask: Optional[torch.Tensor] = None,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
@@ -311,7 +312,7 @@ class DiT(ModelMixin, ConfigMixin):
             if idx % 2 == 1 and self.config.interleave_self_attention:
                 hidden_states = block(
                     hidden_states,
-                    attention_mask=None,
+                    attention_mask=self_attention_mask,
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
@@ -355,6 +356,7 @@ class AlternateVLDiT(DiT):
         return_all_hidden_states: bool = False,
         image_mask: Optional[torch.Tensor] = None,
         backbone_attention_mask: Optional[torch.Tensor] = None,
+        self_attention_mask: Optional[torch.Tensor] = None,
     ):
         assert image_mask is not None, "Image mask is required"
 
@@ -381,7 +383,7 @@ class AlternateVLDiT(DiT):
                 # Self-attention blocks
                 hidden_states = block(
                     hidden_states,
-                    attention_mask=None,
+                    attention_mask=self_attention_mask,
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,

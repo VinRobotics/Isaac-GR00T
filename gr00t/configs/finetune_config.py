@@ -110,11 +110,13 @@ class FinetuneConfig:
     """False (default): decode keypoints from the same action-token hidden states that
     decode the action itself — a pure readout, action_pred is bit-identical whether or
     not the head runs. True: append keypoint_horizon dedicated learned query tokens
-    (DETR-style) to the DiT sequence and decode keypoints from those instead. This
-    gives the keypoint task its own capacity through the transformer, but since these
-    tokens share the same bidirectional self-attention as the action tokens, it is NOT
-    a pure readout anymore: action_pred itself changes (though action_decoder's
-    weights are never trained on the keypoint loss directly).
+    (DETR-style) to the DiT sequence and decode keypoints from those instead, giving
+    the keypoint task its own capacity through the transformer. A one-directional
+    self-attention mask keeps this a pure readout too: keypoint query tokens may
+    attend to the state/action tokens (so keypoint prediction stays conditioned on the
+    specific action being generated), but state/action tokens are masked from ever
+    attending back to the keypoint queries — action_pred is unaffected by their
+    presence, same guarantee as shared mode.
 
     Also changes model parameters (adds keypoint_query_embedding), so it must match
     between saving and loading a checkpoint — changing it on an existing checkpoint

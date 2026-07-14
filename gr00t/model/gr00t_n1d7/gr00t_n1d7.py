@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import logging
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import nn
@@ -81,25 +81,39 @@ class Gr00tN1d7ActionHead(nn.Module):
             output_dim=self.action_dim,
         )
 
-        # Object-centric keypoint auxiliary head. In shared mode (default) this is a
-        # pure readout: action_pred is unchanged whether or not it runs. Dedicated-
-        # tokens mode trades that away — see keypoint_use_dedicated_tokens. Shared
-        # across embodiments (no CategorySpecificMLP): object motion is embodiment-
-        # invariant, which is what lets this head pull human and robot
-        # representations into a common space (either the shared action-token
-        # hidden states, or — in dedicated-tokens mode — the query embeddings below).
+        # Object-centric keypoint auxiliary head: a pure readout in both modes —
+        # action_pred is unaffected whether or not it runs (dedicated-tokens mode
+        # enforces this via a one-directional self-attention mask, see
+        # _keypoint_self_attention_mask). Shared across embodiments (no
+        # CategorySpecificMLP): object motion is embodiment-invariant, which is
+        # what lets this head pull human and robot representations into a common
+        # space (either the shared action-token hidden states, or — in dedicated-
+        # tokens mode — the query embeddings below).
         if config.enable_keypoint_head:
             if not config.keypoint_use_dedicated_tokens:
                 assert config.keypoint_horizon <= config.action_horizon, (
                     "keypoint_horizon must not exceed action_horizon in shared mode"
                 )
-            keypoint_output_dim = config.max_keypoint_objects * (
-                config.keypoints_per_object * 2 + 1
-            )
-            self.keypoint_decoder = nn.Sequential(
+            # Fully independent trunks (no shared parameters) for position
+            # regression vs active classification. A single shared trunk was tried
+            # first: since static_keypoint_weight=0 hard-masks the Chamfer position
+            # loss to active steps only (~30% of cells) while the active BCE trains
+            # on every step, and keypoint_loss_weight (1.0) dominates
+            # keypoint_active_loss_weight (0.1), the shared hidden layer's gradient
+            # was increasingly dominated by the frequent, high-weight position
+            # signal — active-flag accuracy degraded over training even as
+            # position accuracy kept improving. Separate trunks remove that
+            # interference regardless of loss-weight tuning.
+            position_output_dim = config.max_keypoint_objects * config.keypoints_per_object * 2
+            self.keypoint_position_decoder = nn.Sequential(
                 nn.Linear(self.hidden_size, self.hidden_size),
                 nn.ReLU(),
-                nn.Linear(self.hidden_size, keypoint_output_dim),
+                nn.Linear(self.hidden_size, position_output_dim),
+            )
+            self.keypoint_active_decoder = nn.Sequential(
+                nn.Linear(self.hidden_size, self.hidden_size),
+                nn.ReLU(),
+                nn.Linear(self.hidden_size, config.max_keypoint_objects),
             )
             if config.keypoint_use_dedicated_tokens:
                 # DETR-style learned query tokens: one per future keypoint step,
@@ -147,7 +161,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.action_encoder.requires_grad_(False)
             self.action_decoder.requires_grad_(False)
             if self.config.enable_keypoint_head:
-                self.keypoint_decoder.requires_grad_(False)
+                self.keypoint_position_decoder.requires_grad_(False)
+                self.keypoint_active_decoder.requires_grad_(False)
                 if self.config.keypoint_use_dedicated_tokens:
                     self.keypoint_query_embedding.requires_grad_(False)
             if self.config.add_pos_embed:
@@ -180,7 +195,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.action_encoder.eval()
                 self.action_decoder.eval()
                 if self.config.enable_keypoint_head:
-                    self.keypoint_decoder.eval()
+                    self.keypoint_position_decoder.eval()
+                    self.keypoint_active_decoder.eval()
                     if self.config.keypoint_use_dedicated_tokens:
                         self.keypoint_query_embedding.eval()
                 if self.config.add_pos_embed:
@@ -217,13 +233,15 @@ class Gr00tN1d7ActionHead(nn.Module):
             h = model_output[:, -self.config.keypoint_horizon :]
         else:
             h = model_output[:, 1 : 1 + self.config.keypoint_horizon]
-        out = self.keypoint_decoder(h)
-        batch_size, horizon = out.shape[:2]
-        out = out.view(batch_size, horizon, num_objects, kp_per_object * 2 + 1)
-        pred_kp = out[..., : kp_per_object * 2].reshape(
+        batch_size, horizon = h.shape[:2]
+        # Independent trunks (see __init__): position regression and active
+        # classification never share parameters, only the input hidden states.
+        pred_kp = self.keypoint_position_decoder(h).view(
             batch_size, horizon, num_objects, kp_per_object, 2
         )
-        pred_active_logits = out[..., -1]
+        pred_active_logits = self.keypoint_active_decoder(h).view(
+            batch_size, horizon, num_objects
+        )
         return pred_kp, pred_active_logits
 
     def _append_keypoint_queries(self, sa_embs: torch.Tensor) -> torch.Tensor:
@@ -234,6 +252,29 @@ class Gr00tN1d7ActionHead(nn.Module):
         batch_size = sa_embs.shape[0]
         queries = self.keypoint_query_embedding.weight.unsqueeze(0).expand(batch_size, -1, -1)
         return torch.cat((sa_embs, queries), dim=1)
+
+    def _keypoint_self_attention_mask(
+        self, batch_size: int, protected_len: int, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        """One-directional self-attention mask for dedicated-tokens mode.
+
+        State+action tokens (indices [0, protected_len)) may only attend to each
+        other, never to the keypoint query tokens appended after them — this keeps
+        action_pred a pure readout, unaffected by the keypoint head, exactly like
+        shared mode. Keypoint query tokens may attend to everything (state, action,
+        and each other), so keypoint prediction stays conditioned on the specific
+        action being generated — the coupling the aux loss is meant to exploit.
+
+        Returns None in shared mode / when the head is disabled (no masking needed).
+        """
+        if not (self.config.enable_keypoint_head and self.config.keypoint_use_dedicated_tokens):
+            return None
+        total_len = protected_len + self.config.keypoint_horizon
+        # True = allowed to attend (same boolean convention as image_mask /
+        # backbone_attention_mask elsewhere in this codebase).
+        mask = torch.ones(total_len, total_len, dtype=torch.bool, device=device)
+        mask[:protected_len, protected_len:] = False
+        return mask.unsqueeze(0).expand(batch_size, -1, -1)
 
     def _compute_keypoint_loss(
         self, model_output: torch.Tensor, action_input: BatchFeature
@@ -384,7 +425,11 @@ class Gr00tN1d7ActionHead(nn.Module):
         # In keypoint dedicated-tokens mode, dedicated query tokens are appended
         # after the action tokens: [state(1), action(action_horizon), kp_queries].
         sa_embs = torch.cat((state_features, action_features), dim=1)
+        protected_len = sa_embs.shape[1]
         sa_embs = self._append_keypoint_queries(sa_embs)
+        self_attention_mask = self._keypoint_self_attention_mask(
+            sa_embs.shape[0], protected_len, device
+        )
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         if self.config.use_alternate_vl_dit:
@@ -398,6 +443,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 return_all_hidden_states=True,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
+                self_attention_mask=self_attention_mask,
             )
         else:
             model_output, _ = self.model(
@@ -406,6 +452,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 encoder_attention_mask=vl_attn_mask,
                 timestep=t_discretized,
                 return_all_hidden_states=True,
+                self_attention_mask=self_attention_mask,
             )
 
         # Slice off any appended keypoint query tokens before decoding actions: in
@@ -525,6 +572,12 @@ class Gr00tN1d7ActionHead(nn.Module):
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
 
+        # Constant across denoising steps: same protected/total sequence layout
+        # every iteration, so build the (dedicated-tokens mode only) self-attention
+        # mask once rather than per step.
+        protected_len = state_features.shape[1] + self.config.action_horizon
+        self_attention_mask = self._keypoint_self_attention_mask(batch_size, protected_len, device)
+
         if "action" in action_input:
             # If action in input when doing get action, it means we want to use RTC.
             # action_horizon is the action horizon of the input action.
@@ -593,12 +646,14 @@ class Gr00tN1d7ActionHead(nn.Module):
                     timestep=timesteps_tensor,
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
+                    self_attention_mask=self_attention_mask,
                 )
             else:
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
+                    self_attention_mask=self_attention_mask,
                 )
             # Slice off any appended keypoint query tokens before decoding actions
             # (see forward()'s action_decoder call for why).
