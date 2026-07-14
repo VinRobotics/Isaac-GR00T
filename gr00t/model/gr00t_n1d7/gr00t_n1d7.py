@@ -206,13 +206,22 @@ class Gr00tN1d7ActionHead(nn.Module):
     def _compute_keypoint_loss(
         self, model_output: torch.Tensor, action_input: BatchFeature
     ) -> dict[str, torch.Tensor]:
-        """Set-matching auxiliary loss on future object keypoints.
+        """Object-keypoint auxiliary loss on future object keypoints.
 
-        The model receives no keypoint input, so it cannot know which points the
-        tracker sampled on an object nor which object occupies which slot. The loss
-        is therefore invariant to both: symmetric Chamfer distance (Huber-based)
-        within each object, and a min over the two object-slot permutations chosen
-        consistently for the whole chunk.
+        Object slot identity is fixed, not permutation-matched: the data pipeline
+        assigns slot 0/1 by (first-appearance frame, then left-to-right centroid x)
+        and holds it fixed for the whole episode (see assign_slots in
+        test_keypoint_tracking.py / convert_keypoint_tracking.py) — a stable,
+        image-visible convention the model can learn directly via cross-attention to
+        the current frame, rather than a truly arbitrary label the loss must be
+        invariant to. Matching per-sample (as an earlier version did) would let the
+        model dodge learning that convention, and the hard argmin choice flip-flops
+        near-symmetric cases, giving each output slot an inconsistent training
+        target across steps.
+
+        Point identity WITHIN a slot has no such convention (farthest-point sampling
+        assigns no fixed meaning to point index k), so that stays permutation-
+        invariant via symmetric Chamfer distance (Huber-based).
         """
         pred_kp, pred_active_logits = self._decode_keypoints(model_output)
         target_kp = action_input.get("keypoint_target", None)
@@ -240,43 +249,23 @@ class Gr00tN1d7ActionHead(nn.Module):
         if loss_weight is not None:
             sample_weight = sample_weight * loss_weight.to(pred_kp.dtype).view(batch_size)
 
-        def matched_costs(t_kp, t_active):
-            # Pairwise Huber cost between predicted and target point sets per object.
-            diff = pred_kp.unsqueeze(-2) - t_kp.unsqueeze(-3)  # [B,H,O,K,K,2]
-            cost = F.smooth_l1_loss(
-                diff, torch.zeros_like(diff), beta=0.1, reduction="none"
-            ).sum(-1)
-            chamfer = 0.5 * (
-                cost.min(dim=-1).values.mean(dim=-1) + cost.min(dim=-2).values.mean(dim=-1)
-            )  # [B,H,O]
-            # Supervise keypoints only where the tracker is confident. active == 1
-            # requires real motion within reach of a SAM3 mask sighting; inactive slots
-            # may instead hold zeros (slot never appeared / failed episode), frozen
-            # positions (before the first mask frame) or untrusted extrapolations, which
-            # are indistinguishable from a genuinely static object in the data.
-            # static_keypoint_weight > 0 re-enables down-weighted supervision on them.
-            step_weight = t_active + (1.0 - t_active) * self.config.static_keypoint_weight
-            kp_num = (chamfer * step_weight).sum(dim=(1, 2))  # [B]
-            kp_den = step_weight.sum(dim=(1, 2))  # [B]
-            bce = F.binary_cross_entropy_with_logits(
-                pred_active_logits, t_active, reduction="none"
-            )
-            return kp_num, kp_den, bce.mean(dim=(1, 2))
-
-        kp_num_id, kp_den, active_identity = matched_costs(target_kp, target_active)
-        # kp_den is permutation-invariant (sum over objects), so only computed once.
-        kp_num_sw, _, active_swapped = matched_costs(target_kp.flip(2), target_active.flip(2))
-        cost_identity = (
-            self.config.keypoint_loss_weight * kp_num_id / (kp_den + 1e-6)
-            + self.config.keypoint_active_loss_weight * active_identity
-        )
-        cost_swapped = (
-            self.config.keypoint_loss_weight * kp_num_sw / (kp_den + 1e-6)
-            + self.config.keypoint_active_loss_weight * active_swapped
-        )
-        use_swap = (cost_swapped < cost_identity).to(pred_kp.dtype)
-        kp_num = kp_num_id * (1.0 - use_swap) + kp_num_sw * use_swap
-        active_cost = active_identity * (1.0 - use_swap) + active_swapped * use_swap
+        # Pairwise Huber cost between predicted and target point sets, per (fixed) slot.
+        diff = pred_kp.unsqueeze(-2) - target_kp.unsqueeze(-3)  # [B,H,O,K,K,2]
+        cost = F.smooth_l1_loss(diff, torch.zeros_like(diff), beta=0.1, reduction="none").sum(-1)
+        chamfer = 0.5 * (
+            cost.min(dim=-1).values.mean(dim=-1) + cost.min(dim=-2).values.mean(dim=-1)
+        )  # [B,H,O]
+        # Supervise keypoints only where the tracker is confident. active == 1
+        # requires real motion within reach of a SAM3 mask sighting; inactive slots
+        # may instead hold zeros (slot never appeared / failed episode), frozen
+        # positions (before the first mask frame) or untrusted extrapolations, which
+        # are indistinguishable from a genuinely static object in the data.
+        # static_keypoint_weight > 0 re-enables down-weighted supervision on them.
+        step_weight = target_active + (1.0 - target_active) * self.config.static_keypoint_weight
+        kp_num = (chamfer * step_weight).sum(dim=(1, 2))  # [B]
+        kp_den = step_weight.sum(dim=(1, 2))  # [B]
+        bce = F.binary_cross_entropy_with_logits(pred_active_logits, target_active, reduction="none")
+        active_cost = bce.mean(dim=(1, 2))
 
         # Weighted mean over all supervised (step, object) cells across the batch, so
         # samples whose window has no active object dilute nothing.
