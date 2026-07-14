@@ -47,6 +47,29 @@ import wandb
 from gr00t.model.gr00t_n1d7.keypoint_viz import combine_gt_pred, render_keypoint_overlay
 
 
+def _action_loss_by_group(
+    action_loss: torch.Tensor, action_mask: torch.Tensor, is_human: torch.Tensor
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Masked-mean (numerator, denominator) pairs for the action loss, split by
+    human/robot origin. Logging only — human+robot co-training shares one
+    embodiment tag (so embodiment_id can't distinguish them), and this never
+    affects the actual loss used for backprop.
+
+    Returns (num, den) rather than a ready ratio so callers can either take an
+    immediate ratio (per-step train logging) or accumulate across many batches
+    before dividing once (eval, to avoid averaging per-batch means unevenly).
+    Only includes a group if it has any real (masked) contribution in this batch.
+    """
+    is_human = is_human.to(action_loss.dtype).view(-1, 1, 1)
+    weights = {"human": is_human, "robot": 1.0 - is_human}
+    result = {}
+    for name, w in weights.items():
+        den = (action_mask * w).sum()
+        if den > 0:
+            result[name] = ((action_loss * action_mask * w).sum(), den)
+    return result
+
+
 class _TqdmDataLoader:
     """Wraps a DataLoader to show a tqdm progress bar during iteration."""
 
@@ -294,6 +317,20 @@ class Gr00tTrainer(Trainer):
 
         total_loss = torch.tensor(0.0, device=self.args.device)
         total_steps = torch.tensor(0, device=self.args.device)
+        # Pure flow-matching loss, separate from total_loss (which is action +
+        # keypoint combined once the aux head is on).
+        total_action_loss = torch.tensor(0.0, device=self.args.device)
+        # Per-group (human/robot) action-loss breakdown, accumulated as (num, den)
+        # pairs across the whole eval pass and divided once at the end (rather than
+        # averaging per-batch means unevenly) — logging only, see _action_loss_by_group.
+        group_action_num = {
+            "human": torch.tensor(0.0, device=self.args.device),
+            "robot": torch.tensor(0.0, device=self.args.device),
+        }
+        group_action_den = {
+            "human": torch.tensor(0.0, device=self.args.device),
+            "robot": torch.tensor(0.0, device=self.args.device),
+        }
 
         # Object-centric keypoint aux head: aggregate its losses separately and, on
         # rank 0, reservoir-sample a handful of GT-vs-predicted keypoint overlay
@@ -315,15 +352,31 @@ class Gr00tTrainer(Trainer):
             total_loss += loss.detach()
             total_steps += 1
 
+            if isinstance(outputs, dict) and "action_loss_scalar" in outputs:
+                total_action_loss += outputs["action_loss_scalar"].detach()
+
             if enable_keypoint_head and isinstance(outputs, dict) and "keypoint_loss" in outputs:
                 total_kp_loss += outputs["keypoint_loss"].detach()
                 total_kp_active_loss += outputs["keypoint_active_loss"].detach()
 
             # The collator wraps the real batch as {"inputs": {...actual keys...}} so
             # that model(**inputs) resolves to forward(self, inputs=<batch>) — unwrap
-            # here too, otherwise "viz_image"/"keypoint_target" are never found (they
-            # live one level down, not on the outer dict compute_loss receives).
+            # here too, otherwise "viz_image"/"keypoint_target"/"is_human" are never
+            # found (they live one level down, not on the outer dict compute_loss
+            # receives).
             batch = inputs["inputs"]
+
+            if isinstance(outputs, dict) and "action_loss" in outputs and "action_mask" in outputs:
+                is_human_batch = batch.get("is_human")
+                if is_human_batch is not None:
+                    groups = _action_loss_by_group(
+                        outputs["action_loss"].detach(),
+                        outputs["action_mask"].detach(),
+                        is_human_batch,
+                    )
+                    for name, (num, den) in groups.items():
+                        group_action_num[name] += num
+                        group_action_den[name] += den
 
             has_keypoint_batch = batch.get("has_keypoint")
             if (
@@ -349,6 +402,10 @@ class Gr00tTrainer(Trainer):
         if self.args.world_size > 1:
             dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
             dist.all_reduce(total_steps, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_action_loss, op=dist.ReduceOp.SUM)
+            for name in ("human", "robot"):
+                dist.all_reduce(group_action_num[name], op=dist.ReduceOp.SUM)
+                dist.all_reduce(group_action_den[name], op=dist.ReduceOp.SUM)
             if enable_keypoint_head:
                 dist.all_reduce(total_kp_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(total_kp_active_loss, op=dist.ReduceOp.SUM)
@@ -357,7 +414,15 @@ class Gr00tTrainer(Trainer):
         mean_loss = (total_loss / denom).item()
         num_samples = int(total_steps.item()) * self.args.per_device_eval_batch_size
 
-        metrics = {f"{metric_key_prefix}_loss": mean_loss}
+        metrics = {
+            f"{metric_key_prefix}_loss": mean_loss,
+            f"{metric_key_prefix}_action_loss": (total_action_loss / denom).item(),
+        }
+        for name in ("human", "robot"):
+            if group_action_den[name] > 0:
+                metrics[f"{metric_key_prefix}_action_loss_{name}"] = (
+                    group_action_num[name] / group_action_den[name]
+                ).item()
         if enable_keypoint_head:
             metrics[f"{metric_key_prefix}_keypoint_loss"] = (total_kp_loss / denom).item()
             metrics[f"{metric_key_prefix}_keypoint_active_loss"] = (
@@ -530,25 +595,41 @@ class Gr00tTrainer(Trainer):
         self.loss = loss
 
         # --------------------------------------------------------------
-        # Auxiliary keypoint loss logging (object-centric keypoint head)
+        # Loss component logging: pure action (flow-matching) loss, separate from
+        # "loss" (which is action + keypoint combined once the aux head is on), plus
+        # the keypoint aux head's own components.
         # --------------------------------------------------------------
         if (
             self.state.global_step % self.args.logging_steps == 0
             and model.training
             and isinstance(outputs, dict)
-            and "keypoint_loss" in outputs
         ):
-            keypoint_loss = self._nested_gather(outputs["keypoint_loss"].detach()).mean().item()
-            keypoint_active_loss = (
-                self._nested_gather(outputs["keypoint_active_loss"].detach()).mean().item()
-            )
-            if self.args.local_rank in (-1, 0):
-                self.log(
-                    {
-                        "keypoint_loss": keypoint_loss,
-                        "keypoint_active_loss": keypoint_active_loss,
-                    }
+            log_values = {}
+            if "action_loss_scalar" in outputs:
+                log_values["action_loss"] = (
+                    self._nested_gather(outputs["action_loss_scalar"].detach()).mean().item()
                 )
+            # Per-group (human/robot) action-loss breakdown — co-training runs share
+            # one embodiment tag, so this can't come from embodiment_id.
+            if "action_loss" in outputs and "action_mask" in outputs:
+                is_human_batch = inputs["inputs"].get("is_human")
+                if is_human_batch is not None:
+                    groups = _action_loss_by_group(
+                        outputs["action_loss"].detach(),
+                        outputs["action_mask"].detach(),
+                        is_human_batch,
+                    )
+                    for name, (num, den) in groups.items():
+                        log_values[f"action_loss_{name}"] = (num / den).item()
+            if "keypoint_loss" in outputs:
+                log_values["keypoint_loss"] = (
+                    self._nested_gather(outputs["keypoint_loss"].detach()).mean().item()
+                )
+                log_values["keypoint_active_loss"] = (
+                    self._nested_gather(outputs["keypoint_active_loss"].detach()).mean().item()
+                )
+            if log_values and self.args.local_rank in (-1, 0):
+                self.log(log_values)
 
         # --------------------------------------------------------------
         # Accuracy calculation

@@ -249,6 +249,10 @@ class ShardedSingleStepDataset(ShardedDataset):
                 overlap_episode_io=self.overlap_episode_io,
             )
 
+        # Human vs robot origin, for per-group action-loss logging only (visualization
+        # concern, see LeRobotEpisodeLoader.detect_is_human); never fed to the model.
+        self.is_human = self.episode_loader.detect_is_human()
+
         # Create balanced shards from episode timesteps
         self.shard_dataset()
 
@@ -358,6 +362,9 @@ class ShardedSingleStepDataset(ShardedDataset):
         # Per-dataset loss weight (stacked to (B,) by the collator, consumed by the
         # action head as a per-sample loss multiplier).
         datapoint["loss_weight"] = np.float32(self.loss_weight)
+        # Human vs robot origin, for per-group action-loss logging only (see
+        # LeRobotEpisodeLoader.detect_is_human); never fed to the model.
+        datapoint["is_human"] = np.float32(self.is_human)
         if self.collect_viz_images:
             datapoint["viz_image"] = self._render_viz_thumbnail(vla_step_data)
         return datapoint

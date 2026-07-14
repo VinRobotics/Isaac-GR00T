@@ -393,6 +393,10 @@ class Gr00tN1d7ActionHead(nn.Module):
         outputs = {
             "loss": loss,
             "action_loss": action_loss,
+            # Scalar pure flow-matching loss, kept separate from "loss" so it can be
+            # logged on its own once the keypoint aux terms are folded in below
+            # (outputs["loss"] then becomes action + keypoint combined).
+            "action_loss_scalar": loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,

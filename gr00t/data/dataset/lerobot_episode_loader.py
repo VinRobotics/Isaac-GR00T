@@ -628,6 +628,24 @@ class LeRobotEpisodeLoader:
             stats["relative_action"] = self.stats["relative_action"]
         return stats
 
+    def detect_is_human(self) -> bool:
+        """Best-effort human-vs-robot detection for this dataset.
+
+        Visualization/logging only (e.g. splitting action loss by group in
+        human+robot co-training runs where both share one embodiment tag and
+        embodiment_id can't tell them apart) — never affects training. Mirrors
+        gr00t/experiment/launch_finetune.py's dataset_frame_stats(): prefers the
+        observation.is_human column (first row of episode 0), falling back to
+        "human" appearing in info.json's robot_type.
+        """
+        if "observation.is_human" in self.feature_config:
+            first_path = self.dataset_path / self.data_path_pattern.format(
+                episode_chunk=0, episode_index=0
+            )
+            column = pd.read_parquet(first_path, columns=["observation.is_human"])
+            return bool(np.asarray(column.iloc[0, 0]).reshape(-1)[0] > 0.5)
+        return "human" in str(self.info_meta.get("robot_type", "")).lower()
+
     def create_language_from_meta(
         self, episode_meta: dict, nframes: int, lang_key: str
     ) -> list[str]:
