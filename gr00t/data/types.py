@@ -63,6 +63,9 @@ class VLAStepData:
     ]  # state_name -> np.ndarray (dim,) for single step or (horizon, dim) for trajectory
     actions: dict[str, np.ndarray]  # action_name -> np.ndarray (horizon, dim) for action chunk
     masks: dict[str, list[np.ndarray]] | None = None  # view_name -> list[np.ndarray] (H, W)
+    keypoints: dict[str, np.ndarray] | None = (
+        None  # keypoint group -> np.ndarray (horizon, dim); aux supervision targets only
+    )
     text: str | None = None  # Optional task description or instruction
     embodiment: EmbodimentTag = (
         EmbodimentTag.NEW_EMBODIMENT

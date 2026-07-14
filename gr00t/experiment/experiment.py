@@ -248,6 +248,7 @@ def run(config: Config):
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         multiprocessing_context=config.data.multiprocessing_context,
+        keypoint_viz_max_images=config.training.keypoint_viz_max_images,
     )
 
     trainer.add_callback(

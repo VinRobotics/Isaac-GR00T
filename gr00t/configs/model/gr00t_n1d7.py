@@ -121,6 +121,20 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Multi-embodiment parameters
     max_num_embodiments: int = 32
 
+    # Object-centric keypoint auxiliary head (human/robot co-training).
+    # Predicts future object keypoint trajectories from the action-token hidden states;
+    # pure readout: never feeds back into the action path.
+    enable_keypoint_head: bool = False
+    keypoint_horizon: int = 16
+    max_keypoint_objects: int = 2
+    keypoints_per_object: int = 20
+    keypoint_loss_weight: float = 1.0
+    keypoint_active_loss_weight: float = 0.1
+    # Loss weight for keypoints of objects whose active flag is 0. Default 0 = hard
+    # mask: inactive slots may hold zeros / frozen / extrapolated tracker output, so
+    # only active (trusted) steps are supervised.
+    static_keypoint_weight: float = 0.0
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():

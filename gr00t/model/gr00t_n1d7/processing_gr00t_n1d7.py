@@ -157,6 +157,9 @@ class Gr00tN1d7Processor(BaseProcessor):
         max_state_dim: int = 29,
         max_action_dim: int = 29,
         max_action_horizon: int = 40,
+        keypoint_horizon: int = 16,
+        max_keypoint_objects: int = 2,
+        keypoints_per_object: int = 20,
         apply_sincos_state_encoding: bool = False,
         use_albumentations: bool = False,
         extra_augmentation_config: dict | None = None,
@@ -205,6 +208,16 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.max_state_dim = max_state_dim
         self.max_action_dim = max_action_dim
         self.max_action_horizon = max_action_horizon
+
+        # Object keypoint aux targets: if any registered embodiment has a "keypoint"
+        # modality, every sample must emit the keypoint keys (zero-filled when the
+        # sample's dataset has none) so mixed batches collate.
+        self.keypoint_horizon = keypoint_horizon
+        self.max_keypoint_objects = max_keypoint_objects
+        self.keypoints_per_object = keypoints_per_object
+        self._any_keypoint_modality = any(
+            "keypoint" in cfgs for cfgs in self.modality_configs.values()
+        )
 
         # Save image processing settings
         self.image_crop_size = image_crop_size
@@ -598,6 +611,35 @@ class Gr00tN1d7Processor(BaseProcessor):
         if action_mask is not None:
             transformed_inputs["action_mask"] = action_mask
         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
+
+        # Object keypoint aux targets (already [-1, 1] image-normalized by the loader).
+        # Emitted for every sample once any embodiment has a "keypoint" modality, so
+        # samples with and without keypoints collate into the same batch.
+        if self._any_keypoint_modality:
+            kp_dim = self.max_keypoint_objects * self.keypoints_per_object * 2
+            keypoint_target = torch.zeros(self.keypoint_horizon, kp_dim)
+            keypoint_active_target = torch.zeros(self.keypoint_horizon, self.max_keypoint_objects)
+            has_keypoint = 0.0
+            keypoints = content.keypoints or {}
+            coord_keys = [k for k in keypoints if "active" not in k]
+            active_keys = [k for k in keypoints if "active" in k]
+            if coord_keys and active_keys:
+                kp = torch.from_numpy(
+                    np.asarray(keypoints[coord_keys[0]], dtype=np.float32)
+                ).reshape(-1, kp_dim)
+                active = torch.from_numpy(
+                    np.asarray(keypoints[active_keys[0]], dtype=np.float32)
+                ).reshape(-1, self.max_keypoint_objects)
+                assert kp.shape[0] == self.keypoint_horizon, (
+                    f"Expected {self.keypoint_horizon} keypoint steps, got {kp.shape[0]}"
+                )
+                keypoint_target = kp
+                keypoint_active_target = active
+                has_keypoint = 1.0
+            transformed_inputs["keypoint_target"] = keypoint_target
+            transformed_inputs["keypoint_active_target"] = keypoint_active_target
+            transformed_inputs["has_keypoint"] = np.float32(has_keypoint)
+
         return transformed_inputs
 
     def _get_vlm_inputs(
@@ -681,6 +723,10 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "max_state_dim": self.max_state_dim,
                 "max_action_dim": self.max_action_dim,
                 "max_action_horizon": self.max_action_horizon,
+                # Object keypoint aux target dimensions
+                "keypoint_horizon": self.keypoint_horizon,
+                "max_keypoint_objects": self.max_keypoint_objects,
+                "keypoints_per_object": self.keypoints_per_object,
                 # StateActionProcessor settings
                 "use_percentiles": self.use_percentiles,
                 "use_mean_std": self.use_mean_std,

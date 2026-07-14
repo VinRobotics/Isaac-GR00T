@@ -87,6 +87,14 @@ motiontrans_config = {
         delta_indices=[0],
         modality_keys=["annotation.human.task_description"],
     ),
+    # Object keypoints: aux supervision targets for the object-centric keypoint head
+    # (2 objects x 20 tracked points + per-object active flags). Same 16-step window as
+    # the action chunk, so keypoint step t aligns with action token t. Never fed to the
+    # model as input; datasets without a "keypoint" section in modality.json skip this.
+    "keypoint": ModalityConfig(
+        delta_indices=list(range(0, 16)),
+        modality_keys=["keypoint_2d", "keypoint_active"],
+    ),
 }
 
 register_modality_config(motiontrans_config, embodiment_tag=EmbodimentTag.NEW_EMBODIMENT)

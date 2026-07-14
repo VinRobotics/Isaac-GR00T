@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import pandas as pd
 
@@ -26,6 +27,12 @@ from gr00t.data.state_action.camera_projection import apply_camera_projection
 from gr00t.data.types import EmbodimentTag, MessageType, ModalityConfig, VLAStepData
 
 from .lerobot_episode_loader import LeRobotEpisodeLoader
+
+# Fixed canonical size for the keypoint debug/eval visualization thumbnail (see
+# get_datapoint). Keypoint targets are normalized to [-1, 1] independently per axis,
+# so any resize (even non-uniform) keeps the mapping from normalized coords back to
+# pixel coords exact - a fixed size just keeps thumbnails stackable in a batch.
+KEYPOINT_VIZ_IMAGE_SIZE = 224
 
 
 def extract_step_data(
@@ -67,7 +74,7 @@ def extract_step_data(
                 raise KeyError(
                     f"{modality}.{key} not found in episode data, available keys: {episode_data.columns}"
                 )
-            if modality in ["state", "action"]:
+            if modality in ["state", "action", "keypoint"]:
                 # Stack arrays for numerical modalities
                 # step_data[modality][key] = np.vstack(
                 #     [
@@ -111,11 +118,14 @@ def extract_step_data(
     assert len(language_data) == 1, f"Expected 1 language, got {len(language_data)}"
     text = language_data[list(language_data.keys())[0]][0]
 
+    keypoint_data = step_data.get("keypoint", {})
+
     vla_step_data = VLAStepData(
         images=video_data,
         masks=mask_data if mask_data else None,
         states=state_data,
         actions=action_data,
+        keypoints=keypoint_data if keypoint_data else None,
         text=text,
         embodiment=embodiment_tag,
     )
@@ -187,8 +197,22 @@ class ShardedSingleStepDataset(ShardedDataset):
         num_ffmpeg_threads: int = 0,
         overlap_episode_io: bool = False,
         loss_weight: float = 1.0,
+        episode_loader: "LeRobotEpisodeLoader | None" = None,
+        episode_indices: list[int] | None = None,
+        collect_viz_images: bool = False,
     ):
-        """Initialize single-step dataset with sharding configuration."""
+        """Initialize single-step dataset with sharding configuration.
+
+        Args:
+            episode_loader: Reuse an already-constructed loader instead of parsing the
+                dataset's metadata again. Used by DatasetFactory to build a train/val
+                episode split for the same dataset_path without loading meta twice.
+            episode_indices: Restrict sharding to this subset of episode indices (used
+                for the train/val split above). None = use every episode.
+            collect_viz_images: Attach a small current-frame thumbnail to every
+                datapoint (see get_datapoint), for keypoint debug/eval visualization.
+                Only meant for (small) validation splits, never for training data.
+        """
         super().__init__(dataset_path)
         self.embodiment_tag = embodiment_tag
         self.modality_configs = modality_configs
@@ -205,20 +229,25 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.video_decode_workers = max(1, video_decode_workers)
         self.num_ffmpeg_threads = num_ffmpeg_threads
         self.overlap_episode_io = overlap_episode_io
+        self.episode_indices = episode_indices
+        self.collect_viz_images = collect_viz_images
         self.processor = None
         self.rng = np.random.default_rng(seed)
         action_delta_indices = modality_configs["action"].delta_indices
         self.action_horizon = max(action_delta_indices) - min(action_delta_indices) + 1
 
-        self.episode_loader = LeRobotEpisodeLoader(
-            dataset_path=dataset_path,
-            modality_configs=modality_configs,
-            video_backend=video_backend,
-            video_backend_kwargs=video_backend_kwargs,
-            video_decode_workers=self.video_decode_workers,
-            num_ffmpeg_threads=self.num_ffmpeg_threads,
-            overlap_episode_io=self.overlap_episode_io,
-        )
+        if episode_loader is not None:
+            self.episode_loader = episode_loader
+        else:
+            self.episode_loader = LeRobotEpisodeLoader(
+                dataset_path=dataset_path,
+                modality_configs=modality_configs,
+                video_backend=video_backend,
+                video_backend_kwargs=video_backend_kwargs,
+                video_decode_workers=self.video_decode_workers,
+                num_ffmpeg_threads=self.num_ffmpeg_threads,
+                overlap_episode_io=self.overlap_episode_io,
+            )
 
         # Create balanced shards from episode timesteps
         self.shard_dataset()
@@ -238,7 +267,11 @@ class ShardedSingleStepDataset(ShardedDataset):
         - Diversity within shards (mix of episodes and timesteps)
         - Reproducible sharding based on seed
         """
-        shuffled_episode_indices = self.rng.permutation(len(self.episode_loader.episode_lengths))
+        if self.episode_indices is not None:
+            episode_pool = np.asarray(self.episode_indices)
+        else:
+            episode_pool = np.arange(len(self.episode_loader.episode_lengths))
+        shuffled_episode_indices = self.rng.permutation(episode_pool)
         num_splits = int(1 / self.episode_sampling_rate)
 
         assert len(shuffled_episode_indices) > 0, (
@@ -325,7 +358,29 @@ class ShardedSingleStepDataset(ShardedDataset):
         # Per-dataset loss weight (stacked to (B,) by the collator, consumed by the
         # action head as a per-sample loss multiplier).
         datapoint["loss_weight"] = np.float32(self.loss_weight)
+        if self.collect_viz_images:
+            datapoint["viz_image"] = self._render_viz_thumbnail(vla_step_data)
         return datapoint
+
+    def _render_viz_thumbnail(self, vla_step_data: VLAStepData) -> np.ndarray:
+        """Downsize the current-timestep camera frame to a fixed canonical size.
+
+        Independent of the VLM's own image transform (crop/resize): keypoint targets
+        are normalized to [-1, 1] against the original frame, so overlaying them onto
+        this thumbnail later just rescales each axis independently, which stays exact
+        under any resize. Only called for validation splits with collect_viz_images=True.
+        """
+        video_config = self.modality_configs.get("video")
+        delta_indices = video_config.delta_indices if video_config else [0]
+        current_offset = delta_indices.index(0) if 0 in delta_indices else 0
+        first_key = next(iter(vla_step_data.images))
+        frame = np.asarray(vla_step_data.images[first_key])[current_offset]
+        thumb = cv2.resize(
+            frame,
+            (KEYPOINT_VIZ_IMAGE_SIZE, KEYPOINT_VIZ_IMAGE_SIZE),
+            interpolation=cv2.INTER_AREA,
+        )
+        return thumb.astype(np.uint8)
 
     def get_shard_length(self, idx: int) -> int:
         """Get the number of timesteps in a specific shard."""

@@ -41,6 +41,9 @@ from tqdm import tqdm
 from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput, EvalPrediction
+import wandb
+
+from gr00t.model.gr00t_n1d7.keypoint_viz import render_keypoint_overlay
 
 
 class _TqdmDataLoader:
@@ -224,6 +227,7 @@ class Gr00tTrainer(Trainer):
         """
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
+        self.keypoint_viz_max_images = kwargs.pop("keypoint_viz_max_images", 50)
         super().__init__(
             *args,
             **kwargs,
@@ -285,29 +289,121 @@ class Gr00tTrainer(Trainer):
     ):
         model = self._wrap_model(self.model, training=False, dataloader=dataloader)
         model.eval()
+        unwrapped_model = model.module if hasattr(model, "module") else model
 
         total_loss = torch.tensor(0.0, device=self.args.device)
         total_steps = torch.tensor(0, device=self.args.device)
 
+        # Object-centric keypoint aux head: aggregate its losses separately and, on
+        # rank 0, collect a handful of GT-vs-predicted keypoint overlay images to log
+        # to W&B (debug/eval only — action_pred is unaffected either way).
+        enable_keypoint_head = getattr(self.model.config, "enable_keypoint_head", False)
+        total_kp_loss = torch.tensor(0.0, device=self.args.device)
+        total_kp_active_loss = torch.tensor(0.0, device=self.args.device)
+        viz_images_gt: list = []
+        viz_images_pred: list = []
+
         for inputs in tqdm(dataloader, desc=description):
             inputs = self._prepare_inputs(inputs)
             with torch.inference_mode():
-                loss, _ = self.compute_loss(model, inputs, return_outputs=True)
+                loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
             total_loss += loss.detach()
             total_steps += 1
+
+            if enable_keypoint_head and isinstance(outputs, dict) and "keypoint_loss" in outputs:
+                total_kp_loss += outputs["keypoint_loss"].detach()
+                total_kp_active_loss += outputs["keypoint_active_loss"].detach()
+
+            if (
+                enable_keypoint_head
+                and self.args.local_rank in (-1, 0)
+                and "viz_image" in inputs
+                and len(viz_images_gt) < self.keypoint_viz_max_images
+            ):
+                with torch.inference_mode():
+                    # Real (non-teacher-forced) rollout: strip "action" so get_action
+                    # runs standard flow-matching denoising instead of RTC inpainting.
+                    viz_inputs = {k: v for k, v in inputs.items() if k != "action"}
+                    action_out = unwrapped_model.get_action(
+                        viz_inputs, options={"return_keypoints": True}
+                    )
+                self._collect_keypoint_viz(inputs, action_out, viz_images_gt, viz_images_pred)
 
         # Single reduce at the end — avoids per-step all_gather deadlock
         # when ranks process different numbers of batches.
         if self.args.world_size > 1:
             dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
             dist.all_reduce(total_steps, op=dist.ReduceOp.SUM)
+            if enable_keypoint_head:
+                dist.all_reduce(total_kp_loss, op=dist.ReduceOp.SUM)
+                dist.all_reduce(total_kp_active_loss, op=dist.ReduceOp.SUM)
 
-        mean_loss = (total_loss / total_steps.clamp(min=1)).item()
+        denom = total_steps.clamp(min=1)
+        mean_loss = (total_loss / denom).item()
         num_samples = int(total_steps.item()) * self.args.per_device_eval_batch_size
 
         metrics = {f"{metric_key_prefix}_loss": mean_loss}
+        if enable_keypoint_head:
+            metrics[f"{metric_key_prefix}_keypoint_loss"] = (total_kp_loss / denom).item()
+            metrics[f"{metric_key_prefix}_keypoint_active_loss"] = (
+                total_kp_active_loss / denom
+            ).item()
+
+        if self.args.local_rank in (-1, 0) and viz_images_gt:
+            self._log_keypoint_viz(viz_images_gt, viz_images_pred, metric_key_prefix)
+
         return EvalLoopOutput(
             predictions=None, label_ids=None, metrics=metrics, num_samples=num_samples
+        )
+
+    def _collect_keypoint_viz(
+        self,
+        inputs: dict,
+        action_out: dict,
+        gt_images: list,
+        pred_images: list,
+    ) -> None:
+        """Render up to keypoint_viz_max_images GT-vs-predicted overlay pairs.
+
+        `inputs` carries the GT keypoint targets and the raw-frame thumbnail (see
+        ShardedSingleStepDataset._render_viz_thumbnail); `action_out` carries the
+        model's own flow-matching rollout keypoint prediction (get_action with
+        options={"return_keypoints": True}).
+        """
+        has_keypoint = inputs.get("has_keypoint")
+        viz_image = inputs.get("viz_image")
+        if has_keypoint is None or viz_image is None or "keypoint_pred" not in action_out:
+            return
+
+        kp_target = inputs["keypoint_target"]
+        active_target = inputs["keypoint_active_target"]
+        kp_pred = action_out["keypoint_pred"]
+        active_pred = action_out["keypoint_active_pred"]
+        num_objects = kp_pred.shape[2]
+
+        for i in range(viz_image.shape[0]):
+            if len(gt_images) >= self.keypoint_viz_max_images:
+                break
+            if has_keypoint[i].item() < 0.5:
+                continue
+            img = viz_image[i].detach().cpu().numpy()
+            gt_kp = kp_target[i].detach().float().cpu().numpy().reshape(-1, num_objects, 20, 2)
+            gt_active = active_target[i].detach().float().cpu().numpy()
+            pred_kp = kp_pred[i].detach().float().cpu().numpy()
+            pred_active = active_pred[i].detach().float().cpu().numpy()
+
+            gt_images.append(render_keypoint_overlay(img, gt_kp, gt_active))
+            pred_images.append(render_keypoint_overlay(img, pred_kp, pred_active))
+
+    def _log_keypoint_viz(self, gt_images: list, pred_images: list, metric_key_prefix: str) -> None:
+        if wandb.run is None:
+            return
+        wandb.log(
+            {
+                f"{metric_key_prefix}/keypoint_gt": [wandb.Image(img) for img in gt_images],
+                f"{metric_key_prefix}/keypoint_pred": [wandb.Image(img) for img in pred_images],
+            },
+            step=self.state.global_step,
         )
 
     def get_eval_dataloader(self, eval_dataset=None):
@@ -393,6 +489,27 @@ class Gr00tTrainer(Trainer):
 
         # Record last loss for testing purposes.
         self.loss = loss
+
+        # --------------------------------------------------------------
+        # Auxiliary keypoint loss logging (object-centric keypoint head)
+        # --------------------------------------------------------------
+        if (
+            self.state.global_step % self.args.logging_steps == 0
+            and model.training
+            and isinstance(outputs, dict)
+            and "keypoint_loss" in outputs
+        ):
+            keypoint_loss = self._nested_gather(outputs["keypoint_loss"].detach()).mean().item()
+            keypoint_active_loss = (
+                self._nested_gather(outputs["keypoint_active_loss"].detach()).mean().item()
+            )
+            if self.args.local_rank in (-1, 0):
+                self.log(
+                    {
+                        "keypoint_loss": keypoint_loss,
+                        "keypoint_active_loss": keypoint_active_loss,
+                    }
+                )
 
         # --------------------------------------------------------------
         # Accuracy calculation

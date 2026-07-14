@@ -91,6 +91,99 @@ Alternatively you can skip loss weighting and put the imbalance in `--dataset-mi
 0.3 0.7` instead — same expected gradient ratio, but via sampling frequency (robot
 samples seen more often) rather than per-sample scaling.
 
+## 3. Object-centric keypoint auxiliary head (optional)
+
+Object motion is embodiment-invariant: the same cup slides the same way whether a human
+hand or a robot gripper pushes it. The keypoint head exploits that to close the
+human↔robot gap — the **same hidden states that decode actions** are additionally asked
+to predict the future motion of tracked object keypoints, through a decoder **shared
+across embodiments**. A human sample and a robot sample producing the same object motion
+are thereby pulled toward the same action-token representation.
+
+### Data format
+
+Produced by the keypoint-tracking pipeline (SAM3 + CoTracker3, see
+`convert_keypoint_tracking.py` in the lerobot-convert repo) as two extra per-frame
+columns:
+
+| Column | Shape | Meaning |
+|---|---|---|
+| `observation.keypoint_2d` | `[40, 2]` | pixel `(x, y)` of 20 tracked points × 2 object slots (slot `s` owns rows `[s*20:(s+1)*20)`) |
+| `observation.keypoint_active` | `[2]` | 1.0 when the slot's windowed motion exceeds the gate **and** is near a SAM3 mask sighting |
+
+`scripts/convert_motiontrans_to_gr00t.py` emits the `keypoint` section of
+`meta/modality.json` automatically when the columns exist. The loader normalizes pixel
+coordinates to `[-1, 1]` with the camera resolution from `meta/info.json` (datasets
+tracked with `--normalize` are detected by scale and not re-normalized). Datasets
+*without* keypoint columns co-train unchanged: their samples carry `has_keypoint = 0`
+and contribute nothing to the auxiliary loss.
+
+### Architecture
+
+- **Attach point:** the DiT sequence is `[state_token, action_tokens(40)]`; keypoints
+  for step `t` are decoded from the *same* hidden state that decodes action `t` (first
+  16 action tokens), via a plain shared MLP (`keypoint_decoder`, not embodiment-indexed).
+- **Pure readout:** the model receives **no keypoint input** anywhere — no extra tokens,
+  no attention changes. Disabling or removing the head leaves the action path
+  bit-identical, and deployment needs no online tracker.
+- **Output:** per step `t ∈ [0, 16)`: absolute keypoint positions `[2, 20, 2]` in
+  normalized image coordinates plus one active logit per object slot.
+
+### Loss (set matching)
+
+Without keypoint input the model cannot know which points the tracker sampled nor which
+object sits in which slot, so the loss is invariant to both:
+
+1. **Point level:** symmetric Chamfer distance (Huber-based) between the 20 predicted
+   and 20 ground-truth points, per object per step.
+2. **Slot level:** cost is computed for both object-slot permutations and the minimum is
+   taken, one consistent assignment per 16-step chunk.
+3. **Active mask:** keypoint loss only counts steps with `active == 1` — inactive slots
+   can hold zeros (absent object), frozen positions (before the first mask sighting) or
+   untrusted extrapolations, indistinguishable from a truly static object
+   (`--static-keypoint-weight > 0` re-enables down-weighted supervision on them). The
+   active-flag BCE is supervised on every step.
+
+`total = flow_matching + keypoint_loss_weight · chamfer + keypoint_active_loss_weight · bce`,
+with the per-sample α co-training `loss_weight` applied the same way as in the action
+loss. `keypoint_loss` / `keypoint_active_loss` are logged separately by the trainer.
+
+### Usage
+
+```bash
+bash examples/finetune.sh ... \
+    -- --enable-keypoint-head \
+       --keypoint-loss-weight 1.0 \
+       --keypoint-active-loss-weight 0.1
+```
+
+Loading a base checkpoint without the head works: the missing `keypoint_decoder`
+tensors are freshly initialized (logged, not an error).
+
+For debugging/eval, decode the predicted keypoint trajectories on any rollout (no extra
+input needed) and overlay them on the frame to check whether the model understands
+object motion:
+
+```python
+out = policy.model.action_head.get_action(backbone_output, action_input,
+                                          options={"return_keypoints": True})
+out["keypoint_pred"]         # [B, 16, 2, 20, 2], [-1, 1] normalized image coords
+out["keypoint_active_pred"]  # [B, 16, 2] probabilities
+```
+
+### Caveats
+
+- Training random crop (`crop_fraction=0.95`) shifts the visible frame up to ~5% against
+  the target coordinate frame; acceptable for representation shaping. If needed later,
+  thread the keypoints through the albumentations call (`FractionalRandomCrop` already
+  implements `apply_to_keypoints`).
+- Predictions are point *sets* per step (Chamfer has no point identity across time);
+  fine for checking object-motion understanding, use a one-shot Hungarian match if
+  smooth per-point trajectories are needed.
+- Config knobs live in `Gr00tN1d7Config`: `enable_keypoint_head`, `keypoint_horizon=16`,
+  `max_keypoint_objects=2`, `keypoints_per_object=20`, `keypoint_loss_weight`,
+  `keypoint_active_loss_weight`, `static_keypoint_weight`.
+
 ## Notes & caveats
 
 - **`observation.state` min/max stats** are computed from the *unprojected* values

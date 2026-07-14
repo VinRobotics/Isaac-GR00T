@@ -89,6 +89,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
+                enable_keypoint_head=self.config.model.enable_keypoint_head,
+                keypoint_loss_weight=self.config.model.keypoint_loss_weight,
+                keypoint_active_loss_weight=self.config.model.keypoint_active_loss_weight,
+                static_keypoint_weight=self.config.model.static_keypoint_weight,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,
@@ -103,9 +107,18 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     )
                 logging.info("mask_token not in checkpoint - initialized")
 
+            keypoint_missing = [k for k in missing_keys if "keypoint_decoder" in k]
+            if keypoint_missing:
+                logging.info(
+                    "keypoint_decoder not in checkpoint - keeping fresh initialization "
+                    f"({len(keypoint_missing)} tensors)"
+                )
+
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            other_missing = [k for k in missing_keys if "mask_token" not in k]
+            other_missing = [
+                k for k in missing_keys if "mask_token" not in k and "keypoint_decoder" not in k
+            ]
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
@@ -165,6 +178,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 formalize_language=self.model_config.formalize_language,
                 apply_sincos_state_encoding=self.model_config.apply_sincos_state_encoding,
                 max_action_horizon=self.model_config.action_horizon,
+                keypoint_horizon=self.model_config.keypoint_horizon,
+                max_keypoint_objects=self.model_config.max_keypoint_objects,
+                keypoints_per_object=self.model_config.keypoints_per_object,
                 use_albumentations=self.model_config.use_albumentations_transforms,
                 extra_augmentation_config=self.model_config.extra_augmentation_config,
                 shortest_image_edge=self.model_config.shortest_image_edge,
@@ -195,6 +211,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 max_action_dim=self.model_config.max_action_dim,
                 apply_sincos_state_encoding=self.model_config.apply_sincos_state_encoding,
                 max_action_horizon=self.model_config.action_horizon,
+                keypoint_horizon=self.model_config.keypoint_horizon,
+                max_keypoint_objects=self.model_config.max_keypoint_objects,
+                keypoints_per_object=self.model_config.keypoints_per_object,
                 use_albumentations=self.model_config.use_albumentations_transforms,
                 extra_augmentation_config=self.model_config.extra_augmentation_config,
                 shortest_image_edge=self.model_config.shortest_image_edge,

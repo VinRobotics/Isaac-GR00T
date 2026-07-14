@@ -57,7 +57,7 @@ LEROBOT_MODALITY_FILENAME = "modality.json"
 LEROBOT_STATS_FILE_NAME = "stats.json"
 LEROBOT_RELATIVE_STATS_FILE_NAME = "relative_stats.json"
 
-ALLOWED_MODALITIES = ["video", "stereo", "state", "action", "language", "mask"]
+ALLOWED_MODALITIES = ["video", "stereo", "state", "action", "language", "mask", "keypoint"]
 DEFAULT_COLUMN_NAMES = {
     "state": "observation.state",
     "action": "action",
@@ -254,6 +254,16 @@ class LeRobotEpisodeLoader:
             modality_configs = {
                 k: v for k, v in modality_configs.items() if k in ALLOWED_MODALITIES
             }
+        # The keypoint modality is optional per dataset: embodiment configs are shared
+        # across co-trained datasets (e.g. MotionTrans human + robot), some of which may
+        # not carry keypoint annotations. Those datasets simply drop the modality here;
+        # the processor then zero-fills the targets with has_keypoint=0.
+        if "keypoint" in modality_configs and "keypoint" not in self.modality_meta:
+            logging.info(
+                f"Dataset {self.dataset_path} has no 'keypoint' section in modality.json; "
+                "skipping keypoint loading for this dataset."
+            )
+            modality_configs = {k: v for k, v in modality_configs.items() if k != "keypoint"}
         for modality in modality_configs:
             if modality == "language":
                 # Language modality has special constraints.
@@ -415,7 +425,48 @@ class LeRobotEpisodeLoader:
             for joint_group in joint_groups_df.columns:
                 loaded_df[f"{modality_type}.{joint_group}"] = joint_groups_df[joint_group]
 
+        # Object keypoint groups (object-centric aux supervision for human/robot
+        # co-training). Columns may be nested (e.g. [40, 2]); flatten per frame.
+        # Coordinate groups are stored as pixel (x, y) pairs and normalized to
+        # [-1, 1] with the camera resolution so targets are comparable across
+        # datasets; groups with "active" in the name are 0/1 flags, passed through.
+        if "keypoint" in self.modality_configs:
+            width, height = self._get_video_resolution()
+            keypoint_meta = self.modality_meta.get("keypoint", {})
+            for key in self.modality_configs["keypoint"].modality_keys:
+                assert key in keypoint_meta, (
+                    f"Keypoint group '{key}' not found in modality.json, "
+                    f"available: {list(keypoint_meta.keys())}"
+                )
+                original_key = keypoint_meta[key].get("original_key", key)
+                values = original_df[original_key].to_numpy()
+                data = np.stack(
+                    [np.asarray(v.tolist(), dtype=np.float32).reshape(-1) for v in values]
+                )
+                start_idx = keypoint_meta[key].get("start", 0)
+                end_idx = keypoint_meta[key].get("end", data.shape[1])
+                data = data[:, start_idx:end_idx]
+                if "active" not in key:
+                    coords = data.reshape(len(data), -1, 2)
+                    # Tracker output is pixel (x, y); datasets converted with
+                    # --normalize already store [0, 1] coords, detected by scale.
+                    if coords.max() > 1.5:
+                        coords[..., 0] = coords[..., 0] / width
+                        coords[..., 1] = coords[..., 1] / height
+                    coords = coords * 2.0 - 1.0
+                    data = coords.reshape(len(data), -1)
+                loaded_df[f"keypoint.{key}"] = list(data)
+
         return loaded_df
+
+    def _get_video_resolution(self) -> tuple[int, int]:
+        """Return (width, height) of the dataset's primary camera from info.json."""
+        video_meta = self.modality_meta.get("video", {})
+        assert video_meta, "Video modality metadata is required to normalize keypoints"
+        first_key = next(iter(video_meta.keys()))
+        original_key = video_meta[first_key].get("original_key", first_key)
+        shape = self.feature_config[original_key]["shape"]  # [H, W, C]
+        return int(shape[1]), int(shape[0])
 
     def _load_video_data(self, episode_index: int, indices: np.ndarray) -> dict[str, np.ndarray]:
         """

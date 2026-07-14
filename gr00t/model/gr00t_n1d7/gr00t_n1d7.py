@@ -81,6 +81,24 @@ class Gr00tN1d7ActionHead(nn.Module):
             output_dim=self.action_dim,
         )
 
+        # Object-centric keypoint auxiliary head: pure readout from the action-token
+        # hidden states, so the action path is unchanged whether or not it runs.
+        # Shared across embodiments (no CategorySpecificMLP): object motion is
+        # embodiment-invariant, which is what lets this head pull human and robot
+        # action-token representations into a common space.
+        if config.enable_keypoint_head:
+            assert config.keypoint_horizon <= config.action_horizon, (
+                "keypoint_horizon must not exceed action_horizon"
+            )
+            keypoint_output_dim = config.max_keypoint_objects * (
+                config.keypoints_per_object * 2 + 1
+            )
+            self.keypoint_decoder = nn.Sequential(
+                nn.Linear(self.hidden_size, self.hidden_size),
+                nn.ReLU(),
+                nn.Linear(self.hidden_size, keypoint_output_dim),
+            )
+
         self.vlln = (
             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
         )
@@ -116,6 +134,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.state_encoder.requires_grad_(False)
             self.action_encoder.requires_grad_(False)
             self.action_decoder.requires_grad_(False)
+            if self.config.enable_keypoint_head:
+                self.keypoint_decoder.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
         if not tune_diffusion_model:
@@ -145,6 +165,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.state_encoder.eval()
                 self.action_encoder.eval()
                 self.action_decoder.eval()
+                if self.config.enable_keypoint_head:
+                    self.keypoint_decoder.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
             if not self.tune_diffusion_model:
@@ -157,6 +179,113 @@ class Gr00tN1d7ActionHead(nn.Module):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         sample = (1 - sample) * self.config.noise_s
         return sample
+
+    def _decode_keypoints(self, model_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decode future object keypoints from the DiT output hidden states.
+
+        The DiT sequence is [state_token(1), action_tokens(action_horizon)]; keypoints
+        for step t are decoded from the same hidden state that decodes action t.
+
+        Returns:
+            pred_kp: [B, keypoint_horizon, num_objects, kp_per_object, 2] in [-1, 1]
+                image-normalized coordinates.
+            pred_active_logits: [B, keypoint_horizon, num_objects]
+        """
+        num_objects = self.config.max_keypoint_objects
+        kp_per_object = self.config.keypoints_per_object
+        h = model_output[:, 1 : 1 + self.config.keypoint_horizon]
+        out = self.keypoint_decoder(h)
+        batch_size, horizon = out.shape[:2]
+        out = out.view(batch_size, horizon, num_objects, kp_per_object * 2 + 1)
+        pred_kp = out[..., : kp_per_object * 2].reshape(
+            batch_size, horizon, num_objects, kp_per_object, 2
+        )
+        pred_active_logits = out[..., -1]
+        return pred_kp, pred_active_logits
+
+    def _compute_keypoint_loss(
+        self, model_output: torch.Tensor, action_input: BatchFeature
+    ) -> dict[str, torch.Tensor]:
+        """Set-matching auxiliary loss on future object keypoints.
+
+        The model receives no keypoint input, so it cannot know which points the
+        tracker sampled on an object nor which object occupies which slot. The loss
+        is therefore invariant to both: symmetric Chamfer distance (Huber-based)
+        within each object, and a min over the two object-slot permutations chosen
+        consistently for the whole chunk.
+        """
+        pred_kp, pred_active_logits = self._decode_keypoints(model_output)
+        target_kp = action_input.get("keypoint_target", None)
+        target_active = action_input.get("keypoint_active_target", None)
+        if target_kp is None or target_active is None:
+            # Keep the decoder in the graph (DDP runs with find_unused_parameters=False)
+            # while contributing nothing to the loss.
+            zero = pred_kp.sum() * 0.0 + pred_active_logits.sum() * 0.0
+            return {"keypoint_loss": zero, "keypoint_active_loss": zero}
+
+        num_objects = self.config.max_keypoint_objects
+        kp_per_object = self.config.keypoints_per_object
+        batch_size, horizon = pred_kp.shape[:2]
+        target_kp = target_kp.view(batch_size, horizon, num_objects, kp_per_object, 2).to(
+            pred_kp.dtype
+        )
+        target_active = target_active.view(batch_size, horizon, num_objects).to(pred_kp.dtype)
+
+        has_keypoint = action_input.get("has_keypoint", None)
+        if has_keypoint is None:
+            sample_weight = torch.ones(batch_size, device=pred_kp.device, dtype=pred_kp.dtype)
+        else:
+            sample_weight = has_keypoint.to(pred_kp.dtype).view(batch_size)
+        loss_weight = action_input.get("loss_weight", None)
+        if loss_weight is not None:
+            sample_weight = sample_weight * loss_weight.to(pred_kp.dtype).view(batch_size)
+
+        def matched_costs(t_kp, t_active):
+            # Pairwise Huber cost between predicted and target point sets per object.
+            diff = pred_kp.unsqueeze(-2) - t_kp.unsqueeze(-3)  # [B,H,O,K,K,2]
+            cost = F.smooth_l1_loss(
+                diff, torch.zeros_like(diff), beta=0.1, reduction="none"
+            ).sum(-1)
+            chamfer = 0.5 * (
+                cost.min(dim=-1).values.mean(dim=-1) + cost.min(dim=-2).values.mean(dim=-1)
+            )  # [B,H,O]
+            # Supervise keypoints only where the tracker is confident. active == 1
+            # requires real motion within reach of a SAM3 mask sighting; inactive slots
+            # may instead hold zeros (slot never appeared / failed episode), frozen
+            # positions (before the first mask frame) or untrusted extrapolations, which
+            # are indistinguishable from a genuinely static object in the data.
+            # static_keypoint_weight > 0 re-enables down-weighted supervision on them.
+            step_weight = t_active + (1.0 - t_active) * self.config.static_keypoint_weight
+            kp_num = (chamfer * step_weight).sum(dim=(1, 2))  # [B]
+            kp_den = step_weight.sum(dim=(1, 2))  # [B]
+            bce = F.binary_cross_entropy_with_logits(
+                pred_active_logits, t_active, reduction="none"
+            )
+            return kp_num, kp_den, bce.mean(dim=(1, 2))
+
+        kp_num_id, kp_den, active_identity = matched_costs(target_kp, target_active)
+        # kp_den is permutation-invariant (sum over objects), so only computed once.
+        kp_num_sw, _, active_swapped = matched_costs(target_kp.flip(2), target_active.flip(2))
+        cost_identity = (
+            self.config.keypoint_loss_weight * kp_num_id / (kp_den + 1e-6)
+            + self.config.keypoint_active_loss_weight * active_identity
+        )
+        cost_swapped = (
+            self.config.keypoint_loss_weight * kp_num_sw / (kp_den + 1e-6)
+            + self.config.keypoint_active_loss_weight * active_swapped
+        )
+        use_swap = (cost_swapped < cost_identity).to(pred_kp.dtype)
+        kp_num = kp_num_id * (1.0 - use_swap) + kp_num_sw * use_swap
+        active_cost = active_identity * (1.0 - use_swap) + active_swapped * use_swap
+
+        # Weighted mean over all supervised (step, object) cells across the batch, so
+        # samples whose window has no active object dilute nothing.
+        return {
+            "keypoint_loss": (kp_num * sample_weight).sum()
+            / ((kp_den * sample_weight).sum() + 1e-6),
+            "keypoint_active_loss": (active_cost * sample_weight).sum()
+            / (sample_weight.sum() + 1e-6),
+        }
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
@@ -272,13 +401,26 @@ class Gr00tN1d7ActionHead(nn.Module):
         else:
             loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
-        return {
+        outputs = {
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
+
+        if self.config.enable_keypoint_head:
+            keypoint_losses = self._compute_keypoint_loss(model_output, action_input)
+            outputs["keypoint_loss"] = keypoint_losses["keypoint_loss"]
+            outputs["keypoint_active_loss"] = keypoint_losses["keypoint_active_loss"]
+            outputs["loss"] = (
+                loss
+                + self.config.keypoint_loss_weight * keypoint_losses["keypoint_loss"]
+                + self.config.keypoint_active_loss_weight
+                * keypoint_losses["keypoint_active_loss"]
+            )
+
+        return outputs
 
     def _encode_features(
         self, backbone_output: BatchFeature, action_input: BatchFeature
@@ -429,13 +571,25 @@ class Gr00tN1d7ActionHead(nn.Module):
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength
 
-        return BatchFeature(
-            data={
-                "action_pred": actions,
-                "backbone_features": vl_embeds,
-                "state_features": state_features,
-            }
-        )
+        output_data = {
+            "action_pred": actions,
+            "backbone_features": vl_embeds,
+            "state_features": state_features,
+        }
+
+        # Debug/eval readout: decode predicted future object keypoints from the final
+        # denoising step. Needs no extra input and does not affect action_pred.
+        if (
+            self.config.enable_keypoint_head
+            and options is not None
+            and options.get("return_keypoints", False)
+        ):
+            pred_kp, pred_active_logits = self._decode_keypoints(model_output)
+            # Coordinates are in [-1, 1] normalized by the original image (W, H).
+            output_data["keypoint_pred"] = pred_kp
+            output_data["keypoint_active_pred"] = torch.sigmoid(pred_active_logits)
+
+        return BatchFeature(data=output_data)
 
     @torch.no_grad()
     def get_action(

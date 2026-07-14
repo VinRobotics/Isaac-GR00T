@@ -214,12 +214,34 @@ def build_modality_json(features: dict, layout: Layout) -> dict:
         if features[key].get("dtype") == "video" or key.startswith("observation.images."):
             video_groups[key.removeprefix("observation.images.")] = {"original_key": key}
 
-    return {
+    modality = {
         "state": state_groups,
         "action": action_groups,
         "video": video_groups,
         "annotation": {"human.task_description": {"original_key": "task_index"}},
     }
+
+    # Object keypoint tracks (aux supervision for the object-centric keypoint head).
+    # keypoint_2d is stored nested [num_objects * points, 2]; start/end index the
+    # per-frame flattened layout.
+    if "observation.keypoint_2d" in features:
+        kp_shape = features["observation.keypoint_2d"]["shape"]  # e.g. [40, 2]
+        kp_dim = int(np.prod(kp_shape))
+        active_dim = int(np.prod(features["observation.keypoint_active"]["shape"]))
+        modality["keypoint"] = {
+            "keypoint_2d": {
+                "start": 0,
+                "end": kp_dim,
+                "original_key": "observation.keypoint_2d",
+            },
+            "keypoint_active": {
+                "start": 0,
+                "end": active_dim,
+                "original_key": "observation.keypoint_active",
+            },
+        }
+
+    return modality
 
 
 def _link_or_copy(src: Path, dst: Path, copy: bool) -> None:

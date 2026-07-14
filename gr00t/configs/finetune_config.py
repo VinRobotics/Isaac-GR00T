@@ -86,6 +86,26 @@ class FinetuneConfig:
     Dropout probability applied to state inputs for regularization during training.
     """
 
+    # --- Object-centric keypoint auxiliary head ---
+    enable_keypoint_head: bool = False
+    """If True, add the object-centric keypoint auxiliary head: the action-token hidden
+    states additionally predict 16-step future object keypoint trajectories + active
+    flags (set-matching loss). Pure readout — the action path and inference are
+    unchanged. Requires datasets with a "keypoint" section in meta/modality.json
+    (datasets without one contribute has_keypoint=0 samples)."""
+
+    keypoint_loss_weight: float = 1.0
+    """Weight of the keypoint Chamfer loss in the total loss."""
+
+    keypoint_active_loss_weight: float = 0.1
+    """Weight of the keypoint active-flag BCE loss in the total loss."""
+
+    static_keypoint_weight: float = 0.0
+    """Relative loss weight for keypoints of objects whose active flag is 0. Default 0
+    uses the active flags as a hard loss mask: inactive slots can hold zeros (absent
+    object), frozen or extrapolated tracker positions, so only active steps — where the
+    tracker saw real motion near a mask sighting — are supervised."""
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""
@@ -195,5 +215,19 @@ class FinetuneConfig:
     validation_path: list[str] | None = None
     """Optional path(s) to validation dataset(s). When set, eval loss is computed every eval_steps."""
 
+    eval_set_split_ratio: float | None = None
+    """Alternative to validation_path: automatically hold out this fraction of each
+    training dataset's episodes as a validation split (e.g. 0.05 = 5%), rather than
+    requiring separate validation dataset(s). Mutually exclusive with validation_path
+    (validation_path takes precedence if both are set). Held-out episodes are excluded
+    from training."""
+
     eval_steps: int = 2000
-    """Number of training steps between validation loss evaluations (only used when validation_path is set)."""
+    """Number of training steps between validation loss evaluations (only used when
+    validation_path or eval_set_split_ratio is set)."""
+
+    # --- Object-centric keypoint debug/eval visualization ---
+    keypoint_viz_max_images: int = 50
+    """Max number of GT-vs-predicted keypoint overlay image pairs to log to W&B per
+    evaluation run (only meaningful when enable_keypoint_head=True and eval is
+    configured via validation_path or eval_set_split_ratio)."""

@@ -71,10 +71,17 @@ class TrainingConfig:
     # Evaluation
     eval_strategy: str = "no"  # no, steps, epoch
     eval_steps: int = 500
+    # Auto-split each training dataset's episodes into train/val by this fraction
+    # (e.g. 0.05 = 5%) instead of requiring separate validation dataset paths. Only
+    # takes effect when eval_strategy != "no" and no explicit val_dataset_paths is set.
     eval_set_split_ratio: float = 0.1
     eval_batch_size: int = 64
     save_best_eval_metric_name: str = ""
     save_best_eval_metric_greater_is_better: bool = True
+
+    # Max GT-vs-predicted keypoint overlay image pairs logged to W&B per eval run
+    # (object-centric keypoint auxiliary head only).
+    keypoint_viz_max_images: int = 50
 
     # DeepSpeed (default)
     deepspeed_stage: int = 2  # ZeRO stage (1, 2, or 3)

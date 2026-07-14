@@ -175,6 +175,12 @@ if __name__ == "__main__":
     else:
         config.model.extra_augmentation_config = None
 
+    # Object-centric keypoint auxiliary head
+    config.model.enable_keypoint_head = ft_config.enable_keypoint_head
+    config.model.keypoint_loss_weight = ft_config.keypoint_loss_weight
+    config.model.keypoint_active_loss_weight = ft_config.keypoint_active_loss_weight
+    config.model.static_keypoint_weight = ft_config.static_keypoint_weight
+
     config.model.load_bf16 = False
     config.model.reproject_vision = False
     config.model.model_name = "nvidia/Cosmos-Reason2-2B"
@@ -213,5 +219,11 @@ if __name__ == "__main__":
         config.data.val_dataset_paths = ft_config.validation_path
         config.training.eval_strategy = "steps"
         config.training.eval_steps = ft_config.eval_steps
+    elif ft_config.eval_set_split_ratio is not None:
+        config.training.eval_set_split_ratio = ft_config.eval_set_split_ratio
+        config.training.eval_strategy = "steps"
+        config.training.eval_steps = ft_config.eval_steps
+
+    config.training.keypoint_viz_max_images = ft_config.keypoint_viz_max_images
 
     run(config)
