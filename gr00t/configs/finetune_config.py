@@ -129,8 +129,16 @@ class FinetuneConfig:
     pipeline's assign_slots convention does fix) as extra channels of the same
     per-step action vector, jointly noised/denoised by flow matching — plain masked
     MSE, well posed here because object-slot identity is fixed so there's no
-    arbitrary-index ambiguity for the loss to be invariant to. Widens
-    action_encoder's input dim and action_decoder's output dim by
+    arbitrary-index ambiguity for the loss to be invariant to. NOT a pure readout
+    like "default"/"tokens": action_encoder mixes every input channel into one
+    embedding via a dense matrix, so the (noised) active-flag values genuinely
+    influence the shared representation that also produces the real action
+    prediction during training, same as this codebase's existing effort/
+    torque-aware channels. What's preserved is the guarantee that actually
+    matters: no real keypoint data is ever fed as input at train or inference
+    time (the Euler rollout's active channels always start from pure noise, same
+    as the real action channels), and action_pred never leaks the extra channels.
+    Widens action_encoder's input dim and action_decoder's output dim by
     max_keypoint_objects, so — like "tokens" — it must match between saving and
     loading a checkpoint (start_from_checkpoint loading splices the checkpoint's
     narrower action head into the widened tensors' leading slice automatically)."""

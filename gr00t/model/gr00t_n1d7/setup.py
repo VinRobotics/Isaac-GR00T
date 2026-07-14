@@ -160,13 +160,22 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             # the checkpoint's own (narrower) action head into the new tensors'
             # leading slice, so only the new trailing active-flag channels are
             # actually fresh-initialized.
+            # mismatched_keys entries vary by transformers version: either plain key
+            # name strings, or (key, checkpoint_shape, model_shape) tuples. Handle
+            # both rather than assuming one, since indexing a plain string with [0]
+            # silently returns its first *character* instead of raising.
+            def _mismatched_key_name(entry):
+                return entry[0] if isinstance(entry, (tuple, list)) else entry
+
             action_dim_param_names = (
                 "action_encoder.W1.W",
                 "action_decoder.layer2.W",
                 "action_decoder.layer2.b",
             )
             action_dim_mismatched = [
-                m for m in mismatched_keys if any(name in m[0] for name in action_dim_param_names)
+                m
+                for m in mismatched_keys
+                if any(name in _mismatched_key_name(m) for name in action_dim_param_names)
             ]
             share_dim_active = (
                 self.config.model.enable_keypoint_head

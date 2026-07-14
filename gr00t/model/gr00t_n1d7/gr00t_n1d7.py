@@ -94,14 +94,25 @@ class Gr00tN1d7ActionHead(nn.Module):
             output_dim=self.action_dim,
         )
 
-        # Object-centric keypoint auxiliary head: a pure readout in all three
-        # modes — action_pred is unaffected whether or not it runs ("tokens" mode
-        # enforces this via a one-directional self-attention mask, see
-        # _keypoint_self_attention_mask; "share_dim" mode enforces this by slicing
-        # back down to real_action_dim wherever action_pred is produced). Position
-        # decoding (Chamfer) is shared across embodiments (no CategorySpecificMLP)
-        # in every mode: object motion is embodiment-invariant, which is what lets
-        # this head pull human and robot representations into a common space.
+        # Object-centric keypoint auxiliary head. "default"/"tokens" are a pure
+        # readout — action_pred is architecturally provably unaffected by whether
+        # the head runs ("tokens" mode via a one-directional self-attention mask,
+        # see _keypoint_self_attention_mask). "share_dim" is NOT a pure readout:
+        # active-flag channels are extra input columns to action_encoder, whose
+        # W1 is a dense matrix mixing every input channel into one embedding, so
+        # active-flag values (even noised) genuinely influence the shared
+        # representation that also produces the real action prediction during
+        # training — exactly like this codebase's existing effort/torque-aware
+        # channels, which have the same property. The guarantee "share_dim" DOES
+        # keep is the one that actually matters operationally: no real keypoint
+        # DATA is ever fed as input, at train or inference time (the Euler
+        # rollout's active channels start from pure noise exactly like the real
+        # action channels — see get_action_with_features), and action_pred's
+        # returned tensor never leaks the extra channels (sliced to
+        # real_action_dim). Position decoding (Chamfer) is shared across
+        # embodiments (no CategorySpecificMLP) in every mode: object motion is
+        # embodiment-invariant, which is what lets this head pull human and robot
+        # representations into a common space.
         if config.enable_keypoint_head:
             if keypoint_mode in ("default", "share_dim"):
                 assert config.keypoint_horizon <= config.action_horizon, (

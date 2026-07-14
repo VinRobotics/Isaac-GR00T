@@ -121,9 +121,10 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Multi-embodiment parameters
     max_num_embodiments: int = 32
 
-    # Object-centric keypoint auxiliary head (human/robot co-training).
-    # Predicts future object keypoint trajectories; pure readout in all three
-    # modes below: action_pred never depends on whether this head runs.
+    # Object-centric keypoint auxiliary head (human/robot co-training). Predicts
+    # future object keypoint trajectories. "default"/"tokens" are a pure readout:
+    # action_pred never depends on whether the head runs. "share_dim" is NOT —
+    # see its note below.
     enable_keypoint_head: bool = False
     keypoint_horizon: int = 16
     max_keypoint_objects: int = 2
@@ -160,7 +161,17 @@ class Gr00tN1d7Config(PretrainedConfig):
     #     widening (see expand_action_dimension in embodiment_conditioned_mlp.py).
     #     Well posed as plain per-channel MSE because object-slot identity (unlike
     #     point identity) *is* fixed, so there's no arbitrary-index ambiguity for
-    #     the loss to be invariant to. Widens action_encoder's input dim and
+    #     the loss to be invariant to. NOT a pure readout, unlike "default"/
+    #     "tokens": action_encoder's W1 is a dense matrix mixing every input
+    #     channel into one embedding, so the (noised) active-flag values genuinely
+    #     influence the shared representation that also produces the real action
+    #     prediction during training — same property this codebase's existing
+    #     effort/torque-aware channels already have. What's preserved is the
+    #     guarantee that actually matters: no real keypoint data is ever fed as
+    #     input at train or inference time (the Euler rollout's active channels
+    #     always start from pure noise, exactly like the real action channels),
+    #     and the returned action_pred never leaks the extra channels (sliced to
+    #     real_action_dim). Widens action_encoder's input dim and
     #     action_decoder's output dim by max_keypoint_objects, so — like "tokens" —
     #     it must match between saving and loading a checkpoint; see the
     #     action_encoder.W1.W / action_decoder.layer2.{W,b} splice in
