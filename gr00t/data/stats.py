@@ -65,14 +65,15 @@ def calculate_dataset_statistics(
     """
     # Dataset statistics
     all_low_dim_data_list = []
-    # Collect all the data
+    # Collect all the data. Only load the requested columns: concatenating full
+    # dataframes (including unrelated nested/2D columns like object keypoint tracks)
+    # can hit pandas dtype-metadata bugs on concat, and is unnecessary I/O regardless.
     for parquet_path in tqdm(
         sorted(list(parquet_paths)),
         desc="Collecting all parquet files...",
     ):
         # Load the parquet file
-        parquet_data = pd.read_parquet(parquet_path)
-        parquet_data = parquet_data
+        parquet_data = pd.read_parquet(parquet_path, columns=features)
         all_low_dim_data_list.append(parquet_data)
     all_low_dim_data = pd.concat(all_low_dim_data_list, axis=0)
     # Compute dataset statistics
@@ -119,8 +120,16 @@ def generate_stats(dataset_path: Path | str):
     with open(dataset_path / LE_ROBOT_INFO_FILENAME, "r") as f:
         le_features = json.load(f)["features"]
     for feature in le_features:
-        if "float" in le_features[feature]["dtype"]:
-            lowdim_features.append(feature)
+        if "float" not in le_features[feature]["dtype"]:
+            continue
+        # Only flat (dim,) vectors are compatible with the per-dimension mean/std/
+        # min/max below. Nested/2D+ features (e.g. observation.keypoint_2d, [40, 2])
+        # are skipped: they aren't reducible the same way, and don't need stats.json
+        # anyway (the keypoint aux head normalizes directly from image resolution).
+        shape = le_features[feature].get("shape", [])
+        if len(shape) != 1:
+            continue
+        lowdim_features.append(feature)
     if check_stats_validity(dataset_path, lowdim_features):
         return
 
