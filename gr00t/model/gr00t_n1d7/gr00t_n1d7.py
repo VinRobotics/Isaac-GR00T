@@ -59,9 +59,22 @@ class Gr00tN1d7ActionHead(nn.Module):
                 cross_attention_dim=config.backbone_embedding_dim,
             )
             logger.info("Using DiT for diffusion model")
+        # real_action_dim is the actual robot/human action width; action_dim is the
+        # width of the flow-matching vector actually run through the encoder/DiT/
+        # decoder, which "share_dim" mode widens with extra channels (see below).
+        self.real_action_dim = config.max_action_dim
         self.action_dim = config.max_action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
+
+        keypoint_mode = config.keypoint_head_mode if config.enable_keypoint_head else None
+        if keypoint_mode == "share_dim":
+            # Fold the active-flag channels into the action vector itself (see
+            # Gr00tN1d7Config.keypoint_head_mode docstring) — widens both ends of
+            # the flow-matching action space, the same expand_action_dimension
+            # mechanism this codebase already has for other per-embodiment
+            # action-space widening (embodiment_conditioned_mlp.py).
+            self.action_dim = config.max_action_dim + config.max_keypoint_objects
 
         self.state_encoder = CategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -81,18 +94,20 @@ class Gr00tN1d7ActionHead(nn.Module):
             output_dim=self.action_dim,
         )
 
-        # Object-centric keypoint auxiliary head: a pure readout in both modes —
-        # action_pred is unaffected whether or not it runs (dedicated-tokens mode
+        # Object-centric keypoint auxiliary head: a pure readout in all three
+        # modes — action_pred is unaffected whether or not it runs ("tokens" mode
         # enforces this via a one-directional self-attention mask, see
-        # _keypoint_self_attention_mask). Shared across embodiments (no
-        # CategorySpecificMLP): object motion is embodiment-invariant, which is
-        # what lets this head pull human and robot representations into a common
-        # space (either the shared action-token hidden states, or — in dedicated-
-        # tokens mode — the query embeddings below).
+        # _keypoint_self_attention_mask; "share_dim" mode enforces this by slicing
+        # back down to real_action_dim wherever action_pred is produced). Position
+        # decoding (Chamfer) is shared across embodiments (no CategorySpecificMLP)
+        # in every mode: object motion is embodiment-invariant, which is what lets
+        # this head pull human and robot representations into a common space.
         if config.enable_keypoint_head:
-            if not config.keypoint_use_dedicated_tokens:
+            if keypoint_mode in ("default", "share_dim"):
                 assert config.keypoint_horizon <= config.action_horizon, (
-                    "keypoint_horizon must not exceed action_horizon in shared mode"
+                    "keypoint_horizon must not exceed action_horizon when keypoint "
+                    "positions are decoded from action-token hidden states "
+                    "(keypoint_head_mode='default' or 'share_dim')"
                 )
             # Fully independent trunks (no shared parameters) for position
             # regression vs active classification. A single shared trunk was tried
@@ -103,19 +118,22 @@ class Gr00tN1d7ActionHead(nn.Module):
             # was increasingly dominated by the frequent, high-weight position
             # signal — active-flag accuracy degraded over training even as
             # position accuracy kept improving. Separate trunks remove that
-            # interference regardless of loss-weight tuning.
+            # interference regardless of loss-weight tuning. ("share_dim" mode
+            # sidesteps this differently: active isn't decoded by a trunk at all,
+            # it's a flow-matching regression target folded into action_decoder.)
             position_output_dim = config.max_keypoint_objects * config.keypoints_per_object * 2
             self.keypoint_position_decoder = nn.Sequential(
                 nn.Linear(self.hidden_size, self.hidden_size),
                 nn.ReLU(),
                 nn.Linear(self.hidden_size, position_output_dim),
             )
-            self.keypoint_active_decoder = nn.Sequential(
-                nn.Linear(self.hidden_size, self.hidden_size),
-                nn.ReLU(),
-                nn.Linear(self.hidden_size, config.max_keypoint_objects),
-            )
-            if config.keypoint_use_dedicated_tokens:
+            if keypoint_mode != "share_dim":
+                self.keypoint_active_decoder = nn.Sequential(
+                    nn.Linear(self.hidden_size, self.hidden_size),
+                    nn.ReLU(),
+                    nn.Linear(self.hidden_size, config.max_keypoint_objects),
+                )
+            if keypoint_mode == "tokens":
                 # DETR-style learned query tokens: one per future keypoint step,
                 # appended to the DiT sequence so the keypoint task gets its own
                 # self-/cross-attention capacity instead of reusing the action
@@ -162,8 +180,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.action_decoder.requires_grad_(False)
             if self.config.enable_keypoint_head:
                 self.keypoint_position_decoder.requires_grad_(False)
-                self.keypoint_active_decoder.requires_grad_(False)
-                if self.config.keypoint_use_dedicated_tokens:
+                if self.config.keypoint_head_mode != "share_dim":
+                    self.keypoint_active_decoder.requires_grad_(False)
+                if self.config.keypoint_head_mode == "tokens":
                     self.keypoint_query_embedding.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
@@ -196,8 +215,9 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.action_decoder.eval()
                 if self.config.enable_keypoint_head:
                     self.keypoint_position_decoder.eval()
-                    self.keypoint_active_decoder.eval()
-                    if self.config.keypoint_use_dedicated_tokens:
+                    if self.config.keypoint_head_mode != "share_dim":
+                        self.keypoint_active_decoder.eval()
+                    if self.config.keypoint_head_mode == "tokens":
                         self.keypoint_query_embedding.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
@@ -212,42 +232,50 @@ class Gr00tN1d7ActionHead(nn.Module):
         sample = (1 - sample) * self.config.noise_s
         return sample
 
-    def _decode_keypoints(self, model_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Decode future object keypoints from the DiT output hidden states.
+    def _keypoint_hidden_states(self, model_output: torch.Tensor) -> torch.Tensor:
+        """Slice the hidden states keypoint position/active decoding reads from.
 
-        Shared mode (default): the DiT sequence is [state(1), action(action_horizon)];
+        "default"/"share_dim": the DiT sequence is [state(1), action(action_horizon)];
         keypoints for step t are decoded from the same hidden state that decodes
-        action t. Dedicated-tokens mode: the sequence additionally has
-        keypoint_horizon dedicated query tokens appended at the end
+        action t. "tokens": the sequence additionally has keypoint_horizon dedicated
+        query tokens appended at the end
         ([state(1), action(action_horizon), keypoint_queries(keypoint_horizon)]),
         decoded from those instead.
+        """
+        if self.config.keypoint_head_mode == "tokens":
+            return model_output[:, -self.config.keypoint_horizon :]
+        return model_output[:, 1 : 1 + self.config.keypoint_horizon]
 
-        Returns:
-            pred_kp: [B, keypoint_horizon, num_objects, kp_per_object, 2] in [-1, 1]
-                image-normalized coordinates.
-            pred_active_logits: [B, keypoint_horizon, num_objects]
+    def _decode_keypoint_positions(self, model_output: torch.Tensor) -> torch.Tensor:
+        """Decode future object keypoint positions. Used by all three modes —
+        even "share_dim" (which folds active flags into the action vector) keeps
+        position on this same Chamfer-matched decoder, since point index has no
+        fixed convention across episodes (unlike object-slot index).
+
+        Returns pred_kp: [B, keypoint_horizon, num_objects, kp_per_object, 2] in
+        [-1, 1] image-normalized coordinates.
         """
         num_objects = self.config.max_keypoint_objects
         kp_per_object = self.config.keypoints_per_object
-        if self.config.keypoint_use_dedicated_tokens:
-            h = model_output[:, -self.config.keypoint_horizon :]
-        else:
-            h = model_output[:, 1 : 1 + self.config.keypoint_horizon]
+        h = self._keypoint_hidden_states(model_output)
         batch_size, horizon = h.shape[:2]
-        # Independent trunks (see __init__): position regression and active
-        # classification never share parameters, only the input hidden states.
-        pred_kp = self.keypoint_position_decoder(h).view(
+        return self.keypoint_position_decoder(h).view(
             batch_size, horizon, num_objects, kp_per_object, 2
         )
-        pred_active_logits = self.keypoint_active_decoder(h).view(
-            batch_size, horizon, num_objects
+
+    def _decode_keypoint_active_logits(self, model_output: torch.Tensor) -> torch.Tensor:
+        """Decode future active-flag logits via the dedicated BCE trunk. Only used
+        in "default"/"tokens" mode — "share_dim" mode predicts active flags as
+        flow-matching regression targets instead (see forward())."""
+        h = self._keypoint_hidden_states(model_output)
+        return self.keypoint_active_decoder(h).view(
+            h.shape[0], h.shape[1], self.config.max_keypoint_objects
         )
-        return pred_kp, pred_active_logits
 
     def _append_keypoint_queries(self, sa_embs: torch.Tensor) -> torch.Tensor:
-        """Append dedicated keypoint query tokens to the DiT sequence (dedicated-
-        tokens mode only; no-op in shared mode or when the head is disabled)."""
-        if not (self.config.enable_keypoint_head and self.config.keypoint_use_dedicated_tokens):
+        """Append dedicated keypoint query tokens to the DiT sequence ("tokens"
+        mode only; no-op otherwise or when the head is disabled)."""
+        if not (self.config.enable_keypoint_head and self.config.keypoint_head_mode == "tokens"):
             return sa_embs
         batch_size = sa_embs.shape[0]
         queries = self.keypoint_query_embedding.weight.unsqueeze(0).expand(batch_size, -1, -1)
@@ -256,18 +284,20 @@ class Gr00tN1d7ActionHead(nn.Module):
     def _keypoint_self_attention_mask(
         self, batch_size: int, protected_len: int, device: torch.device
     ) -> Optional[torch.Tensor]:
-        """One-directional self-attention mask for dedicated-tokens mode.
+        """One-directional self-attention mask for "tokens" mode.
 
         State+action tokens (indices [0, protected_len)) may only attend to each
         other, never to the keypoint query tokens appended after them — this keeps
         action_pred a pure readout, unaffected by the keypoint head, exactly like
-        shared mode. Keypoint query tokens may attend to everything (state, action,
-        and each other), so keypoint prediction stays conditioned on the specific
-        action being generated — the coupling the aux loss is meant to exploit.
+        "default" mode. Keypoint query tokens may attend to everything (state,
+        action, and each other), so keypoint prediction stays conditioned on the
+        specific action being generated — the coupling the aux loss is meant to
+        exploit.
 
-        Returns None in shared mode / when the head is disabled (no masking needed).
+        Returns None outside "tokens" mode / when the head is disabled (no masking
+        needed).
         """
-        if not (self.config.enable_keypoint_head and self.config.keypoint_use_dedicated_tokens):
+        if not (self.config.enable_keypoint_head and self.config.keypoint_head_mode == "tokens"):
             return None
         total_len = protected_len + self.config.keypoint_horizon
         # True = allowed to attend (same boolean convention as image_mask /
@@ -276,10 +306,28 @@ class Gr00tN1d7ActionHead(nn.Module):
         mask[:protected_len, protected_len:] = False
         return mask.unsqueeze(0).expand(batch_size, -1, -1)
 
-    def _compute_keypoint_loss(
-        self, model_output: torch.Tensor, action_input: BatchFeature
-    ) -> dict[str, torch.Tensor]:
-        """Object-keypoint auxiliary loss on future object keypoints.
+    def _keypoint_sample_weight(
+        self, batch_size: int, action_input: BatchFeature, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """has_keypoint (per-sample keypoint availability) x loss_weight (e.g.
+        MotionTrans alpha co-training re-weighting) — shared by every keypoint
+        loss term regardless of mode."""
+        has_keypoint = action_input.get("has_keypoint", None)
+        if has_keypoint is None:
+            sample_weight = torch.ones(batch_size, device=device, dtype=dtype)
+        else:
+            sample_weight = has_keypoint.to(dtype=dtype, device=device).view(batch_size)
+        loss_weight = action_input.get("loss_weight", None)
+        if loss_weight is not None:
+            sample_weight = sample_weight * loss_weight.to(dtype=dtype, device=device).view(
+                batch_size
+            )
+        return sample_weight
+
+    def _compute_keypoint_position_loss(
+        self, pred_kp: torch.Tensor, action_input: BatchFeature
+    ) -> torch.Tensor:
+        """Chamfer position loss on future object keypoints, used by all three modes.
 
         Object slot identity is fixed, not permutation-matched: the data pipeline
         assigns slot 0/1 by (first-appearance frame, then left-to-right centroid x)
@@ -296,14 +344,12 @@ class Gr00tN1d7ActionHead(nn.Module):
         assigns no fixed meaning to point index k), so that stays permutation-
         invariant via symmetric Chamfer distance (Huber-based).
         """
-        pred_kp, pred_active_logits = self._decode_keypoints(model_output)
         target_kp = action_input.get("keypoint_target", None)
         target_active = action_input.get("keypoint_active_target", None)
         if target_kp is None or target_active is None:
             # Keep the decoder in the graph (DDP runs with find_unused_parameters=False)
             # while contributing nothing to the loss.
-            zero = pred_kp.sum() * 0.0 + pred_active_logits.sum() * 0.0
-            return {"keypoint_loss": zero, "keypoint_active_loss": zero}
+            return pred_kp.sum() * 0.0
 
         num_objects = self.config.max_keypoint_objects
         kp_per_object = self.config.keypoints_per_object
@@ -312,15 +358,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             pred_kp.dtype
         )
         target_active = target_active.view(batch_size, horizon, num_objects).to(pred_kp.dtype)
-
-        has_keypoint = action_input.get("has_keypoint", None)
-        if has_keypoint is None:
-            sample_weight = torch.ones(batch_size, device=pred_kp.device, dtype=pred_kp.dtype)
-        else:
-            sample_weight = has_keypoint.to(pred_kp.dtype).view(batch_size)
-        loss_weight = action_input.get("loss_weight", None)
-        if loss_weight is not None:
-            sample_weight = sample_weight * loss_weight.to(pred_kp.dtype).view(batch_size)
+        sample_weight = self._keypoint_sample_weight(
+            batch_size, action_input, pred_kp.device, pred_kp.dtype
+        )
 
         # Pairwise Huber cost between predicted and target point sets, per (fixed) slot.
         diff = pred_kp.unsqueeze(-2) - target_kp.unsqueeze(-3)  # [B,H,O,K,K,2]
@@ -337,17 +377,68 @@ class Gr00tN1d7ActionHead(nn.Module):
         step_weight = target_active + (1.0 - target_active) * self.config.static_keypoint_weight
         kp_num = (chamfer * step_weight).sum(dim=(1, 2))  # [B]
         kp_den = step_weight.sum(dim=(1, 2))  # [B]
-        bce = F.binary_cross_entropy_with_logits(pred_active_logits, target_active, reduction="none")
-        active_cost = bce.mean(dim=(1, 2))
 
         # Weighted mean over all supervised (step, object) cells across the batch, so
         # samples whose window has no active object dilute nothing.
-        return {
-            "keypoint_loss": (kp_num * sample_weight).sum()
-            / ((kp_den * sample_weight).sum() + 1e-6),
-            "keypoint_active_loss": (active_cost * sample_weight).sum()
-            / (sample_weight.sum() + 1e-6),
-        }
+        return (kp_num * sample_weight).sum() / ((kp_den * sample_weight).sum() + 1e-6)
+
+    def _compute_keypoint_active_bce_loss(
+        self, pred_active_logits: torch.Tensor, action_input: BatchFeature
+    ) -> torch.Tensor:
+        """BCE active-flag loss via the dedicated trunk. "default"/"tokens" mode
+        only — see _compute_share_dim_active_loss for "share_dim" mode."""
+        target_active = action_input.get("keypoint_active_target", None)
+        if target_active is None:
+            return pred_active_logits.sum() * 0.0
+
+        batch_size, horizon = pred_active_logits.shape[:2]
+        target_active = target_active.view(
+            batch_size, horizon, self.config.max_keypoint_objects
+        ).to(pred_active_logits.dtype)
+        sample_weight = self._keypoint_sample_weight(
+            batch_size, action_input, pred_active_logits.device, pred_active_logits.dtype
+        )
+
+        bce = F.binary_cross_entropy_with_logits(pred_active_logits, target_active, reduction="none")
+        active_cost = bce.mean(dim=(1, 2))
+        return (active_cost * sample_weight).sum() / (sample_weight.sum() + 1e-6)
+
+    def _share_dim_active_targets(
+        self,
+        batch_size: int,
+        action_horizon: int,
+        action_input: BatchFeature,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Zero-padded active-flag target + mask, appended as extra
+        action_encoder/action_decoder channels in "share_dim" mode (see
+        Gr00tN1d7Config.keypoint_head_mode). Both are
+        [B, action_horizon, max_keypoint_objects]: target holds
+        keypoint_active_target for t < keypoint_horizon and zeros after (there's
+        no active label beyond the keypoint window); mask is 1 wherever a real,
+        has_keypoint sample supplies a target and 0 elsewhere, so padding steps
+        and keypoint-missing samples don't enter the flow-matching loss.
+        """
+        num_objects = self.config.max_keypoint_objects
+        kp_horizon = self.config.keypoint_horizon
+        target = torch.zeros(batch_size, action_horizon, num_objects, device=device, dtype=dtype)
+        mask = torch.zeros(batch_size, action_horizon, num_objects, device=device, dtype=dtype)
+
+        active_target = action_input.get("keypoint_active_target", None)
+        if active_target is not None:
+            active_target = active_target.to(device=device, dtype=dtype).view(
+                batch_size, kp_horizon, num_objects
+            )
+            target[:, :kp_horizon] = active_target
+            step_mask = torch.ones(batch_size, kp_horizon, num_objects, device=device, dtype=dtype)
+            has_keypoint = action_input.get("has_keypoint", None)
+            if has_keypoint is not None:
+                step_mask = step_mask * has_keypoint.to(device=device, dtype=dtype).view(
+                    batch_size, 1, 1
+                )
+            mask[:, :kp_horizon] = step_mask
+        return target, mask
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
@@ -402,8 +493,20 @@ class Gr00tN1d7ActionHead(nn.Module):
             do_dropout = do_dropout[:, None, None].to(dtype=state_features.dtype)
             state_features = state_features * (1 - do_dropout)
 
-        # Embed noised action trajectory.
+        # Embed noised action trajectory. In "share_dim" mode, active-flag
+        # channels are appended as extra columns of this same per-step vector and
+        # jointly noised/denoised — see Gr00tN1d7Config.keypoint_head_mode.
         actions = action_input.action
+        share_dim_active = (
+            self.config.enable_keypoint_head and self.config.keypoint_head_mode == "share_dim"
+        )
+        share_dim_mask = None
+        if share_dim_active:
+            share_dim_target, share_dim_mask = self._share_dim_active_targets(
+                actions.shape[0], actions.shape[1], action_input, actions.device, actions.dtype
+            )
+            actions = torch.cat((actions, share_dim_target), dim=-1)
+
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
@@ -456,25 +559,32 @@ class Gr00tN1d7ActionHead(nn.Module):
             )
 
         # Slice off any appended keypoint query tokens before decoding actions: in
-        # dedicated-tokens mode the action tokens are no longer the tail of the
-        # sequence, and running action_decoder on the keypoint tokens would be
-        # wasted (category-specific) compute anyway.
+        # "tokens" mode the action tokens are no longer the tail of the sequence,
+        # and running action_decoder on the keypoint tokens would be wasted
+        # (category-specific) compute anyway.
         action_end = 1 + actions.shape[1]
         pred = self.action_decoder(model_output[:, :action_end], embodiment_id)
         pred_actions = pred[:, 1:]
 
-        # Slice out only the action portion of pred and target.
+        # Slice out only the real action portion of pred/target — in "share_dim"
+        # mode pred_actions/velocity carry extra trailing active-flag channels,
+        # handled separately below so they never leak into action_loss/action_pred.
+        pred_real_actions = pred_actions[..., : self.real_action_dim]
+        velocity_real = velocity[..., : self.real_action_dim]
         action_mask = action_input.action_mask
-        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+        action_loss = F.mse_loss(pred_real_actions, velocity_real, reduction="none") * action_mask
         # Optional per-sample loss weight (e.g. MotionTrans-style human/robot alpha
         # co-training re-weighting, set per dataset via SingleDatasetConfig.loss_weight).
         # Weighted mean: relative gradient contribution follows the weights while uniform
         # weights reduce exactly to the unweighted loss.
         loss_weight = action_input.get("loss_weight", None)
         if loss_weight is not None:
-            loss_weight = loss_weight.to(action_loss.dtype)[:, None, None]
-            loss = (action_loss * loss_weight).sum() / ((action_mask * loss_weight).sum() + 1e-6)
+            loss_weight_bc = loss_weight.to(action_loss.dtype)[:, None, None]
+            loss = (action_loss * loss_weight_bc).sum() / (
+                (action_mask * loss_weight_bc).sum() + 1e-6
+            )
         else:
+            loss_weight_bc = None
             loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
         outputs = {
@@ -487,18 +597,43 @@ class Gr00tN1d7ActionHead(nn.Module):
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
+            # Exposed so eval-time keypoint viz can call get_action_with_features()
+            # directly and reuse this forward pass's backbone output, instead of
+            # re-running the full VLM backbone a second time per batch.
+            "image_mask": backbone_output.get("image_mask"),
+            "backbone_attention_mask": backbone_output.backbone_attention_mask,
         }
 
         if self.config.enable_keypoint_head:
-            keypoint_losses = self._compute_keypoint_loss(model_output, action_input)
-            outputs["keypoint_loss"] = keypoint_losses["keypoint_loss"]
-            outputs["keypoint_active_loss"] = keypoint_losses["keypoint_active_loss"]
-            outputs["loss"] = (
-                loss
-                + self.config.keypoint_loss_weight * keypoint_losses["keypoint_loss"]
-                + self.config.keypoint_active_loss_weight
-                * keypoint_losses["keypoint_active_loss"]
-            )
+            pred_kp = self._decode_keypoint_positions(model_output)
+            keypoint_loss = self._compute_keypoint_position_loss(pred_kp, action_input)
+            outputs["keypoint_loss"] = keypoint_loss
+            combined_loss = loss + self.config.keypoint_loss_weight * keypoint_loss
+
+            if share_dim_active:
+                # Active flags are a flow-matching regression target folded into
+                # the action vector (see _share_dim_active_targets) rather than a
+                # BCE decoder output — plain masked MSE on the velocity, exactly
+                # like the action loss above.
+                pred_active_vel = pred_actions[..., self.real_action_dim :]
+                velocity_active = velocity[..., self.real_action_dim :]
+                active_diff = (
+                    F.mse_loss(pred_active_vel, velocity_active, reduction="none") * share_dim_mask
+                )
+                if loss_weight_bc is not None:
+                    active_loss = (active_diff * loss_weight_bc).sum() / (
+                        (share_dim_mask * loss_weight_bc).sum() + 1e-6
+                    )
+                else:
+                    active_loss = active_diff.sum() / (share_dim_mask.sum() + 1e-6)
+            else:
+                pred_active_logits = self._decode_keypoint_active_logits(model_output)
+                active_loss = self._compute_keypoint_active_bce_loss(
+                    pred_active_logits, action_input
+                )
+
+            outputs["keypoint_active_loss"] = active_loss
+            outputs["loss"] = combined_loss + self.config.keypoint_active_loss_weight * active_loss
 
         return outputs
 
@@ -592,12 +727,18 @@ class Gr00tN1d7ActionHead(nn.Module):
 
             action_horizon_before_padding = options["action_horizon"]
 
-            # Use previous action instead of pure noise to do inpainting
-            actions[:, : options["rtc_overlap_steps"], :] = action_input["action"][
+            # Use previous action instead of pure noise to do inpainting. Sliced to
+            # real_action_dim on both sides: in "share_dim" mode `actions` also
+            # carries extra active-flag channels that action_input["action"] (a
+            # real action tensor) doesn't have — those channels keep denoising
+            # from pure noise as usual, RTC inpainting only applies to real actions.
+            actions[:, : options["rtc_overlap_steps"], : self.real_action_dim] = action_input[
+                "action"
+            ][
                 :,
                 action_horizon_before_padding
                 - options["rtc_overlap_steps"] : action_horizon_before_padding,
-                :,
+                : self.real_action_dim,
             ]
             vel_strength[:, : options["rtc_frozen_steps"], :] = 0.0
             # NOTE: use an exponential ramp strength to set the remaining unfrozen rtc_steps
@@ -665,8 +806,11 @@ class Gr00tN1d7ActionHead(nn.Module):
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength
 
+        # Sliced to real_action_dim: in "share_dim" mode `actions` also carries the
+        # extra active-flag channels denoised alongside the real action (see
+        # forward()) — those never belong in action_pred.
         output_data = {
-            "action_pred": actions,
+            "action_pred": actions[..., : self.real_action_dim],
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
@@ -678,10 +822,20 @@ class Gr00tN1d7ActionHead(nn.Module):
             and options is not None
             and options.get("return_keypoints", False)
         ):
-            pred_kp, pred_active_logits = self._decode_keypoints(model_output)
             # Coordinates are in [-1, 1] normalized by the original image (W, H).
-            output_data["keypoint_pred"] = pred_kp
-            output_data["keypoint_active_pred"] = torch.sigmoid(pred_active_logits)
+            output_data["keypoint_pred"] = self._decode_keypoint_positions(model_output)
+            if self.config.keypoint_head_mode == "share_dim":
+                # The final Euler-integrated value of the extra channels IS the
+                # model's direct regression estimate of the raw 0/1 target (the
+                # flow-matching target was the label itself, not a logit) — no
+                # sigmoid, unlike "default"/"tokens" mode's BCE decoder. Clamp
+                # only for display; the raw value is the more honest signal.
+                output_data["keypoint_active_pred"] = actions[..., self.real_action_dim :].clamp(
+                    0.0, 1.0
+                )
+            else:
+                pred_active_logits = self._decode_keypoint_active_logits(model_output)
+                output_data["keypoint_active_pred"] = torch.sigmoid(pred_active_logits)
 
         return BatchFeature(data=output_data)
 

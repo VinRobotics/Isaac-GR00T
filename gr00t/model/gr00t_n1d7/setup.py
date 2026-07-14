@@ -93,9 +93,14 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 keypoint_loss_weight=self.config.model.keypoint_loss_weight,
                 keypoint_active_loss_weight=self.config.model.keypoint_active_loss_weight,
                 static_keypoint_weight=self.config.model.static_keypoint_weight,
-                keypoint_use_dedicated_tokens=self.config.model.keypoint_use_dedicated_tokens,
+                keypoint_head_mode=self.config.model.keypoint_head_mode,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
+                # "share_dim" mode widens action_encoder/action_decoder (see
+                # keypoint_head_mode docstring); without this flag that shape
+                # mismatch would hard-crash the load instead of surfacing in
+                # loading_info.mismatched_keys, where it's handled explicitly below.
+                ignore_mismatched_sizes=True,
                 **self.transformers_loading_kwargs,
             )
 
@@ -109,8 +114,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 logging.info("mask_token not in checkpoint - initialized")
 
             # Newly-added keypoint aux head params: fine to be missing (fresh init)
-            # the first time enable_keypoint_head / keypoint_use_dedicated_tokens is
-            # turned on for a checkpoint that predates them. If the checkpoint HAS
+            # the first time enable_keypoint_head / keypoint_head_mode is turned on
+            # for a checkpoint that predates them. If the checkpoint HAS
             # them but the current config doesn't use them, that's caught below as
             # unexpected_keys instead (architecture mismatch, not a safe default).
             keypoint_missing = [
@@ -145,6 +150,54 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     "(fresh init)."
                 )
 
+            # keypoint_head_mode="share_dim" widens action_encoder.W1.W (input) and
+            # action_decoder.layer2.{W,b} (output) by max_keypoint_objects channels
+            # to carry the active-flag flow-matching targets (see
+            # Gr00tN1d7Config.keypoint_head_mode). ignore_mismatched_sizes=True
+            # above means these show up as mismatched_keys with the *checkpoint's*
+            # pretrained weights simply discarded (whole tensor fresh-initialized) -
+            # instead of accepting that loss of pretrained action capacity, splice
+            # the checkpoint's own (narrower) action head into the new tensors'
+            # leading slice, so only the new trailing active-flag channels are
+            # actually fresh-initialized.
+            action_dim_param_names = (
+                "action_encoder.W1.W",
+                "action_decoder.layer2.W",
+                "action_decoder.layer2.b",
+            )
+            action_dim_mismatched = [
+                m for m in mismatched_keys if any(name in m[0] for name in action_dim_param_names)
+            ]
+            share_dim_active = (
+                self.config.model.enable_keypoint_head
+                and self.config.model.keypoint_head_mode == "share_dim"
+            )
+            if action_dim_mismatched and share_dim_active:
+                logging.info(
+                    "share_dim mode: action_encoder/action_decoder widened for the "
+                    f"keypoint active-flag channels ({len(action_dim_mismatched)} tensors "
+                    "affected). Reloading the checkpoint's own (narrower) action head so "
+                    "pretrained action weights are spliced into the new tensors' leading "
+                    "slice, rather than lost to random re-init."
+                )
+                old_model, _ = AutoModel.from_pretrained(
+                    self.config.training.start_from_checkpoint,
+                    output_loading_info=True,
+                    **self.transformers_loading_kwargs,
+                )
+                old_action_dim = old_model.action_head.action_dim
+                with torch.no_grad():
+                    model.action_head.action_encoder.W1.W.data[:, :old_action_dim, :] = (
+                        old_model.action_head.action_encoder.W1.W.data
+                    )
+                    model.action_head.action_decoder.layer2.W.data[:, :, :old_action_dim] = (
+                        old_model.action_head.action_decoder.layer2.W.data
+                    )
+                    model.action_head.action_decoder.layer2.b.data[:, :old_action_dim] = (
+                        old_model.action_head.action_decoder.layer2.b.data
+                    )
+                del old_model
+
             other_missing = [
                 k
                 for k in missing_keys
@@ -154,13 +207,15 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 and "keypoint_query_embedding" not in k
             ]
             other_unexpected = [k for k in unexpected_keys if "keypoint_decoder." not in k]
+            handled_mismatched = action_dim_mismatched if (action_dim_mismatched and share_dim_active) else []
+            other_mismatched = [m for m in mismatched_keys if m not in handled_mismatched]
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
             if other_unexpected:
                 errors.append(f"Unexpected keys ({len(other_unexpected)}): {other_unexpected}")
-            if mismatched_keys:
-                errors.append(f"Mismatched keys ({len(mismatched_keys)}): {mismatched_keys}")
+            if other_mismatched:
+                errors.append(f"Mismatched keys ({len(other_mismatched)}): {other_mismatched}")
             if errors:
                 raise RuntimeError(
                     "Checkpoint weight mismatch for "

@@ -106,23 +106,34 @@ class FinetuneConfig:
     object), frozen or extrapolated tracker positions, so only active steps — where the
     tracker saw real motion near a mask sighting — are supervised."""
 
-    keypoint_use_dedicated_tokens: bool = False
-    """False (default): decode keypoints from the same action-token hidden states that
-    decode the action itself — a pure readout, action_pred is bit-identical whether or
-    not the head runs. True: append keypoint_horizon dedicated learned query tokens
-    (DETR-style) to the DiT sequence and decode keypoints from those instead, giving
-    the keypoint task its own capacity through the transformer. A one-directional
+    keypoint_head_mode: str = "default"
+    """How the keypoint head attaches to the action head. One of:
+
+    "default": decode both keypoint position (Chamfer) and active flags (BCE) from
+    the same action-token hidden states that decode the action itself — a pure
+    readout, action_pred is bit-identical whether or not the head runs.
+
+    "tokens": append keypoint_horizon dedicated learned query tokens (DETR-style) to
+    the DiT sequence and decode position + active from those instead, giving the
+    keypoint task its own capacity through the transformer. A one-directional
     self-attention mask keeps this a pure readout too: keypoint query tokens may
     attend to the state/action tokens (so keypoint prediction stays conditioned on the
     specific action being generated), but state/action tokens are masked from ever
     attending back to the keypoint queries — action_pred is unaffected by their
-    presence, same guarantee as shared mode.
+    presence, same guarantee as "default". Adds keypoint_query_embedding parameters,
+    so it must match between saving and loading a checkpoint.
 
-    Also changes model parameters (adds keypoint_query_embedding), so it must match
-    between saving and loading a checkpoint — changing it on an existing checkpoint
-    requires fresh-initializing (missing) or dropping (unexpected) that embedding,
-    which start_from_checkpoint loading treats as an architecture-mismatch error
-    unless the weights are genuinely absent for the first time."""
+    "share_dim": fold the *active* flags only (not point positions, which stay
+    Chamfer-matched from hidden states exactly like "default" — point index has no
+    fixed convention across episodes, unlike object-slot index which the data
+    pipeline's assign_slots convention does fix) as extra channels of the same
+    per-step action vector, jointly noised/denoised by flow matching — plain masked
+    MSE, well posed here because object-slot identity is fixed so there's no
+    arbitrary-index ambiguity for the loss to be invariant to. Widens
+    action_encoder's input dim and action_decoder's output dim by
+    max_keypoint_objects, so — like "tokens" — it must match between saving and
+    loading a checkpoint (start_from_checkpoint loading splices the checkpoint's
+    narrower action head into the widened tensors' leading slice automatically)."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None

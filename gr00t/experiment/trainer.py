@@ -39,6 +39,7 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
+from transformers.feature_extraction_utils import BatchFeature
 from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput, EvalPrediction
@@ -385,13 +386,29 @@ class Gr00tTrainer(Trainer):
                 and "viz_image" in batch
                 and has_keypoint_batch is not None
                 and bool((has_keypoint_batch >= 0.5).any())
+                and viz_candidates_seen < self.keypoint_viz_max_images * 20
             ):
                 with torch.inference_mode():
-                    # Real (non-teacher-forced) rollout: strip "action" so get_action
-                    # runs standard flow-matching denoising instead of RTC inpainting.
-                    viz_inputs = {k: v for k, v in batch.items() if k != "action"}
-                    action_out = unwrapped_model.get_action(
-                        viz_inputs, options={"return_keypoints": True}
+                    # Reuse the backbone/state features compute_loss's forward pass
+                    # already computed above instead of re-running the full VLM
+                    # backbone a second time (that redundant rerun, once per eval
+                    # batch with keypoint data, was the actual cause of eval blowing
+                    # up training wall time). action_input is intentionally empty:
+                    # get_action_with_features only reads it for the RTC "action" in
+                    # action_input gate, which we don't want here (this is a real,
+                    # non-teacher-forced rollout for visualization).
+                    action_out = unwrapped_model.action_head.get_action_with_features(
+                        backbone_features=outputs["backbone_features"],
+                        state_features=outputs["state_features"],
+                        embodiment_id=batch["embodiment_id"],
+                        backbone_output=BatchFeature(
+                            data={
+                                "image_mask": outputs["image_mask"],
+                                "backbone_attention_mask": outputs["backbone_attention_mask"],
+                            }
+                        ),
+                        action_input=BatchFeature(data={}),
+                        options={"return_keypoints": True},
                     )
                 viz_candidates_seen = self._collect_keypoint_viz(
                     batch, action_out, viz_images_gt, viz_images_pred, viz_candidates_seen

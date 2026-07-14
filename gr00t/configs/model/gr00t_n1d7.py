@@ -122,8 +122,8 @@ class Gr00tN1d7Config(PretrainedConfig):
     max_num_embodiments: int = 32
 
     # Object-centric keypoint auxiliary head (human/robot co-training).
-    # Predicts future object keypoint trajectories; pure readout in both modes
-    # below: action_pred never depends on whether this head runs.
+    # Predicts future object keypoint trajectories; pure readout in all three
+    # modes below: action_pred never depends on whether this head runs.
     enable_keypoint_head: bool = False
     keypoint_horizon: int = 16
     max_keypoint_objects: int = 2
@@ -134,22 +134,39 @@ class Gr00tN1d7Config(PretrainedConfig):
     # mask: inactive slots may hold zeros / frozen / extrapolated tracker output, so
     # only active (trusted) steps are supervised.
     static_keypoint_weight: float = 0.0
-    # False (default): decode keypoints from the same action-token hidden states
-    # that decode the action itself (cheap, shared representation). True: append
-    # keypoint_horizon dedicated learned query tokens to the DiT sequence (like
-    # DETR object queries) and decode keypoints from those instead, giving the
-    # keypoint task its own capacity through the transformer's self-/cross-
-    # attention rather than squeezing it into the action tokens' hidden state.
-    # A one-directional self-attention mask (see
-    # Gr00tN1d7ActionHead._keypoint_self_attention_mask) keeps this a pure
-    # readout too: keypoint query tokens may attend to the state/action tokens
-    # (so keypoint prediction stays conditioned on the specific action being
-    # generated), but state/action tokens are masked from ever attending back to
-    # the keypoint queries, at every layer — so action_pred is unaffected by
-    # their presence, exactly like shared mode. This changes model parameters
-    # (adds keypoint_query_embedding), so it must match between saving and
-    # loading a checkpoint.
-    keypoint_use_dedicated_tokens: bool = False
+    # How the keypoint head attaches to the action head. One of:
+    #   "default": decode both keypoint position (Chamfer) and active flags (BCE)
+    #     from the same action-token hidden states that decode the action itself
+    #     (cheap, shared representation).
+    #   "tokens": append keypoint_horizon dedicated learned query tokens to the DiT
+    #     sequence (DETR-style) and decode position + active from those instead,
+    #     giving the keypoint task its own capacity through the transformer's
+    #     self-/cross-attention rather than squeezing it into the action tokens'
+    #     hidden state. A one-directional self-attention mask (see
+    #     Gr00tN1d7ActionHead._keypoint_self_attention_mask) keeps this a pure
+    #     readout too: keypoint query tokens may attend to the state/action tokens
+    #     (so keypoint prediction stays conditioned on the specific action being
+    #     generated), but state/action tokens are masked from ever attending back
+    #     to the keypoint queries, at every layer — so action_pred is unaffected by
+    #     their presence, exactly like "default". Adds keypoint_query_embedding
+    #     parameters, so it must match between saving and loading a checkpoint.
+    #   "share_dim": fold the *active* flags only (not point positions — those stay
+    #     Chamfer-matched from hidden states exactly like "default", since point
+    #     index has no fixed convention across episodes, unlike object-slot index
+    #     which the data pipeline's assign_slots convention does fix) as extra
+    #     channels of the same per-step action vector, jointly noised/denoised by
+    #     flow matching — the same mechanism this codebase already uses to extend
+    #     action_encoder/action_decoder for other per-embodiment action-space
+    #     widening (see expand_action_dimension in embodiment_conditioned_mlp.py).
+    #     Well posed as plain per-channel MSE because object-slot identity (unlike
+    #     point identity) *is* fixed, so there's no arbitrary-index ambiguity for
+    #     the loss to be invariant to. Widens action_encoder's input dim and
+    #     action_decoder's output dim by max_keypoint_objects, so — like "tokens" —
+    #     it must match between saving and loading a checkpoint; see the
+    #     action_encoder.W1.W / action_decoder.layer2.{W,b} splice in
+    #     Gr00tN1d7Pipeline._create_model for the migration path from a checkpoint
+    #     trained without it.
+    keypoint_head_mode: str = "default"  # one of {"default", "tokens", "share_dim"}
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -165,6 +182,12 @@ class Gr00tN1d7Config(PretrainedConfig):
                     setattr(self, f.name, f.default)
                 elif getattr(f, "default_factory", MISSING) is not MISSING:
                     setattr(self, f.name, f.default_factory())
+
+        if self.keypoint_head_mode not in ("default", "tokens", "share_dim"):
+            raise ValueError(
+                f"keypoint_head_mode must be one of 'default', 'tokens', 'share_dim', "
+                f"got {self.keypoint_head_mode!r}"
+            )
 
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""
