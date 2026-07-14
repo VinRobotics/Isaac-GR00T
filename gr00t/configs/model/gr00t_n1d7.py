@@ -122,8 +122,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     max_num_embodiments: int = 32
 
     # Object-centric keypoint auxiliary head (human/robot co-training).
-    # Predicts future object keypoint trajectories from the action-token hidden states;
-    # pure readout: never feeds back into the action path.
+    # Predicts future object keypoint trajectories. In the default shared mode this
+    # is a pure readout that never feeds back into the action path; the
+    # keypoint_use_dedicated_tokens variant below trades that away (see its comment).
     enable_keypoint_head: bool = False
     keypoint_horizon: int = 16
     max_keypoint_objects: int = 2
@@ -134,6 +135,19 @@ class Gr00tN1d7Config(PretrainedConfig):
     # mask: inactive slots may hold zeros / frozen / extrapolated tracker output, so
     # only active (trusted) steps are supervised.
     static_keypoint_weight: float = 0.0
+    # False (default): decode keypoints from the same action-token hidden states
+    # that decode the action itself (cheap, pure readout — action_pred is bit-
+    # identical whether or not the head runs). True: append keypoint_horizon
+    # dedicated learned query tokens to the DiT sequence (like DETR object
+    # queries) and decode keypoints from those instead, giving the keypoint task
+    # its own capacity through the transformer's self-/cross-attention. Because
+    # these query tokens sit in the SAME bidirectional self-attention sequence as
+    # the action tokens, this is no longer a pure readout: action_pred itself
+    # changes (the action tokens now also attend to the keypoint queries), even
+    # though action_decoder's weights are never trained on the keypoint loss
+    # directly. This changes model parameters (adds keypoint_query_embedding), so
+    # it must match between saving and loading a checkpoint.
+    keypoint_use_dedicated_tokens: bool = False
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

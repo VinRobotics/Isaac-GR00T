@@ -180,6 +180,7 @@ if __name__ == "__main__":
     config.model.keypoint_loss_weight = ft_config.keypoint_loss_weight
     config.model.keypoint_active_loss_weight = ft_config.keypoint_active_loss_weight
     config.model.static_keypoint_weight = ft_config.static_keypoint_weight
+    config.model.keypoint_use_dedicated_tokens = ft_config.keypoint_use_dedicated_tokens
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False

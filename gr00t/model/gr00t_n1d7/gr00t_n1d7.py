@@ -81,15 +81,18 @@ class Gr00tN1d7ActionHead(nn.Module):
             output_dim=self.action_dim,
         )
 
-        # Object-centric keypoint auxiliary head: pure readout from the action-token
-        # hidden states, so the action path is unchanged whether or not it runs.
-        # Shared across embodiments (no CategorySpecificMLP): object motion is
-        # embodiment-invariant, which is what lets this head pull human and robot
-        # action-token representations into a common space.
+        # Object-centric keypoint auxiliary head. In shared mode (default) this is a
+        # pure readout: action_pred is unchanged whether or not it runs. Dedicated-
+        # tokens mode trades that away — see keypoint_use_dedicated_tokens. Shared
+        # across embodiments (no CategorySpecificMLP): object motion is embodiment-
+        # invariant, which is what lets this head pull human and robot
+        # representations into a common space (either the shared action-token
+        # hidden states, or — in dedicated-tokens mode — the query embeddings below).
         if config.enable_keypoint_head:
-            assert config.keypoint_horizon <= config.action_horizon, (
-                "keypoint_horizon must not exceed action_horizon"
-            )
+            if not config.keypoint_use_dedicated_tokens:
+                assert config.keypoint_horizon <= config.action_horizon, (
+                    "keypoint_horizon must not exceed action_horizon in shared mode"
+                )
             keypoint_output_dim = config.max_keypoint_objects * (
                 config.keypoints_per_object * 2 + 1
             )
@@ -98,6 +101,15 @@ class Gr00tN1d7ActionHead(nn.Module):
                 nn.ReLU(),
                 nn.Linear(self.hidden_size, keypoint_output_dim),
             )
+            if config.keypoint_use_dedicated_tokens:
+                # DETR-style learned query tokens: one per future keypoint step,
+                # appended to the DiT sequence so the keypoint task gets its own
+                # self-/cross-attention capacity instead of reusing the action
+                # tokens' hidden states.
+                self.keypoint_query_embedding = nn.Embedding(
+                    config.keypoint_horizon, self.input_embedding_dim
+                )
+                nn.init.normal_(self.keypoint_query_embedding.weight, mean=0.0, std=0.02)
 
         self.vlln = (
             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
@@ -136,6 +148,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.action_decoder.requires_grad_(False)
             if self.config.enable_keypoint_head:
                 self.keypoint_decoder.requires_grad_(False)
+                if self.config.keypoint_use_dedicated_tokens:
+                    self.keypoint_query_embedding.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
         if not tune_diffusion_model:
@@ -167,6 +181,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.action_decoder.eval()
                 if self.config.enable_keypoint_head:
                     self.keypoint_decoder.eval()
+                    if self.config.keypoint_use_dedicated_tokens:
+                        self.keypoint_query_embedding.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
             if not self.tune_diffusion_model:
@@ -183,8 +199,12 @@ class Gr00tN1d7ActionHead(nn.Module):
     def _decode_keypoints(self, model_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Decode future object keypoints from the DiT output hidden states.
 
-        The DiT sequence is [state_token(1), action_tokens(action_horizon)]; keypoints
-        for step t are decoded from the same hidden state that decodes action t.
+        Shared mode (default): the DiT sequence is [state(1), action(action_horizon)];
+        keypoints for step t are decoded from the same hidden state that decodes
+        action t. Dedicated-tokens mode: the sequence additionally has
+        keypoint_horizon dedicated query tokens appended at the end
+        ([state(1), action(action_horizon), keypoint_queries(keypoint_horizon)]),
+        decoded from those instead.
 
         Returns:
             pred_kp: [B, keypoint_horizon, num_objects, kp_per_object, 2] in [-1, 1]
@@ -193,7 +213,10 @@ class Gr00tN1d7ActionHead(nn.Module):
         """
         num_objects = self.config.max_keypoint_objects
         kp_per_object = self.config.keypoints_per_object
-        h = model_output[:, 1 : 1 + self.config.keypoint_horizon]
+        if self.config.keypoint_use_dedicated_tokens:
+            h = model_output[:, -self.config.keypoint_horizon :]
+        else:
+            h = model_output[:, 1 : 1 + self.config.keypoint_horizon]
         out = self.keypoint_decoder(h)
         batch_size, horizon = out.shape[:2]
         out = out.view(batch_size, horizon, num_objects, kp_per_object * 2 + 1)
@@ -202,6 +225,15 @@ class Gr00tN1d7ActionHead(nn.Module):
         )
         pred_active_logits = out[..., -1]
         return pred_kp, pred_active_logits
+
+    def _append_keypoint_queries(self, sa_embs: torch.Tensor) -> torch.Tensor:
+        """Append dedicated keypoint query tokens to the DiT sequence (dedicated-
+        tokens mode only; no-op in shared mode or when the head is disabled)."""
+        if not (self.config.enable_keypoint_head and self.config.keypoint_use_dedicated_tokens):
+            return sa_embs
+        batch_size = sa_embs.shape[0]
+        queries = self.keypoint_query_embedding.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        return torch.cat((sa_embs, queries), dim=1)
 
     def _compute_keypoint_loss(
         self, model_output: torch.Tensor, action_input: BatchFeature
@@ -349,7 +381,10 @@ class Gr00tN1d7ActionHead(nn.Module):
             action_features = action_features + pos_embs
 
         # Join vision, language, state and action embedding along sequence dimension.
+        # In keypoint dedicated-tokens mode, dedicated query tokens are appended
+        # after the action tokens: [state(1), action(action_horizon), kp_queries].
         sa_embs = torch.cat((state_features, action_features), dim=1)
+        sa_embs = self._append_keypoint_queries(sa_embs)
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         if self.config.use_alternate_vl_dit:
@@ -373,8 +408,13 @@ class Gr00tN1d7ActionHead(nn.Module):
                 return_all_hidden_states=True,
             )
 
-        pred = self.action_decoder(model_output, embodiment_id)
-        pred_actions = pred[:, -actions.shape[1] :]
+        # Slice off any appended keypoint query tokens before decoding actions: in
+        # dedicated-tokens mode the action tokens are no longer the tail of the
+        # sequence, and running action_decoder on the keypoint tokens would be
+        # wasted (category-specific) compute anyway.
+        action_end = 1 + actions.shape[1]
+        pred = self.action_decoder(model_output[:, :action_end], embodiment_id)
+        pred_actions = pred[:, 1:]
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
@@ -539,8 +579,11 @@ class Gr00tN1d7ActionHead(nn.Module):
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
-            # Join vision, language, state and action embedding along sequence dimension.
+            # Join vision, language, state and action embedding along sequence
+            # dimension. In keypoint dedicated-tokens mode, dedicated query tokens
+            # are appended after the action tokens.
             sa_embs = torch.cat((state_features, action_features), dim=1)
+            sa_embs = self._append_keypoint_queries(sa_embs)
 
             # Run model forward.
             if self.config.use_alternate_vl_dit:
@@ -557,9 +600,12 @@ class Gr00tN1d7ActionHead(nn.Module):
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
                 )
-            pred = self.action_decoder(model_output, embodiment_id)
-
-            pred_velocity = pred[:, -self.action_horizon :]
+            # Slice off any appended keypoint query tokens before decoding actions
+            # (see forward()'s action_decoder call for why).
+            pred = self.action_decoder(
+                model_output[:, : 1 + self.action_horizon], embodiment_id
+            )
+            pred_velocity = pred[:, 1:]
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength

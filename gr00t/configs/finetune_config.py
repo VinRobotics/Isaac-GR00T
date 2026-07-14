@@ -106,6 +106,22 @@ class FinetuneConfig:
     object), frozen or extrapolated tracker positions, so only active steps — where the
     tracker saw real motion near a mask sighting — are supervised."""
 
+    keypoint_use_dedicated_tokens: bool = False
+    """False (default): decode keypoints from the same action-token hidden states that
+    decode the action itself — a pure readout, action_pred is bit-identical whether or
+    not the head runs. True: append keypoint_horizon dedicated learned query tokens
+    (DETR-style) to the DiT sequence and decode keypoints from those instead. This
+    gives the keypoint task its own capacity through the transformer, but since these
+    tokens share the same bidirectional self-attention as the action tokens, it is NOT
+    a pure readout anymore: action_pred itself changes (though action_decoder's
+    weights are never trained on the keypoint loss directly).
+
+    Also changes model parameters (adds keypoint_query_embedding), so it must match
+    between saving and loading a checkpoint — changing it on an existing checkpoint
+    requires fresh-initializing (missing) or dropping (unexpected) that embedding,
+    which start_from_checkpoint loading treats as an architecture-mismatch error
+    unless the weights are genuinely absent for the first time."""
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""
