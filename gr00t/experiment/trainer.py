@@ -314,20 +314,26 @@ class Gr00tTrainer(Trainer):
                 total_kp_loss += outputs["keypoint_loss"].detach()
                 total_kp_active_loss += outputs["keypoint_active_loss"].detach()
 
+            # The collator wraps the real batch as {"inputs": {...actual keys...}} so
+            # that model(**inputs) resolves to forward(self, inputs=<batch>) — unwrap
+            # here too, otherwise "viz_image"/"keypoint_target" are never found (they
+            # live one level down, not on the outer dict compute_loss receives).
+            batch = inputs["inputs"]
+
             if (
                 enable_keypoint_head
                 and self.args.local_rank in (-1, 0)
-                and "viz_image" in inputs
+                and "viz_image" in batch
                 and len(viz_images_gt) < self.keypoint_viz_max_images
             ):
                 with torch.inference_mode():
                     # Real (non-teacher-forced) rollout: strip "action" so get_action
                     # runs standard flow-matching denoising instead of RTC inpainting.
-                    viz_inputs = {k: v for k, v in inputs.items() if k != "action"}
+                    viz_inputs = {k: v for k, v in batch.items() if k != "action"}
                     action_out = unwrapped_model.get_action(
                         viz_inputs, options={"return_keypoints": True}
                     )
-                self._collect_keypoint_viz(inputs, action_out, viz_images_gt, viz_images_pred)
+                self._collect_keypoint_viz(batch, action_out, viz_images_gt, viz_images_pred)
 
         # Single reduce at the end — avoids per-step all_gather deadlock
         # when ranks process different numbers of batches.
@@ -349,8 +355,13 @@ class Gr00tTrainer(Trainer):
                 total_kp_active_loss / denom
             ).item()
 
-        if self.args.local_rank in (-1, 0) and viz_images_gt:
-            self._log_keypoint_viz(viz_images_gt, viz_images_pred, metric_key_prefix)
+        if enable_keypoint_head and self.args.local_rank in (-1, 0):
+            logging.info(
+                f"Keypoint viz: collected {len(viz_images_gt)}/{self.keypoint_viz_max_images} "
+                f"image pairs for {metric_key_prefix}."
+            )
+            if viz_images_gt:
+                self._log_keypoint_viz(viz_images_gt, viz_images_pred, metric_key_prefix)
 
         return EvalLoopOutput(
             predictions=None, label_ids=None, metrics=metrics, num_samples=num_samples
@@ -397,6 +408,10 @@ class Gr00tTrainer(Trainer):
 
     def _log_keypoint_viz(self, gt_images: list, pred_images: list, metric_key_prefix: str) -> None:
         if wandb.run is None:
+            logging.info(
+                f"Keypoint viz: {len(gt_images)} image pairs collected but wandb.run is None "
+                "(use_wandb not set?) — skipping W&B image log."
+            )
             return
         wandb.log(
             {
