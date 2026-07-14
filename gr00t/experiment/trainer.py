@@ -43,7 +43,7 @@ from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput, EvalPrediction
 import wandb
 
-from gr00t.model.gr00t_n1d7.keypoint_viz import render_keypoint_overlay
+from gr00t.model.gr00t_n1d7.keypoint_viz import combine_gt_pred, render_keypoint_overlay
 
 
 class _TqdmDataLoader:
@@ -413,13 +413,14 @@ class Gr00tTrainer(Trainer):
                 "(use_wandb not set?) — skipping W&B image log."
             )
             return
-        wandb.log(
-            {
-                f"{metric_key_prefix}/keypoint_gt": [wandb.Image(img) for img in gt_images],
-                f"{metric_key_prefix}/keypoint_pred": [wandb.Image(img) for img in pred_images],
-            },
-            step=self.state.global_step,
-        )
+        # One panel, one key: each entry is GT|Pred side by side for the same sample,
+        # so the list's built-in index slider pages through matched pairs and the
+        # run's step slider pages through eval calls.
+        combined = [
+            wandb.Image(combine_gt_pred(gt, pred), caption=f"sample {i}")
+            for i, (gt, pred) in enumerate(zip(gt_images, pred_images))
+        ]
+        wandb.log({f"{metric_key_prefix}/keypoint": combined}, step=self.state.global_step)
 
     def get_eval_dataloader(self, eval_dataset=None):
         """Return a plain DataLoader for eval to avoid accelerate's NCCL broadcast on CPU tensors."""

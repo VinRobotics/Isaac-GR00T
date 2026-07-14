@@ -66,3 +66,30 @@ def render_keypoint_overlay(
                 if 0 <= px < w and 0 <= py < h:
                     cv2.circle(out, (px, py), radius, color, thickness=-1)
     return out
+
+
+def combine_gt_pred(gt_image: np.ndarray, pred_image: np.ndarray, gap: int = 6) -> np.ndarray:
+    """Concatenate a GT overlay (left) and predicted overlay (right) into one image.
+
+    Logged as a single wandb.Image so a single panel gives both the built-in list
+    index slider (to page through sample pairs) and the run's step slider (to page
+    through eval calls) — GT and pred always shown side by side for the same sample.
+    """
+    h = gt_image.shape[0]
+    divider = np.full((h, gap, 3), 255, dtype=np.uint8)
+    combined = np.concatenate([gt_image, divider, pred_image], axis=1)
+    cv2.putText(
+        combined, "GT", (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA
+    )
+    pred_x = gt_image.shape[1] + gap + 4
+    cv2.putText(
+        combined,
+        "Pred",
+        (pred_x, 14),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    return combined
