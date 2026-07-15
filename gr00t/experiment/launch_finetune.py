@@ -226,5 +226,9 @@ if __name__ == "__main__":
         config.training.eval_steps = ft_config.eval_steps
 
     config.training.keypoint_viz_max_images = ft_config.keypoint_viz_max_images
+    config.training.keypoint_video_episodes = ft_config.keypoint_video_episodes
+    config.training.keypoint_video_max_frames = ft_config.keypoint_video_max_frames
+    config.training.keypoint_video_batch_size = ft_config.keypoint_video_batch_size
+    config.training.keypoint_video_fps = ft_config.keypoint_video_fps
 
     run(config)

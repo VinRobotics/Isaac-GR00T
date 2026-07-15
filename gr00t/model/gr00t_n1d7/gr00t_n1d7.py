@@ -140,9 +140,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             )
             if keypoint_mode != "share_dim":
                 self.keypoint_active_decoder = nn.Sequential(
-                    nn.Linear(self.hidden_size, self.hidden_size),
+                    nn.Linear(self.hidden_size, self.hidden_size//8),
                     nn.ReLU(),
-                    nn.Linear(self.hidden_size, config.max_keypoint_objects),
+                    nn.Linear(self.hidden_size//8, config.max_keypoint_objects),
                 )
             if keypoint_mode == "tokens":
                 # DETR-style learned query tokens: one per future keypoint step,

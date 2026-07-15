@@ -268,3 +268,20 @@ class FinetuneConfig:
     """Max number of GT-vs-predicted keypoint overlay image pairs to log to W&B per
     evaluation run (only meaningful when enable_keypoint_head=True and eval is
     configured via validation_path or eval_set_split_ratio)."""
+
+    keypoint_video_episodes: int = 1
+    """Number of held-out episodes (drawn from validation_path / eval_set_split_ratio)
+    to roll the model forward over and log as a GT-vs-predicted keypoint overlay
+    video per evaluation run. 0 disables episode-video logging (only meaningful when
+    enable_keypoint_head=True)."""
+
+    keypoint_video_max_frames: int = 100
+    """Cap on frames rendered per episode video (uniformly strided across the
+    episode if longer) — bounds the extra per-eval rollout cost."""
+
+    keypoint_video_batch_size: int = 8
+    """Batch size used when rolling the model forward over an episode's frames for
+    keypoint_video_episodes."""
+
+    keypoint_video_fps: int = 10
+    """Playback fps for the logged keypoint overlay video."""

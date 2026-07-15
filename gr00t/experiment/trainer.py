@@ -36,6 +36,7 @@ import random
 import threading
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
@@ -253,6 +254,10 @@ class Gr00tTrainer(Trainer):
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
         self.keypoint_viz_max_images = kwargs.pop("keypoint_viz_max_images", 50)
+        self.keypoint_video_episodes = kwargs.pop("keypoint_video_episodes", 1)
+        self.keypoint_video_max_frames = kwargs.pop("keypoint_video_max_frames", 100)
+        self.keypoint_video_batch_size = kwargs.pop("keypoint_video_batch_size", 8)
+        self.keypoint_video_fps = kwargs.pop("keypoint_video_fps", 10)
         super().__init__(
             *args,
             **kwargs,
@@ -454,6 +459,8 @@ class Gr00tTrainer(Trainer):
             )
             if viz_images_gt:
                 self._log_keypoint_viz(viz_images_gt, viz_images_pred, metric_key_prefix)
+            if self.keypoint_video_episodes > 0 and self.keypoint_video_max_frames > 0:
+                self._log_keypoint_episode_video(unwrapped_model, metric_key_prefix)
 
         return EvalLoopOutput(
             predictions=None, label_ids=None, metrics=metrics, num_samples=num_samples
@@ -526,6 +533,110 @@ class Gr00tTrainer(Trainer):
             for i, (gt, pred) in enumerate(zip(gt_images, pred_images))
         ]
         wandb.log({f"{metric_key_prefix}/keypoint": combined}, step=self.state.global_step)
+
+    def _pick_keypoint_video_episodes(self) -> list:
+        """Pick keypoint_video_episodes distinct (dataset, episode_index) pairs from
+        the held-out eval split (see eval_set_split_ratio / validation_path) whose
+        underlying ShardedSingleStepDataset actually carries a "keypoint" modality.
+        Held out, not train, episodes only — eval_dataset's datasets already are the
+        val-split ones (see DatasetFactory.build), so no extra filtering needed.
+        """
+        eval_dataset = getattr(self, "eval_dataset", None)
+        candidates = getattr(eval_dataset, "datasets", None) if eval_dataset is not None else None
+        if not candidates:
+            return []
+        keypoint_datasets = [
+            ds
+            for ds in candidates
+            if "keypoint" in getattr(ds, "modality_configs", {})
+            and getattr(ds, "episode_indices", None)
+        ]
+        if not keypoint_datasets:
+            return []
+        picks = []
+        for _ in range(self.keypoint_video_episodes):
+            dataset = random.choice(keypoint_datasets)
+            ep_idx = random.choice(dataset.episode_indices)
+            picks.append((dataset, ep_idx))
+        return picks
+
+    def _render_keypoint_episode_video(self, unwrapped_model, dataset, ep_idx: int) -> np.ndarray | None:
+        """Roll the model's keypoint head forward over a held-out episode's frames
+        (strided down to keypoint_video_max_frames) and render a GT-vs-predicted
+        overlay video, the per-episode analogue of _collect_keypoint_viz's
+        single-frame panels — see keypoint_viz.render_keypoint_overlay for the
+        overlay.mp4-style visualization itself.
+
+        Loads the full episode once (dense, so keypoint_target's forward-looking
+        delta indices stay correct — see LeRobotEpisodeLoader / extract_step_data)
+        and only spends model rollout compute on the strided subset of frames.
+        """
+        episode_data = dataset.episode_loader[ep_idx]
+        effective_len = dataset.get_effective_episode_length(ep_idx)
+        if effective_len <= 0:
+            return None
+        stride = max(1, effective_len // self.keypoint_video_max_frames)
+        step_indices = list(range(0, effective_len, stride))[: self.keypoint_video_max_frames]
+
+        frames = []
+        for start in range(0, len(step_indices), self.keypoint_video_batch_size):
+            chunk = step_indices[start : start + self.keypoint_video_batch_size]
+            datapoints = [dataset.get_datapoint(episode_data, t) for t in chunk]
+            batch = self.data_collator(datapoints)["inputs"]
+            batch = self._prepare_inputs(batch)
+            if "viz_image" not in batch or "keypoint_target" not in batch:
+                return None
+            with torch.inference_mode():
+                action_out = unwrapped_model.get_action(
+                    inputs=batch, options={"return_keypoints": True}
+                )
+            if "keypoint_pred" not in action_out:
+                return None
+            num_objects = action_out["keypoint_pred"].shape[2]
+            for i in range(len(chunk)):
+                img = batch["viz_image"][i].detach().cpu().numpy()
+                gt_kp = (
+                    batch["keypoint_target"][i]
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1, num_objects, 20, 2)
+                )
+                gt_active = batch["keypoint_active_target"][i].detach().float().cpu().numpy()
+                pred_kp = action_out["keypoint_pred"][i].detach().float().cpu().numpy()
+                pred_active = action_out["keypoint_active_pred"][i].detach().float().cpu().numpy()
+                gt_img = render_keypoint_overlay(img, gt_kp, gt_active)
+                pred_img = render_keypoint_overlay(img, pred_kp, pred_active)
+                frames.append(combine_gt_pred(gt_img, pred_img))
+
+        if not frames:
+            return None
+        return np.stack(frames).transpose(0, 3, 1, 2)  # (T, C, H, W), RGB, for wandb.Video
+
+    def _log_keypoint_episode_video(self, unwrapped_model, metric_key_prefix: str) -> None:
+        if wandb.run is None:
+            return
+        episodes = self._pick_keypoint_video_episodes()
+        if not episodes:
+            return
+        # One key per episode (rather than a list under one key, as with
+        # wandb.Image): W&B's list-panel paging is Image-specific, Video isn't
+        # guaranteed to render the same way.
+        logs = {}
+        for i, (dataset, ep_idx) in enumerate(episodes):
+            video = self._render_keypoint_episode_video(unwrapped_model, dataset, ep_idx)
+            if video is not None:
+                logs[f"{metric_key_prefix}/keypoint_episode_video_{i}"] = wandb.Video(
+                    video, fps=self.keypoint_video_fps, format="mp4", caption=f"episode_{ep_idx}"
+                )
+        if not logs:
+            logging.info(
+                "Keypoint episode video: no held-out episode with keypoint data produced a "
+                f"video for {metric_key_prefix}."
+            )
+            return
+        wandb.log(logs, step=self.state.global_step)
 
     def get_eval_dataloader(self, eval_dataset=None):
         """Return a plain DataLoader for eval to avoid accelerate's NCCL broadcast on CPU tensors."""

@@ -83,6 +83,15 @@ class TrainingConfig:
     # (object-centric keypoint auxiliary head only).
     keypoint_viz_max_images: int = 50
 
+    # Per-eval-run GT-vs-predicted keypoint overlay VIDEO (object-centric keypoint
+    # auxiliary head only): rolls the model forward over a held-out episode (drawn
+    # from the eval_set_split_ratio split) and logs it to W&B, the per-episode
+    # analogue of keypoint_viz_max_images' single-frame panels. 0 disables it.
+    keypoint_video_episodes: int = 1
+    keypoint_video_max_frames: int = 100
+    keypoint_video_batch_size: int = 8
+    keypoint_video_fps: int = 10
+
     # DeepSpeed (default)
     deepspeed_stage: int = 2  # ZeRO stage (1, 2, or 3)
     gradient_checkpointing: bool = False
