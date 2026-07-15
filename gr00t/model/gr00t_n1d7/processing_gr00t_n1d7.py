@@ -159,7 +159,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         max_action_horizon: int = 40,
         keypoint_horizon: int = 16,
         max_keypoint_objects: int = 2,
-        keypoints_per_object: int = 20,
+        keypoints_per_object: int = 8,
         apply_sincos_state_encoding: bool = False,
         use_albumentations: bool = False,
         extra_augmentation_config: dict | None = None,
