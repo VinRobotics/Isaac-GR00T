@@ -31,6 +31,24 @@ from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
 from gr00t.model.registry import register_model
 
 
+# Object-centric keypoint aux head submodule name fragments, across every
+# keypoint_head_mode (see Gr00tN1d7Config.keypoint_head_mode): safe to be
+# missing from an older checkpoint (fresh init) when resuming/starting from one
+# that predates a given mode's extra modules. Single source of truth for
+# _create_model's missing-key handling below, so adding a new keypoint
+# submodule only requires updating this one list.
+KEYPOINT_AUX_PARAM_NAMES = (
+    "keypoint_position_decoder",
+    "keypoint_query_embedding",
+    "keypoint_cls_token",
+    "keypoint_condition_proj",
+    "keypoint_label_step_embed",
+    "keypoint_style_encoder",
+    "keypoint_style_head",
+    "keypoint_style_to_query",
+)
+
+
 # Convert tensors to lists for JSON serialization
 def convert_tensors_to_lists(obj):
     """Recursively convert tensors to lists in nested dictionaries/lists."""
@@ -123,13 +141,16 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             # Newly-added keypoint aux head params: fine to be missing (fresh init)
             # the first time enable_keypoint_head / keypoint_head_mode is turned on
-            # for a checkpoint that predates them. If the checkpoint HAS
-            # them but the current config doesn't use them, that's caught below as
-            # unexpected_keys instead (architecture mismatch, not a safe default).
+            # for a checkpoint that predates them (or predates a specific mode's
+            # extra modules, e.g. "cvae"'s recognition encoder). If the checkpoint
+            # HAS them but the current config doesn't use them, that's caught below
+            # as unexpected_keys instead (architecture mismatch, not a safe
+            # default). Single source of truth (also used by other_missing below)
+            # so a newly added keypoint submodule can't silently hard-crash loading
+            # here while being fine everywhere else — exactly what happened when
+            # "cvae"'s style-encoder params were added but not listed here.
             keypoint_missing = [
-                k
-                for k in missing_keys
-                if "keypoint_position_decoder" in k or "keypoint_query_embedding" in k
+                k for k in missing_keys if any(name in k for name in KEYPOINT_AUX_PARAM_NAMES)
             ]
             if keypoint_missing:
                 logging.info(
@@ -224,9 +245,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             other_missing = [
                 k
                 for k in missing_keys
-                if "mask_token" not in k
-                and "keypoint_position_decoder" not in k
-                and "keypoint_query_embedding" not in k
+                if "mask_token" not in k and not any(name in k for name in KEYPOINT_AUX_PARAM_NAMES)
             ]
             other_unexpected = [
                 k
