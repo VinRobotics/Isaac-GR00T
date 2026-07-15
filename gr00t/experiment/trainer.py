@@ -535,30 +535,29 @@ class Gr00tTrainer(Trainer):
         wandb.log({f"{metric_key_prefix}/keypoint": combined}, step=self.state.global_step)
 
     def _pick_keypoint_video_episodes(self) -> list:
-        """Pick keypoint_video_episodes distinct (dataset, episode_index) pairs from
-        the held-out eval split (see eval_set_split_ratio / validation_path) whose
-        underlying ShardedSingleStepDataset actually carries a "keypoint" modality.
-        Held out, not train, episodes only — eval_dataset's datasets already are the
-        val-split ones (see DatasetFactory.build), so no extra filtering needed.
+        """Pick keypoint_video_episodes distinct held-out episodes PER dataset_path
+        (every ShardedSingleStepDataset in the eval split — see eval_set_split_ratio
+        / validation_path — that carries a "keypoint" modality), not
+        keypoint_video_episodes total pooled across all of them: otherwise a
+        multi-dataset mix could end up rendering every video from the same one
+        dataset by chance, starving the rest of coverage. Sampling within each
+        dataset is without replacement, capped to however many held-out episodes
+        that dataset actually has.
         """
         eval_dataset = getattr(self, "eval_dataset", None)
         candidates = getattr(eval_dataset, "datasets", None) if eval_dataset is not None else None
         if not candidates:
             return []
-        # Flatten to one (dataset, episode_index) pool and sample WITHOUT
-        # replacement, so keypoint_video_episodes > 1 actually yields distinct
-        # episodes instead of independently re-drawing the same one by chance
-        # (especially likely when a dataset only has a handful of held-out
-        # episodes to begin with).
-        pool = [
-            (ds, ep_idx)
-            for ds in candidates
-            if "keypoint" in getattr(ds, "modality_configs", {})
-            for ep_idx in (getattr(ds, "episode_indices", None) or [])
-        ]
-        if not pool:
-            return []
-        return random.sample(pool, min(self.keypoint_video_episodes, len(pool)))
+        picks = []
+        for ds in candidates:
+            if "keypoint" not in getattr(ds, "modality_configs", {}):
+                continue
+            episode_indices = getattr(ds, "episode_indices", None) or []
+            if not episode_indices:
+                continue
+            k = min(self.keypoint_video_episodes, len(episode_indices))
+            picks.extend((ds, ep_idx) for ep_idx in random.sample(episode_indices, k))
+        return picks
 
     def _render_keypoint_episode_video(
         self, model, unwrapped_model, dataset, ep_idx: int
@@ -649,13 +648,21 @@ class Gr00tTrainer(Trainer):
             return
         # One key per episode (rather than a list under one key, as with
         # wandb.Image): W&B's list-panel paging is Image-specific, Video isn't
-        # guaranteed to render the same way.
+        # guaranteed to render the same way. Key includes the dataset (basename of
+        # dataset_path) since episodes are now picked per dataset_path — with a
+        # multi-dataset mix there can be several videos per eval call.
         logs = {}
-        for i, (dataset, ep_idx) in enumerate(episodes):
+        for dataset, ep_idx in episodes:
             video = self._render_keypoint_episode_video(model, unwrapped_model, dataset, ep_idx)
             if video is not None:
-                logs[f"{metric_key_prefix}/keypoint_episode_video_{i}"] = wandb.Video(
-                    video, fps=self.keypoint_video_fps, format="mp4", caption=f"episode_{ep_idx}"
+                dataset_name = os.path.basename(str(getattr(dataset, "dataset_path", "dataset")))
+                logs[f"{metric_key_prefix}/keypoint_episode_video/{dataset_name}/ep{ep_idx}"] = (
+                    wandb.Video(
+                        video,
+                        fps=self.keypoint_video_fps,
+                        format="mp4",
+                        caption=f"{dataset_name} episode_{ep_idx}",
+                    )
                 )
         if not logs:
             logging.info(

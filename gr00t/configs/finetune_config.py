@@ -270,10 +270,12 @@ class FinetuneConfig:
     configured via validation_path or eval_set_split_ratio)."""
 
     keypoint_video_episodes: int = 1
-    """Number of held-out episodes (drawn from validation_path / eval_set_split_ratio)
-    to roll the model forward over and log as a GT-vs-predicted keypoint overlay
-    video per evaluation run. 0 disables episode-video logging (only meaningful when
-    enable_keypoint_head=True)."""
+    """Number of held-out episodes to roll the model forward over and log as a
+    GT-vs-predicted keypoint overlay video per evaluation run, PER dataset_path
+    (each dataset in the mix that carries a "keypoint" modality gets its own
+    keypoint_video_episodes videos, drawn from that dataset's validation_path /
+    eval_set_split_ratio split — not a total pooled across every dataset). 0
+    disables episode-video logging (only meaningful when enable_keypoint_head=True)."""
 
     keypoint_video_max_frames: int = 100
     """Cap on frames rendered per episode video (uniformly strided across the

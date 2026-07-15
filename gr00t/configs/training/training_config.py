@@ -84,9 +84,11 @@ class TrainingConfig:
     keypoint_viz_max_images: int = 50
 
     # Per-eval-run GT-vs-predicted keypoint overlay VIDEO (object-centric keypoint
-    # auxiliary head only): rolls the model forward over a held-out episode (drawn
-    # from the eval_set_split_ratio split) and logs it to W&B, the per-episode
-    # analogue of keypoint_viz_max_images' single-frame panels. 0 disables it.
+    # auxiliary head only): rolls the model forward over held-out episode(s) (drawn
+    # from the eval_set_split_ratio split) and logs them to W&B, the per-episode
+    # analogue of keypoint_viz_max_images' single-frame panels. keypoint_video_episodes
+    # is applied PER dataset_path carrying a "keypoint" modality, not pooled across
+    # the whole mix. 0 disables it.
     keypoint_video_episodes: int = 1
     keypoint_video_max_frames: int = 100
     keypoint_video_batch_size: int = 8
