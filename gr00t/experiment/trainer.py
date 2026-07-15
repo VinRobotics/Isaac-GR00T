@@ -551,6 +551,11 @@ class Gr00tTrainer(Trainer):
         dataset by chance, starving the rest of coverage. Sampling within each
         dataset is without replacement, capped to however many held-out episodes
         that dataset actually has.
+
+        Returns (dataset, episode_index, slot) tuples, where slot is the pick's
+        0-indexed position within this dataset's picks (0..keypoint_video_episodes-1)
+        — see _log_keypoint_episode_video for why callers key on slot, not
+        episode_index.
         """
         eval_dataset = getattr(self, "eval_dataset", None)
         candidates = getattr(eval_dataset, "datasets", None) if eval_dataset is not None else None
@@ -564,7 +569,9 @@ class Gr00tTrainer(Trainer):
             if not episode_indices:
                 continue
             k = min(self.keypoint_video_episodes, len(episode_indices))
-            picks.extend((ds, ep_idx) for ep_idx in random.sample(episode_indices, k))
+            picks.extend(
+                (ds, ep_idx, slot) for slot, ep_idx in enumerate(random.sample(episode_indices, k))
+            )
         return picks
 
     def _render_keypoint_episode_video(
@@ -659,13 +666,19 @@ class Gr00tTrainer(Trainer):
         # wandb.Image): W&B's list-panel paging is Image-specific, Video isn't
         # guaranteed to render the same way. Key includes the dataset (basename of
         # dataset_path) since episodes are now picked per dataset_path — with a
-        # multi-dataset mix there can be several videos per eval call.
+        # multi-dataset mix there can be several videos per eval call. Keyed by
+        # `slot` (0..keypoint_video_episodes-1, this pick's position in
+        # _pick_keypoint_video_episodes) rather than the sampled episode's real,
+        # random dataset-wide index: the real index changes every eval call, which
+        # would scatter each dataset's videos across an ever-growing set of keys
+        # instead of giving W&B a stable key per slot to show progress over
+        # training on. The real episode index is kept in the caption for reference.
         logs = {}
-        for dataset, ep_idx in episodes:
+        for dataset, ep_idx, slot in episodes:
             video = self._render_keypoint_episode_video(model, unwrapped_model, dataset, ep_idx)
             if video is not None:
                 dataset_name = os.path.basename(str(getattr(dataset, "dataset_path", "dataset")))
-                logs[f"{metric_key_prefix}/keypoint_episode_video/{dataset_name}/ep{ep_idx}"] = (
+                logs[f"{metric_key_prefix}/keypoint_episode_video/{dataset_name}/ep{slot}"] = (
                     wandb.Video(
                         video,
                         fps=self.keypoint_video_fps,
