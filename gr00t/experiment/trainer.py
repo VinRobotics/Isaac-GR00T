@@ -495,12 +495,20 @@ class Gr00tTrainer(Trainer):
         kp_pred = action_out["keypoint_pred"]
         active_pred = action_out["keypoint_active_pred"]
         num_objects = kp_pred.shape[2]
+        kp_per_object = kp_pred.shape[3]
 
         for i in range(viz_image.shape[0]):
             if has_keypoint[i].item() < 0.5:
                 continue
             img = viz_image[i].detach().cpu().numpy()
-            gt_kp = kp_target[i].detach().float().cpu().numpy().reshape(-1, num_objects, 20, 2)
+            gt_kp = (
+                kp_target[i]
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+                .reshape(-1, num_objects, kp_per_object, 2)
+            )
             gt_active = active_target[i].detach().float().cpu().numpy()
             pred_kp = kp_pred[i].detach().float().cpu().numpy()
             pred_active = active_pred[i].detach().float().cpu().numpy()
@@ -619,6 +627,7 @@ class Gr00tTrainer(Trainer):
             if "keypoint_pred" not in action_out:
                 return None
             num_objects = action_out["keypoint_pred"].shape[2]
+            kp_per_object = action_out["keypoint_pred"].shape[3]
             for i in range(len(chunk)):
                 img = batch["viz_image"][i].detach().cpu().numpy()
                 gt_kp = (
@@ -627,7 +636,7 @@ class Gr00tTrainer(Trainer):
                     .float()
                     .cpu()
                     .numpy()
-                    .reshape(-1, num_objects, 20, 2)
+                    .reshape(-1, num_objects, kp_per_object, 2)
                 )
                 gt_active = batch["keypoint_active_target"][i].detach().float().cpu().numpy()
                 pred_kp = action_out["keypoint_pred"][i].detach().float().cpu().numpy()
