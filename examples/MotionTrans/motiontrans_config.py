@@ -93,7 +93,7 @@ motiontrans_config = {
     # model as input; datasets without a "keypoint" section in modality.json skip this.
     "keypoint": ModalityConfig(
         delta_indices=list(range(0, 16)),
-        modality_keys=["keypoint_2d", "keypoint_active"],
+        modality_keys=["keypoint_2d"],
     ),
 }
 
