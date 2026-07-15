@@ -397,7 +397,17 @@ class Gr00tN1d7ActionHead(nn.Module):
         self, pred_active_logits: torch.Tensor, action_input: BatchFeature
     ) -> torch.Tensor:
         """BCE active-flag loss via the dedicated trunk. "default"/"tokens" mode
-        only — see _compute_share_dim_active_loss for "share_dim" mode."""
+        only — see _compute_share_dim_active_loss for "share_dim" mode.
+
+        pos_weight (num_negative / num_positive, the standard BCEWithLogits
+        class-balancing ratio) is estimated fresh from THIS batch's own active
+        cell counts rather than a fixed constant: the true active/inactive split
+        depends on the dataset mix (human vs robot, which objects/episodes are in
+        play) and can drift as --dataset-mix-ratio or co-training alpha change, so
+        a hardcoded number would silently go stale. Counted over has_keypoint
+        samples only — the zero-filled target on has_keypoint=0 samples isn't a
+        real "inactive" label and would bias the ratio toward negative.
+        """
         target_active = action_input.get("keypoint_active_target", None)
         if target_active is None:
             return pred_active_logits.sum() * 0.0
@@ -410,7 +420,27 @@ class Gr00tN1d7ActionHead(nn.Module):
             batch_size, action_input, pred_active_logits.device, pred_active_logits.dtype
         )
 
-        bce = F.binary_cross_entropy_with_logits(pred_active_logits, target_active, reduction="none")
+        has_keypoint = action_input.get("has_keypoint", None)
+        if has_keypoint is not None:
+            valid = (has_keypoint.to(device=pred_active_logits.device) >= 0.5).view(
+                batch_size, 1, 1
+            ).expand_as(target_active)
+        else:
+            valid = torch.ones_like(target_active, dtype=torch.bool)
+
+        with torch.no_grad():
+            num_pos = target_active[valid].sum()
+            num_neg = valid.sum() - num_pos
+            # No positive cell this batch: nothing to estimate a ratio from, so
+            # leave BCE unweighted rather than dividing by zero / near-zero.
+            # Capped so one unlucky low-positive batch can't spike the gradient.
+            pos_weight = torch.where(
+                num_pos > 0, num_neg / num_pos.clamp(min=1), torch.ones_like(num_pos)
+            ).clamp(max=50.0)
+
+        bce = F.binary_cross_entropy_with_logits(
+            pred_active_logits, target_active, pos_weight=pos_weight, reduction="none"
+        )
         active_cost = bce.mean(dim=(1, 2))
         return (active_cost * sample_weight).sum() / (sample_weight.sum() + 1e-6)
 
