@@ -804,6 +804,19 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "use_mean_std",
                 "model_name",
                 "model_type",
+                "use_percentiles",
+                "image_crop_size",
+                "image_target_size",
+                "formalize_language",
+                "apply_sincos_state_encoding",
+                "max_action_horizon",
+                "keypoint_horizon",
+                "max_keypoint_objects",
+                "keypoints_per_object",
+                "use_albumentations",
+                "extra_augmentation_config",
+                "shortest_image_edge",
+                "crop_fraction",
             ]
             for key in override_keys:
                 if key in kwargs:
