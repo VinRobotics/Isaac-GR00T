@@ -128,7 +128,7 @@ class Gr00tN1d7Config(PretrainedConfig):
     enable_keypoint_head: bool = False
     keypoint_horizon: int = 16
     max_keypoint_objects: int = 2
-    keypoints_per_object: int = 20
+    keypoints_per_object: int = 8
     keypoint_loss_weight: float = 1.0
     keypoint_active_loss_weight: float = 0.1
     # Loss weight for keypoints of objects whose active flag is 0. Default 0 = hard

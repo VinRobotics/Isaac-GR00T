@@ -35,22 +35,18 @@ def render_keypoint_overlay(
     min_brightness: float = 0.35,
     active_threshold: float = 0.05,
 ) -> np.ndarray:
-    """Overlay the full 16-step future keypoint trajectory as a trail per tracked
-    point (one polyline per point, like test_keypoint_tracking.py's trail viz),
-    onto a copy of `image`.
+    """Overlay the future keypoint trajectory as a trail per tracked point (one
+    polyline per point, like test_keypoint_tracking.py's trail viz), onto a copy
+    of `image`.
 
-    Every step is still drawn as a marker (filled circle when weight >=
-    active_threshold, hollow ring otherwise, following test_keypoint_tracking.py's
-    visible/occluded convention) — so the model's full spatial guess stays visible
-    even where it isn't confident. The TRAIL, however, only bridges two
-    consecutive active steps (test_keypoint_tracking.py's
-    `visibility[tt] and visibility[tt-1]` gate): an inactive step is an untrusted
-    position (frozen/extrapolated/never-tracked, see module docstring), so drawing
-    a line through it would visually claim motion the tracker never actually saw.
-    This does NOT reintroduce the earlier "dim inactive points" mistake — color
-    intensity here is still driven by time-fade only (never multiplied by weight),
-    which is what made early-trail inactive points nearly black and imperceptible
-    before; only line continuity is gated, not marker color.
+    Only ACTIVE steps (weight >= active_threshold) are drawn at all — neither
+    marker nor trail. An inactive step is an untrusted position (frozen/
+    extrapolated/never-tracked, see module docstring): it's not a real motion
+    claim, so it's better left off the image entirely rather than shown as a
+    hollow/low-confidence marker. The trail additionally only bridges two
+    CONSECUTIVE active steps (test_keypoint_tracking.py's
+    `visibility[tt] and visibility[tt-1]` gate), so a gap in activeness breaks
+    the line rather than drawing a straight shortcut across it.
 
     Args:
         image: (H, W, 3) uint8 RGB thumbnail.
@@ -58,11 +54,12 @@ def render_keypoint_overlay(
             same way for any image size (independent axis rescaling), so this works
             regardless of what size `image` was resized to.
         weight: (horizon, num_objects) in [0, 1] — GT active flag or predicted
-            probability. Only selects marker style (>= active_threshold: filled,
-            else hollow); never affects color/brightness or skips a step.
+            probability. Steps below active_threshold are skipped entirely (no
+            marker, no trail segment).
 
     Returns:
-        (H, W, 3) uint8 RGB copy of `image` with the full trajectories drawn on top.
+        (H, W, 3) uint8 RGB copy of `image` with the active-step trajectories
+        drawn on top.
     """
     out = np.ascontiguousarray(image).copy()
     h, w = out.shape[:2]
@@ -80,37 +77,27 @@ def render_keypoint_overlay(
     for obj in range(num_objects):
         base_color = np.array(_OBJECT_COLORS[obj % len(_OBJECT_COLORS)], dtype=np.float32)
         for p in range(num_points):
-            prev_px = None
-            prev_active = False
+            prev_px = None  # last ACTIVE step's pixel pos, or None if none yet / broken
             for t in range(horizon):
                 w_t = float(weight[t, obj])
-                is_active = w_t >= active_threshold
+                if w_t < active_threshold:
+                    # Skip entirely: no marker, no trail segment into or out of
+                    # this step (see docstring — an inactive step isn't a real
+                    # position, so it shouldn't appear on the image at all).
+                    prev_px = None
+                    continue
                 # Fade early steps in, later steps fully saturated, so the direction
-                # of motion is visible at a glance. Active/inactive is NOT folded into
-                # color here (see docstring) — only into marker style and trail
-                # continuity below — so inactive points stay just as visible as
-                # active ones wherever they ARE drawn.
+                # of motion is visible at a glance.
                 brightness = min_brightness + (1.0 - min_brightness) * (t / max(horizon - 1, 1))
                 color = tuple(int(c) for c in (base_color * brightness).clip(0, 255))
                 px = to_px(keypoints[t, obj, p])
-                if (
-                    prev_active
-                    and is_active
-                    and prev_px is not None
-                    and in_bounds(prev_px)
-                    and in_bounds(px)
-                ):
+                if prev_px is not None and in_bounds(prev_px) and in_bounds(px):
                     cv2.line(out, prev_px, px, color, line_thickness, cv2.LINE_AA)
                 if in_bounds(px):
-                    # Filled = active/confident, hollow = inactive/low-confidence.
-                    cv2.circle(
-                        out, px, point_radius, color, thickness=-1 if is_active else 1
-                    )
+                    cv2.circle(out, px, point_radius, color, thickness=-1)
                     if t == horizon - 1:
-                        # Head marker: always the final future step, regardless of
-                        # its own active state, so GT and pred line up visually.
                         cv2.circle(out, px, point_radius + 2, color, thickness=1)
-                prev_px, prev_active = px, is_active
+                prev_px = px
         # Per-object legend label, following test_keypoint_tracking.py's
         # "active_{role} = slot_{slot}" convention (simplified: we have no
         # role/slot distinction here, just the fixed per-object color).
