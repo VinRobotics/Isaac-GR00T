@@ -545,20 +545,20 @@ class Gr00tTrainer(Trainer):
         candidates = getattr(eval_dataset, "datasets", None) if eval_dataset is not None else None
         if not candidates:
             return []
-        keypoint_datasets = [
-            ds
+        # Flatten to one (dataset, episode_index) pool and sample WITHOUT
+        # replacement, so keypoint_video_episodes > 1 actually yields distinct
+        # episodes instead of independently re-drawing the same one by chance
+        # (especially likely when a dataset only has a handful of held-out
+        # episodes to begin with).
+        pool = [
+            (ds, ep_idx)
             for ds in candidates
             if "keypoint" in getattr(ds, "modality_configs", {})
-            and getattr(ds, "episode_indices", None)
+            for ep_idx in (getattr(ds, "episode_indices", None) or [])
         ]
-        if not keypoint_datasets:
+        if not pool:
             return []
-        picks = []
-        for _ in range(self.keypoint_video_episodes):
-            dataset = random.choice(keypoint_datasets)
-            ep_idx = random.choice(dataset.episode_indices)
-            picks.append((dataset, ep_idx))
-        return picks
+        return random.sample(pool, min(self.keypoint_video_episodes, len(pool)))
 
     def _render_keypoint_episode_video(
         self, model, unwrapped_model, dataset, ep_idx: int
