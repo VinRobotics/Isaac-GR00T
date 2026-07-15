@@ -460,7 +460,7 @@ class Gr00tTrainer(Trainer):
             if viz_images_gt:
                 self._log_keypoint_viz(viz_images_gt, viz_images_pred, metric_key_prefix)
             if self.keypoint_video_episodes > 0 and self.keypoint_video_max_frames > 0:
-                self._log_keypoint_episode_video(unwrapped_model, metric_key_prefix)
+                self._log_keypoint_episode_video(model, unwrapped_model, metric_key_prefix)
 
         return EvalLoopOutput(
             predictions=None, label_ids=None, metrics=metrics, num_samples=num_samples
@@ -560,7 +560,9 @@ class Gr00tTrainer(Trainer):
             picks.append((dataset, ep_idx))
         return picks
 
-    def _render_keypoint_episode_video(self, unwrapped_model, dataset, ep_idx: int) -> np.ndarray | None:
+    def _render_keypoint_episode_video(
+        self, model, unwrapped_model, dataset, ep_idx: int
+    ) -> np.ndarray | None:
         """Roll the model's keypoint head forward over a held-out episode's frames
         (strided down to keypoint_video_max_frames) and render a GT-vs-predicted
         overlay video, the per-episode analogue of _collect_keypoint_viz's
@@ -586,16 +588,34 @@ class Gr00tTrainer(Trainer):
             batch = self._prepare_inputs(batch)
             if "viz_image" not in batch or "keypoint_target" not in batch:
                 return None
-            # get_action() runs the VLM backbone directly, bypassing model.forward —
-            # the only place Accelerate's bf16 autocast gets installed (it patches
-            # .forward specifically, not arbitrary methods). Without it, any
+            # Deliberately NOT unwrapped_model.get_action(inputs=batch, ...): that
+            # runs the VLM backbone directly, bypassing model.forward — the only
+            # place Accelerate's bf16 handling (whether an autocast patch or
+            # DeepSpeed's own precision management) actually gets applied — so any
             # backbone_trainable_params_fp32 layer produces real fp32 activations,
-            # which flash-attn rejects outright. compute_loss_context_manager() is
-            # the same context Trainer normally wraps forward passes in (a no-op
-            # under DeepSpeed, which manages precision itself).
-            with torch.inference_mode(), self.compute_loss_context_manager():
-                action_out = unwrapped_model.get_action(
-                    inputs=batch, options={"return_keypoints": True}
+            # which flash-attn rejects outright. Instead, get backbone_features via
+            # the WRAPPED model's forward (the exact call compute_loss already makes
+            # successfully every eval batch), then hand them to
+            # action_head.get_action_with_features for the actual rollout — same
+            # split _collect_keypoint_viz above uses, and it never touches the
+            # backbone a second time.
+            with torch.inference_mode():
+                outputs = model(inputs=batch)
+            if not isinstance(outputs, dict) or "backbone_features" not in outputs:
+                return None
+            with torch.inference_mode():
+                action_out = unwrapped_model.action_head.get_action_with_features(
+                    backbone_features=outputs["backbone_features"],
+                    state_features=outputs["state_features"],
+                    embodiment_id=batch["embodiment_id"],
+                    backbone_output=BatchFeature(
+                        data={
+                            "image_mask": outputs["image_mask"],
+                            "backbone_attention_mask": outputs["backbone_attention_mask"],
+                        }
+                    ),
+                    action_input=BatchFeature(data={}),
+                    options={"return_keypoints": True},
                 )
             if "keypoint_pred" not in action_out:
                 return None
@@ -621,7 +641,7 @@ class Gr00tTrainer(Trainer):
             return None
         return np.stack(frames).transpose(0, 3, 1, 2)  # (T, C, H, W), RGB, for wandb.Video
 
-    def _log_keypoint_episode_video(self, unwrapped_model, metric_key_prefix: str) -> None:
+    def _log_keypoint_episode_video(self, model, unwrapped_model, metric_key_prefix: str) -> None:
         if wandb.run is None:
             return
         episodes = self._pick_keypoint_video_episodes()
@@ -632,7 +652,7 @@ class Gr00tTrainer(Trainer):
         # guaranteed to render the same way.
         logs = {}
         for i, (dataset, ep_idx) in enumerate(episodes):
-            video = self._render_keypoint_episode_video(unwrapped_model, dataset, ep_idx)
+            video = self._render_keypoint_episode_video(model, unwrapped_model, dataset, ep_idx)
             if video is not None:
                 logs[f"{metric_key_prefix}/keypoint_episode_video_{i}"] = wandb.Video(
                     video, fps=self.keypoint_video_fps, format="mp4", caption=f"episode_{ep_idx}"
