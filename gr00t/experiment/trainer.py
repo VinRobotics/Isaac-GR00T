@@ -345,8 +345,11 @@ class Gr00tTrainer(Trainer):
         # evaluate() call independently draws a fresh random subset instead of
         # always showing the same first-N samples encountered.
         enable_keypoint_head = getattr(self.model.config, "enable_keypoint_head", False)
+        # "cvae" mode additionally reports keypoint_kl_loss — no mode reports a
+        # separate "active" loss anymore (see Gr00tN1d7Config.keypoint_head_mode).
+        keypoint_is_cvae = getattr(self.model.config, "keypoint_head_mode", None) == "cvae"
         total_kp_loss = torch.tensor(0.0, device=self.args.device)
-        total_kp_active_loss = torch.tensor(0.0, device=self.args.device)
+        total_kp_kl_loss = torch.tensor(0.0, device=self.args.device)
         viz_images_gt: list = []
         viz_images_pred: list = []
         viz_candidates_seen = 0
@@ -363,7 +366,8 @@ class Gr00tTrainer(Trainer):
 
             if enable_keypoint_head and isinstance(outputs, dict) and "keypoint_loss" in outputs:
                 total_kp_loss += outputs["keypoint_loss"].detach()
-                total_kp_active_loss += outputs["keypoint_active_loss"].detach()
+                if keypoint_is_cvae:
+                    total_kp_kl_loss += outputs["keypoint_kl_loss"].detach()
 
             # The collator wraps the real batch as {"inputs": {...actual keys...}} so
             # that model(**inputs) resolves to forward(self, inputs=<batch>) — unwrap
@@ -430,7 +434,8 @@ class Gr00tTrainer(Trainer):
                 dist.all_reduce(group_action_den[name], op=dist.ReduceOp.SUM)
             if enable_keypoint_head:
                 dist.all_reduce(total_kp_loss, op=dist.ReduceOp.SUM)
-                dist.all_reduce(total_kp_active_loss, op=dist.ReduceOp.SUM)
+                if keypoint_is_cvae:
+                    dist.all_reduce(total_kp_kl_loss, op=dist.ReduceOp.SUM)
 
         denom = total_steps.clamp(min=1)
         mean_loss = (total_loss / denom).item()
@@ -447,9 +452,8 @@ class Gr00tTrainer(Trainer):
                 ).item()
         if enable_keypoint_head:
             metrics[f"{metric_key_prefix}_keypoint_loss"] = (total_kp_loss / denom).item()
-            metrics[f"{metric_key_prefix}_keypoint_active_loss"] = (
-                total_kp_active_loss / denom
-            ).item()
+            if keypoint_is_cvae:
+                metrics[f"{metric_key_prefix}_keypoint_kl_loss"] = (total_kp_kl_loss / denom).item()
 
         if enable_keypoint_head and self.args.local_rank in (-1, 0):
             logging.info(
@@ -809,9 +813,10 @@ class Gr00tTrainer(Trainer):
                 log_values["keypoint_loss"] = (
                     self._nested_gather(outputs["keypoint_loss"].detach()).mean().item()
                 )
-                log_values["keypoint_active_loss"] = (
-                    self._nested_gather(outputs["keypoint_active_loss"].detach()).mean().item()
-                )
+                if "keypoint_kl_loss" in outputs:
+                    log_values["keypoint_kl_loss"] = (
+                        self._nested_gather(outputs["keypoint_kl_loss"].detach()).mean().item()
+                    )
             if log_values and self.args.local_rank in (-1, 0):
                 self.log(log_values)
 

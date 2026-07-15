@@ -88,19 +88,19 @@ class FinetuneConfig:
 
     # --- Object-centric keypoint auxiliary head ---
     enable_keypoint_head: bool = False
-    """If True, add the object-centric keypoint auxiliary head: the action-token hidden
-    states additionally predict 16-step future object keypoint trajectories + active
-    flags (set-matching loss). Pure readout — the action path and inference are
-    unchanged. Requires datasets with a "keypoint" section in meta/modality.json
-    (datasets without one contribute has_keypoint=0 samples)."""
+    """If True, add the object-centric keypoint auxiliary head: predicts 16-step
+    future object keypoint POSITIONS (Huber regression by fixed point index — see
+    keypoint_head_mode). "default"/"tokens" are a pure readout — the action path
+    and inference are unchanged. Requires datasets with a "keypoint" section in
+    meta/modality.json (datasets without one contribute has_keypoint=0 samples)."""
 
     keypoint_horizon: int = 16
-    """Number of future steps the keypoint head predicts (position + active).
-    Must not exceed the action horizon. Fixes keypoint_position_decoder's /
-    keypoint_active_decoder's shape, so it must match both the dataset's actual
-    keypoint window and whatever checkpoint you resume/start from — a mismatch
-    with the dataset fails at data-processing time (reshape error); a mismatch
-    with the checkpoint fails at load time (size-mismatch error)."""
+    """Number of future steps the keypoint head predicts. Must not exceed the
+    action horizon. Fixes keypoint_position_decoder's shape, so it must match
+    both the dataset's actual keypoint window and whatever checkpoint you
+    resume/start from — a mismatch with the dataset fails at data-processing time
+    (reshape error); a mismatch with the checkpoint fails at load time
+    (size-mismatch error)."""
 
     max_keypoint_objects: int = 2
     """Number of tracked object slots the keypoint head predicts per step. Same
@@ -113,27 +113,26 @@ class FinetuneConfig:
     count in meta/modality.json, and the checkpoint being resumed/started from)."""
 
     keypoint_loss_weight: float = 1.0
-    """Weight of the keypoint Chamfer loss in the total loss."""
-
-    keypoint_active_loss_weight: float = 0.1
-    """Weight of the keypoint active-flag BCE loss in the total loss."""
+    """Weight of the keypoint position loss (Huber) in the total loss."""
 
     static_keypoint_weight: float = 0.0
-    """Relative loss weight for keypoints of objects whose active flag is 0. Default 0
-    uses the active flags as a hard loss mask: inactive slots can hold zeros (absent
-    object), frozen or extrapolated tracker positions, so only active steps — where the
-    tracker saw real motion near a mask sighting — are supervised."""
+    """Relative loss weight for keypoints of objects whose valid mask is 0
+    (padding slot — no real object at the init frame). Default 0 uses the valid
+    mask as a hard loss mask: only valid slots are supervised."""
 
     keypoint_head_mode: str = "default"
-    """How the keypoint head attaches to the action head. One of:
+    """How the keypoint head attaches to the action head. Every mode predicts
+    POSITION only (point k always means the same physical point for the whole
+    episode in the current data pipeline — test_keypoint_tracking_simple.py — so
+    there is no time-varying "active" signal left to classify). One of:
 
-    "default": decode both keypoint position (Chamfer) and active flags (BCE) from
-    the same action-token hidden states that decode the action itself — a pure
-    readout, action_pred is bit-identical whether or not the head runs.
+    "default": decode keypoint position from the same action-token hidden states
+    that decode the action itself — a pure readout, action_pred is bit-identical
+    whether or not the head runs.
 
     "tokens": append keypoint_horizon dedicated learned query tokens (DETR-style) to
-    the DiT sequence and decode position + active from those instead, giving the
-    keypoint task its own capacity through the transformer. A one-directional
+    the DiT sequence and decode position from those instead, giving the keypoint
+    task its own capacity through the transformer. A one-directional
     self-attention mask keeps this a pure readout too: keypoint query tokens may
     attend to the state/action tokens (so keypoint prediction stays conditioned on the
     specific action being generated), but state/action tokens are masked from ever
@@ -141,25 +140,70 @@ class FinetuneConfig:
     presence, same guarantee as "default". Adds keypoint_query_embedding parameters,
     so it must match between saving and loading a checkpoint.
 
-    "share_dim": fold the *active* flags only (not point positions, which stay
-    Chamfer-matched from hidden states exactly like "default" — point index has no
-    fixed convention across episodes, unlike object-slot index which the data
-    pipeline's assign_slots convention does fix) as extra channels of the same
-    per-step action vector, jointly noised/denoised by flow matching — plain masked
-    MSE, well posed here because object-slot identity is fixed so there's no
+    "share_dim": fold future keypoint POSITIONS themselves as extra channels of the
+    same per-step action vector, jointly noised/denoised by flow matching — plain
+    masked MSE, well posed here because point identity is fixed so there's no
     arbitrary-index ambiguity for the loss to be invariant to. NOT a pure readout
     like "default"/"tokens": action_encoder mixes every input channel into one
-    embedding via a dense matrix, so the (noised) active-flag values genuinely
+    embedding via a dense matrix, so the (noised) position values genuinely
     influence the shared representation that also produces the real action
     prediction during training, same as this codebase's existing effort/
     torque-aware channels. What's preserved is the guarantee that actually
     matters: no real keypoint data is ever fed as input at train or inference
-    time (the Euler rollout's active channels always start from pure noise, same
-    as the real action channels), and action_pred never leaks the extra channels.
-    Widens action_encoder's input dim and action_decoder's output dim by
-    max_keypoint_objects, so — like "tokens" — it must match between saving and
-    loading a checkpoint (start_from_checkpoint loading splices the checkpoint's
-    narrower action head into the widened tensors' leading slice automatically)."""
+    time (the Euler rollout's position channels always start from pure noise,
+    same as the real action channels), and action_pred never leaks the extra
+    channels. No separate position decoder in this mode. Widens action_encoder's
+    input dim and action_decoder's output dim by
+    max_keypoint_objects*keypoints_per_object*2, so — like "tokens" — it must
+    match between saving and loading a checkpoint (start_from_checkpoint loading
+    splices the checkpoint's narrower action head into the widened tensors'
+    leading slice automatically).
+
+    "cvae": everything above ("default"/"tokens"-style Huber regression) plus a
+    small CVAE to handle multimodal futures (which object moves, in what
+    direction) that plain regression would blur into an average. An encoder sees
+    the true future keypoints + a condition token (see keypoint_cvae_condition)
+    during training and produces a style latent z_style, added to the
+    "tokens"-mode dedicated query tokens (never concatenated into the shared
+    action/state tokens, so action_pred stays a pure readout exactly like
+    "tokens"/"default"); at inference z_style defaults to zeros. Trained with
+    reconstruction (Huber, same as every other mode) + KL to N(0,I)
+    (keypoint_kl_weight)."""
+
+    keypoint_style_dim: int = 16
+    """CVAE style latent dimensionality (keypoint_head_mode="cvae" only). Kept
+    small so it can only capture a coarse "which future" choice, not enough to
+    losslessly reconstruct the whole trajectory (which would make the decoder
+    ignore real conditioning and rely on z_style alone — fine at train time since
+    z_style is label-derived, but breaks at inference where z_style=0)."""
+
+    keypoint_kl_weight: float = 0.01
+    """Weight of KL(q(z_style|future,condition) || N(0,I)) in the total loss
+    (keypoint_head_mode="cvae" only). Keeps the posterior close enough to the
+    prior that z_style=0 at inference is a reasonable stand-in for "no
+    information about which future"."""
+
+    keypoint_cvae_condition: str = "vlm"
+    """What conditions the CVAE recognition encoder alongside the true future
+    keypoints (keypoint_head_mode="cvae" only). "vlm" (default) pools the
+    backbone's vision+language tokens — richer than "state" (robot proprioception
+    only), so z_style only has to capture residual ambiguity the backbone can't
+    already resolve. One of {"vlm", "state"}."""
+
+    keypoint_cvae_encoder_layers: int = 2
+    """Self-attention layers in the CVAE recognition encoder (keypoint_head_mode
+    ="cvae" only)."""
+
+    keypoint_cvae_encoder_heads: int = 4
+    """Attention heads in the CVAE recognition encoder (keypoint_head_mode="cvae"
+    only)."""
+
+    keypoint_n_key: int | None = None
+    """Number of the max_keypoint_objects*keypoints_per_object flat points
+    supervised (and shown to the CVAE encoder) per training step, resampled every
+    step (keypoint_head_mode="cvae" only). None (default) = use all of them. The
+    position decoder always predicts the full set regardless — this only controls
+    how many predictions get gradient on a given step."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None

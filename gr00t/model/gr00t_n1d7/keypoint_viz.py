@@ -39,27 +39,29 @@ def render_keypoint_overlay(
     polyline per point, like test_keypoint_tracking.py's trail viz), onto a copy
     of `image`.
 
-    Only ACTIVE steps (weight >= active_threshold) are drawn at all — neither
-    marker nor trail. An inactive step is an untrusted position (frozen/
-    extrapolated/never-tracked, see module docstring): it's not a real motion
-    claim, so it's better left off the image entirely rather than shown as a
-    hollow/low-confidence marker. The trail additionally only bridges two
-    CONSECUTIVE active steps (test_keypoint_tracking.py's
-    `visibility[tt] and visibility[tt-1]` gate), so a gap in activeness breaks
-    the line rather than drawing a straight shortcut across it.
+    Only steps with weight >= active_threshold are drawn at all — neither marker
+    nor trail. With the current data pipeline (test_keypoint_tracking_simple.py),
+    `weight` is a per-object VALID mask, constant across the whole horizon (1 =
+    real tracked object, 0 = padding slot with no object at the init frame — see
+    Gr00tN1d7Config.keypoint_head_mode), so in practice each object's full
+    trajectory is either drawn entirely or not at all; this function still gates
+    per-step so it also degrades gracefully on genuinely time-varying weight
+    (e.g. a caller passing per-step confidence). The trail additionally only
+    bridges two CONSECUTIVE above-threshold steps, so a gap breaks the line
+    rather than drawing a straight shortcut across it.
 
     Args:
         image: (H, W, 3) uint8 RGB thumbnail.
         keypoints: (horizon, num_objects, num_points, 2) in [-1, 1], normalized the
             same way for any image size (independent axis rescaling), so this works
             regardless of what size `image` was resized to.
-        weight: (horizon, num_objects) in [0, 1] — GT active flag or predicted
-            probability. Steps below active_threshold are skipped entirely (no
-            marker, no trail segment).
+        weight: (horizon, num_objects) in [0, 1] — GT valid mask or predicted
+            equivalent (currently always a constant all-ones/all-zeros per object;
+            see keypoint_active_pred in gr00t_n1d7.py). Steps below
+            active_threshold are skipped entirely (no marker, no trail segment).
 
     Returns:
-        (H, W, 3) uint8 RGB copy of `image` with the active-step trajectories
-        drawn on top.
+        (H, W, 3) uint8 RGB copy of `image` with the drawn-in trajectories on top.
     """
     out = np.ascontiguousarray(image).copy()
     h, w = out.shape[:2]

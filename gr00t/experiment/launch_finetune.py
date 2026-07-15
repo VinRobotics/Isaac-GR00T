@@ -181,9 +181,14 @@ if __name__ == "__main__":
     config.model.max_keypoint_objects = ft_config.max_keypoint_objects
     config.model.keypoints_per_object = ft_config.keypoints_per_object
     config.model.keypoint_loss_weight = ft_config.keypoint_loss_weight
-    config.model.keypoint_active_loss_weight = ft_config.keypoint_active_loss_weight
     config.model.static_keypoint_weight = ft_config.static_keypoint_weight
     config.model.keypoint_head_mode = ft_config.keypoint_head_mode
+    config.model.keypoint_style_dim = ft_config.keypoint_style_dim
+    config.model.keypoint_kl_weight = ft_config.keypoint_kl_weight
+    config.model.keypoint_cvae_condition = ft_config.keypoint_cvae_condition
+    config.model.keypoint_cvae_encoder_layers = ft_config.keypoint_cvae_encoder_layers
+    config.model.keypoint_cvae_encoder_heads = ft_config.keypoint_cvae_encoder_heads
+    config.model.keypoint_n_key = ft_config.keypoint_n_key
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False

@@ -91,7 +91,6 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 load_bf16=self.config.model.load_bf16,
                 enable_keypoint_head=self.config.model.enable_keypoint_head,
                 keypoint_loss_weight=self.config.model.keypoint_loss_weight,
-                keypoint_active_loss_weight=self.config.model.keypoint_active_loss_weight,
                 static_keypoint_weight=self.config.model.static_keypoint_weight,
                 keypoint_head_mode=self.config.model.keypoint_head_mode,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
@@ -121,9 +120,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             keypoint_missing = [
                 k
                 for k in missing_keys
-                if "keypoint_position_decoder" in k
-                or "keypoint_active_decoder" in k
-                or "keypoint_query_embedding" in k
+                if "keypoint_position_decoder" in k or "keypoint_query_embedding" in k
             ]
             if keypoint_missing:
                 logging.info(
@@ -138,28 +135,36 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             # replaced by two independent heads, keypoint_position_decoder and
             # keypoint_active_decoder (shared trunk caused gradient interference:
             # the active-flag BCE degraded over training under the dominant,
-            # active-only-masked position Chamfer loss). Resuming from a
-            # checkpoint saved with the old combined decoder is expected to drop
-            # its weights, not an architecture-mismatch error.
-            old_keypoint_decoder_unexpected = [k for k in unexpected_keys if "keypoint_decoder." in k]
+            # active-only-masked position Chamfer loss); keypoint_active_decoder
+            # was later removed entirely (no mode classifies "active" anymore — the
+            # current data pipeline's keypoint_valid mask is static, not a
+            # per-step prediction target; see Gr00tN1d7Config.keypoint_head_mode).
+            # Resuming from a checkpoint saved with either of these retired decoders
+            # is expected to drop their weights, not an architecture-mismatch error.
+            old_keypoint_decoder_unexpected = [
+                k
+                for k in unexpected_keys
+                if "keypoint_decoder." in k or "keypoint_active_decoder." in k
+            ]
             if old_keypoint_decoder_unexpected:
                 logging.info(
-                    "Old combined keypoint_decoder found in checkpoint - discarding "
-                    f"({len(old_keypoint_decoder_unexpected)} tensors); replaced by "
-                    "separate keypoint_position_decoder / keypoint_active_decoder "
-                    "(fresh init)."
+                    "Retired keypoint decoder params found in checkpoint "
+                    "(combined keypoint_decoder and/or keypoint_active_decoder) - "
+                    f"discarding ({len(old_keypoint_decoder_unexpected)} tensors); "
+                    "replaced by keypoint_position_decoder (fresh init)."
                 )
 
             # keypoint_head_mode="share_dim" widens action_encoder.W1.W (input) and
-            # action_decoder.layer2.{W,b} (output) by max_keypoint_objects channels
-            # to carry the active-flag flow-matching targets (see
+            # action_decoder.layer2.{W,b} (output) by
+            # max_keypoint_objects*keypoints_per_object*2 channels to carry the
+            # future-keypoint-position flow-matching targets (see
             # Gr00tN1d7Config.keypoint_head_mode). ignore_mismatched_sizes=True
             # above means these show up as mismatched_keys with the *checkpoint's*
             # pretrained weights simply discarded (whole tensor fresh-initialized) -
             # instead of accepting that loss of pretrained action capacity, splice
             # the checkpoint's own (narrower) action head into the new tensors'
-            # leading slice, so only the new trailing active-flag channels are
-            # actually fresh-initialized.
+            # leading slice, so only the new trailing keypoint-position channels
+            # are actually fresh-initialized.
             # mismatched_keys entries vary by transformers version: either plain key
             # name strings, or (key, checkpoint_shape, model_shape) tuples. Handle
             # both rather than assuming one, since indexing a plain string with [0]
@@ -177,14 +182,14 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 for m in mismatched_keys
                 if any(name in _mismatched_key_name(m) for name in action_dim_param_names)
             ]
-            share_dim_active = (
+            share_dim_mode = (
                 self.config.model.enable_keypoint_head
                 and self.config.model.keypoint_head_mode == "share_dim"
             )
-            if action_dim_mismatched and share_dim_active:
+            if action_dim_mismatched and share_dim_mode:
                 logging.info(
                     "share_dim mode: action_encoder/action_decoder widened for the "
-                    f"keypoint active-flag channels ({len(action_dim_mismatched)} tensors "
+                    f"keypoint position channels ({len(action_dim_mismatched)} tensors "
                     "affected). Reloading the checkpoint's own (narrower) action head so "
                     "pretrained action weights are spliced into the new tensors' leading "
                     "slice, rather than lost to random re-init."
@@ -212,11 +217,14 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 for k in missing_keys
                 if "mask_token" not in k
                 and "keypoint_position_decoder" not in k
-                and "keypoint_active_decoder" not in k
                 and "keypoint_query_embedding" not in k
             ]
-            other_unexpected = [k for k in unexpected_keys if "keypoint_decoder." not in k]
-            handled_mismatched = action_dim_mismatched if (action_dim_mismatched and share_dim_active) else []
+            other_unexpected = [
+                k
+                for k in unexpected_keys
+                if "keypoint_decoder." not in k and "keypoint_active_decoder." not in k
+            ]
+            handled_mismatched = action_dim_mismatched if (action_dim_mismatched and share_dim_mode) else []
             other_mismatched = [m for m in mismatched_keys if m not in handled_mismatched]
             errors = []
             if other_missing:
