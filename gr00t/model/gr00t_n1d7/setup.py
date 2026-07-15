@@ -224,7 +224,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 for k in unexpected_keys
                 if "keypoint_decoder." not in k and "keypoint_active_decoder." not in k
             ]
-            handled_mismatched = action_dim_mismatched if (action_dim_mismatched and share_dim_mode) else []
+            handled_mismatched = (
+                action_dim_mismatched if (action_dim_mismatched and share_dim_mode) else []
+            )
             other_mismatched = [m for m in mismatched_keys if m not in handled_mismatched]
             errors = []
             if other_missing:

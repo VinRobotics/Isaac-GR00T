@@ -802,9 +802,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 # velocity, exactly like the action loss above.
                 pred_kp_vel = pred_actions[..., self.real_action_dim :]
                 velocity_kp = velocity[..., self.real_action_dim :]
-                kp_diff = (
-                    F.mse_loss(pred_kp_vel, velocity_kp, reduction="none") * share_dim_weight
-                )
+                kp_diff = F.mse_loss(pred_kp_vel, velocity_kp, reduction="none") * share_dim_weight
                 if loss_weight_bc is not None:
                     keypoint_loss = (kp_diff * loss_weight_bc).sum() / (
                         (share_dim_weight * loss_weight_bc).sum() + 1e-6
@@ -840,9 +838,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                     outputs["loss"] = combined_loss + self.config.keypoint_kl_weight * kl_loss
                 else:
                     # "default" / "tokens".
-                    keypoint_loss = self._compute_keypoint_position_loss(
-                        pred_kp_flat, action_input
-                    )
+                    keypoint_loss = self._compute_keypoint_position_loss(pred_kp_flat, action_input)
                     outputs["keypoint_loss"] = keypoint_loss
                     outputs["loss"] = loss + self.config.keypoint_loss_weight * keypoint_loss
 
