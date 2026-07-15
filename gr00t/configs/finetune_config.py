@@ -94,6 +94,24 @@ class FinetuneConfig:
     unchanged. Requires datasets with a "keypoint" section in meta/modality.json
     (datasets without one contribute has_keypoint=0 samples)."""
 
+    keypoint_horizon: int = 16
+    """Number of future steps the keypoint head predicts (position + active).
+    Must not exceed the action horizon. Fixes keypoint_position_decoder's /
+    keypoint_active_decoder's shape, so it must match both the dataset's actual
+    keypoint window and whatever checkpoint you resume/start from — a mismatch
+    with the dataset fails at data-processing time (reshape error); a mismatch
+    with the checkpoint fails at load time (size-mismatch error)."""
+
+    max_keypoint_objects: int = 2
+    """Number of tracked object slots the keypoint head predicts per step. Same
+    matching requirement as keypoint_horizon (dataset's actual object-slot count
+    and the checkpoint being resumed/started from)."""
+
+    keypoints_per_object: int = 8
+    """Number of tracked points per object the keypoint head predicts. Same
+    matching requirement as keypoint_horizon (dataset's actual per-object point
+    count in meta/modality.json, and the checkpoint being resumed/started from)."""
+
     keypoint_loss_weight: float = 1.0
     """Weight of the keypoint Chamfer loss in the total loss."""
 

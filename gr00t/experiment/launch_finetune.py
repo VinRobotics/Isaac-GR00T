@@ -177,6 +177,9 @@ if __name__ == "__main__":
 
     # Object-centric keypoint auxiliary head
     config.model.enable_keypoint_head = ft_config.enable_keypoint_head
+    config.model.keypoint_horizon = ft_config.keypoint_horizon
+    config.model.max_keypoint_objects = ft_config.max_keypoint_objects
+    config.model.keypoints_per_object = ft_config.keypoints_per_object
     config.model.keypoint_loss_weight = ft_config.keypoint_loss_weight
     config.model.keypoint_active_loss_weight = ft_config.keypoint_active_loss_weight
     config.model.static_keypoint_weight = ft_config.static_keypoint_weight
