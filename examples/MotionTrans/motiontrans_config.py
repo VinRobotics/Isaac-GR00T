@@ -88,12 +88,17 @@ motiontrans_config = {
         modality_keys=["annotation.human.task_description"],
     ),
     # Object keypoints: aux supervision targets for the object-centric keypoint head
-    # (2 objects x 20 tracked points + per-object active flags). Same 16-step window as
-    # the action chunk, so keypoint step t aligns with action token t. Never fed to the
-    # model as input; datasets without a "keypoint" section in modality.json skip this.
+    # (max_keypoint_objects objects x keypoints_per_object tracked points, flat/fixed
+    # identity per episode — test_keypoint_tracking_simple.py). Same 16-step window as
+    # the action chunk, so keypoint step t aligns with action token t. "keypoint_valid"
+    # is REQUIRED here alongside "keypoint_2d": without it, the loader/processor never
+    # see a group matching the "active"/"valid" flag heuristic, has_keypoint stays 0 for
+    # every sample, and keypoint_loss silently trains as a constant 0.0 forever (no
+    # error - just no signal). Never fed to the model as input; datasets without a
+    # "keypoint" section in modality.json skip this (has_keypoint=0 for them too).
     "keypoint": ModalityConfig(
         delta_indices=list(range(0, 16)),
-        modality_keys=["keypoint_2d"],
+        modality_keys=["keypoint_2d", "keypoint_valid"],
     ),
 }
 
