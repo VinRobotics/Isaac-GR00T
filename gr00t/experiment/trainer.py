@@ -586,7 +586,14 @@ class Gr00tTrainer(Trainer):
             batch = self._prepare_inputs(batch)
             if "viz_image" not in batch or "keypoint_target" not in batch:
                 return None
-            with torch.inference_mode():
+            # get_action() runs the VLM backbone directly, bypassing model.forward —
+            # the only place Accelerate's bf16 autocast gets installed (it patches
+            # .forward specifically, not arbitrary methods). Without it, any
+            # backbone_trainable_params_fp32 layer produces real fp32 activations,
+            # which flash-attn rejects outright. compute_loss_context_manager() is
+            # the same context Trainer normally wraps forward passes in (a no-op
+            # under DeepSpeed, which manages precision itself).
+            with torch.inference_mode(), self.compute_loss_context_manager():
                 action_out = unwrapped_model.get_action(
                     inputs=batch, options={"return_keypoints": True}
                 )
