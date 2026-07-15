@@ -429,7 +429,11 @@ class LeRobotEpisodeLoader:
         # co-training). Columns may be nested (e.g. [40, 2]); flatten per frame.
         # Coordinate groups are stored as pixel (x, y) pairs and normalized to
         # [-1, 1] with the camera resolution so targets are comparable across
-        # datasets; groups with "active" in the name are 0/1 flags, passed through.
+        # datasets; groups with "active" or "valid" in the name are 0/1 flags
+        # (the retired object-slot pipeline's time-varying "active" flag, or the
+        # current flat-point pipeline's static "valid" mask — see
+        # test_keypoint_tracking_simple.py / Gr00tN1d7Config.keypoint_head_mode),
+        # passed through unchanged.
         if "keypoint" in self.modality_configs:
             width, height = self._get_video_resolution()
             keypoint_meta = self.modality_meta.get("keypoint", {})
@@ -446,7 +450,7 @@ class LeRobotEpisodeLoader:
                 start_idx = keypoint_meta[key].get("start", 0)
                 end_idx = keypoint_meta[key].get("end", data.shape[1])
                 data = data[:, start_idx:end_idx]
-                if "active" not in key:
+                if "active" not in key and "valid" not in key:
                     coords = data.reshape(len(data), -1, 2)
                     # Tracker output is pixel (x, y); datasets converted with
                     # --normalize already store [0, 1] coords, detected by scale.

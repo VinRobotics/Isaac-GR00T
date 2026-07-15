@@ -621,8 +621,12 @@ class Gr00tN1d7Processor(BaseProcessor):
             keypoint_active_target = torch.zeros(self.keypoint_horizon, self.max_keypoint_objects)
             has_keypoint = 0.0
             keypoints = content.keypoints or {}
-            coord_keys = [k for k in keypoints if "active" not in k]
-            active_keys = [k for k in keypoints if "active" in k]
+            # "active" = retired object-slot pipeline's time-varying flag; "valid" =
+            # the current flat-point pipeline's static per-object mask (see
+            # test_keypoint_tracking_simple.py / Gr00tN1d7Config.keypoint_head_mode).
+            # Both are 0/1 flags, never coordinate data.
+            coord_keys = [k for k in keypoints if "active" not in k and "valid" not in k]
+            active_keys = [k for k in keypoints if "active" in k or "valid" in k]
             if coord_keys and active_keys:
                 kp = torch.from_numpy(
                     np.asarray(keypoints[coord_keys[0]], dtype=np.float32)

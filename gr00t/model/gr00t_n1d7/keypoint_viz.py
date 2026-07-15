@@ -23,7 +23,12 @@ object motion. Never used on the action path.
 import cv2
 import numpy as np
 
-_OBJECT_COLORS = [(220, 30, 30), (30, 110, 220)]  # per-slot RGB, red / blue
+_OBJECT_COLORS = [
+    (220, 30, 30),
+    (30, 110, 220),
+    (30, 180, 60),
+    (220, 160, 20),
+]  # per-slot RGB: red, blue, green, orange — wraps (%) if max_keypoint_objects exceeds this
 
 
 def render_keypoint_overlay(
