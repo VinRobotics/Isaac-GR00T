@@ -402,10 +402,11 @@ class Gr00tTrainer(Trainer):
                     # already computed above instead of re-running the full VLM
                     # backbone a second time (that redundant rerun, once per eval
                     # batch with keypoint data, was the actual cause of eval blowing
-                    # up training wall time). action_input is intentionally empty:
-                    # get_action_with_features only reads it for the RTC "action" in
-                    # action_input gate, which we don't want here (this is a real,
-                    # non-teacher-forced rollout for visualization).
+                    # up training wall time). action_input deliberately carries ONLY
+                    # keypoint_target — needed for the point-token query coords
+                    # ("tokens"/"cvae", t=0 positions; see _keypoint_query_coords) —
+                    # and NOT "action", whose presence would trip the RTC inpainting
+                    # gate (this is a real, non-teacher-forced rollout for viz).
                     action_out = unwrapped_model.action_head.get_action_with_features(
                         backbone_features=outputs["backbone_features"],
                         state_features=outputs["state_features"],
@@ -416,7 +417,9 @@ class Gr00tTrainer(Trainer):
                                 "backbone_attention_mask": outputs["backbone_attention_mask"],
                             }
                         ),
-                        action_input=BatchFeature(data={}),
+                        action_input=BatchFeature(
+                            data={"keypoint_target": batch["keypoint_target"]}
+                        ),
                         options={"return_keypoints": True},
                     )
                 viz_candidates_seen = self._collect_keypoint_viz(
@@ -514,6 +517,12 @@ class Gr00tTrainer(Trainer):
                 .reshape(-1, num_objects, kp_per_object, 2)
             )
             gt_active = active_target[i].detach().float().cpu().numpy()
+            if gt_active.shape[-1] != num_objects:
+                # Per-object GT valid mask vs per-point prediction groups
+                # ("tokens"/"cvae" report each point as its own group; see
+                # keypoint_pred in get_action_with_features) — broadcast each
+                # object's mask to its points.
+                gt_active = np.repeat(gt_active, num_objects // gt_active.shape[-1], axis=-1)
             pred_kp = kp_pred[i].detach().float().cpu().numpy()
             pred_active = active_pred[i].detach().float().cpu().numpy()
             gt_img = render_keypoint_overlay(img, gt_kp, gt_active)
@@ -632,7 +641,10 @@ class Gr00tTrainer(Trainer):
                             "backbone_attention_mask": outputs["backbone_attention_mask"],
                         }
                     ),
-                    action_input=BatchFeature(data={}),
+                    # keypoint_target supplies the point-token query coords
+                    # ("tokens"/"cvae") — same reasoning as _collect_keypoint_viz's
+                    # call site above.
+                    action_input=BatchFeature(data={"keypoint_target": batch["keypoint_target"]}),
                     options={"return_keypoints": True},
                 )
             if "keypoint_pred" not in action_out:
@@ -650,6 +662,9 @@ class Gr00tTrainer(Trainer):
                     .reshape(-1, num_objects, kp_per_object, 2)
                 )
                 gt_active = batch["keypoint_active_target"][i].detach().float().cpu().numpy()
+                if gt_active.shape[-1] != num_objects:
+                    # Same per-object -> per-point broadcast as _collect_keypoint_viz.
+                    gt_active = np.repeat(gt_active, num_objects // gt_active.shape[-1], axis=-1)
                 pred_kp = action_out["keypoint_pred"][i].detach().float().cpu().numpy()
                 pred_active = action_out["keypoint_active_pred"][i].detach().float().cpu().numpy()
                 gt_img = render_keypoint_overlay(img, gt_kp, gt_active)

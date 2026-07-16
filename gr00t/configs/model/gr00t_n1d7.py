@@ -147,29 +147,45 @@ class Gr00tN1d7Config(PretrainedConfig):
     # How the keypoint head attaches to the action head. One of:
     #   "default": decode keypoint position from the same action-token hidden
     #     states that decode the action itself (cheap, shared representation).
-    #   "tokens": append keypoint_horizon dedicated learned query tokens to the DiT
-    #     sequence (DETR-style) and decode position from those instead, giving the
-    #     keypoint task its own capacity through the transformer's self-/cross-
-    #     attention rather than squeezing it into the action tokens' hidden state.
-    #     A one-directional self-attention mask (see
+    #   "tokens": append query-conditioned point tokens to the DiT sequence
+    #     (ATM-style): one token per sampled point (keypoint_n_key of them, or the
+    #     full flat set when None), each built from a shared learned base
+    #     embedding + an embedding of that point's CURRENT (t=0) position from
+    #     keypoint_target, each decoding its own point's full keypoint_horizon
+    #     future trajectory. Identity is bound to the input coordinate rather
+    #     than a slot index — so the by-index Huber loss is automatically
+    #     permutation-invariant (the converter's arbitrary enumeration order
+    #     stops mattering) and the prediction task gets a concrete spatial anchor
+    #     instead of having to re-derive "where is this point now" from visual
+    #     grounding alone. A one-directional self-attention mask (see
     #     Gr00tN1d7ActionHead._keypoint_self_attention_mask) keeps this a pure
-    #     readout too: keypoint query tokens may attend to the state/action tokens
-    #     (so keypoint prediction stays conditioned on the specific action being
+    #     readout: point tokens may attend to the state/action tokens (so
+    #     keypoint prediction stays conditioned on the specific action being
     #     generated), but state/action tokens are masked from ever attending back
-    #     to the keypoint queries, at every layer — so action_pred is unaffected by
-    #     their presence, exactly like "default". Adds keypoint_query_embedding
-    #     parameters, so it must match between saving and loading a checkpoint.
+    #     — so action_pred is unaffected by their presence, exactly like
+    #     "default". That same mask is what lets get_action_with_features skip
+    #     appending these tokens entirely unless keypoint predictions are
+    #     explicitly requested (options["return_keypoints"]) — the real-robot
+    #     action path never needs current keypoint positions and pays no extra
+    #     sequence length. Adds keypoint_query_base +
+    #     keypoint_query_coord_encoder parameters, so it must match between
+    #     saving and loading a checkpoint.
     #   "share_dim": fold future keypoint POSITIONS themselves as extra channels of
     #     the same per-step action vector, jointly noised/denoised by flow
     #     matching — the same mechanism this codebase already uses to extend
     #     action_encoder/action_decoder for other per-embodiment action-space
     #     widening (see expand_action_dimension in embodiment_conditioned_mlp.py).
-    #     Well posed as plain per-channel MSE because point identity is fixed (see
-    #     above) — no permutation ambiguity for the loss to be invariant to; this
-    #     is what makes folding POSITION (not just a per-object flag) viable here,
+    #     Well posed as plain per-channel MSE because point identity is fixed
+    #     across TIME (see above) — no *temporal* permutation ambiguity; this is
+    #     what makes folding POSITION (not just a per-object flag) viable here,
     #     unlike the retired object-slot pipeline, where only the *active* flags
     #     (max_keypoint_objects dims) were cheap enough to fold and position had
-    #     to stay on a separate Chamfer-matched decoder. NOT a pure readout, unlike
+    #     to stay on a separate Chamfer-matched decoder. Always uses "index"
+    #     matching regardless of keypoint_match (see below) — it has no decoded
+    #     prediction to match against before the flow-matching loss runs, so the
+    #     within-object enumeration-order ambiguity keypoint_match="chamfer"
+    #     addresses for the other three modes is left unaddressed here. NOT a
+    #     pure readout, unlike
     #     "default"/"tokens": action_encoder's W1 is a dense matrix mixing every
     #     input channel into one embedding, so the (noised) position values
     #     genuinely influence the shared representation that also produces the
@@ -190,7 +206,7 @@ class Gr00tN1d7Config(PretrainedConfig):
     #     recognition encoder (Gr00tN1d7ActionHead._encode_keypoint_style) sees the
     #     TRUE future keypoints + a condition token (see keypoint_cvae_condition)
     #     during training and outputs (mu, logvar) for a style latent z_style;
-    #     z_style is added to the "tokens"-mode dedicated keypoint query tokens
+    #     z_style is added to the "tokens"-mode query-conditioned point tokens
     #     (NOT concatenated into sa_embs — see below) before the DiT, and the
     #     position decoder (reading those tokens' hidden states, exactly like
     #     "tokens" mode) becomes the CVAE decoder p(keypoints | z_style, context).
@@ -237,14 +253,35 @@ class Gr00tN1d7Config(PretrainedConfig):
     keypoint_cvae_condition: str = "vlm"  # one of {"vlm", "state"}
     keypoint_cvae_encoder_layers: int = 2
     keypoint_cvae_encoder_heads: int = 4
-    # Number of the max_keypoint_objects * keypoints_per_object flat points
-    # supervised (and shown to the CVAE encoder as the "future" label) per training
-    # step, resampled every step. None (default) = use all of them — the first
-    # experiment per keypoint_tracking_simple_pipeline.md. The position decoder
-    # always predicts the full set regardless of this value; it only controls how
-    # many predictions get gradient on a given step, so shrinking it later doesn't
-    # require touching decoder shapes / any saved checkpoint.
+    # "tokens"/"cvae" only: number of points the PROCESSOR samples per training
+    # sample from the valid subset of the max_keypoint_objects *
+    # keypoints_per_object flat set (fresh draw, random order, each sample — see
+    # Gr00tN1d7Processor). The head appends exactly this many query-conditioned
+    # point tokens, predicts exactly these points' futures, and the loss updates
+    # exactly them. None (default) = use the full flat set (no sampling; the
+    # per-object valid mask handles padding slots). Changing it changes
+    # keypoint_label_step_embed's shape ("cvae") and the token count, so it must
+    # match between saving and loading a checkpoint.
     keypoint_n_key: int | None = None
+    # "default" mode only: how predicted keypoints are paired with target
+    # keypoints within one object before the Huber loss. "default" is the one
+    # mode left regressing against the converter's arbitrary per-episode
+    # enumeration order (farthest_point_sample in
+    # test_keypoint_tracking_simple.py starts from a random pixel, so index k
+    # within an object carries no consistent meaning ACROSS episodes, only
+    # within one). "index" (default): plain by-index regression. "chamfer":
+    # reorder target points to their nearest predicted point within the same
+    # object first, using a cost aggregated over the whole keypoint_horizon (one
+    # fixed assignment per sample/object, not re-matched independently at every
+    # step) — see Gr00tN1d7ActionHead._match_keypoints_chamfer; one-directional
+    # nearest-neighbor, not a strict bijection, so some duplicate-assignment
+    # collapse risk remains. The object axis is untouched either way (it carries
+    # real signal, e.g. "first object to move"). Ignored by every other mode:
+    # "tokens"/"cvae" bind each prediction to its target through the input query
+    # coordinate (no matching needed — see keypoint_head_mode above), and
+    # "share_dim" has no decoded prediction to match before its flow-matching
+    # loss runs.
+    keypoint_match: str = "index"  # one of {"index", "chamfer"}
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -271,6 +308,23 @@ class Gr00tN1d7Config(PretrainedConfig):
                 f"keypoint_cvae_condition must be one of 'vlm', 'state', "
                 f"got {self.keypoint_cvae_condition!r}"
             )
+        if self.keypoint_match not in ("index", "chamfer"):
+            raise ValueError(
+                f"keypoint_match must be one of 'index', 'chamfer', got {self.keypoint_match!r}"
+            )
+        if self.keypoint_n_key is not None:
+            if self.keypoint_head_mode not in ("tokens", "cvae"):
+                raise ValueError(
+                    "keypoint_n_key requires keypoint_head_mode 'tokens' or 'cvae' "
+                    "(query-conditioned point tokens); 'default'/'share_dim' always "
+                    f"predict the full flat point set, got {self.keypoint_head_mode!r}"
+                )
+            n_total = self.max_keypoint_objects * self.keypoints_per_object
+            if not 1 <= self.keypoint_n_key <= n_total:
+                raise ValueError(
+                    f"keypoint_n_key must be in [1, max_keypoint_objects * "
+                    f"keypoints_per_object = {n_total}], got {self.keypoint_n_key}"
+                )
 
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""

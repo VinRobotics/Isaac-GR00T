@@ -189,6 +189,7 @@ if __name__ == "__main__":
     config.model.keypoint_cvae_encoder_layers = ft_config.keypoint_cvae_encoder_layers
     config.model.keypoint_cvae_encoder_heads = ft_config.keypoint_cvae_encoder_heads
     config.model.keypoint_n_key = ft_config.keypoint_n_key
+    config.model.keypoint_match = ft_config.keypoint_match
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False

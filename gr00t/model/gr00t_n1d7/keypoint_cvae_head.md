@@ -11,21 +11,65 @@ chừng. Điều này loại bỏ 2 vấn đề đã gặp với thiết kế c�
 - **Keypoint active bị overfit**: active giờ là mask tĩnh (`keypoint_valid`, không đổi theo frame),
   không còn gì để học/overfit — **không mode nào còn active decoder nữa** (`keypoint_active_decoder`
   đã bị xoá hoàn toàn khỏi codebase).
-- **Permutation ambiguity trong Chamfer loss**: vì point k luôn là cùng 1 điểm vật lý suốt episode,
-  không cần Chamfer set-matching nữa — **mọi mode** giờ regress trực tiếp theo index qua 1 hàm dùng
-  chung: `_compute_keypoint_position_loss(pred_kp, action_input, key_indices=None)`.
+- **Permutation ambiguity theo TRỤC THỜI GIAN**: vì point k luôn là cùng 1 điểm vật lý suốt episode,
+  không cần Chamfer set-matching giữa các timestep nữa — **mọi mode** giờ regress theo index qua 1 hàm
+  dùng chung: `_compute_keypoint_position_loss(pred_kp, action_input)`.
+
+## Permutation invariance: identity đến từ input, không phải từ loss
+
+Thứ tự K điểm trong 1 object KHÔNG well-defined giữa các episode: K điểm được chọn bằng
+`farthest_point_sample` (`test_keypoint_tracking_simple.py`), bắt đầu từ 1 pixel random rồi greedy
+chọn điểm xa nhất — index k chỉ nhất quán trong nội bộ 1 episode. Có 2 cách xử lý, dùng cho các mode
+khác nhau:
+
+1. **`tokens`/`cvae` — query-conditioned point tokens (cách chính, ATM-style)**: mỗi điểm được cấp 1
+   token = `keypoint_query_base` (base embedding học chung) + `keypoint_query_coord_encoder`(vị trí
+   t=0 của điểm đó, lấy từ `keypoint_target[:, 0]` — dữ liệu tracker đã có sẵn trong sample). Mỗi
+   token decode **toàn bộ quỹ đạo `keypoint_horizon` step của chính điểm đó**
+   (`keypoint_position_decoder` output `keypoint_horizon*2` mỗi token). Identity gắn với **tọa độ
+   input** chứ không phải slot index ⇒ hoán vị điểm ⇒ prediction/target hoán vị theo ⇒ Huber theo
+   index tự động **permutation-invariant trên toàn bộ tập điểm** — không cần Chamfer/Hungarian, không
+   rủi ro collapse. Processor còn sample điểm theo **thứ tự ngẫu nhiên** mỗi lần, nên model không thể
+   bám vào vị trí token. (Đây cũng là câu trả lời cho "escnn?": escnn làm equivariance cho nhóm
+   Euclide E(2)/E(3) — xoay/lật ảnh — không phải nhóm hoán vị S_n trên tập điểm; công cụ đúng cho
+   S_n là set/transformer không đánh số token + identity từ input, chính là thiết kế này.)
+2. **`default` — `keypoint_match: "index" | "chamfer"`**: mode duy nhất còn regress theo enumeration
+   tuỳ ý của converter. `"chamfer"` match target về predicted gần nhất trong nội bộ 1 object (cost
+   gộp cả horizon, 1 phép gán cố định mỗi sample/object) — xem
+   `Gr00tN1d7ActionHead._match_keypoints_chamfer`; one-directional nên vẫn còn rủi ro collapse trùng
+   lặp. `share_dim` luôn `"index"` (không có prediction đã decode để match trước khi flow-matching
+   loss chạy).
+
+## Sampling `n_key` điểm (processor-side, `tokens`/`cvae`)
+
+`keypoint_n_key` giờ là **sampling thật ở processor** (không phải subsample loss như thiết kế cũ —
+`_sample_keypoint_indices` đã xóa): mỗi training sample, `Gr00tN1d7Processor` sample `n_key` điểm từ
+tập điểm VALID (loại padding slot; lấy without replacement khi đủ, with replacement khi thiếu), emit
+`keypoint_target [H, n_key*2]` + `keypoint_active_target [H, n_key]` (per-POINT valid, phân biệt với
+per-object `[H, N]` của chế độ full-set qua last dim). Head append đúng `n_key` point token, predict
+đúng `n_key` điểm, loss update đúng các điểm đó. `keypoint_n_key=None` = dùng cả N*K điểm (vẫn
+query-conditioned, chỉ là không sample).
+
+## Inference / real robot: zero overhead
+
+Nhờ mask 1 chiều (state/action không bao giờ attend vào point token), attention của các token
+protected được tính y hệt như khi point token không tồn tại ⇒ `get_action_with_features` **chỉ append
+point token khi `options["return_keypoints"]=True`** (eval/viz — query lấy từ GT của eval batch).
+Trên real robot (mặc định không yêu cầu keypoint): không cần vị trí keypoint hiện tại, không tracker,
+không token thừa — `action_pred` giống hệt từng bit, sequence còn NGẮN hơn code cũ (trước đây append
+16 query token vô ích ở mọi denoising step).
 
 ## Tóm tắt 4 mode sau khi đồng bộ
 
-| Mode | Vị trí decode position | Có decoder riêng? | Pure readout? |
+| Mode | Vị trí decode position | Token layout | Pure readout? |
 |---|---|---|---|
-| `default` | hidden state của action token | Có (`keypoint_position_decoder`) | Có |
-| `tokens` | hidden state của dedicated query token | Có (`keypoint_position_decoder`) | Có |
-| `share_dim` | trực tiếp từ `action_decoder` (fold vào flow-matching) | **Không** — không có `keypoint_position_decoder` | Không (như trước, chỉ là active→position) |
-| `cvae` | hidden state của dedicated query token + z_style | Có (`keypoint_position_decoder`) | Có (z_style không leak nhờ query-token routing) |
+| `default` | hidden state của action token (mỗi step decode cả N*K điểm) | không thêm token | Có |
+| `tokens` | point token (mỗi token decode cả quỹ đạo H step của 1 điểm) | `n_key` (hoặc N*K) point token, query = t0 coord | Có |
+| `share_dim` | trực tiếp từ `action_decoder` (fold vào flow-matching) | không thêm token, widen action channel | Không |
+| `cvae` | như `tokens` + z_style cộng vào point token | như `tokens` | Có (z_style không leak nhờ mask 1 chiều) |
 
-`default`/`tokens` gần như giống hệt nhau về mặt loss bây giờ (chỉ khác chỗ decode), vì cả 2 đều mất
-phần active decoder — khác biệt kiến trúc thật sự chỉ còn giữa chúng và `share_dim`/`cvae`.
+`tokens`/`cvae` giờ dùng chung kiến trúc point-token (khác nhau đúng phần CVAE encoder + z_style);
+`default`/`share_dim` giữ layout cũ theo-step, predict full N*K theo index.
 
 ## `share_dim`: đổi từ fold active-flag sang fold position
 
@@ -48,11 +92,13 @@ N(0,I) mà KL loss huấn luyện cho posterior tiến gần tới).
 ## Pipeline (`cvae` mode)
 
 ```
+Processor: sample n_key điểm valid (random order, mỗi sample) ──► keypoint_target [H, n_key, 2]
+                                                                   keypoint_active_target [H, n_key]
                     ┌─ TRAIN ONLY ───────────────────────────────────────┐
-                    │  keypoint_target (label thật, full N*K)            │
+                    │  keypoint_target (label thật, n_key điểm đã sample)│
                     │        │                                          │
                     │        ▼                                          │
-condition_token ───►│  [cls] [condition] [label_t0..t15] ──► SelfAttn ──►│── mu, logvar
+condition_token ───►│  [cls] [condition] [label_t0..t15] ──► SelfAttn ──►│── mu, logvar (clamp ±10)
 (vlm pooled, hoặc   │                                          Transformer│      │
  state)             │                                                    │  reparameterize
                     └────────────────────────────────────────────────────┘      │
@@ -61,18 +107,16 @@ condition_token ───►│  [cls] [condition] [label_t0..t15] ──► Sel
                                                                      (train: sample; infer: zeros)
                                                                                   │
 state ──┐                                                                        │
-        ├─► sa_embs ──► DiT (self-attn 1 chiều: sa_embs KHÔNG thấy z_style) ◄─────┘ (+ vào keypoint
-action ─┘        │                                                                   query tokens)
-                  ▼
-             action_decoder ──► action_pred (không đổi dù bật/tắt keypoint head)
-                  │
-     keypoint query tokens (state+action CÓ THỂ bị nhìn, keypoint query tokens
-     KHÔNG được nhìn ngược lại — self-attention mask 1 chiều)
-                  │
-                  ▼
-       keypoint_position_decoder ──► pred_kp (full N*K, luôn full dù keypoint_n_key < N*K)
-                  │
-    reconstruction loss (Huber, index cố định, mask theo keypoint_valid + keypoint_n_key subsample)
+        ├─► sa_embs ──► DiT (mask 1 chiều: sa_embs KHÔNG thấy point token) ◄──────┘
+action ─┘        │                                                        │
+                  ▼                                     n_key point token: │
+             action_decoder ──► action_pred              base + coord_enc(t0 của điểm) + z_style
+        (không đổi dù bật/tắt keypoint head;                       │
+         robot: point token không được append)                     ▼
+                                       keypoint_position_decoder (mỗi token ──► quỹ đạo H step)
+                                                                   │
+                              reconstruction loss (Huber theo index — well-posed vì identity
+                              đã gắn với coord input; mask theo per-point valid)
 ```
 
 ## Quyết định thiết kế quan trọng (riêng cho `cvae`)
@@ -84,24 +128,21 @@ action ─┘        │                                                        
    conditioning thật → hỏng khi inference set z=0 (posterior collapse theo hướng xấu). Cấu hình qua
    `keypoint_cvae_condition: "vlm" | "state"` (mặc định `"vlm"`).
 
-2. **z_style nối vào keypoint query tokens, KHÔNG nối vào `sa_embs`.**
+2. **z_style nối vào point tokens, KHÔNG nối vào `sa_embs`.**
    `sa_embs` (state+action) được dùng chung để `action_decoder` ra `action_pred`. Nếu z_style (vốn
    được encoder tính từ **label thật** lúc train) lọt vào `sa_embs`, `action_pred` sẽ "nhìn trộm"
    tương lai lúc train nhưng lúc infer z=0 (không có gì) → lệch train/inference, hỏng action một
-   cách âm thầm (train loss trông tốt giả tạo). Thay vào đó, z_style được cộng vào
-   `keypoint_query_embedding` (cơ chế `"tokens"` mode có sẵn) — các token này bị
-   `_keypoint_self_attention_mask` chặn 1 chiều: state/action **không bao giờ** attend ngược lại
-   keypoint query tokens, nên `action_pred` **provably unaffected**, đúng guarantee mà `"default"`/
-   `"tokens"` mode đã có.
+   cách âm thầm (train loss trông tốt giả tạo). Thay vào đó, z_style được cộng vào các point token
+   (cơ chế `"tokens"` mode có sẵn) — các token này bị `_keypoint_self_attention_mask` chặn 1 chiều:
+   state/action **không bao giờ** attend ngược lại point token, nên `action_pred` **provably
+   unaffected**, đúng guarantee mà `"default"`/`"tokens"` mode đã có.
 
-3. **Encoder luôn thấy FULL N*K điểm, decoder loss có thể chỉ dùng `keypoint_n_key` điểm/step.**
-   Tách rời 2 việc: "encoder nhìn label thật để nén z" (luôn full, không phụ thuộc subsample) và
-   "decoder loss được tính trên bao nhiêu điểm mỗi step" (`keypoint_n_key`, resample ngẫu nhiên mỗi
-   step qua `_sample_keypoint_indices`, mặc định `None` = dùng hết N*K — thử nghiệm đầu tiên theo kế
-   hoạch). Decoder luôn output full N*K (`keypoint_position_decoder` không đổi shape theo
-   `keypoint_n_key`), nên đổi `keypoint_n_key` sau này không cần đổi checkpoint. `key_indices` cũng
-   là tham số optional của `_compute_keypoint_position_loss` — 3 mode kia luôn gọi không truyền
-   (None = dùng hết).
+3. **Encoder và decoder thấy CÙNG tập `n_key` điểm đã sample.**
+   Processor sample 1 lần mỗi sample; cả CVAE encoder (label = future của đúng các điểm đó) lẫn
+   decoder (predict + loss trên đúng các điểm đó) đều làm việc trên cùng tập — posterior và decoder
+   thống nhất về "future nào đang được mô tả". `keypoint_label_step_embed` có input dim `n_key*2`
+   nên đổi `keypoint_n_key` là đổi shape checkpoint (validation trong config đã chặn dùng
+   `keypoint_n_key` với `default`/`share_dim`).
 
 4. **z_dim nhỏ (`keypoint_style_dim=16`) + zero-init `keypoint_style_head`.**
    z phải là bottleneck thật sự — nếu đủ lớn để tái tạo losslessly cả trajectory, decoder sẽ học bỏ
@@ -127,7 +168,8 @@ action ─┘        │                                                        
 | `keypoint_cvae_condition` | `"vlm"` | `cvae` | `"vlm"` (khuyến nghị) hoặc `"state"` |
 | `keypoint_cvae_encoder_layers` | 2 | `cvae` | số layer self-attention của encoder |
 | `keypoint_cvae_encoder_heads` | 4 | `cvae` | phải chia hết `input_embedding_dim` |
-| `keypoint_n_key` | `None` | `cvae` | `None` = dùng hết N*K; đặt số nhỏ hơn để subsample mỗi step |
+| `keypoint_n_key` | `None` | `tokens`/`cvae` | processor sample n_key điểm valid mỗi sample; `None` = dùng cả N*K; đổi giá trị = đổi shape checkpoint |
+| `keypoint_match` | `"index"` | `default` | `"chamfer"` = match trong nội bộ 1 object; `tokens`/`cvae` không cần (identity từ coord input), `share_dim` luôn `"index"` |
 
 `keypoint_active_loss_weight` đã bị **xoá** (không còn field này trong config) — không mode nào còn
 active loss để weight nữa.
@@ -140,40 +182,48 @@ active loss để weight nữa.
   khi `keypoint_head_mode == "cvae"`.
 - `keypoint_active_loss` — **đã bị xoá hoàn toàn**, không mode nào emit key này nữa.
 
-## Data pipeline: KHÔNG cần đổi
+## Data pipeline (dataset trên đĩa): KHÔNG cần đổi
 
-Tái dùng nguyên schema cũ (`keypoint_target`, `keypoint_active_target`, `has_keypoint`) — chỉ đổi
-**ý nghĩa** của `keypoint_active_target`: từ "active theo từng frame" (bản gốc) sang "valid mask tĩnh
-theo object, lặp lại giống nhau ở mọi horizon step" (bản simple pipeline, xem
-`observation.keypoint_valid` trong `keypoint_tracking_simple_pipeline.md`). Không cần sửa
-`gr00t/data/dataset/lerobot_episode_loader.py` hay `processing_gr00t_n1d7.py`.
+Dataset vẫn là schema cũ (`keypoint_2d` + `keypoint_valid` per-object trong `meta/modality.json`).
+Việc sample `n_key` và emit per-point valid xảy ra hoàn toàn trong `Gr00tN1d7Processor` lúc
+training — không cần convert lại data. `keypoint_active_target` emit ra batch giờ có 2 layout,
+phân biệt bằng last dim: `[H, N]` per-object (khi `keypoint_n_key=None`) hoặc `[H, n_key]` per-point
+(khi set); `_compute_keypoint_position_loss` và trainer viz đều tự nhận biết.
 
 ## Checkpoint migration (`gr00t/model/gr00t_n1d7/setup.py`)
 
-Load từ checkpoint cũ (train trước khi đồng bộ hoá) sẽ tự động:
-- Bỏ qua (discard, không lỗi) mọi weight `keypoint_active_decoder.*` tìm thấy trong checkpoint —
-  coi như retired param, giống cách `keypoint_decoder.` (bản combined cũ hơn) đã được xử lý.
-- Với `share_dim`: `action_dim` mismatch giờ lớn hơn nhiều (N*K*2 thay vì N) — splice logic
-  (`action_dim_mismatched`) không đổi cách hoạt động, chỉ đổi độ rộng; pretrained action weights vẫn
-  được ghép vào leading slice của tensor mới.
+Load từ checkpoint cũ sẽ tự động:
+- Discard (không lỗi) mọi weight retired: `keypoint_decoder.*`, `keypoint_active_decoder.*`, và giờ
+  thêm `keypoint_query_embedding.*` (bị thay bằng `keypoint_query_base` +
+  `keypoint_query_coord_encoder`).
+- Re-init tường minh (`_reinit_missing_keypoint_params` — tránh fast-init memory rác) mọi keypoint
+  param missing HOẶC mismatch shape (vd `keypoint_position_decoder` đổi output dim khi chuyển sang
+  point token).
+- Với `share_dim`: splice logic (`action_dim_mismatched`) không đổi.
 
 ## Inference
 
-`get_action_with_features`: `keypoint_pred` decode khác nhau theo mode (`share_dim` đọc trực tiếp từ
-`actions[..., real_action_dim:]`, 3 mode kia gọi `_decode_keypoint_positions`). `cvae`: z_style mặc
-định = `zeros`. Debug/eval có thể truyền
-`options={"return_keypoints": True, "keypoint_style_sample": True}` để sample z_style ~ N(0,I) thay
-vì 0 (xem đa dạng future dự đoán) — không ảnh hưởng `action_pred` dù chọn cách nào.
-`keypoint_active_pred` trả về hằng số 1 (mọi điểm luôn "on") ở **mọi mode**, chỉ để code overlay
-visualization cũ (`keypoint_viz.py`, `trainer.py`) chạy không cần sửa.
+`get_action_with_features`: point token **chỉ được append khi `options["return_keypoints"]=True`**
+(query coords lấy từ `keypoint_target[:, 0]` của eval batch; robot không bao giờ cần). `share_dim`
+đọc keypoint trực tiếp từ `actions[..., real_action_dim:]`; `default` decode từ action-token hidden
+state. `cvae`: z_style mặc định `zeros`; `options={"keypoint_style_sample": True}` để sample
+z_style ~ N(0,I) (xem đa dạng future) — không ảnh hưởng `action_pred` dù chọn cách nào.
+`keypoint_pred` giữ contract 5-D `[B, T, groups, points_per_group, 2]` cho viz: `default`/`share_dim`
+group theo object `[B,T,N,K,2]`; `tokens`/`cvae` mỗi điểm là 1 group `[B,T,n_key,1,2]`.
+`keypoint_active_pred` trả hằng số 1 ở mọi mode, chỉ để code overlay cũ chạy không cần sửa.
 
 ## Tham chiếu code
 
 - `gr00t/model/gr00t_n1d7/gr00t_n1d7.py`:
-  `_compute_keypoint_position_loss` (dùng chung mọi mode, tham số `key_indices` optional),
-  `_share_dim_position_targets`, `_init_keypoint_cvae_modules`, `_keypoint_condition_token`,
-  `_sample_keypoint_indices`, `_encode_keypoint_style`, `_sample_keypoint_style`,
-  `_compute_keypoint_kl_loss`, `_append_keypoint_queries` (tham số `z_style`).
-- `gr00t/configs/model/gr00t_n1d7.py`: docstring đầy đủ trong `keypoint_head_mode`.
-- `gr00t/model/gr00t_n1d7/setup.py`: `_create_model` — checkpoint migration cho các retired param.
-- `gr00t/experiment/trainer.py`: log `keypoint_kl_loss` khi `keypoint_head_mode == "cvae"`.
+  `_compute_keypoint_position_loss` (dùng chung `default`/`tokens`/`cvae`),
+  `_match_keypoints_chamfer` (`default` + `keypoint_match="chamfer"`),
+  `_share_dim_position_targets`, `_append_keypoint_queries` + `_keypoint_query_coords`
+  (point token: base + coord encoder + z_style), `_init_keypoint_cvae_modules`,
+  `_keypoint_condition_token`, `_encode_keypoint_style` (logvar clamp ±10),
+  `_sample_keypoint_style`, `_compute_keypoint_kl_loss`.
+- `gr00t/model/gr00t_n1d7/processing_gr00t_n1d7.py`: sampling `keypoint_n_key` điểm valid mỗi sample.
+- `gr00t/configs/model/gr00t_n1d7.py`: docstring đầy đủ trong `keypoint_head_mode`; validation
+  `keypoint_n_key` (chỉ `tokens`/`cvae`, 1..N*K).
+- `gr00t/model/gr00t_n1d7/setup.py`: `_create_model` — checkpoint migration + re-init tường minh.
+- `gr00t/experiment/trainer.py`: log `keypoint_kl_loss` khi cvae; viz broadcast per-object →
+  per-point khi cần.

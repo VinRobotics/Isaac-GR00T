@@ -160,6 +160,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         keypoint_horizon: int = 16,
         max_keypoint_objects: int = 2,
         keypoints_per_object: int = 8,
+        keypoint_n_key: int | None = None,
         apply_sincos_state_encoding: bool = False,
         use_albumentations: bool = False,
         extra_augmentation_config: dict | None = None,
@@ -215,6 +216,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.keypoint_horizon = keypoint_horizon
         self.max_keypoint_objects = max_keypoint_objects
         self.keypoints_per_object = keypoints_per_object
+        self.keypoint_n_key = keypoint_n_key
         self._any_keypoint_modality = any(
             "keypoint" in cfgs for cfgs in self.modality_configs.values()
         )
@@ -615,10 +617,26 @@ class Gr00tN1d7Processor(BaseProcessor):
         # Object keypoint aux targets (already [-1, 1] image-normalized by the loader).
         # Emitted for every sample once any embodiment has a "keypoint" modality, so
         # samples with and without keypoints collate into the same batch.
+        #
+        # keypoint_n_key=None: emit the full flat point set —
+        # keypoint_target [H, N*K*2] + per-OBJECT static valid mask [H, N].
+        # keypoint_n_key set ("tokens"/"cvae" query-conditioned modes, see
+        # Gr00tN1d7Config.keypoint_n_key): sample keypoint_n_key points from the
+        # valid (non-padding-slot) subset, fresh per sample and in RANDOM ORDER —
+        # the model binds each prediction to its point via the t=0 coordinate
+        # query (Gr00tN1d7ActionHead._append_keypoint_queries), and the random
+        # order guarantees token position carries no identity for it to latch
+        # onto. Emits keypoint_target [H, n_key*2] + per-POINT valid mask
+        # [H, n_key] (the loss tells the two mask layouts apart by their last
+        # dim).
         if self._any_keypoint_modality:
-            kp_dim = self.max_keypoint_objects * self.keypoints_per_object * 2
-            keypoint_target = torch.zeros(self.keypoint_horizon, kp_dim)
-            keypoint_active_target = torch.zeros(self.keypoint_horizon, self.max_keypoint_objects)
+            n_total = self.max_keypoint_objects * self.keypoints_per_object
+            full_dim = n_total * 2
+            n_key = self.keypoint_n_key
+            out_points = n_key or n_total
+            valid_dim = out_points if n_key is not None else self.max_keypoint_objects
+            keypoint_target = torch.zeros(self.keypoint_horizon, out_points * 2)
+            keypoint_active_target = torch.zeros(self.keypoint_horizon, valid_dim)
             has_keypoint = 0.0
             keypoints = content.keypoints or {}
             # "active" = retired object-slot pipeline's time-varying flag; "valid" =
@@ -630,16 +648,35 @@ class Gr00tN1d7Processor(BaseProcessor):
             if coord_keys and active_keys:
                 kp = torch.from_numpy(
                     np.asarray(keypoints[coord_keys[0]], dtype=np.float32)
-                ).reshape(-1, kp_dim)
+                ).reshape(-1, full_dim)
                 active = torch.from_numpy(
                     np.asarray(keypoints[active_keys[0]], dtype=np.float32)
                 ).reshape(-1, self.max_keypoint_objects)
                 assert kp.shape[0] == self.keypoint_horizon, (
                     f"Expected {self.keypoint_horizon} keypoint steps, got {kp.shape[0]}"
                 )
-                keypoint_target = kp
-                keypoint_active_target = active
-                has_keypoint = 1.0
+                if n_key is None:
+                    keypoint_target = kp
+                    keypoint_active_target = active
+                    has_keypoint = 1.0
+                else:
+                    # Static per-point validity from the (static) per-object mask
+                    # at the window's first step.
+                    point_valid = active[0].repeat_interleave(self.keypoints_per_object)
+                    valid_idx = (point_valid > 0.5).nonzero(as_tuple=True)[0].numpy()
+                    if len(valid_idx) > 0:
+                        # Without replacement when enough valid points exist; with
+                        # replacement otherwise (duplicated points just get
+                        # supervised twice — harmless).
+                        sel = torch.from_numpy(
+                            np.random.choice(valid_idx, size=n_key, replace=len(valid_idx) < n_key)
+                        )
+                        kp_pts = kp.view(self.keypoint_horizon, n_total, 2)
+                        keypoint_target = kp_pts[:, sel].reshape(self.keypoint_horizon, -1)
+                        keypoint_active_target = (
+                            point_valid[sel].unsqueeze(0).expand(self.keypoint_horizon, -1).clone()
+                        )
+                        has_keypoint = 1.0
             transformed_inputs["keypoint_target"] = keypoint_target
             transformed_inputs["keypoint_active_target"] = keypoint_active_target
             transformed_inputs["has_keypoint"] = np.float32(has_keypoint)
@@ -731,6 +768,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "keypoint_horizon": self.keypoint_horizon,
                 "max_keypoint_objects": self.max_keypoint_objects,
                 "keypoints_per_object": self.keypoints_per_object,
+                "keypoint_n_key": self.keypoint_n_key,
                 # StateActionProcessor settings
                 "use_percentiles": self.use_percentiles,
                 "use_mean_std": self.use_mean_std,
@@ -817,6 +855,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "keypoint_horizon",
                 "max_keypoint_objects",
                 "keypoints_per_object",
+                "keypoint_n_key",
                 "use_albumentations",
                 "extra_augmentation_config",
                 "shortest_image_edge",

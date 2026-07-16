@@ -130,15 +130,22 @@ class FinetuneConfig:
     that decode the action itself — a pure readout, action_pred is bit-identical
     whether or not the head runs.
 
-    "tokens": append keypoint_horizon dedicated learned query tokens (DETR-style) to
-    the DiT sequence and decode position from those instead, giving the keypoint
-    task its own capacity through the transformer. A one-directional
-    self-attention mask keeps this a pure readout too: keypoint query tokens may
-    attend to the state/action tokens (so keypoint prediction stays conditioned on the
-    specific action being generated), but state/action tokens are masked from ever
-    attending back to the keypoint queries — action_pred is unaffected by their
-    presence, same guarantee as "default". Adds keypoint_query_embedding parameters,
-    so it must match between saving and loading a checkpoint.
+    "tokens": append query-conditioned point tokens to the DiT sequence
+    (ATM-style): one token per sampled point (see keypoint_n_key), each built
+    from a shared learned base embedding + an embedding of that point's CURRENT
+    (t=0) position, each decoding its own point's full keypoint_horizon future
+    trajectory. Identity is bound to the input coordinate rather than a slot
+    index, so the by-index Huber loss is automatically permutation-invariant and
+    the model gets a concrete spatial anchor for each point. A one-directional
+    self-attention mask keeps this a pure readout: point tokens may attend to
+    the state/action tokens (so keypoint prediction stays conditioned on the
+    specific action being generated), but state/action tokens are masked from
+    ever attending back — action_pred is unaffected by their presence, same
+    guarantee as "default". At inference the tokens are only appended when
+    keypoint predictions are explicitly requested (eval/viz) — the real-robot
+    action path never needs current keypoint positions and pays no extra
+    sequence length. Adds keypoint_query_base + keypoint_query_coord_encoder
+    parameters, so it must match between saving and loading a checkpoint.
 
     "share_dim": fold future keypoint POSITIONS themselves as extra channels of the
     same per-step action vector, jointly noised/denoised by flow matching — plain
@@ -159,16 +166,15 @@ class FinetuneConfig:
     splices the checkpoint's narrower action head into the widened tensors'
     leading slice automatically).
 
-    "cvae": everything above ("default"/"tokens"-style Huber regression) plus a
-    small CVAE to handle multimodal futures (which object moves, in what
-    direction) that plain regression would blur into an average. An encoder sees
-    the true future keypoints + a condition token (see keypoint_cvae_condition)
-    during training and produces a style latent z_style, added to the
-    "tokens"-mode dedicated query tokens (never concatenated into the shared
-    action/state tokens, so action_pred stays a pure readout exactly like
-    "tokens"/"default"); at inference z_style defaults to zeros. Trained with
-    reconstruction (Huber, same as every other mode) + KL to N(0,I)
-    (keypoint_kl_weight)."""
+    "cvae": everything "tokens" does plus a small CVAE to handle multimodal
+    futures (which object moves, in what direction) that plain regression would
+    blur into an average. An encoder sees the true future keypoints + a
+    condition token (see keypoint_cvae_condition) during training and produces a
+    style latent z_style, added to the "tokens"-mode point tokens (never
+    concatenated into the shared action/state tokens, so action_pred stays a
+    pure readout exactly like "tokens"/"default"); at inference z_style defaults
+    to zeros. Trained with reconstruction (Huber, same as every other mode) + KL
+    to N(0,I) (keypoint_kl_weight)."""
 
     keypoint_style_dim: int = 16
     """CVAE style latent dimensionality (keypoint_head_mode="cvae" only). Kept
@@ -199,11 +205,29 @@ class FinetuneConfig:
     only)."""
 
     keypoint_n_key: int | None = None
-    """Number of the max_keypoint_objects*keypoints_per_object flat points
-    supervised (and shown to the CVAE encoder) per training step, resampled every
-    step (keypoint_head_mode="cvae" only). None (default) = use all of them. The
-    position decoder always predicts the full set regardless — this only controls
-    how many predictions get gradient on a given step."""
+    """keypoint_head_mode "tokens"/"cvae" only: number of points the processor
+    samples per training sample from the valid subset of the
+    max_keypoint_objects*keypoints_per_object flat set (fresh draw, random
+    order, each sample). The head appends exactly this many query-conditioned
+    point tokens, predicts exactly these points' futures, and the loss updates
+    exactly them. None (default) = use the full flat set. Changes parameter
+    shapes ("cvae") and the token count, so it must match between saving and
+    loading a checkpoint."""
+
+    keypoint_match: str = "index"
+    """keypoint_head_mode="default" only: how predicted keypoints are paired
+    with target keypoints within one object before the Huber loss. "default" is
+    the one mode left regressing against the converter's arbitrary per-episode
+    point enumeration (farthest_point_sample in
+    test_keypoint_tracking_simple.py — index k within an object has no
+    consistent meaning across episodes). "index": plain by-index regression.
+    "chamfer": match each predicted point to its nearest target point within
+    the same object first, cost aggregated over the whole keypoint_horizon (one
+    fixed assignment per sample/object). One-directional nearest-neighbor, so
+    some duplicate-assignment collapse risk remains; watch per-point spread.
+    Ignored by every other mode: "tokens"/"cvae" bind predictions to targets
+    via the input query coordinate (no matching needed), "share_dim" has no
+    decoded prediction to match before its flow-matching loss."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None

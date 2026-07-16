@@ -39,7 +39,8 @@ from gr00t.model.registry import register_model
 # submodule only requires updating this one list.
 KEYPOINT_AUX_PARAM_NAMES = (
     "keypoint_position_decoder",
-    "keypoint_query_embedding",
+    "keypoint_query_base",
+    "keypoint_query_coord_encoder",
     "keypoint_cls_token",
     "keypoint_condition_proj",
     "keypoint_label_step_embed",
@@ -83,10 +84,8 @@ def _reinit_missing_keypoint_params(action_head: torch.nn.Module, missing_keys: 
         if submodule is None:
             continue
         with torch.no_grad():
-            if name == "keypoint_cls_token":
+            if name in ("keypoint_cls_token", "keypoint_query_base"):
                 submodule.data.normal_(mean=0.0, std=0.02)
-            elif name == "keypoint_query_embedding":
-                torch.nn.init.normal_(submodule.weight, mean=0.0, std=0.02)
             elif name == "keypoint_style_head":
                 submodule.weight.zero_()
                 submodule.bias.zero_()
@@ -166,6 +165,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 keypoint_cvae_encoder_layers=self.config.model.keypoint_cvae_encoder_layers,
                 keypoint_cvae_encoder_heads=self.config.model.keypoint_cvae_encoder_heads,
                 keypoint_n_key=self.config.model.keypoint_n_key,
+                keypoint_match=self.config.model.keypoint_match,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 # "share_dim" mode widens action_encoder/action_decoder (see
@@ -185,6 +185,16 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     )
                 logging.info("mask_token not in checkpoint - initialized")
 
+            unexpected_keys = loading_info.get("unexpected_keys", [])
+            mismatched_keys = loading_info.get("mismatched_keys", [])
+
+            # mismatched_keys entries vary by transformers version: either plain key
+            # name strings, or (key, checkpoint_shape, model_shape) tuples. Handle
+            # both rather than assuming one, since indexing a plain string with [0]
+            # silently returns its first *character* instead of raising.
+            def _mismatched_key_name(entry):
+                return entry[0] if isinstance(entry, (tuple, list)) else entry
+
             # Newly-added keypoint aux head params: fine to be missing (fresh init)
             # the first time enable_keypoint_head / keypoint_head_mode is turned on
             # for a checkpoint that predates them (or predates a specific mode's
@@ -195,8 +205,18 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             # so a newly added keypoint submodule can't silently hard-crash loading
             # here while being fine everywhere else — exactly what happened when
             # "cvae"'s style-encoder params were added but not listed here.
+            # Keypoint names in mismatched_keys are treated the same as missing:
+            # ignore_mismatched_sizes drops the checkpoint tensor, leaving the
+            # module's construction-time memory — which the fast-init path may
+            # never have actually initialized (see _reinit_fresh_linear_like) —
+            # e.g. keypoint_position_decoder's output dim changed when
+            # "tokens"/"cvae" moved to query-conditioned point tokens.
             keypoint_missing = [
                 k for k in missing_keys if any(name in k for name in KEYPOINT_AUX_PARAM_NAMES)
+            ] + [
+                k
+                for k in (_mismatched_key_name(m) for m in mismatched_keys)
+                if any(name in k for name in KEYPOINT_AUX_PARAM_NAMES)
             ]
             if keypoint_missing:
                 # Not "keeping fresh initialization" — explicitly re-running it.
@@ -208,13 +228,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 # from the very first training step under keypoint_head_mode="cvae".
                 reinitialized = _reinit_missing_keypoint_params(model.action_head, keypoint_missing)
                 logging.info(
-                    "keypoint aux head params not in checkpoint - explicitly "
-                    f"re-initialized ({len(keypoint_missing)} tensors, modules: "
-                    f"{reinitialized})"
+                    "keypoint aux head params not in checkpoint (or shape-changed) - "
+                    f"explicitly re-initialized ({len(keypoint_missing)} tensors, "
+                    f"modules: {reinitialized})"
                 )
-
-            unexpected_keys = loading_info.get("unexpected_keys", [])
-            mismatched_keys = loading_info.get("mismatched_keys", [])
 
             # keypoint_decoder (single shared trunk for position + active) was
             # replaced by two independent heads, keypoint_position_decoder and
@@ -224,19 +241,25 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             # was later removed entirely (no mode classifies "active" anymore — the
             # current data pipeline's keypoint_valid mask is static, not a
             # per-step prediction target; see Gr00tN1d7Config.keypoint_head_mode).
-            # Resuming from a checkpoint saved with either of these retired decoders
+            # Resuming from a checkpoint saved with any of these retired modules
             # is expected to drop their weights, not an architecture-mismatch error.
-            old_keypoint_decoder_unexpected = [
+            # keypoint_query_embedding (per-horizon-step learned query tokens) was
+            # retired when "tokens"/"cvae" moved to query-conditioned point tokens
+            # (keypoint_query_base + keypoint_query_coord_encoder).
+            retired_keypoint_unexpected = [
                 k
                 for k in unexpected_keys
-                if "keypoint_decoder." in k or "keypoint_active_decoder." in k
+                if "keypoint_decoder." in k
+                or "keypoint_active_decoder." in k
+                or "keypoint_query_embedding." in k
             ]
-            if old_keypoint_decoder_unexpected:
+            if retired_keypoint_unexpected:
                 logging.info(
-                    "Retired keypoint decoder params found in checkpoint "
-                    "(combined keypoint_decoder and/or keypoint_active_decoder) - "
-                    f"discarding ({len(old_keypoint_decoder_unexpected)} tensors); "
-                    "replaced by keypoint_position_decoder (fresh init)."
+                    "Retired keypoint module params found in checkpoint "
+                    "(keypoint_decoder / keypoint_active_decoder / "
+                    f"keypoint_query_embedding) - discarding "
+                    f"({len(retired_keypoint_unexpected)} tensors); current keypoint "
+                    "modules are fresh-initialized instead."
                 )
 
             # keypoint_head_mode="share_dim" widens action_encoder.W1.W (input) and
@@ -250,13 +273,6 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             # the checkpoint's own (narrower) action head into the new tensors'
             # leading slice, so only the new trailing keypoint-position channels
             # are actually fresh-initialized.
-            # mismatched_keys entries vary by transformers version: either plain key
-            # name strings, or (key, checkpoint_shape, model_shape) tuples. Handle
-            # both rather than assuming one, since indexing a plain string with [0]
-            # silently returns its first *character* instead of raising.
-            def _mismatched_key_name(entry):
-                return entry[0] if isinstance(entry, (tuple, list)) else entry
-
             action_dim_param_names = (
                 "action_encoder.W1.W",
                 "action_decoder.layer2.W",
@@ -302,15 +318,19 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 for k in missing_keys
                 if "mask_token" not in k and not any(name in k for name in KEYPOINT_AUX_PARAM_NAMES)
             ]
-            other_unexpected = [
-                k
-                for k in unexpected_keys
-                if "keypoint_decoder." not in k and "keypoint_active_decoder." not in k
-            ]
+            other_unexpected = [k for k in unexpected_keys if k not in retired_keypoint_unexpected]
             handled_mismatched = (
                 action_dim_mismatched if (action_dim_mismatched and share_dim_mode) else []
             )
-            other_mismatched = [m for m in mismatched_keys if m not in handled_mismatched]
+            # Keypoint-named mismatched tensors were explicitly re-initialized
+            # above (shape changes across keypoint_head_mode revisions) — handled,
+            # not an error.
+            other_mismatched = [
+                m
+                for m in mismatched_keys
+                if m not in handled_mismatched
+                and not any(name in _mismatched_key_name(m) for name in KEYPOINT_AUX_PARAM_NAMES)
+            ]
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
@@ -373,6 +393,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 keypoint_horizon=self.model_config.keypoint_horizon,
                 max_keypoint_objects=self.model_config.max_keypoint_objects,
                 keypoints_per_object=self.model_config.keypoints_per_object,
+                keypoint_n_key=self.model_config.keypoint_n_key,
                 use_albumentations=self.model_config.use_albumentations_transforms,
                 extra_augmentation_config=self.model_config.extra_augmentation_config,
                 shortest_image_edge=self.model_config.shortest_image_edge,
@@ -406,6 +427,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 keypoint_horizon=self.model_config.keypoint_horizon,
                 max_keypoint_objects=self.model_config.max_keypoint_objects,
                 keypoints_per_object=self.model_config.keypoints_per_object,
+                keypoint_n_key=self.model_config.keypoint_n_key,
                 use_albumentations=self.model_config.use_albumentations_transforms,
                 extra_augmentation_config=self.model_config.extra_augmentation_config,
                 shortest_image_edge=self.model_config.shortest_image_edge,
