@@ -52,6 +52,19 @@ except ImportError:
 # Suppress protobuf deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="google.protobuf")
 
+# Noise floor for the keypoint_n_key top-k-by-motion selection: total path length
+# over the keypoint window (sum of per-step displacement norms, in the loader's
+# [-1, 1]-normalized image coordinates) below which a point is treated as static.
+# Point-tracker jitter accumulates linearly in this score (norms never cancel),
+# so near-static points sit at a small positive, noise-dominated value whose
+# relative order is meaningless — they are selected in flat-index order instead
+# (stable across windows) rather than by that noise. Calibration intuition: 0.05
+# over a 16-step window ≈ a sustained drift of 0.4 px/step at 256 px resolution;
+# real object motion (say 20% of the image over the window) scores ~0.4, an
+# order of magnitude above. Misclassifying a very slow mover as static is
+# harmless — it just gets selected by index instead of rank.
+_KEYPOINT_STATIC_MOTION_EPS = 0.05
+
 ### Mapping from embodiment tag to projector index.
 EMBODIMENT_TAG_TO_PROJECTOR_INDEX = {
     ##### Pretrain embodiment ids (in base model) #####
@@ -672,17 +685,30 @@ class Gr00tN1d7Processor(BaseProcessor):
                     if len(valid_idx) > 0:
                         kp_pts = kp.view(self.keypoint_horizon, n_total, 2)
                         # Motion score per point: total per-step displacement
-                        # across the window (see the block comment above).
+                        # across the window (see the block comment above). Norms
+                        # are non-negative, so tracker jitter ACCUMULATES over
+                        # the window — a perfectly static point still scores > 0,
+                        # and the ordering among near-static points is pure
+                        # noise, reshuffling the selected set from one window to
+                        # the next (flickering eval videos, supervision hopping
+                        # between physical points). Two-tier selection fixes
+                        # that: genuinely moving points (above the noise floor)
+                        # ranked by motion, near-static points appended in flat
+                        # INDEX order — deterministic and stable across windows.
                         diff = kp_pts[1:] - kp_pts[:-1]  # [H-1, n_total, 2]
                         motion = diff.norm(dim=-1).sum(dim=0)  # [n_total]
-                        order = motion[valid_idx].argsort(descending=True)
-                        if len(valid_idx) >= n_key:
-                            sel = valid_idx[order[:n_key]]
+                        moving_mask = motion[valid_idx] >= _KEYPOINT_STATIC_MOTION_EPS
+                        moving_idx = valid_idx[moving_mask]
+                        static_idx = valid_idx[~moving_mask]  # ascending (nonzero order)
+                        moving_order = motion[moving_idx].argsort(descending=True)
+                        ranked = torch.cat([moving_idx[moving_order], static_idx])
+                        if len(ranked) >= n_key:
+                            sel = ranked[:n_key]
                         else:
                             # Fewer valid points than n_key: cycle the ranked
                             # list (duplicated points just get supervised twice).
-                            reps = -(-n_key // len(valid_idx))  # ceil division
-                            sel = valid_idx[order].repeat(reps)[:n_key]
+                            reps = -(-n_key // len(ranked))  # ceil division
+                            sel = ranked.repeat(reps)[:n_key]
                         keypoint_target = kp_pts[:, sel].reshape(self.keypoint_horizon, -1)
                         keypoint_active_target = (
                             point_valid[sel].unsqueeze(0).expand(self.keypoint_horizon, -1).clone()

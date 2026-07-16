@@ -49,13 +49,25 @@ re-match từng step). Xem `Gr00tN1d7ActionHead._match_keypoints_hungarian`. Áp
 ## Chọn `n_key` điểm: top-k theo motion (processor-side, `tokens`/`cvae`)
 
 `keypoint_n_key` giờ là **selection thật ở processor** (không phải subsample loss như thiết kế cũ —
-`_sample_keypoint_indices` đã xóa): mỗi training sample, `Gr00tN1d7Processor` chọn **top-`n_key` điểm
-chuyển động nhiều nhất** trong window từ tập điểm VALID (motion score = tổng displacement từng step
-trên cả horizon: `diff = kp[1:] - kp[:-1]; motion = diff.norm(-1).sum(0)`, sort giảm dần; thiếu điểm
-valid thì cycle danh sách đã rank). Điểm chuyển động mới mang tín hiệu tương tác vật thể — điểm đứng
-yên dự đoán tầm thường. Chọn lọc này **deterministic theo window** nên các frame liên tiếp của 1
-episode chọn tập gần như trùng nhau (video eval xem được, metric eval so sánh được — không cần toggle
-riêng). Lưu ý: motion score đọc từ **future track (chính là label)** — hợp lệ để chọn cái gì được
+`_sample_keypoint_indices` đã xóa): mỗi training sample, `Gr00tN1d7Processor` chọn `n_key` điểm từ
+tập điểm VALID theo quy tắc **2 tầng** (motion score = tổng displacement từng step trên cả horizon:
+`diff = kp[1:] - kp[:-1]; motion = diff.norm(-1).sum(0)`; thiếu điểm valid thì cycle danh sách đã
+rank):
+
+1. Điểm **chuyển động thật** (score ≥ `_KEYPOINT_STATIC_MOTION_EPS = 0.05`, tọa độ [-1,1]): rank
+   theo motion giảm dần — thứ hạng có nghĩa thật.
+2. Điểm **gần đứng yên**: nối vào sau theo **flat index tăng dần**. Lý do bắt buộc: norm không âm
+   nên jitter của tracker TÍCH LŨY trong score — điểm đứng yên vẫn có score > 0 nhưng thuần nhiễu,
+   thứ hạng giữa chúng random theo từng window ⇒ nếu rank cả tầng này theo motion thì tập được chọn
+   nhảy loạn giữa các step (video nhấp nháy, supervision đổi điểm vật lý liên tục). Index order thì
+   ổn định tuyệt đối giữa các window.
+
+Điểm chuyển động mang tín hiệu tương tác vật thể — được ưu tiên; window hoàn toàn tĩnh ⇒ chọn
+`n_key` điểm valid đầu theo index, ổn định 100%. Chọn lọc **deterministic theo window** nên các
+frame liên tiếp của 1 episode chọn tập gần như trùng nhau (video eval xem được, metric eval so sánh
+được — không cần toggle riêng). Còn 1 nguồn flicker nhỏ đã biết: điểm có motion lởn vởn quanh
+ngưỡng eps có thể đổi tầng giữa 2 window — bounded, và phía loss vốn đã robust với việc đổi tập nhờ
+Hungarian matching. Lưu ý: motion score đọc từ **future track (chính là label)** — hợp lệ để chọn cái gì được
 supervise/viz, không có gì trong đó chạm vào action path. Emit `keypoint_target [H, n_key*2]` +
 `keypoint_active_target [H, n_key]` (per-POINT valid, phân biệt với per-object `[H, N]` của chế độ
 full-set qua last dim). Head append đúng `n_key` point token, predict đúng `n_key` điểm, loss update
