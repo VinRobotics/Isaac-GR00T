@@ -217,15 +217,6 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.max_keypoint_objects = max_keypoint_objects
         self.keypoints_per_object = keypoints_per_object
         self.keypoint_n_key = keypoint_n_key
-        # Runtime toggle (never serialized): when True, the keypoint_n_key
-        # sampling below picks a DETERMINISTIC evenly-spaced subset of the valid
-        # points instead of a fresh random draw. Since the valid mask is static
-        # for a whole episode (test_keypoint_tracking_simple.py), every frame of
-        # an episode then selects the SAME physical points — which is what the
-        # eval episode-video overlay needs to be watchable (see
-        # trainer._render_keypoint_episode_video); training keeps the random
-        # draw/order.
-        self.keypoint_fixed_sampling = False
         self._any_keypoint_modality = any(
             "keypoint" in cfgs for cfgs in self.modality_configs.values()
         )
@@ -630,14 +621,19 @@ class Gr00tN1d7Processor(BaseProcessor):
         # keypoint_n_key=None: emit the full flat point set —
         # keypoint_target [H, N*K*2] + per-OBJECT static valid mask [H, N].
         # keypoint_n_key set ("tokens"/"cvae" query-conditioned modes, see
-        # Gr00tN1d7Config.keypoint_n_key): sample keypoint_n_key points from the
-        # valid (non-padding-slot) subset, fresh per sample and in RANDOM ORDER —
-        # the model binds each prediction to its point via the t=0 coordinate
-        # query (Gr00tN1d7ActionHead._append_keypoint_queries), and the random
-        # order guarantees token position carries no identity for it to latch
-        # onto. Emits keypoint_target [H, n_key*2] + per-POINT valid mask
-        # [H, n_key] (the loss tells the two mask layouts apart by their last
-        # dim).
+        # Gr00tN1d7Config.keypoint_n_key): select the TOP-K MOST-MOVING valid
+        # (non-padding-slot) points of this window — motion score = total
+        # per-step displacement over the horizon — ordered by descending motion.
+        # Moving points carry the actual object-interaction signal (static ones
+        # are trivially predictable), and the selection is deterministic per
+        # window, so consecutive frames of an episode pick near-identical sets
+        # (watchable eval videos, comparable eval metrics). Identity is bound to
+        # each point's t=0 coordinate query, not its token position
+        # (Gr00tN1d7ActionHead._append_keypoint_queries). Note the selection
+        # reads the window's FUTURE track (it's the label) — fine for choosing
+        # what to supervise/visualize; nothing about it feeds the action path.
+        # Emits keypoint_target [H, n_key*2] + per-POINT valid mask [H, n_key]
+        # (the loss tells the two mask layouts apart by their last dim).
         if self._any_keypoint_modality:
             n_total = self.max_keypoint_objects * self.keypoints_per_object
             full_dim = n_total * 2
@@ -672,26 +668,21 @@ class Gr00tN1d7Processor(BaseProcessor):
                     # Static per-point validity from the (static) per-object mask
                     # at the window's first step.
                     point_valid = active[0].repeat_interleave(self.keypoints_per_object)
-                    valid_idx = (point_valid > 0.5).nonzero(as_tuple=True)[0].numpy()
+                    valid_idx = (point_valid > 0.5).nonzero(as_tuple=True)[0]
                     if len(valid_idx) > 0:
-                        if self.keypoint_fixed_sampling:
-                            # Deterministic evenly-spaced pick over the valid set
-                            # (episode-static) — same points every frame of an
-                            # episode; see the attribute's comment in __init__.
-                            pos = np.round(np.linspace(0, len(valid_idx) - 1, n_key)).astype(
-                                np.int64
-                            )
-                            sel = torch.from_numpy(valid_idx[pos])
-                        else:
-                            # Without replacement when enough valid points exist;
-                            # with replacement otherwise (duplicated points just
-                            # get supervised twice — harmless).
-                            sel = torch.from_numpy(
-                                np.random.choice(
-                                    valid_idx, size=n_key, replace=len(valid_idx) < n_key
-                                )
-                            )
                         kp_pts = kp.view(self.keypoint_horizon, n_total, 2)
+                        # Motion score per point: total per-step displacement
+                        # across the window (see the block comment above).
+                        diff = kp_pts[1:] - kp_pts[:-1]  # [H-1, n_total, 2]
+                        motion = diff.norm(dim=-1).sum(dim=0)  # [n_total]
+                        order = motion[valid_idx].argsort(descending=True)
+                        if len(valid_idx) >= n_key:
+                            sel = valid_idx[order[:n_key]]
+                        else:
+                            # Fewer valid points than n_key: cycle the ranked
+                            # list (duplicated points just get supervised twice).
+                            reps = -(-n_key // len(valid_idx))  # ceil division
+                            sel = valid_idx[order].repeat(reps)[:n_key]
                         keypoint_target = kp_pts[:, sel].reshape(self.keypoint_horizon, -1)
                         keypoint_active_target = (
                             point_valid[sel].unsqueeze(0).expand(self.keypoint_horizon, -1).clone()

@@ -402,11 +402,11 @@ class Gr00tTrainer(Trainer):
                     # already computed above instead of re-running the full VLM
                     # backbone a second time (that redundant rerun, once per eval
                     # batch with keypoint data, was the actual cause of eval blowing
-                    # up training wall time). action_input deliberately carries ONLY
-                    # keypoint_target — needed for the point-token query coords
-                    # ("tokens"/"cvae", t=0 positions; see _keypoint_query_coords) —
-                    # and NOT "action", whose presence would trip the RTC inpainting
-                    # gate (this is a real, non-teacher-forced rollout for viz).
+                    # up training wall time). action_input is intentionally empty:
+                    # the keypoint head needs no input data (rank-identity point
+                    # tokens — see _append_keypoint_queries), and the RTC
+                    # inpainting gate ("action" in action_input) must not trip
+                    # (this is a real, non-teacher-forced rollout for viz).
                     action_out = unwrapped_model.action_head.get_action_with_features(
                         backbone_features=outputs["backbone_features"],
                         state_features=outputs["state_features"],
@@ -417,9 +417,7 @@ class Gr00tTrainer(Trainer):
                                 "backbone_attention_mask": outputs["backbone_attention_mask"],
                             }
                         ),
-                        action_input=BatchFeature(
-                            data={"keypoint_target": batch["keypoint_target"]}
-                        ),
+                        action_input=BatchFeature(data={}),
                         options={"return_keypoints": True},
                     )
                 viz_candidates_seen = self._collect_keypoint_viz(
@@ -607,26 +605,10 @@ class Gr00tTrainer(Trainer):
         stride = max(1, effective_len // self.keypoint_video_max_frames)
         step_indices = list(range(0, effective_len, stride))[: self.keypoint_video_max_frames]
 
-        # With keypoint_n_key sampling on, every frame would otherwise draw a
-        # DIFFERENT random point subset, making the video unwatchable — switch
-        # the processor to its deterministic pick (episode-static valid mask =>
-        # the same physical points on every frame) for the duration of this
-        # render, and restore afterward (training dataloader workers hold their
-        # own processor copies, so this synchronous toggle can't leak into them).
-        processor = getattr(dataset, "processor", None)
-        if processor is not None and getattr(processor, "keypoint_n_key", None):
-            processor.keypoint_fixed_sampling = True
-        try:
-            return self._render_keypoint_episode_video_frames(
-                model, unwrapped_model, dataset, episode_data, step_indices
-            )
-        finally:
-            if processor is not None:
-                processor.keypoint_fixed_sampling = False
-
-    def _render_keypoint_episode_video_frames(
-        self, model, unwrapped_model, dataset, episode_data, step_indices: list
-    ) -> np.ndarray | None:
+        # No special handling needed for keypoint_n_key here: the processor's
+        # top-k-by-motion selection is deterministic per window, so consecutive
+        # frames pick near-identical point sets on their own (see the keypoint
+        # block in Gr00tN1d7Processor).
         frames = []
         for start in range(0, len(step_indices), self.keypoint_video_batch_size):
             chunk = step_indices[start : start + self.keypoint_video_batch_size]
@@ -661,10 +643,9 @@ class Gr00tTrainer(Trainer):
                             "backbone_attention_mask": outputs["backbone_attention_mask"],
                         }
                     ),
-                    # keypoint_target supplies the point-token query coords
-                    # ("tokens"/"cvae") — same reasoning as _collect_keypoint_viz's
-                    # call site above.
-                    action_input=BatchFeature(data={"keypoint_target": batch["keypoint_target"]}),
+                    # Intentionally empty — same reasoning as _collect_keypoint_viz's
+                    # call site above (no keypoint input needed, no RTC gate).
+                    action_input=BatchFeature(data={}),
                     options={"return_keypoints": True},
                 )
             if "keypoint_pred" not in action_out:

@@ -15,24 +15,26 @@ chừng. Điều này loại bỏ 2 vấn đề đã gặp với thiết kế c�
   không cần Chamfer set-matching giữa các timestep nữa — **mọi mode** giờ regress theo index qua 1 hàm
   dùng chung: `_compute_keypoint_position_loss(pred_kp, action_input)`.
 
-## Permutation invariance: identity đến từ input, không phải từ loss
+## Point identity: rank theo motion, không cần input keypoint
 
 Thứ tự K điểm trong 1 object KHÔNG well-defined giữa các episode: K điểm được chọn bằng
 `farthest_point_sample` (`test_keypoint_tracking_simple.py`), bắt đầu từ 1 pixel random rồi greedy
 chọn điểm xa nhất — index k chỉ nhất quán trong nội bộ 1 episode. Có 2 cách xử lý, dùng cho các mode
 khác nhau:
 
-1. **`tokens`/`cvae` — query-conditioned point tokens (cách chính, ATM-style)**: mỗi điểm được cấp 1
-   token = `keypoint_query_base` (base embedding học chung) + `keypoint_query_coord_encoder`(vị trí
-   t=0 của điểm đó, lấy từ `keypoint_target[:, 0]` — dữ liệu tracker đã có sẵn trong sample). Mỗi
-   token decode **toàn bộ quỹ đạo `keypoint_horizon` step của chính điểm đó**
-   (`keypoint_position_decoder` output `keypoint_horizon*2` mỗi token). Identity gắn với **tọa độ
-   input** chứ không phải slot index ⇒ hoán vị điểm ⇒ prediction/target hoán vị theo ⇒ Huber theo
-   index tự động **permutation-invariant trên toàn bộ tập điểm** — không cần Chamfer/Hungarian, không
-   rủi ro collapse. Processor còn sample điểm theo **thứ tự ngẫu nhiên** mỗi lần, nên model không thể
-   bám vào vị trí token. (Đây cũng là câu trả lời cho "escnn?": escnn làm equivariance cho nhóm
-   Euclide E(2)/E(3) — xoay/lật ảnh — không phải nhóm hoán vị S_n trên tập điểm; công cụ đúng cho
-   S_n là set/transformer không đánh số token + identity từ input, chính là thiết kế này.)
+1. **`tokens`/`cvae` — rank-identity point tokens**: processor rank các điểm được chọn theo **motion
+   giảm dần**, nên token i luôn có nghĩa cố định xuyên episode: "điểm chuyển động nhiều thứ i". Mỗi
+   token là 1 learned embedding riêng theo rank (`keypoint_rank_embedding` — bắt buộc phải riêng:
+   token giống hệt nhau sẽ cho output giống hệt nhau), decode **toàn bộ quỹ đạo `keypoint_horizon`
+   step của chính điểm đó, kể cả t=0** (`keypoint_position_decoder` output `keypoint_horizon*2` mỗi
+   token). **KHÔNG có bất kỳ keypoint data nào được feed làm input** — kể cả vị trí t=0 (đã bỏ
+   `keypoint_query_base`/`keypoint_query_coord_encoder`): model phải tự localize "motion sẽ xảy ra ở
+   đâu" thuần từ vision/language/state, đúng phần scene understanding mà aux loss muốn ép học.
+   **Ambiguity đã biết**: 2 vật chuyển động lượng gần bằng nhau có thể swap rank giữa các window ⇒
+   target của token i thành đa modal — chính là loại ambiguity `z_style` của `cvae` sinh ra để hấp
+   thụ; mode `tokens` thuần có thể bị blur ở điểm này, cần theo dõi. (Về "escnn?": escnn làm
+   equivariance cho nhóm Euclide E(2)/E(3) — xoay/lật ảnh — không phải nhóm hoán vị S_n trên tập
+   điểm; với rank-ordering thì enumeration đã mang nghĩa cố định nên cũng không còn bài toán S_n.)
 2. **`default` — `keypoint_match: "index" | "chamfer"`**: mode duy nhất còn regress theo enumeration
    tuỳ ý của converter. `"chamfer"` match target về predicted gần nhất trong nội bộ 1 object (cost
    gộp cả horizon, 1 phép gán cố định mỗi sample/object) — xem
@@ -40,31 +42,38 @@ khác nhau:
    lặp. `share_dim` luôn `"index"` (không có prediction đã decode để match trước khi flow-matching
    loss chạy).
 
-## Sampling `n_key` điểm (processor-side, `tokens`/`cvae`)
+## Chọn `n_key` điểm: top-k theo motion (processor-side, `tokens`/`cvae`)
 
-`keypoint_n_key` giờ là **sampling thật ở processor** (không phải subsample loss như thiết kế cũ —
-`_sample_keypoint_indices` đã xóa): mỗi training sample, `Gr00tN1d7Processor` sample `n_key` điểm từ
-tập điểm VALID (loại padding slot; lấy without replacement khi đủ, with replacement khi thiếu), emit
-`keypoint_target [H, n_key*2]` + `keypoint_active_target [H, n_key]` (per-POINT valid, phân biệt với
-per-object `[H, N]` của chế độ full-set qua last dim). Head append đúng `n_key` point token, predict
-đúng `n_key` điểm, loss update đúng các điểm đó. `keypoint_n_key=None` = dùng cả N*K điểm (vẫn
-query-conditioned, chỉ là không sample).
+`keypoint_n_key` giờ là **selection thật ở processor** (không phải subsample loss như thiết kế cũ —
+`_sample_keypoint_indices` đã xóa): mỗi training sample, `Gr00tN1d7Processor` chọn **top-`n_key` điểm
+chuyển động nhiều nhất** trong window từ tập điểm VALID (motion score = tổng displacement từng step
+trên cả horizon: `diff = kp[1:] - kp[:-1]; motion = diff.norm(-1).sum(0)`, sort giảm dần; thiếu điểm
+valid thì cycle danh sách đã rank). Điểm chuyển động mới mang tín hiệu tương tác vật thể — điểm đứng
+yên dự đoán tầm thường. Chọn lọc này **deterministic theo window** nên các frame liên tiếp của 1
+episode chọn tập gần như trùng nhau (video eval xem được, metric eval so sánh được — không cần toggle
+riêng). Lưu ý: motion score đọc từ **future track (chính là label)** — hợp lệ để chọn cái gì được
+supervise/viz, không có gì trong đó chạm vào action path. Emit `keypoint_target [H, n_key*2]` +
+`keypoint_active_target [H, n_key]` (per-POINT valid, phân biệt với per-object `[H, N]` của chế độ
+full-set qua last dim). Head append đúng `n_key` point token, predict đúng `n_key` điểm, loss update
+đúng các điểm đó. `keypoint_n_key=None` = dùng cả N*K điểm (vẫn rank-identity token, chỉ là không
+chọn lọc).
 
-## Inference / real robot: zero overhead
+## Inference / real robot: zero overhead, zero input
 
+Model **không nhận bất kỳ keypoint input nào** ở mọi chế độ (token là learned embedding theo rank),
+nên inference không cần tracker, không cần vị trí keypoint hiện tại — kể cả khi muốn XEM prediction.
 Nhờ mask 1 chiều (state/action không bao giờ attend vào point token), attention của các token
 protected được tính y hệt như khi point token không tồn tại ⇒ `get_action_with_features` **chỉ append
-point token khi `options["return_keypoints"]=True`** (eval/viz — query lấy từ GT của eval batch).
-Trên real robot (mặc định không yêu cầu keypoint): không cần vị trí keypoint hiện tại, không tracker,
-không token thừa — `action_pred` giống hệt từng bit, sequence còn NGẮN hơn code cũ (trước đây append
-16 query token vô ích ở mọi denoising step).
+point token khi `options["return_keypoints"]=True`** (eval/viz). Trên real robot (mặc định không yêu
+cầu keypoint): không token thừa — `action_pred` giống hệt từng bit, sequence còn NGẮN hơn code cũ
+(trước đây append 16 query token vô ích ở mọi denoising step).
 
 ## Tóm tắt 4 mode sau khi đồng bộ
 
 | Mode | Vị trí decode position | Token layout | Pure readout? |
 |---|---|---|---|
 | `default` | hidden state của action token (mỗi step decode cả N*K điểm) | không thêm token | Có |
-| `tokens` | point token (mỗi token decode cả quỹ đạo H step của 1 điểm) | `n_key` (hoặc N*K) point token, query = t0 coord | Có |
+| `tokens` | point token (mỗi token decode cả quỹ đạo H step của 1 điểm) | `n_key` (hoặc N*K) rank-identity token, không input | Có |
 | `share_dim` | trực tiếp từ `action_decoder` (fold vào flow-matching) | không thêm token, widen action channel | Không |
 | `cvae` | như `tokens` + z_style cộng vào point token | như `tokens` | Có (z_style không leak nhờ mask 1 chiều) |
 
@@ -92,8 +101,8 @@ N(0,I) mà KL loss huấn luyện cho posterior tiến gần tới).
 ## Pipeline (`cvae` mode)
 
 ```
-Processor: sample n_key điểm valid (random order, mỗi sample) ──► keypoint_target [H, n_key, 2]
-                                                                   keypoint_active_target [H, n_key]
+Processor: chọn top-n_key điểm valid chuyển động nhiều nhất ──► keypoint_target [H, n_key, 2]
+           (motion score trên window, deterministic)             keypoint_active_target [H, n_key]
                     ┌─ TRAIN ONLY ───────────────────────────────────────┐
                     │  keypoint_target (label thật, n_key điểm đã sample)│
                     │        │                                          │
@@ -110,7 +119,7 @@ state ──┐                                                                 
         ├─► sa_embs ──► DiT (mask 1 chiều: sa_embs KHÔNG thấy point token) ◄──────┘
 action ─┘        │                                                        │
                   ▼                                     n_key point token: │
-             action_decoder ──► action_pred              base + coord_enc(t0 của điểm) + z_style
+             action_decoder ──► action_pred              rank_embedding[i] + z_style (không input)
         (không đổi dù bật/tắt keypoint head;                       │
          robot: point token không được append)                     ▼
                                        keypoint_position_decoder (mỗi token ──► quỹ đạo H step)
@@ -193,9 +202,9 @@ phân biệt bằng last dim: `[H, N]` per-object (khi `keypoint_n_key=None`) ho
 ## Checkpoint migration (`gr00t/model/gr00t_n1d7/setup.py`)
 
 Load từ checkpoint cũ sẽ tự động:
-- Discard (không lỗi) mọi weight retired: `keypoint_decoder.*`, `keypoint_active_decoder.*`, và giờ
-  thêm `keypoint_query_embedding.*` (bị thay bằng `keypoint_query_base` +
-  `keypoint_query_coord_encoder`).
+- Discard (không lỗi) mọi weight retired: `keypoint_decoder.*`, `keypoint_active_decoder.*`,
+  `keypoint_query_embedding.*`, `keypoint_query_base`, `keypoint_query_coord_encoder.*` (tất cả bị
+  thay bằng `keypoint_rank_embedding`).
 - Re-init tường minh (`_reinit_missing_keypoint_params` — tránh fast-init memory rác) mọi keypoint
   param missing HOẶC mismatch shape (vd `keypoint_position_decoder` đổi output dim khi chuyển sang
   point token).
@@ -217,8 +226,8 @@ group theo object `[B,T,N,K,2]`; `tokens`/`cvae` mỗi điểm là 1 group `[B,T
 - `gr00t/model/gr00t_n1d7/gr00t_n1d7.py`:
   `_compute_keypoint_position_loss` (dùng chung `default`/`tokens`/`cvae`),
   `_match_keypoints_chamfer` (`default` + `keypoint_match="chamfer"`),
-  `_share_dim_position_targets`, `_append_keypoint_queries` + `_keypoint_query_coords`
-  (point token: base + coord encoder + z_style), `_init_keypoint_cvae_modules`,
+  `_share_dim_position_targets`, `_append_keypoint_queries`
+  (point token: rank embedding + z_style, không input), `_init_keypoint_cvae_modules`,
   `_keypoint_condition_token`, `_encode_keypoint_style` (logvar clamp ±10),
   `_sample_keypoint_style`, `_compute_keypoint_kl_loss`.
 - `gr00t/model/gr00t_n1d7/processing_gr00t_n1d7.py`: sampling `keypoint_n_key` điểm valid mỗi sample.

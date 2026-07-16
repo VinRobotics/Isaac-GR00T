@@ -130,22 +130,25 @@ class FinetuneConfig:
     that decode the action itself — a pure readout, action_pred is bit-identical
     whether or not the head runs.
 
-    "tokens": append query-conditioned point tokens to the DiT sequence
-    (ATM-style): one token per sampled point (see keypoint_n_key), each built
-    from a shared learned base embedding + an embedding of that point's CURRENT
-    (t=0) position, each decoding its own point's full keypoint_horizon future
-    trajectory. Identity is bound to the input coordinate rather than a slot
-    index, so the by-index Huber loss is automatically permutation-invariant and
-    the model gets a concrete spatial anchor for each point. A one-directional
-    self-attention mask keeps this a pure readout: point tokens may attend to
-    the state/action tokens (so keypoint prediction stays conditioned on the
-    specific action being generated), but state/action tokens are masked from
-    ever attending back — action_pred is unaffected by their presence, same
-    guarantee as "default". At inference the tokens are only appended when
-    keypoint predictions are explicitly requested (eval/viz) — the real-robot
-    action path never needs current keypoint positions and pays no extra
-    sequence length. Adds keypoint_query_base + keypoint_query_coord_encoder
-    parameters, so it must match between saving and loading a checkpoint.
+    "tokens": append rank-identity point tokens to the DiT sequence: one
+    learned embedding per motion rank (see keypoint_n_key), where the processor
+    rank-orders the selected points by descending total motion — token i's
+    target is always "the i-th most-moving point's trajectory", a consistent
+    meaning across episodes. Each token decodes its own point's full
+    keypoint_horizon trajectory, t=0 included: NO keypoint data is fed as input
+    at train or inference time — the model must localize where motion will
+    happen purely from vision/language/state context. Known ambiguity: objects
+    moving similar amounts can swap ranks between windows (multimodal targets)
+    — "cvae"'s z_style absorbs exactly that; plain "tokens" may blur there. A
+    one-directional self-attention mask keeps this a pure readout: point tokens
+    may attend to the state/action tokens (so keypoint prediction stays
+    conditioned on the specific action being generated), but state/action
+    tokens are masked from ever attending back — action_pred is unaffected by
+    their presence, same guarantee as "default". At inference the tokens are
+    only appended when keypoint predictions are explicitly requested (eval/viz)
+    — the real-robot action path pays no extra sequence length. Adds
+    keypoint_rank_embedding parameters, so it must match between saving and
+    loading a checkpoint.
 
     "share_dim": fold future keypoint POSITIONS themselves as extra channels of the
     same per-step action vector, jointly noised/denoised by flow matching — plain
@@ -206,13 +209,15 @@ class FinetuneConfig:
 
     keypoint_n_key: int | None = None
     """keypoint_head_mode "tokens"/"cvae" only: number of points the processor
-    samples per training sample from the valid subset of the
-    max_keypoint_objects*keypoints_per_object flat set (fresh draw, random
-    order, each sample). The head appends exactly this many query-conditioned
-    point tokens, predicts exactly these points' futures, and the loss updates
-    exactly them. None (default) = use the full flat set. Changes parameter
-    shapes ("cvae") and the token count, so it must match between saving and
-    loading a checkpoint."""
+    selects per training sample from the valid subset of the
+    max_keypoint_objects*keypoints_per_object flat set — the top-k MOST-MOVING
+    points of the window (motion = total per-step displacement over the
+    horizon). Moving points carry the object-interaction signal; static ones
+    are trivially predictable. The head appends exactly this many
+    rank-identity point tokens, predicts exactly these points' futures, and
+    the loss updates exactly them. None (default) = use the full flat set.
+    Changes parameter shapes and the token count, so it must match between
+    saving and loading a checkpoint."""
 
     keypoint_match: str = "index"
     """keypoint_head_mode="default" only: how predicted keypoints are paired
@@ -225,9 +230,10 @@ class FinetuneConfig:
     the same object first, cost aggregated over the whole keypoint_horizon (one
     fixed assignment per sample/object). One-directional nearest-neighbor, so
     some duplicate-assignment collapse risk remains; watch per-point spread.
-    Ignored by every other mode: "tokens"/"cvae" bind predictions to targets
-    via the input query coordinate (no matching needed), "share_dim" has no
-    decoded prediction to match before its flow-matching loss."""
+    Ignored by every other mode: "tokens"/"cvae" targets are rank-ordered by
+    motion so token index already has a consistent meaning (no matching
+    needed), "share_dim" has no decoded prediction to match before its
+    flow-matching loss."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None

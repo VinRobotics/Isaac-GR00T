@@ -126,7 +126,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         # representations into a common space.
         if config.enable_keypoint_head:
             n_total_keypoints = config.max_keypoint_objects * config.keypoints_per_object
-            # "tokens"/"cvae": number of query-conditioned point tokens appended to
+            # "tokens"/"cvae": number of rank-identity point tokens appended to
             # the DiT sequence — the keypoint_n_key subsample the processor draws
             # per training sample, or the full flat set when keypoint_n_key is None
             # (see Gr00tN1d7Config.keypoint_n_key / _append_keypoint_queries).
@@ -145,24 +145,24 @@ class Gr00tN1d7ActionHead(nn.Module):
                     nn.Linear(self.hidden_size, n_total_keypoints * 2),
                 )
             if keypoint_mode in ("tokens", "cvae"):
-                # Query-conditioned point tokens (ATM-style): one token per sampled
-                # point, built from a shared learned base embedding plus an
-                # embedding of that point's CURRENT (t=0) position — identity comes
-                # from the input coordinate, not from a slot index, so permuting
-                # the sampled points permutes predictions/targets consistently and
-                # the by-index Huber loss is automatically permutation-invariant
-                # (no Chamfer needed; see _append_keypoint_queries). Each token
-                # decodes its own point's full keypoint_horizon future trajectory.
-                # "cvae" reuses this same mechanism as the substrate its style
-                # latent (z_style) is injected into.
-                self.keypoint_query_base = nn.Parameter(
-                    torch.randn(1, 1, self.input_embedding_dim) * 0.02
+                # Rank-identity point tokens: one learned embedding per MOTION
+                # RANK — the processor orders the selected points by descending
+                # total motion (see Gr00tN1d7Processor), so token i's target is
+                # always "the i-th most-moving point's trajectory". No input
+                # coordinate/anchor is fed: the model must localize where motion
+                # will happen purely from vision/language context (which is the
+                # scene understanding the aux task is meant to force). Distinct
+                # per-rank embeddings are required — a single shared token would
+                # produce identical hidden states, hence identical predictions,
+                # for every point. Each token decodes its own point's full
+                # keypoint_horizon future trajectory (t=0 included). "cvae"
+                # reuses this same mechanism as the substrate its style latent
+                # (z_style) is injected into — which also absorbs the rank-swap
+                # ambiguity when two objects move similar amounts.
+                self.keypoint_rank_embedding = nn.Embedding(
+                    self.num_keypoint_points, self.input_embedding_dim
                 )
-                self.keypoint_query_coord_encoder = nn.Sequential(
-                    nn.Linear(2, self.input_embedding_dim),
-                    nn.ReLU(),
-                    nn.Linear(self.input_embedding_dim, self.input_embedding_dim),
-                )
+                nn.init.normal_(self.keypoint_rank_embedding.weight, mean=0.0, std=0.02)
                 self.keypoint_position_decoder = nn.Sequential(
                     nn.Linear(self.hidden_size, self.hidden_size),
                     nn.ReLU(),
@@ -250,8 +250,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 if self.config.keypoint_head_mode != "share_dim":
                     self.keypoint_position_decoder.requires_grad_(False)
                 if self.config.keypoint_head_mode in ("tokens", "cvae"):
-                    self.keypoint_query_base.requires_grad_(False)
-                    self.keypoint_query_coord_encoder.requires_grad_(False)
+                    self.keypoint_rank_embedding.requires_grad_(False)
                 if self.config.keypoint_head_mode == "cvae":
                     self.keypoint_label_step_embed.requires_grad_(False)
                     self.keypoint_cls_token.requires_grad_(False)
@@ -293,9 +292,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                     if self.config.keypoint_head_mode != "share_dim":
                         self.keypoint_position_decoder.eval()
                     if self.config.keypoint_head_mode in ("tokens", "cvae"):
-                        # keypoint_query_base is a bare Parameter (no .eval());
-                        # only the coord-encoder MLP is a Module.
-                        self.keypoint_query_coord_encoder.eval()
+                        self.keypoint_rank_embedding.eval()
                     if self.config.keypoint_head_mode == "cvae":
                         self.keypoint_label_step_embed.eval()
                         if self.config.keypoint_cvae_condition == "vlm":
@@ -322,7 +319,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         "default": the DiT sequence is [state(1), action(action_horizon)]; keypoints
         for step t are decoded from the same hidden state that decodes action t.
         "tokens"/"cvae": the sequence additionally has num_keypoint_points
-        query-conditioned point tokens appended at the end
+        rank-identity point tokens appended at the end
         ([state(1), action(action_horizon), point_queries(num_keypoint_points)]),
         decoded from those instead — one token per sampled point, each carrying
         its full future trajectory (see _append_keypoint_queries). Not called at
@@ -358,25 +355,18 @@ class Gr00tN1d7ActionHead(nn.Module):
         return decoded.view(batch_size, self.config.keypoint_horizon, -1, 2)
 
     def _append_keypoint_queries(
-        self,
-        sa_embs: torch.Tensor,
-        query_coords: torch.Tensor,
-        z_style: Optional[torch.Tensor] = None,
+        self, sa_embs: torch.Tensor, z_style: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Append query-conditioned point tokens to the DiT sequence ("tokens"/
-        "cvae" mode only; no-op otherwise or when the head is disabled).
+        """Append rank-identity point tokens to the DiT sequence ("tokens"/"cvae"
+        mode only; no-op otherwise or when the head is disabled).
 
-        Each of the num_keypoint_points tokens = shared learned base embedding +
-        coord-encoder embedding of that point's CURRENT (t=0) position
-        (query_coords, [B, num_keypoint_points, 2] in [-1, 1] image-normalized
-        coordinates — during training/eval this is keypoint_target's first
-        horizon step, i.e. tracker data the sample already carries; never a
-        model input on the real-robot action path, where these tokens aren't
-        appended at all, see get_action_with_features). Identity is bound to the
-        input coordinate rather than a slot index, and the processor draws the
-        sampled points in random order (see Gr00tN1d7Processor), so predictions
-        can't rely on token position — the per-index Huber loss becomes
-        permutation-invariant automatically.
+        Token i is a learned embedding meaning "the i-th most-moving point of
+        this window" (the processor rank-orders the selected points by
+        descending motion — see Gr00tN1d7Processor and keypoint_rank_embedding
+        in __init__). No keypoint data is fed as input in ANY mode, at train or
+        inference time — the model localizes and forecasts the moving points
+        purely from vision/language/state context, which is exactly the scene
+        understanding the aux loss is meant to force.
 
         z_style ([B, keypoint_style_dim], "cvae" mode only): added as a bias to
         every point token — NOT concatenated into sa_embs itself. sa_embs also
@@ -392,34 +382,11 @@ class Gr00tN1d7ActionHead(nn.Module):
             and self.config.keypoint_head_mode in ("tokens", "cvae")
         ):
             return sa_embs
-        queries = self.keypoint_query_base + self.keypoint_query_coord_encoder(
-            query_coords.to(sa_embs.dtype)
-        )
+        batch_size = sa_embs.shape[0]
+        queries = self.keypoint_rank_embedding.weight.unsqueeze(0).expand(batch_size, -1, -1)
         if z_style is not None:
             queries = queries + self.keypoint_style_to_query(z_style).unsqueeze(1)
         return torch.cat((sa_embs, queries), dim=1)
-
-    def _keypoint_query_coords(
-        self, action_input: BatchFeature, batch_size: int, device: torch.device, dtype: torch.dtype
-    ) -> Optional[torch.Tensor]:
-        """Current (t=0) positions of the sampled points, [B, num_keypoint_points, 2],
-        for _append_keypoint_queries ("tokens"/"cvae" only, else None). Taken from
-        keypoint_target's first horizon step — already zero-filled by the processor
-        for samples without keypoint data (has_keypoint=0), whose loss is masked
-        anyway. Zeros when the batch carries no keypoint fields at all, purely to
-        keep the query modules in the DDP graph."""
-        if not (
-            self.config.enable_keypoint_head
-            and self.config.keypoint_head_mode in ("tokens", "cvae")
-        ):
-            return None
-        target_kp = action_input.get("keypoint_target", None)
-        if target_kp is None:
-            return torch.zeros(batch_size, self.num_keypoint_points, 2, device=device, dtype=dtype)
-        target_kp = target_kp.view(
-            batch_size, self.config.keypoint_horizon, self.num_keypoint_points, 2
-        )
-        return target_kp[:, 0].to(device=device, dtype=dtype)
 
     def _keypoint_self_attention_mask(
         self, batch_size: int, protected_len: int, device: torch.device
@@ -571,8 +538,9 @@ class Gr00tN1d7ActionHead(nn.Module):
         point k's position WITHIN one object's enumeration has no consistent
         meaning ACROSS episodes, only the object axis does (see
         Gr00tN1d7Config.keypoint_match). "tokens"/"cvae" don't need this: their
-        predictions are bound to targets by the input query coordinate instead
-        (see _append_keypoint_queries). Matching is one-directional (nearest
+        targets are rank-ordered by motion, so token index i always means "the
+        i-th most-moving point" (see _append_keypoint_queries). Matching is
+        one-directional (nearest
         target for each predicted point, not a strict bijection), so some
         duplicate-assignment collapse risk remains, same caveat as any
         Chamfer-style loss.
@@ -616,12 +584,13 @@ class Gr00tN1d7ActionHead(nn.Module):
         By-index regression is well posed here: the data pipeline
         (test_keypoint_tracking_simple.py) tracks every point from a single init
         frame with a FIXED identity for the whole episode, so no matching is
-        needed across time; and in "tokens"/"cvae" each prediction is bound to
-        its target by the input query coordinate (see _append_keypoint_queries),
-        so no matching is needed across points either — the loss is automatically
-        permutation-invariant. Only "default" mode still regresses against the
-        converter's arbitrary per-episode enumeration order; keypoint_match =
-        "chamfer" optionally removes that (see _match_keypoints_chamfer).
+        needed across time; and in "tokens"/"cvae" the processor rank-orders the
+        selected points by motion, so token index carries a consistent meaning
+        ("the i-th most-moving point" — see _append_keypoint_queries) and no
+        matching is needed across points either. Only "default" mode still
+        regresses against the converter's arbitrary per-episode enumeration
+        order; keypoint_match = "chamfer" optionally removes that (see
+        _match_keypoints_chamfer).
 
         keypoint_active_target is a static valid mask, either per-object
         ([B, H, max_keypoint_objects], broadcast to every point of the object) or
@@ -821,14 +790,11 @@ class Gr00tN1d7ActionHead(nn.Module):
                     ).view(-1, 1)
 
         # Join vision, language, state and action embedding along sequence dimension.
-        # In "tokens"/"cvae" mode, query-conditioned point tokens are appended
+        # In "tokens"/"cvae" mode, rank-identity point tokens are appended
         # after the action tokens: [state(1), action(action_horizon), point_queries].
         sa_embs = torch.cat((state_features, action_features), dim=1)
         protected_len = sa_embs.shape[1]
-        query_coords = self._keypoint_query_coords(
-            action_input, sa_embs.shape[0], device, sa_embs.dtype
-        )
-        sa_embs = self._append_keypoint_queries(sa_embs, query_coords, z_style=z_style)
+        sa_embs = self._append_keypoint_queries(sa_embs, z_style=z_style)
         self_attention_mask = self._keypoint_self_attention_mask(
             sa_embs.shape[0], protected_len, device
         )
@@ -1033,19 +999,14 @@ class Gr00tN1d7ActionHead(nn.Module):
         )
 
         # Constant across denoising steps: same protected/total sequence layout
-        # every iteration, so build the point-token self-attention mask and query
-        # coords once rather than per step. Query coords come from the eval
-        # batch's own keypoint_target (t=0 step) — see _keypoint_query_coords.
+        # every iteration, so build the point-token self-attention mask once
+        # rather than per step.
         protected_len = state_features.shape[1] + self.config.action_horizon
         self_attention_mask = None
-        query_coords = None
         z_style = None
         if append_keypoint_tokens:
             self_attention_mask = self._keypoint_self_attention_mask(
                 batch_size, protected_len, device
-            )
-            query_coords = self._keypoint_query_coords(
-                action_input, batch_size, device, vl_embeds.dtype
             )
             # CVAE style code at inference: no true future to encode (unlike
             # forward() / _encode_keypoint_style), so z_style defaults to zeros —
@@ -1129,7 +1090,7 @@ class Gr00tN1d7ActionHead(nn.Module):
             # predictions were requested (see append_keypoint_tokens above).
             sa_embs = torch.cat((state_features, action_features), dim=1)
             if append_keypoint_tokens:
-                sa_embs = self._append_keypoint_queries(sa_embs, query_coords, z_style=z_style)
+                sa_embs = self._append_keypoint_queries(sa_embs, z_style=z_style)
 
             # Run model forward.
             if self.config.use_alternate_vl_dit:

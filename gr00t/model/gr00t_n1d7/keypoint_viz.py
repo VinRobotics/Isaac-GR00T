@@ -105,16 +105,18 @@ def render_keypoint_overlay(
                     prev_px = None
                     continue
                 # Fade early steps in, later steps fully saturated, so the direction
-                # of motion is visible at a glance.
+                # of motion is visible at a glance. Named step_color so it can't
+                # shadow the `color` parameter (assigning to `color` here would
+                # silently corrupt every later group's base_color).
                 brightness = min_brightness + (1.0 - min_brightness) * (t / max(horizon - 1, 1))
-                color = tuple(int(c) for c in (base_color * brightness).clip(0, 255))
+                step_color = tuple(int(c) for c in (base_color * brightness).clip(0, 255))
                 px = to_px(keypoints[t, obj, p])
                 if prev_px is not None and in_bounds(prev_px) and in_bounds(px):
-                    cv2.line(out, prev_px, px, color, line_thickness, cv2.LINE_AA)
+                    cv2.line(out, prev_px, px, step_color, line_thickness, cv2.LINE_AA)
                 if in_bounds(px):
-                    cv2.circle(out, px, point_radius, color, thickness=-1)
+                    cv2.circle(out, px, point_radius, step_color, thickness=-1)
                     if t == horizon - 1:
-                        cv2.circle(out, px, point_radius + 2, color, thickness=1)
+                        cv2.circle(out, px, point_radius + 2, step_color, thickness=1)
                 prev_px = px
     return out
 
