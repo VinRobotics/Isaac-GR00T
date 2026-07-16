@@ -49,6 +49,52 @@ KEYPOINT_AUX_PARAM_NAMES = (
 )
 
 
+def _reinit_fresh_linear_like(module: torch.nn.Module) -> None:
+    """Re-run real parameter init for every Linear/Embedding inside `module`.
+
+    from_pretrained's fast-init path monkey-patches torch.nn.init.{kaiming_uniform_,
+    uniform_,normal_} to no-ops for the duration of model construction (skipping the
+    RNG cost for weights about to be overwritten by the checkpoint anyway). A
+    submodule with no checkpoint counterpart never gets overwritten, so it comes out
+    of from_pretrained holding raw torch.empty(...) memory (occasionally NaN/Inf),
+    not its class's normal default init. Only safe to call after from_pretrained has
+    returned, once that patch context has exited.
+    """
+    for m in module.modules():
+        if isinstance(m, (torch.nn.Linear, torch.nn.Embedding)):
+            m.reset_parameters()
+
+
+def _reinit_missing_keypoint_params(action_head: torch.nn.Module, missing_keys: list) -> list:
+    """Explicitly re-initialize keypoint aux-head submodules from_pretrained reported
+    as missing (see _reinit_fresh_linear_like for why __init__'s own init calls can't
+    be trusted to have taken effect). Mirrors the mask_token_missing handling above:
+    an explicit post-load re-init rather than assuming __init__ already did it.
+
+    keypoint_style_head is special-cased back to all-zeros (not reset_parameters'
+    random init) since it must start at mu=0, logvar=0 - the CVAE prior itself, see
+    Gr00tN1d7ActionHead._init_keypoint_cvae_modules.
+    """
+    missing_names = [
+        name for name in KEYPOINT_AUX_PARAM_NAMES if any(name in k for k in missing_keys)
+    ]
+    for name in missing_names:
+        submodule = getattr(action_head, name, None)
+        if submodule is None:
+            continue
+        with torch.no_grad():
+            if name == "keypoint_cls_token":
+                submodule.data.normal_(mean=0.0, std=0.02)
+            elif name == "keypoint_query_embedding":
+                torch.nn.init.normal_(submodule.weight, mean=0.0, std=0.02)
+            elif name == "keypoint_style_head":
+                submodule.weight.zero_()
+                submodule.bias.zero_()
+            else:
+                _reinit_fresh_linear_like(submodule)
+    return missing_names
+
+
 # Convert tensors to lists for JSON serialization
 def convert_tensors_to_lists(obj):
     """Recursively convert tensors to lists in nested dictionaries/lists."""
@@ -153,9 +199,18 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 k for k in missing_keys if any(name in k for name in KEYPOINT_AUX_PARAM_NAMES)
             ]
             if keypoint_missing:
+                # Not "keeping fresh initialization" — explicitly re-running it.
+                # from_pretrained's fast-init path means these submodules' own
+                # __init__-time init calls may never have taken effect (see
+                # _reinit_fresh_linear_like); without this they can come out of
+                # from_pretrained holding raw uninitialized memory (occasionally
+                # NaN/Inf), which is exactly what caused keypoint_kl_loss to be inf
+                # from the very first training step under keypoint_head_mode="cvae".
+                reinitialized = _reinit_missing_keypoint_params(model.action_head, keypoint_missing)
                 logging.info(
-                    "keypoint aux head params not in checkpoint - keeping fresh "
-                    f"initialization ({len(keypoint_missing)} tensors)"
+                    "keypoint aux head params not in checkpoint - explicitly "
+                    f"re-initialized ({len(keypoint_missing)} tensors, modules: "
+                    f"{reinitialized})"
                 )
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
