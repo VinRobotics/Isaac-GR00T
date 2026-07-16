@@ -217,6 +217,15 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.max_keypoint_objects = max_keypoint_objects
         self.keypoints_per_object = keypoints_per_object
         self.keypoint_n_key = keypoint_n_key
+        # Runtime toggle (never serialized): when True, the keypoint_n_key
+        # sampling below picks a DETERMINISTIC evenly-spaced subset of the valid
+        # points instead of a fresh random draw. Since the valid mask is static
+        # for a whole episode (test_keypoint_tracking_simple.py), every frame of
+        # an episode then selects the SAME physical points — which is what the
+        # eval episode-video overlay needs to be watchable (see
+        # trainer._render_keypoint_episode_video); training keeps the random
+        # draw/order.
+        self.keypoint_fixed_sampling = False
         self._any_keypoint_modality = any(
             "keypoint" in cfgs for cfgs in self.modality_configs.values()
         )
@@ -665,12 +674,23 @@ class Gr00tN1d7Processor(BaseProcessor):
                     point_valid = active[0].repeat_interleave(self.keypoints_per_object)
                     valid_idx = (point_valid > 0.5).nonzero(as_tuple=True)[0].numpy()
                     if len(valid_idx) > 0:
-                        # Without replacement when enough valid points exist; with
-                        # replacement otherwise (duplicated points just get
-                        # supervised twice — harmless).
-                        sel = torch.from_numpy(
-                            np.random.choice(valid_idx, size=n_key, replace=len(valid_idx) < n_key)
-                        )
+                        if self.keypoint_fixed_sampling:
+                            # Deterministic evenly-spaced pick over the valid set
+                            # (episode-static) — same points every frame of an
+                            # episode; see the attribute's comment in __init__.
+                            pos = np.round(np.linspace(0, len(valid_idx) - 1, n_key)).astype(
+                                np.int64
+                            )
+                            sel = torch.from_numpy(valid_idx[pos])
+                        else:
+                            # Without replacement when enough valid points exist;
+                            # with replacement otherwise (duplicated points just
+                            # get supervised twice — harmless).
+                            sel = torch.from_numpy(
+                                np.random.choice(
+                                    valid_idx, size=n_key, replace=len(valid_idx) < n_key
+                                )
+                            )
                         kp_pts = kp.view(self.keypoint_horizon, n_total, 2)
                         keypoint_target = kp_pts[:, sel].reshape(self.keypoint_horizon, -1)
                         keypoint_active_target = (

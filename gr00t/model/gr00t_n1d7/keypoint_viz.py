@@ -39,6 +39,7 @@ def render_keypoint_overlay(
     point_radius: int = 2,
     min_brightness: float = 0.35,
     active_threshold: float = 0.05,
+    color: tuple[int, int, int] | None = None,
 ) -> np.ndarray:
     """Overlay the future keypoint trajectory as a trail per tracked point (one
     polyline per point, like test_keypoint_tracking.py's trail viz), onto a copy
@@ -64,6 +65,13 @@ def render_keypoint_overlay(
             equivalent (currently always a constant all-ones/all-zeros per object;
             see keypoint_active_pred in gr00t_n1d7.py). Steps below
             active_threshold are skipped entirely (no marker, no trail segment).
+        color: single RGB color for EVERY point group (also suppresses the
+            per-group legend labels, which would just be noise when groups aren't
+            visually distinguished). None (default) = per-group palette cycling
+            through _OBJECT_COLORS + "obj_<i>" legend. Use a single color when
+            groups are individual sampled points rather than objects (the
+            "tokens"/"cvae" per-point layout — see keypoint_pred in
+            gr00t_n1d7.py), where 8-24 cycling colors/labels are unreadable.
 
     Returns:
         (H, W, 3) uint8 RGB copy of `image` with the drawn-in trajectories on top.
@@ -82,7 +90,10 @@ def render_keypoint_overlay(
         return 0 <= pt[0] < w and 0 <= pt[1] < h
 
     for obj in range(num_objects):
-        base_color = np.array(_OBJECT_COLORS[obj % len(_OBJECT_COLORS)], dtype=np.float32)
+        base_color = np.array(
+            color if color is not None else _OBJECT_COLORS[obj % len(_OBJECT_COLORS)],
+            dtype=np.float32,
+        )
         for p in range(num_points):
             prev_px = None  # last ACTIVE step's pixel pos, or None if none yet / broken
             for t in range(horizon):
@@ -105,20 +116,6 @@ def render_keypoint_overlay(
                     if t == horizon - 1:
                         cv2.circle(out, px, point_radius + 2, color, thickness=1)
                 prev_px = px
-        # Per-object legend label, following test_keypoint_tracking.py's
-        # "active_{role} = slot_{slot}" convention (simplified: we have no
-        # role/slot distinction here, just the fixed per-object color).
-        label_color = tuple(int(c) for c in base_color.clip(0, 255))
-        cv2.putText(
-            out,
-            f"obj_{obj}",
-            (6, 16 + 16 * obj),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            label_color,
-            1,
-            cv2.LINE_AA,
-        )
     return out
 
 

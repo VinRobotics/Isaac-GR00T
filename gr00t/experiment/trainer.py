@@ -607,6 +607,26 @@ class Gr00tTrainer(Trainer):
         stride = max(1, effective_len // self.keypoint_video_max_frames)
         step_indices = list(range(0, effective_len, stride))[: self.keypoint_video_max_frames]
 
+        # With keypoint_n_key sampling on, every frame would otherwise draw a
+        # DIFFERENT random point subset, making the video unwatchable — switch
+        # the processor to its deterministic pick (episode-static valid mask =>
+        # the same physical points on every frame) for the duration of this
+        # render, and restore afterward (training dataloader workers hold their
+        # own processor copies, so this synchronous toggle can't leak into them).
+        processor = getattr(dataset, "processor", None)
+        if processor is not None and getattr(processor, "keypoint_n_key", None):
+            processor.keypoint_fixed_sampling = True
+        try:
+            return self._render_keypoint_episode_video_frames(
+                model, unwrapped_model, dataset, episode_data, step_indices
+            )
+        finally:
+            if processor is not None:
+                processor.keypoint_fixed_sampling = False
+
+    def _render_keypoint_episode_video_frames(
+        self, model, unwrapped_model, dataset, episode_data, step_indices: list
+    ) -> np.ndarray | None:
         frames = []
         for start in range(0, len(step_indices), self.keypoint_video_batch_size):
             chunk = step_indices[start : start + self.keypoint_video_batch_size]
@@ -667,8 +687,12 @@ class Gr00tTrainer(Trainer):
                     gt_active = np.repeat(gt_active, num_objects // gt_active.shape[-1], axis=-1)
                 pred_kp = action_out["keypoint_pred"][i].detach().float().cpu().numpy()
                 pred_active = action_out["keypoint_active_pred"][i].detach().float().cpu().numpy()
-                gt_img = render_keypoint_overlay(img, gt_kp, gt_active)
-                pred_img = render_keypoint_overlay(img, pred_kp, pred_active)
+                # Single red for every keypoint in the episode video: with the
+                # per-point layout there are 8-24 groups, and a cycling palette +
+                # legend is unreadable at video size (the GT/Pred split already
+                # distinguishes the two panels).
+                gt_img = render_keypoint_overlay(img, gt_kp, gt_active, color=(220, 30, 30))
+                pred_img = render_keypoint_overlay(img, pred_kp, pred_active, color=(220, 30, 30))
                 frames.append(combine_gt_pred(gt_img, pred_img))
 
         if not frames:
