@@ -163,11 +163,17 @@ action ─┘        │                                                        
    Zero-init khiến encoder khởi động ở đúng mu=0, logvar=0 (= prior), để z=0 lúc infer khớp với
    những gì decoder thấy ngay từ đầu training, không phải một điểm ngẫu nhiên decoder chưa từng gặp.
 
-   **Rủi ro cần theo dõi thực nghiệm** (chưa validate): với `keypoint_kl_weight=0.01` khá nhỏ,
-   posterior có thể học `logvar` rất nhỏ → z gần deterministic → decoder ỷ lại z thay vì học từ
-   scene qua cross-attention → train loss thấp giả tạo, inference (z=0) kém. Theo dõi
-   `keypoint_kl_loss` qua training; nếu nghi ngờ, so sánh eval với `keypoint_style_sample=False` (z=0)
-   vs ép z=mu thật trên cùng batch.
+   **Rủi ro này ĐÃ xảy ra thực tế** (quan sát: `keypoint_kl_loss` tăng mạnh trong training): với
+   `keypoint_kl_weight=0.01` quá yếu, encoder cứ đẩy `mu` xa prior — mỗi nat thông tin trong z mua
+   được nhiều reconstruction hơn giá KL phải trả, đặc biệt sau khi bỏ coord anchor (bài toán khó hơn
+   → thông tin "motion ở đâu" trong z càng có giá). Decoder ỷ lại z; inference (z=0) rơi ra ngoài
+   phân phối z từng thấy → hỏng. **Đối sách**:
+   - Tăng `--keypoint-kl-weight` lên `0.1` (thử trước), chưa đủ thì `0.5`–`1.0`. KL nên ổn định ở
+     mức vài nat, không leo tuyến tính.
+   - Có thể giảm `--keypoint-style-dim` 16 → 8 (siết bottleneck).
+   - `forward()` ở EVAL giờ dùng **z=0** (đúng như inference) thay vì sample từ posterior — nên
+     `eval_keypoint_loss` giờ đo thẳng chất lượng deployment; **gap train↔eval keypoint_loss chính
+     là thước đo mức độ decoder ỷ lại z**. KL vẫn tính từ posterior như cũ.
 
 ## Config (`Gr00tN1d7Config` / `FinetuneConfig`)
 

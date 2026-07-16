@@ -816,12 +816,26 @@ class Gr00tN1d7ActionHead(nn.Module):
                 keypoint_mu, keypoint_logvar = self._encode_keypoint_style(
                     target_kp_flat, condition_token
                 )
-                z_style = self._sample_keypoint_style(keypoint_mu, keypoint_logvar)
-                has_keypoint = action_input.get("has_keypoint", None)
-                if has_keypoint is not None:
-                    z_style = z_style * has_keypoint.to(
-                        device=z_style.device, dtype=z_style.dtype
-                    ).view(-1, 1)
+                if self.training:
+                    z_style = self._sample_keypoint_style(keypoint_mu, keypoint_logvar)
+                    has_keypoint = action_input.get("has_keypoint", None)
+                    if has_keypoint is not None:
+                        z_style = z_style * has_keypoint.to(
+                            device=z_style.device, dtype=z_style.dtype
+                        ).view(-1, 1)
+                else:
+                    # Eval: z_style = 0, exactly what inference uses
+                    # (get_action_with_features has no label to encode). This
+                    # makes eval keypoint_loss measure DEPLOYMENT reconstruction
+                    # quality rather than posterior-conditioned ELBO — the
+                    # train-vs-eval keypoint_loss gap is then a direct readout of
+                    # how much the decoder has come to depend on z_style (the
+                    # failure mode a runaway keypoint_kl_loss signals: with a
+                    # weak keypoint_kl_weight the encoder can keep buying
+                    # reconstruction with information in z, and z=0 drifts out
+                    # of the distribution the decoder was trained on). KL is
+                    # still computed from the posterior (mu/logvar) as usual.
+                    z_style = torch.zeros_like(keypoint_mu)
 
         # Join vision, language, state and action embedding along sequence dimension.
         # In "tokens"/"cvae" mode, set-slot point tokens are appended
