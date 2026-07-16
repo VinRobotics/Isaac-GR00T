@@ -130,11 +130,12 @@ class Gr00tN1d7Config(PretrainedConfig):
     # pipeline had) — so there is no time-varying "active" signal left to classify
     # in ANY mode, and keypoint_active_target is reinterpreted as a static
     # per-object valid mask (same value at every horizon step: 1 if a real object
-    # occupied that slot at the init frame, 0 if it's padding). Position uses
-    # direct masked regression (point k always means the same physical point),
-    # not Chamfer set-matching. "default"/"tokens" are a pure readout: action_pred
-    # never depends on whether the head runs. "share_dim" is NOT — see its note
-    # below.
+    # occupied that slot at the init frame, 0 if it's padding). Fixed identity
+    # across TIME means one assignment per window suffices — no per-step
+    # re-matching; across POINTS, "tokens"/"cvae" bind predictions to targets by
+    # optimal bijection (see keypoint_match / _match_keypoints_hungarian).
+    # "default"/"tokens" are a pure readout: action_pred never depends on
+    # whether the head runs. "share_dim" is NOT — see its note below.
     enable_keypoint_head: bool = False
     keypoint_horizon: int = 16
     max_keypoint_objects: int = 2
@@ -147,20 +148,22 @@ class Gr00tN1d7Config(PretrainedConfig):
     # How the keypoint head attaches to the action head. One of:
     #   "default": decode keypoint position from the same action-token hidden
     #     states that decode the action itself (cheap, shared representation).
-    #   "tokens": append rank-identity point tokens to the DiT sequence: one
-    #     learned embedding per motion rank (keypoint_n_key of them, or the full
-    #     flat set when None), where the processor rank-orders the selected
-    #     points by descending total motion — so token i's target is always "the
-    #     i-th most-moving point's trajectory", a consistent meaning across
-    #     episodes (unlike the converter's arbitrary enumeration order). Each
-    #     token decodes its own point's full keypoint_horizon trajectory, t=0
-    #     included: NO keypoint data is fed as input in any mode, at train or
-    #     inference time — the model must localize where motion will happen
-    #     purely from vision/language/state context, which is exactly the scene
-    #     understanding the aux loss is meant to force. Known ambiguity: when
-    #     two objects move similar amounts their ranks can swap between windows,
-    #     making token i's target multimodal — "cvae"'s z_style exists to absorb
-    #     exactly that; plain "tokens" may blur there. A one-directional
+    #   "tokens": append DETR-style set-slot point tokens to the DiT sequence:
+    #     one learned embedding per slot (keypoint_n_key of them, or the full
+    #     flat set when None). The loss binds slots to target points by optimal
+    #     one-to-one (Hungarian) assignment per window — NOT by index: the
+    #     processor's motion-rank target order is per-window noise among
+    #     same-object points (a rigid object's points all move the same
+    #     amount), and by-index regression against exchangeable targets is
+    #     minimized by every slot predicting the same central point — the
+    #     classic all-points-collapse-to-one failure. The bijection makes that
+    #     collapse expensive instead (every unclaimed target still costs), see
+    #     Gr00tN1d7ActionHead._match_keypoints_hungarian. Each token decodes
+    #     one point's full keypoint_horizon trajectory, t=0 included: NO
+    #     keypoint data is fed as input in any mode, at train or inference time
+    #     — the model must localize where motion will happen purely from
+    #     vision/language/state context, which is exactly the scene
+    #     understanding the aux loss is meant to force. A one-directional
     #     self-attention mask (see
     #     Gr00tN1d7ActionHead._keypoint_self_attention_mask) keeps this a pure
     #     readout: point tokens may attend to the state/action tokens (so
@@ -183,11 +186,11 @@ class Gr00tN1d7Config(PretrainedConfig):
     #     what makes folding POSITION (not just a per-object flag) viable here,
     #     unlike the retired object-slot pipeline, where only the *active* flags
     #     (max_keypoint_objects dims) were cheap enough to fold and position had
-    #     to stay on a separate Chamfer-matched decoder. Always uses "index"
+    #     to stay on a separate set-matched decoder. Always uses "index"
     #     matching regardless of keypoint_match (see below) — it has no decoded
     #     prediction to match against before the flow-matching loss runs, so the
-    #     within-object enumeration-order ambiguity keypoint_match="chamfer"
-    #     addresses for the other three modes is left unaddressed here. NOT a
+    #     within-object enumeration-order ambiguity keypoint_match="hungarian"
+    #     addresses for "default" is left unaddressed here. NOT a
     #     pure readout, unlike
     #     "default"/"tokens": action_encoder's W1 is a dense matrix mixing every
     #     input channel into one embedding, so the (noised) position values
@@ -209,7 +212,7 @@ class Gr00tN1d7Config(PretrainedConfig):
     #     recognition encoder (Gr00tN1d7ActionHead._encode_keypoint_style) sees the
     #     TRUE future keypoints + a condition token (see keypoint_cvae_condition)
     #     during training and outputs (mu, logvar) for a style latent z_style;
-    #     z_style is added to the "tokens"-mode rank-identity point tokens
+    #     z_style is added to the "tokens"-mode set-slot point tokens
     #     (NOT concatenated into sa_embs — see below) before the DiT, and the
     #     position decoder (reading those tokens' hidden states, exactly like
     #     "tokens" mode) becomes the CVAE decoder p(keypoints | z_style, context).
@@ -263,7 +266,7 @@ class Gr00tN1d7Config(PretrainedConfig):
     # see Gr00tN1d7Processor). Moving points carry the object-interaction
     # signal; static ones are trivially predictable. Deterministic per window,
     # so eval picks are stable frame to frame. The head appends exactly this
-    # many rank-identity point tokens, predicts exactly these points'
+    # many set-slot point tokens, predicts exactly these points'
     # futures, and the loss updates exactly them. None (default) = use the full
     # flat set (no selection; the per-object valid mask handles padding slots).
     # Changing it changes keypoint_label_step_embed's and
@@ -276,19 +279,18 @@ class Gr00tN1d7Config(PretrainedConfig):
     # enumeration order (farthest_point_sample in
     # test_keypoint_tracking_simple.py starts from a random pixel, so index k
     # within an object carries no consistent meaning ACROSS episodes, only
-    # within one). "index" (default): plain by-index regression. "chamfer":
-    # reorder target points to their nearest predicted point within the same
-    # object first, using a cost aggregated over the whole keypoint_horizon (one
-    # fixed assignment per sample/object, not re-matched independently at every
-    # step) — see Gr00tN1d7ActionHead._match_keypoints_chamfer; one-directional
-    # nearest-neighbor, not a strict bijection, so some duplicate-assignment
-    # collapse risk remains. The object axis is untouched either way (it carries
-    # real signal, e.g. "first object to move"). Ignored by every other mode:
-    # "tokens"/"cvae" targets are rank-ordered by motion, so token index already
-    # carries a consistent meaning (no matching needed — see keypoint_head_mode
-    # above), and "share_dim" has no decoded prediction to match before its
-    # flow-matching loss runs.
-    keypoint_match: str = "index"  # one of {"index", "chamfer"}
+    # within one). "index" (default): plain by-index regression. "hungarian":
+    # optimal one-to-one assignment of target points to predicted points within
+    # each object, cost aggregated over the whole keypoint_horizon (one fixed
+    # bijection per sample/object, not re-matched independently at every step)
+    # — see Gr00tN1d7ActionHead._match_keypoints_hungarian for why the strict
+    # bijection matters (softer variants collapse every prediction onto one
+    # point). The object axis is untouched either way (it carries real signal,
+    # e.g. "first object to move"). Ignored by every other mode: "tokens"/
+    # "cvae" ALWAYS Hungarian-match over their full point set (see
+    # keypoint_head_mode above), and "share_dim" has no decoded prediction to
+    # match before its flow-matching loss runs.
+    keypoint_match: str = "index"  # one of {"index", "hungarian"}
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -315,15 +317,15 @@ class Gr00tN1d7Config(PretrainedConfig):
                 f"keypoint_cvae_condition must be one of 'vlm', 'state', "
                 f"got {self.keypoint_cvae_condition!r}"
             )
-        if self.keypoint_match not in ("index", "chamfer"):
+        if self.keypoint_match not in ("index", "hungarian"):
             raise ValueError(
-                f"keypoint_match must be one of 'index', 'chamfer', got {self.keypoint_match!r}"
+                f"keypoint_match must be one of 'index', 'hungarian', got {self.keypoint_match!r}"
             )
         if self.keypoint_n_key is not None:
             if self.keypoint_head_mode not in ("tokens", "cvae"):
                 raise ValueError(
                     "keypoint_n_key requires keypoint_head_mode 'tokens' or 'cvae' "
-                    "(rank-identity point tokens); 'default'/'share_dim' always "
+                    "(set-slot point tokens); 'default'/'share_dim' always "
                     f"predict the full flat point set, got {self.keypoint_head_mode!r}"
                 )
             n_total = self.max_keypoint_objects * self.keypoints_per_object

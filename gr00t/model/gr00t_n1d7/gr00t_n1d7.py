@@ -16,6 +16,7 @@
 import logging
 from typing import Any, Optional, Tuple
 
+from scipy.optimize import linear_sum_assignment
 import torch
 from torch import nn
 from torch.distributions import Beta
@@ -126,7 +127,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         # representations into a common space.
         if config.enable_keypoint_head:
             n_total_keypoints = config.max_keypoint_objects * config.keypoints_per_object
-            # "tokens"/"cvae": number of rank-identity point tokens appended to
+            # "tokens"/"cvae": number of set-slot point tokens appended to
             # the DiT sequence — the keypoint_n_key subsample the processor draws
             # per training sample, or the full flat set when keypoint_n_key is None
             # (see Gr00tN1d7Config.keypoint_n_key / _append_keypoint_queries).
@@ -145,20 +146,20 @@ class Gr00tN1d7ActionHead(nn.Module):
                     nn.Linear(self.hidden_size, n_total_keypoints * 2),
                 )
             if keypoint_mode in ("tokens", "cvae"):
-                # Rank-identity point tokens: one learned embedding per MOTION
-                # RANK — the processor orders the selected points by descending
-                # total motion (see Gr00tN1d7Processor), so token i's target is
-                # always "the i-th most-moving point's trajectory". No input
+                # DETR-style set-slot point tokens: one learned embedding per
+                # slot. Each token decodes one point's full keypoint_horizon
+                # trajectory (t=0 included), and the loss binds slots to target
+                # points by optimal bijective assignment per window (see
+                # _match_keypoints_hungarian — by-index binding against the
+                # processor's motion-rank order collapses, since that order is
+                # per-window noise among same-object points). No input
                 # coordinate/anchor is fed: the model must localize where motion
                 # will happen purely from vision/language context (which is the
                 # scene understanding the aux task is meant to force). Distinct
-                # per-rank embeddings are required — a single shared token would
+                # per-slot embeddings are required — a single shared token would
                 # produce identical hidden states, hence identical predictions,
-                # for every point. Each token decodes its own point's full
-                # keypoint_horizon future trajectory (t=0 included). "cvae"
-                # reuses this same mechanism as the substrate its style latent
-                # (z_style) is injected into — which also absorbs the rank-swap
-                # ambiguity when two objects move similar amounts.
+                # for every point. "cvae" reuses this same mechanism as the
+                # substrate its style latent (z_style) is injected into.
                 self.keypoint_rank_embedding = nn.Embedding(
                     self.num_keypoint_points, self.input_embedding_dim
                 )
@@ -319,7 +320,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         "default": the DiT sequence is [state(1), action(action_horizon)]; keypoints
         for step t are decoded from the same hidden state that decodes action t.
         "tokens"/"cvae": the sequence additionally has num_keypoint_points
-        rank-identity point tokens appended at the end
+        set-slot point tokens appended at the end
         ([state(1), action(action_horizon), point_queries(num_keypoint_points)]),
         decoded from those instead — one token per sampled point, each carrying
         its full future trajectory (see _append_keypoint_queries). Not called at
@@ -357,16 +358,16 @@ class Gr00tN1d7ActionHead(nn.Module):
     def _append_keypoint_queries(
         self, sa_embs: torch.Tensor, z_style: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Append rank-identity point tokens to the DiT sequence ("tokens"/"cvae"
+        """Append set-slot point tokens to the DiT sequence ("tokens"/"cvae"
         mode only; no-op otherwise or when the head is disabled).
 
-        Token i is a learned embedding meaning "the i-th most-moving point of
-        this window" (the processor rank-orders the selected points by
-        descending motion — see Gr00tN1d7Processor and keypoint_rank_embedding
-        in __init__). No keypoint data is fed as input in ANY mode, at train or
-        inference time — the model localizes and forecasts the moving points
-        purely from vision/language/state context, which is exactly the scene
-        understanding the aux loss is meant to force.
+        Each token is a learned slot embedding (keypoint_rank_embedding); the
+        loss assigns slots to target points by optimal bijection per window
+        (see _match_keypoints_hungarian), DETR-style. No keypoint data is fed
+        as input in ANY mode, at train or inference time — the model localizes
+        and forecasts the moving points purely from vision/language/state
+        context, which is exactly the scene understanding the aux loss is meant
+        to force.
 
         z_style ([B, keypoint_style_dim], "cvae" mode only): added as a bias to
         every point token — NOT concatenated into sa_embs itself. sa_embs also
@@ -522,56 +523,79 @@ class Gr00tN1d7ActionHead(nn.Module):
         kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=-1)  # [B]
         return (kl * sample_weight).sum() / (sample_weight.sum() + 1e-6)
 
-    def _match_keypoints_chamfer(
-        self, pred_kp: torch.Tensor, target_kp: torch.Tensor
-    ) -> torch.Tensor:
-        """Reorder target_kp's within-object point axis to align with pred_kp via
-        one-directional nearest-neighbor (Chamfer-style) matching, aggregated over
-        the whole horizon so one fixed assignment applies to every step — not
-        re-matched independently at each step, which would let a given predicted
-        channel track a different physical point from step to step.
+    def _match_keypoints_hungarian(
+        self,
+        pred_kp: torch.Tensor,
+        target_kp: torch.Tensor,
+        valid: torch.Tensor,
+        group_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reorder target points (and their valid mask) to the optimal ONE-TO-ONE
+        assignment against the predictions, per group, cost aggregated over the
+        whole horizon — one fixed bijection per sample/group, never re-matched
+        per step (a given predicted channel tracks one physical point across the
+        window).
 
-        "default" mode only (keypoint_match="chamfer"): it's the one mode left
-        regressing against the converter's arbitrary per-episode enumeration
-        order — keypoints_per_object points come from farthest-point sampling per
-        episode (farthest_point_sample in test_keypoint_tracking_simple.py), so
-        point k's position WITHIN one object's enumeration has no consistent
-        meaning ACROSS episodes, only the object axis does (see
-        Gr00tN1d7Config.keypoint_match). "tokens"/"cvae" don't need this: their
-        targets are rank-ordered by motion, so token index i always means "the
-        i-th most-moving point" (see _append_keypoint_queries). Matching is
-        one-directional (nearest
-        target for each predicted point, not a strict bijection), so some
-        duplicate-assignment collapse risk remains, same caveat as any
-        Chamfer-style loss.
+        A strict bijection (scipy linear_sum_assignment) is the load-bearing
+        property, not a nicety: every target must be claimed by exactly one
+        prediction, so collapsing all predictions onto one point pays full cost
+        for every unclaimed target. Both softer alternatives demonstrably
+        collapse — one-directional nearest-neighbor (Chamfer) has a degenerate
+        near-zero-loss optimum with every prediction sitting on a single target
+        point, and plain by-index regression against exchangeable targets (the
+        motion-rank order of same-object points is per-window noise, since a
+        rigid object's points all move the same amount) is minimized by every
+        token predicting the same central point. The "all predictions cluster at
+        one point" failure observed in training is exactly those two optima.
 
         Args:
-            pred_kp, target_kp: [B, H, n_total, 2] (n_total = max_keypoint_objects
-                * keypoints_per_object).
+            pred_kp, target_kp: [B, H, P, 2] flat.
+            valid: [B, H, P] per-point weights, reordered with the same
+                permutation so weights stay attached to their target points.
+            group_size: matching is restricted to within groups of this many
+                consecutive points — keypoints_per_object for "default"
+                (never match across objects: the object axis carries real
+                signal), the full P for "tokens"/"cvae" (one global set).
         Returns:
-            target_kp reordered along the per-object point axis (same shape).
+            (target_kp, valid) reordered along the point axis (same shapes).
         """
-        num_objects = self.config.max_keypoint_objects
-        kp_per_object = self.config.keypoints_per_object
-        batch_size, horizon = pred_kp.shape[:2]
-        target = target_kp.view(batch_size, horizon, num_objects, kp_per_object, 2)
+        batch_size, horizon, num_points = pred_kp.shape[:3]
+        num_groups = num_points // group_size
         with torch.no_grad():
-            pred = pred_kp.view(batch_size, horizon, num_objects, kp_per_object, 2)
-            pred_t = pred.permute(0, 2, 1, 3, 4)  # [B, N, H, K, 2]
-            target_t = target.permute(0, 2, 1, 3, 4)  # [B, N, H, K, 2]
-            diff = pred_t.unsqueeze(4) - target_t.unsqueeze(3)  # [B, N, H, K(pred), K(target), 2]
-            cost = F.smooth_l1_loss(diff, torch.zeros_like(diff), beta=0.1, reduction="none").sum(
-                -1
-            )
-            cost = cost.sum(dim=2)  # sum over horizon -> [B, N, K(pred), K(target)]
-            match_idx = cost.argmin(dim=-1)  # nearest target per predicted point: [B, N, K]
-            gather_idx = (
-                match_idx.unsqueeze(1)
-                .unsqueeze(-1)
-                .expand(batch_size, horizon, num_objects, kp_per_object, 2)
-            )
+            pred = pred_kp.view(batch_size, horizon, num_groups, group_size, 2)
+            target = target_kp.view(batch_size, horizon, num_groups, group_size, 2)
+            diff = pred.permute(0, 2, 1, 3, 4).unsqueeze(4) - target.permute(
+                0, 2, 1, 3, 4
+            ).unsqueeze(3)  # [B, G, H, K(pred), K(target), 2]
+            cost = F.smooth_l1_loss(diff, torch.zeros_like(diff), beta=0.1, reduction="none")
+            cost = cost.sum(-1).sum(2)  # aggregate coords + horizon -> [B, G, Kp, Kt]
+            cost_np = cost.float().cpu().numpy()
+            perm = torch.empty(batch_size, num_groups, group_size, dtype=torch.long)
+            for b in range(batch_size):
+                for g in range(num_groups):
+                    # row_ind is sorted 0..K-1 for a square cost matrix, so
+                    # col_ind[k] is the target assigned to prediction k.
+                    _, col_ind = linear_sum_assignment(cost_np[b, g])
+                    perm[b, g] = torch.from_numpy(col_ind)
+            perm = perm.to(target_kp.device)
+
+        target = target_kp.view(batch_size, horizon, num_groups, group_size, 2)
+        gather_idx = perm.view(batch_size, 1, num_groups, group_size, 1).expand(
+            batch_size, horizon, num_groups, group_size, 2
+        )
         matched_target = torch.gather(target, dim=3, index=gather_idx)
-        return matched_target.reshape(batch_size, horizon, num_objects * kp_per_object, 2)
+        valid_groups = valid.view(batch_size, horizon, num_groups, group_size)
+        matched_valid = torch.gather(
+            valid_groups,
+            dim=3,
+            index=perm.view(batch_size, 1, num_groups, group_size).expand(
+                batch_size, horizon, num_groups, group_size
+            ),
+        )
+        return (
+            matched_target.reshape(batch_size, horizon, num_points, 2),
+            matched_valid.reshape(batch_size, horizon, num_points),
+        )
 
     def _compute_keypoint_position_loss(
         self, pred_kp: torch.Tensor, action_input: BatchFeature
@@ -581,16 +605,17 @@ class Gr00tN1d7ActionHead(nn.Module):
         computes the analogous MSE directly on flow-matching velocity in forward()
         instead, since it has no separate decoder).
 
-        By-index regression is well posed here: the data pipeline
-        (test_keypoint_tracking_simple.py) tracks every point from a single init
-        frame with a FIXED identity for the whole episode, so no matching is
-        needed across time; and in "tokens"/"cvae" the processor rank-orders the
-        selected points by motion, so token index carries a consistent meaning
-        ("the i-th most-moving point" — see _append_keypoint_queries) and no
-        matching is needed across points either. Only "default" mode still
-        regresses against the converter's arbitrary per-episode enumeration
-        order; keypoint_match = "chamfer" optionally removes that (see
-        _match_keypoints_chamfer).
+        Matching before the Huber (see _match_keypoints_hungarian for why a
+        strict bijection is required — both by-index-on-exchangeable-targets and
+        one-directional Chamfer provably collapse every prediction onto one
+        point): "tokens"/"cvae" ALWAYS match over the full point set (their
+        motion-rank target order is per-window noise among same-object points,
+        so the tokens are really DETR-style set slots); "default" matches within
+        each object when keypoint_match="hungarian" (its per-object enumeration
+        order is arbitrary per episode), or regresses plainly by index
+        ("index"). Fixed point identity across TIME (the data pipeline tracks
+        every point from a single init frame) is what makes one assignment per
+        window sufficient — no per-step re-matching.
 
         keypoint_active_target is a static valid mask, either per-object
         ([B, H, max_keypoint_objects], broadcast to every point of the object) or
@@ -610,12 +635,21 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         batch_size, horizon, num_points = pred_kp.shape[:3]
         target_kp = target_kp.view(batch_size, horizon, num_points, 2).to(pred_kp.dtype)
-        if self.config.keypoint_head_mode == "default" and self.config.keypoint_match == "chamfer":
-            target_kp = self._match_keypoints_chamfer(pred_kp, target_kp)
         valid = valid.view(batch_size, horizon, -1).to(pred_kp.dtype)
         if valid.shape[-1] != num_points:
             # Per-object mask -> per-point (num_points is a multiple of num_objects).
             valid = valid.repeat_interleave(num_points // valid.shape[-1], dim=-1)
+        if self.config.keypoint_head_mode in ("tokens", "cvae"):
+            target_kp, valid = self._match_keypoints_hungarian(
+                pred_kp, target_kp, valid, group_size=num_points
+            )
+        elif (
+            self.config.keypoint_head_mode == "default"
+            and self.config.keypoint_match == "hungarian"
+        ):
+            target_kp, valid = self._match_keypoints_hungarian(
+                pred_kp, target_kp, valid, group_size=self.config.keypoints_per_object
+            )
         sample_weight = self._keypoint_sample_weight(
             batch_size, action_input, pred_kp.device, pred_kp.dtype
         )
@@ -790,7 +824,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                     ).view(-1, 1)
 
         # Join vision, language, state and action embedding along sequence dimension.
-        # In "tokens"/"cvae" mode, rank-identity point tokens are appended
+        # In "tokens"/"cvae" mode, set-slot point tokens are appended
         # after the action tokens: [state(1), action(action_horizon), point_queries].
         sa_embs = torch.cat((state_features, action_features), dim=1)
         protected_len = sa_embs.shape[1]

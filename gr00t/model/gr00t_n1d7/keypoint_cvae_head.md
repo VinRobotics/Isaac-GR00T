@@ -15,32 +15,36 @@ chừng. Điều này loại bỏ 2 vấn đề đã gặp với thiết kế c�
   không cần Chamfer set-matching giữa các timestep nữa — **mọi mode** giờ regress theo index qua 1 hàm
   dùng chung: `_compute_keypoint_position_loss(pred_kp, action_input)`.
 
-## Point identity: rank theo motion, không cần input keypoint
+## Point identity: set-slot + Hungarian matching, không cần input keypoint
 
 Thứ tự K điểm trong 1 object KHÔNG well-defined giữa các episode: K điểm được chọn bằng
 `farthest_point_sample` (`test_keypoint_tracking_simple.py`), bắt đầu từ 1 pixel random rồi greedy
-chọn điểm xa nhất — index k chỉ nhất quán trong nội bộ 1 episode. Có 2 cách xử lý, dùng cho các mode
-khác nhau:
+chọn điểm xa nhất — index k chỉ nhất quán trong nội bộ 1 episode.
 
-1. **`tokens`/`cvae` — rank-identity point tokens**: processor rank các điểm được chọn theo **motion
-   giảm dần**, nên token i luôn có nghĩa cố định xuyên episode: "điểm chuyển động nhiều thứ i". Mỗi
-   token là 1 learned embedding riêng theo rank (`keypoint_rank_embedding` — bắt buộc phải riêng:
-   token giống hệt nhau sẽ cho output giống hệt nhau), decode **toàn bộ quỹ đạo `keypoint_horizon`
-   step của chính điểm đó, kể cả t=0** (`keypoint_position_decoder` output `keypoint_horizon*2` mỗi
-   token). **KHÔNG có bất kỳ keypoint data nào được feed làm input** — kể cả vị trí t=0 (đã bỏ
-   `keypoint_query_base`/`keypoint_query_coord_encoder`): model phải tự localize "motion sẽ xảy ra ở
-   đâu" thuần từ vision/language/state, đúng phần scene understanding mà aux loss muốn ép học.
-   **Ambiguity đã biết**: 2 vật chuyển động lượng gần bằng nhau có thể swap rank giữa các window ⇒
-   target của token i thành đa modal — chính là loại ambiguity `z_style` của `cvae` sinh ra để hấp
-   thụ; mode `tokens` thuần có thể bị blur ở điểm này, cần theo dõi. (Về "escnn?": escnn làm
-   equivariance cho nhóm Euclide E(2)/E(3) — xoay/lật ảnh — không phải nhóm hoán vị S_n trên tập
-   điểm; với rank-ordering thì enumeration đã mang nghĩa cố định nên cũng không còn bài toán S_n.)
-2. **`default` — `keypoint_match: "index" | "chamfer"`**: mode duy nhất còn regress theo enumeration
-   tuỳ ý của converter. `"chamfer"` match target về predicted gần nhất trong nội bộ 1 object (cost
-   gộp cả horizon, 1 phép gán cố định mỗi sample/object) — xem
-   `Gr00tN1d7ActionHead._match_keypoints_chamfer`; one-directional nên vẫn còn rủi ro collapse trùng
-   lặp. `share_dim` luôn `"index"` (không có prediction đã decode để match trước khi flow-matching
-   loss chạy).
+**Bài học collapse (đã gặp thực tế khi train)**: mọi cách gán target "mềm" đều có nghiệm suy biến
+dồn toàn bộ prediction về 1 điểm:
+- *By-index trên target exchangeable*: các điểm cùng 1 vật rắn chuyển động gần y hệt nhau ⇒ thứ hạng
+  motion giữa chúng là nhiễu thuần túy theo từng window ⇒ target của token i là biến ngẫu nhiên trên
+  cả vùng chuyển động ⇒ nghiệm Huber-tối-ưu của MỌI token là cùng 1 điểm trung tâm ⇒ collapse.
+- *Chamfer một chiều (pred→nearest target)*: dồn hết prediction lên đúng 1 điểm target bất kỳ cho
+  loss ≈ 0 vì không ai bị phạt cho các target không được phủ ⇒ collapse.
+
+Fix: **Hungarian (bijection chặt, `scipy.linear_sum_assignment`)** — mỗi target phải được claim bởi
+đúng 1 prediction, nên collapse phải trả giá đầy đủ cho mọi target còn lại. Cost gộp trên cả
+`keypoint_horizon`, 1 phép gán cố định mỗi sample (identity cố định theo thời gian nên không cần
+re-match từng step). Xem `Gr00tN1d7ActionHead._match_keypoints_hungarian`. Áp dụng:
+
+1. **`tokens`/`cvae` — DETR-style set-slot tokens, LUÔN Hungarian trên toàn tập điểm**: mỗi token là
+   1 learned slot embedding (`keypoint_rank_embedding` — bắt buộc riêng từng slot: token giống hệt
+   nhau cho output giống hệt nhau), decode **toàn bộ quỹ đạo `keypoint_horizon` step của 1 điểm, kể
+   cả t=0** (`keypoint_position_decoder` output `keypoint_horizon*2` mỗi token). **KHÔNG có bất kỳ
+   keypoint data nào được feed làm input** — kể cả vị trí t=0: model phải tự localize "motion sẽ xảy
+   ra ở đâu" thuần từ vision/language/state, đúng phần scene understanding mà aux loss muốn ép học.
+   Valid mask được hoán vị cùng target để weight luôn dính đúng điểm.
+2. **`default` — `keypoint_match: "index" | "hungarian"`**: mode duy nhất còn tùy chọn regress theo
+   enumeration của converter; `"hungarian"` match bijection trong nội bộ từng object (không match
+   xuyên object — trục object vẫn mang tín hiệu thật). `share_dim` luôn `"index"` (không có
+   prediction đã decode để match trước khi flow-matching loss chạy).
 
 ## Chọn `n_key` điểm: top-k theo motion (processor-side, `tokens`/`cvae`)
 
@@ -124,8 +128,8 @@ action ─┘        │                                                        
          robot: point token không được append)                     ▼
                                        keypoint_position_decoder (mỗi token ──► quỹ đạo H step)
                                                                    │
-                              reconstruction loss (Huber theo index — well-posed vì identity
-                              đã gắn với coord input; mask theo per-point valid)
+                              reconstruction loss (Huber sau Hungarian matching — bijection
+                              chặt chống collapse; mask per-point valid hoán vị cùng target)
 ```
 
 ## Quyết định thiết kế quan trọng (riêng cho `cvae`)
@@ -178,7 +182,7 @@ action ─┘        │                                                        
 | `keypoint_cvae_encoder_layers` | 2 | `cvae` | số layer self-attention của encoder |
 | `keypoint_cvae_encoder_heads` | 4 | `cvae` | phải chia hết `input_embedding_dim` |
 | `keypoint_n_key` | `None` | `tokens`/`cvae` | processor sample n_key điểm valid mỗi sample; `None` = dùng cả N*K; đổi giá trị = đổi shape checkpoint |
-| `keypoint_match` | `"index"` | `default` | `"chamfer"` = match trong nội bộ 1 object; `tokens`/`cvae` không cần (identity từ coord input), `share_dim` luôn `"index"` |
+| `keypoint_match` | `"index"` | `default` | `"hungarian"` = bijection trong nội bộ 1 object; `tokens`/`cvae` LUÔN Hungarian toàn tập, `share_dim` luôn `"index"` |
 
 `keypoint_active_loss_weight` đã bị **xoá** (không còn field này trong config) — không mode nào còn
 active loss để weight nữa.
@@ -225,7 +229,7 @@ group theo object `[B,T,N,K,2]`; `tokens`/`cvae` mỗi điểm là 1 group `[B,T
 
 - `gr00t/model/gr00t_n1d7/gr00t_n1d7.py`:
   `_compute_keypoint_position_loss` (dùng chung `default`/`tokens`/`cvae`),
-  `_match_keypoints_chamfer` (`default` + `keypoint_match="chamfer"`),
+  `_match_keypoints_hungarian` (`tokens`/`cvae` luôn dùng; `default` + `keypoint_match="hungarian"`),
   `_share_dim_position_targets`, `_append_keypoint_queries`
   (point token: rank embedding + z_style, không input), `_init_keypoint_cvae_modules`,
   `_keypoint_condition_token`, `_encode_keypoint_style` (logvar clamp ±10),
