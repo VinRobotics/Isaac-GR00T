@@ -471,6 +471,12 @@ class Gr00tN1d7ActionHead(nn.Module):
         encoded = self.keypoint_style_encoder(seq)  # [B, 2+H, D]
         stats = self.keypoint_style_head(encoded[:, 0])  # [B, 2*z_dim]
         mu, logvar = stats.chunk(2, dim=-1)
+        # keypoint_kl_weight is small by design (weak regularizer), so nothing else
+        # bounds logvar's growth during training. Clamp before every downstream
+        # exp(logvar) (here and in _compute_keypoint_kl_loss) so it can't overflow
+        # to inf — an unclamped logvar is a standard VAE instability, and one inf
+        # here poisons every shared parameter's gradient on the next backward pass.
+        logvar = logvar.clamp(min=-10.0, max=10.0)
         return mu, logvar
 
     def _sample_keypoint_style(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
