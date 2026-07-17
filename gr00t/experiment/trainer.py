@@ -402,11 +402,11 @@ class Gr00tTrainer(Trainer):
                     # already computed above instead of re-running the full VLM
                     # backbone a second time (that redundant rerun, once per eval
                     # batch with keypoint data, was the actual cause of eval blowing
-                    # up training wall time). action_input is intentionally empty:
-                    # the keypoint head needs no input data (rank-identity point
-                    # tokens — see _append_keypoint_queries), and the RTC
-                    # inpainting gate ("action" in action_input) must not trip
-                    # (this is a real, non-teacher-forced rollout for viz).
+                    # up training wall time). action_input deliberately carries
+                    # ONLY keypoint_target — its t=0 step is the anchor the point
+                    # tokens/position decoder need (see _keypoint_anchor) — and
+                    # NOT "action", whose presence would trip the RTC inpainting
+                    # gate (this is a real, non-teacher-forced rollout for viz).
                     action_out = unwrapped_model.action_head.get_action_with_features(
                         backbone_features=outputs["backbone_features"],
                         state_features=outputs["state_features"],
@@ -417,7 +417,9 @@ class Gr00tTrainer(Trainer):
                                 "backbone_attention_mask": outputs["backbone_attention_mask"],
                             }
                         ),
-                        action_input=BatchFeature(data={}),
+                        action_input=BatchFeature(
+                            data={"keypoint_target": batch["keypoint_target"]}
+                        ),
                         options={"return_keypoints": True},
                     )
                 viz_candidates_seen = self._collect_keypoint_viz(
@@ -498,7 +500,6 @@ class Gr00tTrainer(Trainer):
         kp_target = inputs["keypoint_target"]
         active_target = inputs["keypoint_active_target"]
         kp_pred = action_out["keypoint_pred"]
-        active_pred = action_out["keypoint_active_pred"]
         num_objects = kp_pred.shape[2]
         kp_per_object = kp_pred.shape[3]
 
@@ -522,9 +523,12 @@ class Gr00tTrainer(Trainer):
                 # object's mask to its points.
                 gt_active = np.repeat(gt_active, num_objects // gt_active.shape[-1], axis=-1)
             pred_kp = kp_pred[i].detach().float().cpu().numpy()
-            pred_active = active_pred[i].detach().float().cpu().numpy()
+            # The GT valid mask weights BOTH panels (no keypoint_active_pred —
+            # no mode predicts an "active" signal, and a prediction for a
+            # padding/invalid slot shouldn't be drawn either): every mode's
+            # keypoint_pred is on the same keypoint_horizon window as the GT.
             gt_img = render_keypoint_overlay(img, gt_kp, gt_active)
-            pred_img = render_keypoint_overlay(img, pred_kp, pred_active)
+            pred_img = render_keypoint_overlay(img, pred_kp, gt_active)
 
             if num_seen < self.keypoint_viz_max_images:
                 gt_images.append(gt_img)
@@ -643,9 +647,10 @@ class Gr00tTrainer(Trainer):
                             "backbone_attention_mask": outputs["backbone_attention_mask"],
                         }
                     ),
-                    # Intentionally empty — same reasoning as _collect_keypoint_viz's
-                    # call site above (no keypoint input needed, no RTC gate).
-                    action_input=BatchFeature(data={}),
+                    # keypoint_target supplies the t=0 anchor — same reasoning as
+                    # _collect_keypoint_viz's call site above (and no "action" key,
+                    # so the RTC gate never trips).
+                    action_input=BatchFeature(data={"keypoint_target": batch["keypoint_target"]}),
                     options={"return_keypoints": True},
                 )
             if "keypoint_pred" not in action_out:
@@ -667,13 +672,17 @@ class Gr00tTrainer(Trainer):
                     # Same per-object -> per-point broadcast as _collect_keypoint_viz.
                     gt_active = np.repeat(gt_active, num_objects // gt_active.shape[-1], axis=-1)
                 pred_kp = action_out["keypoint_pred"][i].detach().float().cpu().numpy()
-                pred_active = action_out["keypoint_active_pred"][i].detach().float().cpu().numpy()
+                # The GT valid mask weights BOTH panels (same reasoning as
+                # _collect_keypoint_viz) — this is also what blanks the pred
+                # overlay on windows with no valid tracked points
+                # (has_keypoint=0: zero-filled mask/anchor would otherwise draw
+                # junk trails; a video must keep the frame rather than skip it).
                 # Single red for every keypoint in the episode video: with the
                 # per-point layout there are 8-24 groups, and a cycling palette +
                 # legend is unreadable at video size (the GT/Pred split already
                 # distinguishes the two panels).
                 gt_img = render_keypoint_overlay(img, gt_kp, gt_active, color=(220, 30, 30))
-                pred_img = render_keypoint_overlay(img, pred_kp, pred_active, color=(220, 30, 30))
+                pred_img = render_keypoint_overlay(img, pred_kp, gt_active, color=(220, 30, 30))
                 frames.append(combine_gt_pred(gt_img, pred_img))
 
         if not frames:

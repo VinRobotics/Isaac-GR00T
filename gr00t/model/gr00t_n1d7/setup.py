@@ -39,7 +39,8 @@ from gr00t.model.registry import register_model
 # submodule only requires updating this one list.
 KEYPOINT_AUX_PARAM_NAMES = (
     "keypoint_position_decoder",
-    "keypoint_rank_embedding",
+    "keypoint_query_base",
+    "keypoint_query_coord_encoder",
     "keypoint_cls_token",
     "keypoint_condition_proj",
     "keypoint_label_step_embed",
@@ -83,12 +84,8 @@ def _reinit_missing_keypoint_params(action_head: torch.nn.Module, missing_keys: 
         if submodule is None:
             continue
         with torch.no_grad():
-            if name == "keypoint_cls_token":
+            if name in ("keypoint_cls_token", "keypoint_query_base"):
                 submodule.data.normal_(mean=0.0, std=0.02)
-            elif name == "keypoint_rank_embedding":
-                # Embedding.reset_parameters would give N(0,1) — 50x the intended
-                # scale; match __init__'s explicit std=0.02.
-                torch.nn.init.normal_(submodule.weight, mean=0.0, std=0.02)
             elif name == "keypoint_style_head":
                 submodule.weight.zero_()
                 submodule.bias.zero_()
@@ -168,6 +165,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 keypoint_cvae_encoder_layers=self.config.model.keypoint_cvae_encoder_layers,
                 keypoint_cvae_encoder_heads=self.config.model.keypoint_cvae_encoder_heads,
                 keypoint_n_key=self.config.model.keypoint_n_key,
+                keypoint_relative=self.config.model.keypoint_relative,
                 keypoint_match=self.config.model.keypoint_match,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
@@ -247,18 +245,17 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             # Resuming from a checkpoint saved with any of these retired modules
             # is expected to drop their weights, not an architecture-mismatch error.
             # keypoint_query_embedding (per-horizon-step learned query tokens) and
-            # then keypoint_query_base/keypoint_query_coord_encoder
-            # (t0-coordinate-anchored point tokens) were both retired when
-            # "tokens"/"cvae" moved to rank-identity point tokens
-            # (keypoint_rank_embedding — no keypoint input at all).
+            # keypoint_rank_embedding (per-slot rank-identity tokens, briefly used
+            # while no keypoint input was fed) were both retired when
+            # "tokens"/"cvae" moved to t0-anchored point tokens
+            # (keypoint_query_base + keypoint_query_coord_encoder).
             retired_keypoint_unexpected = [
                 k
                 for k in unexpected_keys
                 if "keypoint_decoder." in k
                 or "keypoint_active_decoder." in k
                 or "keypoint_query_embedding." in k
-                or "keypoint_query_base" in k
-                or "keypoint_query_coord_encoder." in k
+                or "keypoint_rank_embedding." in k
             ]
             if retired_keypoint_unexpected:
                 logging.info(

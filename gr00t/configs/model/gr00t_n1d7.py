@@ -131,9 +131,10 @@ class Gr00tN1d7Config(PretrainedConfig):
     # in ANY mode, and keypoint_active_target is reinterpreted as a static
     # per-object valid mask (same value at every horizon step: 1 if a real object
     # occupied that slot at the init frame, 0 if it's padding). Fixed identity
-    # across TIME means one assignment per window suffices — no per-step
-    # re-matching; across POINTS, "tokens"/"cvae" bind predictions to targets by
-    # optimal bijection (see keypoint_match / _match_keypoints_hungarian).
+    # across TIME means no per-step re-matching is ever needed; across POINTS,
+    # "tokens"/"cvae" bind each prediction to its target through the t=0 anchor
+    # input (see keypoint_head_mode below), "default" optionally
+    # Hungarian-matches within objects (keypoint_match).
     # "default"/"tokens" are a pure readout: action_pred never depends on
     # whether the head runs. "share_dim" is NOT — see its note below.
     enable_keypoint_head: bool = False
@@ -148,22 +149,21 @@ class Gr00tN1d7Config(PretrainedConfig):
     # How the keypoint head attaches to the action head. One of:
     #   "default": decode keypoint position from the same action-token hidden
     #     states that decode the action itself (cheap, shared representation).
-    #   "tokens": append DETR-style set-slot point tokens to the DiT sequence:
-    #     one learned embedding per slot (keypoint_n_key of them, or the full
-    #     flat set when None). The loss binds slots to target points by optimal
-    #     one-to-one (Hungarian) assignment per window — NOT by index: the
-    #     processor's motion-rank target order is per-window noise among
-    #     same-object points (a rigid object's points all move the same
-    #     amount), and by-index regression against exchangeable targets is
-    #     minimized by every slot predicting the same central point — the
-    #     classic all-points-collapse-to-one failure. The bijection makes that
-    #     collapse expensive instead (every unclaimed target still costs), see
-    #     Gr00tN1d7ActionHead._match_keypoints_hungarian. Each token decodes
-    #     one point's full keypoint_horizon trajectory, t=0 included: NO
-    #     keypoint data is fed as input in any mode, at train or inference time
-    #     — the model must localize where motion will happen purely from
-    #     vision/language/state context, which is exactly the scene
-    #     understanding the aux loss is meant to force. A one-directional
+    #   "tokens": append point tokens to the DiT sequence — one learned slot
+    #     embedding per point (keypoint_query_base, keypoint_n_key of them), so
+    #     each slot gathers its own motion-scene context through attention
+    #     (slot order follows the processor's motion-rank emission order).
+    #     Firm per-point identity enters at the position decoder, which
+    #     concatenates slot i's hidden state with point i's ENCODED t=0 anchor
+    #     (keypoint_query_coord_encoder over keypoint_target's first step —
+    #     tracker data the sample already carries) and predicts the
+    #     keypoint_horizon - 1 FUTURE steps — absolute, or displacements from
+    #     the anchor (keypoint_relative). The anchor binds each slot's identity
+    #     through its input, so the plain by-index Huber loss is well posed
+    #     (each slot's target is unique given its anchor — none of the
+    #     exchangeable-target collapse that unanchored by-index regression
+    #     suffered, and no Hungarian matching needed;
+    #     _match_keypoints_hungarian remains for "default" only). A one-directional
     #     self-attention mask (see
     #     Gr00tN1d7ActionHead._keypoint_self_attention_mask) keeps this a pure
     #     readout: point tokens may attend to the state/action tokens (so
@@ -173,9 +173,10 @@ class Gr00tN1d7Config(PretrainedConfig):
     #     "default". That same mask is what lets get_action_with_features skip
     #     appending these tokens entirely unless keypoint predictions are
     #     explicitly requested (options["return_keypoints"]) — the real-robot
-    #     action path pays no extra sequence length. Adds
-    #     keypoint_rank_embedding parameters, so it must match between saving
-    #     and loading a checkpoint.
+    #     action path pays no extra sequence length and never needs current
+    #     keypoint positions. Adds keypoint_query_base +
+    #     keypoint_query_coord_encoder parameters, so it must match between
+    #     saving and loading a checkpoint.
     #   "share_dim": fold future keypoint POSITIONS themselves as extra channels of
     #     the same per-step action vector, jointly noised/denoised by flow
     #     matching — the same mechanism this codebase already uses to extend
@@ -212,7 +213,7 @@ class Gr00tN1d7Config(PretrainedConfig):
     #     recognition encoder (Gr00tN1d7ActionHead._encode_keypoint_style) sees the
     #     TRUE future keypoints + a condition token (see keypoint_cvae_condition)
     #     during training and outputs (mu, logvar) for a style latent z_style;
-    #     z_style is added to the "tokens"-mode set-slot point tokens
+    #     z_style is added to the "tokens"-mode anchored point tokens
     #     (NOT concatenated into sa_embs — see below) before the DiT, and the
     #     position decoder (reading those tokens' hidden states, exactly like
     #     "tokens" mode) becomes the CVAE decoder p(keypoints | z_style, context).
@@ -231,9 +232,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     #     "tokens"/"default".
     #
     # None of the four modes classify anything anymore (see above) —
-    # get_action_with_features reports a constant all-ones keypoint_active_pred
-    # regardless of mode, purely so existing keypoint_viz overlay code keeps
-    # working unchanged.
+    # get_action_with_features returns keypoint_pred only (always on the
+    # keypoint_horizon window); viz weights both GT and predicted overlays with
+    # the GT valid mask (see trainer._collect_keypoint_viz).
     keypoint_head_mode: str = "default"  # one of {"default", "tokens", "share_dim", "cvae"}
     # CVAE style latent dimensionality (keypoint_head_mode="cvae" only). Kept small
     # (default 16) so it can only capture a coarse "which future" choice, not enough
@@ -266,13 +267,22 @@ class Gr00tN1d7Config(PretrainedConfig):
     # see Gr00tN1d7Processor). Moving points carry the object-interaction
     # signal; static ones are trivially predictable. Deterministic per window,
     # so eval picks are stable frame to frame. The head appends exactly this
-    # many set-slot point tokens, predicts exactly these points'
-    # futures, and the loss updates exactly them. None (default) = use the full
-    # flat set (no selection; the per-object valid mask handles padding slots).
-    # Changing it changes keypoint_label_step_embed's and
-    # keypoint_rank_embedding's shapes, so it must match between saving and
-    # loading a checkpoint.
+    # many t0-anchored point tokens, predicts exactly these points' futures,
+    # and the loss updates exactly them. None (default) = use the full flat set
+    # (no selection; the per-object valid mask handles padding slots). Changing
+    # it changes keypoint_query_base's and keypoint_label_step_embed's ("cvae")
+    # shapes and the token count, so it must match between saving and loading a
+    # checkpoint.
     keypoint_n_key: int | None = None
+    # "tokens"/"cvae" only: train the anchored position decoder on RELATIVE
+    # displacements from each point's t=0 anchor instead of absolute [-1, 1]
+    # positions. Zero-centered and mostly small (a static point's target is
+    # exactly 0), which is an easier regression geometry; the anchor is added
+    # back when reassembling absolute trajectories for eval/viz
+    # (get_action_with_features). Pure target reparameterization — no shape or
+    # parameter change, but a checkpoint trained one way predicts garbage
+    # interpreted the other way, so keep it consistent across save/load.
+    keypoint_relative: bool = False
     # "default" mode only: how predicted keypoints are paired with target
     # keypoints within one object before the Huber loss. "default" is the one
     # mode left regressing against the converter's arbitrary per-episode
@@ -325,7 +335,7 @@ class Gr00tN1d7Config(PretrainedConfig):
             if self.keypoint_head_mode not in ("tokens", "cvae"):
                 raise ValueError(
                     "keypoint_n_key requires keypoint_head_mode 'tokens' or 'cvae' "
-                    "(set-slot point tokens); 'default'/'share_dim' always "
+                    "(anchored point tokens); 'default'/'share_dim' always "
                     f"predict the full flat point set, got {self.keypoint_head_mode!r}"
                 )
             n_total = self.max_keypoint_objects * self.keypoints_per_object
@@ -334,6 +344,12 @@ class Gr00tN1d7Config(PretrainedConfig):
                     f"keypoint_n_key must be in [1, max_keypoint_objects * "
                     f"keypoints_per_object = {n_total}], got {self.keypoint_n_key}"
                 )
+        if self.keypoint_relative and self.keypoint_head_mode not in ("tokens", "cvae"):
+            raise ValueError(
+                "keypoint_relative requires keypoint_head_mode 'tokens' or 'cvae' (the "
+                "anchored position decoder); 'default'/'share_dim' regress absolute "
+                f"positions only, got {self.keypoint_head_mode!r}"
+            )
 
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""

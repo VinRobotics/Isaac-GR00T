@@ -245,16 +245,18 @@ bash examples/finetune.sh ... \
     -- --enable-keypoint-head --keypoint-head-mode tokens
 ```
 
-For debugging/eval, decode the predicted keypoint trajectories on any rollout (no extra
-input needed) and overlay them on the frame to check whether the model understands
-object motion:
+For debugging/eval, decode the predicted keypoint trajectories on any rollout and
+overlay them on the frame to check whether the model understands object motion
+("tokens"/"cvae" need the current keypoint positions in action_input["keypoint_target"]
+as the t=0 anchor — eval batches carry it; see keypoint_cvae_head.md):
 
 ```python
 out = policy.model.action_head.get_action(backbone_output, action_input,
                                           options={"return_keypoints": True})
-out["keypoint_pred"]         # [B, 16, 2, 20, 2], [-1, 1] normalized image coords
-out["keypoint_active_pred"]  # [B, 16, 2] probabilities ("default"/"tokens"), or raw
-                              # ~[0, 1] flow-matching regression values ("share_dim")
+out["keypoint_pred"]  # [B, keypoint_horizon, groups, points_per_group, 2], [-1, 1]
+                      # normalized image coords. Weight overlays with the GT valid
+                      # mask (keypoint_active_target) — no keypoint_active_pred is
+                      # returned; no mode predicts an "active" signal.
 ```
 
 ### Caveats

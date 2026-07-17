@@ -61,9 +61,10 @@ def render_keypoint_overlay(
         keypoints: (horizon, num_objects, num_points, 2) in [-1, 1], normalized the
             same way for any image size (independent axis rescaling), so this works
             regardless of what size `image` was resized to.
-        weight: (horizon, num_objects) in [0, 1] — GT valid mask or predicted
-            equivalent (currently always a constant all-ones/all-zeros per object;
-            see keypoint_active_pred in gr00t_n1d7.py). Steps below
+        weight: (horizon, num_objects) in [0, 1] — the GT valid mask (callers
+            weight predicted overlays with it too: no mode predicts an "active"
+            signal, and a prediction for a padding/invalid slot shouldn't be
+            drawn either — see trainer._collect_keypoint_viz). Steps below
             active_threshold are skipped entirely (no marker, no trail segment).
         color: single RGB color for EVERY point group (also suppresses the
             per-group legend labels, which would just be noise when groups aren't

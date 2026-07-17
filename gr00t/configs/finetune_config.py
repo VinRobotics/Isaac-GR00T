@@ -130,25 +130,27 @@ class FinetuneConfig:
     that decode the action itself — a pure readout, action_pred is bit-identical
     whether or not the head runs.
 
-    "tokens": append DETR-style set-slot point tokens to the DiT sequence: one
-    learned embedding per slot (see keypoint_n_key). The loss binds slots to
-    target points by optimal one-to-one (Hungarian) assignment per window — NOT
-    by index: the motion-rank target order is per-window noise among
-    same-object points, and by-index regression against exchangeable targets is
-    minimized by every slot predicting the same central point (the classic
-    all-points-collapse-to-one failure); the bijection makes collapse expensive
-    instead. Each token decodes one point's full keypoint_horizon trajectory,
-    t=0 included: NO keypoint data is fed as input at train or inference time —
-    the model must localize where motion will happen purely from
-    vision/language/state context. A one-directional self-attention mask keeps
-    this a pure readout: point tokens may attend to the state/action tokens (so
-    keypoint prediction stays conditioned on the specific action being
-    generated), but state/action tokens are masked from ever attending back —
-    action_pred is unaffected by their presence, same guarantee as "default".
-    At inference the tokens are only appended when keypoint predictions are
-    explicitly requested (eval/viz) — the real-robot action path pays no extra
-    sequence length. Adds keypoint_rank_embedding parameters, so it must match
-    between saving and loading a checkpoint.
+    "tokens": append point tokens to the DiT sequence — one learned slot
+    embedding per point (see keypoint_n_key), so each slot gathers its own
+    motion-scene context through attention (slot order follows the processor's
+    motion-rank emission order). Firm per-point identity enters at the position
+    decoder, which concatenates slot i's hidden state with point i's ENCODED
+    t=0 anchor (a small MLP over keypoint_target's first step — tracker data
+    the sample already carries) and predicts the keypoint_horizon - 1 FUTURE
+    steps — absolute, or displacements from the anchor (keypoint_relative). The
+    anchor binds each slot's identity through its input, so the plain by-index
+    Huber loss is well posed (no exchangeable-target collapse, no Hungarian
+    matching needed here). A
+    one-directional self-attention mask keeps this a pure readout: point tokens
+    may attend to the state/action tokens (so keypoint prediction stays
+    conditioned on the specific action being generated), but state/action
+    tokens are masked from ever attending back — action_pred is unaffected by
+    their presence, same guarantee as "default". At inference the tokens are
+    only appended when keypoint predictions are explicitly requested (eval/viz,
+    anchor from the eval batch's own keypoint_target) — the real-robot action
+    path pays no extra sequence length and never needs current keypoint
+    positions. Adds keypoint_query_base + keypoint_query_coord_encoder
+    parameters, so it must match between saving and loading a checkpoint.
 
     "share_dim": fold future keypoint POSITIONS themselves as extra channels of the
     same per-step action vector, jointly noised/denoised by flow matching — plain
@@ -213,11 +215,21 @@ class FinetuneConfig:
     max_keypoint_objects*keypoints_per_object flat set — the top-k MOST-MOVING
     points of the window (motion = total per-step displacement over the
     horizon). Moving points carry the object-interaction signal; static ones
-    are trivially predictable. The head appends exactly this many set-slot
+    are trivially predictable. The head appends exactly this many t0-anchored
     point tokens, predicts exactly these points' futures, and the loss updates
-    exactly them (bound by Hungarian assignment — see keypoint_head_mode). None
-    (default) = use the full flat set. Changes parameter shapes and the token
-    count, so it must match between saving and loading a checkpoint."""
+    exactly them (bound by each point's anchor — see keypoint_head_mode). None
+    (default) = use the full flat set. Changes parameter shapes (per-slot
+    keypoint_query_base; plus keypoint_label_step_embed for "cvae") and the
+    token count, so it must match between saving and loading a checkpoint."""
+
+    keypoint_relative: bool = False
+    """keypoint_head_mode "tokens"/"cvae" only: train the anchored position
+    decoder on RELATIVE displacements from each point's t=0 anchor instead of
+    absolute positions — zero-centered, mostly small (a static point's target
+    is exactly 0), an easier regression geometry. The anchor is added back for
+    eval/viz. No parameter-shape change, but a checkpoint trained one way
+    predicts garbage interpreted the other way — keep it consistent across
+    save/load."""
 
     keypoint_match: str = "index"
     """keypoint_head_mode="default" only: how predicted keypoints are paired
@@ -231,9 +243,9 @@ class FinetuneConfig:
     (one fixed bijection per sample/object — the strict bijection is what
     prevents every prediction collapsing onto one point, see
     Gr00tN1d7ActionHead._match_keypoints_hungarian). Ignored by every other
-    mode: "tokens"/"cvae" ALWAYS Hungarian-match over their full point set,
-    "share_dim" has no decoded prediction to match before its flow-matching
-    loss."""
+    mode: "tokens"/"cvae" bind predictions to targets through the t=0 anchor
+    input (no matching needed), "share_dim" has no decoded prediction to match
+    before its flow-matching loss."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
