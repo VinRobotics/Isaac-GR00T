@@ -94,10 +94,13 @@ class TrainingConfig:
     motion_video_batch_size: int = 8
     motion_video_fps: int = 10
 
-    # Optional cap on (pooled motion feature, is_human) pairs used for the
-    # human-vs-robot t-SNE alignment scatter + KNN domain-composition diagnostic.
-    # None (the default) uses the whole validation set; set a positive value to
-    # reservoir-sample when a full t-SNE would be too expensive.
+    # Optional cap on (pooled motion feature, pooled backbone feature, is_human)
+    # triples used for the human-vs-robot t-SNE scatter + KNN domain-composition
+    # diagnostic on backbone_pooled_features. None (the default) uses the whole
+    # validation set; set a positive value to reservoir-sample when a full
+    # t-SNE would be too expensive. Active whenever enable_motion_head=True,
+    # REGARDLESS of enable_ot_align — with alignment off this shows the
+    # natural (unaligned) baseline distribution of the two domains.
     domain_viz_max_points: int | None = None
 
     # DeepSpeed (default)

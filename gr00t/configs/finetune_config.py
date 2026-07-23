@@ -72,6 +72,18 @@ class FinetuneConfig:
     tune_llm: bool = False
     """If True, fine-tune the language model (LLM) backbone during training."""
 
+    tune_top_llm_layers: int = 0
+    """Number of top (last) LLM backbone layers to unfreeze even when tune_llm
+    is False — a partial-unfreeze alternative to tuning the whole LLM. Useful
+    when enable_motion_head=True: the motion-query tokens are appended to and
+    processed entirely by the VLM backbone's own (select_layer-truncated)
+    transformer layers, so if those layers are fully frozen (tune_llm=False,
+    the default), the only trainable capacity for learning to predict future
+    motion is the small MotionHead MLP + the query embedding itself — often not
+    enough, showing up as motion_loss decreasing then plateauing early. Set
+    this to unfreeze the last N layers without paying for tuning the whole
+    backbone."""
+
     tune_visual: bool = False
     """If True, fine-tune the visual encoder (e.g., ViT or CNN backbone)."""
 
@@ -341,7 +353,12 @@ class FinetuneConfig:
     """Playback fps for the logged keypoint overlay video."""
 
     domain_viz_max_points: int | None = None
-    """Optional cap on (pooled motion feature, is_human) pairs used for the
-    human-vs-robot t-SNE alignment scatter plot and KNN domain-composition
-    diagnostic. None (the default) uses every validation sample; set a positive
-    value to reservoir-sample a large validation set."""
+    """Optional cap on (pooled motion feature, pooled backbone feature,
+    is_human) triples used for the human-vs-robot t-SNE scatter plot and KNN
+    domain-composition diagnostic on backbone_pooled_features (see
+    Gr00tTrainer._log_domain_alignment_viz). None (the default) uses every
+    validation sample; set a positive value to reservoir-sample a large
+    validation set. Active whenever enable_motion_head=True, REGARDLESS of
+    enable_ot_align — with alignment off this shows the natural (unaligned)
+    baseline distribution of the two domains, useful for comparing against
+    once ot_align is turned on."""
