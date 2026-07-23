@@ -36,17 +36,22 @@ import random
 import threading
 from typing import Any, Optional
 
+import matplotlib
+
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
-from transformers.feature_extraction_utils import BatchFeature
 from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput, EvalPrediction
 import wandb
 
 from gr00t.model.gr00t_n1d7.keypoint_viz import combine_gt_pred, render_keypoint_overlay
+from gr00t.model.modules.optimal_transport import sinkhorn_ot_loss
 
 
 def _action_loss_by_group(
@@ -253,11 +258,12 @@ class Gr00tTrainer(Trainer):
         """
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
-        self.keypoint_viz_max_images = kwargs.pop("keypoint_viz_max_images", 50)
-        self.keypoint_video_episodes = kwargs.pop("keypoint_video_episodes", 1)
-        self.keypoint_video_max_frames = kwargs.pop("keypoint_video_max_frames", 100)
-        self.keypoint_video_batch_size = kwargs.pop("keypoint_video_batch_size", 8)
-        self.keypoint_video_fps = kwargs.pop("keypoint_video_fps", 10)
+        self.motion_viz_max_images = kwargs.pop("motion_viz_max_images", 50)
+        self.motion_video_episodes = kwargs.pop("motion_video_episodes", 1)
+        self.motion_video_max_frames = kwargs.pop("motion_video_max_frames", 100)
+        self.motion_video_batch_size = kwargs.pop("motion_video_batch_size", 8)
+        self.motion_video_fps = kwargs.pop("motion_video_fps", 10)
+        self.domain_viz_max_points = kwargs.pop("domain_viz_max_points", 500)
         super().__init__(
             *args,
             **kwargs,
@@ -319,12 +325,11 @@ class Gr00tTrainer(Trainer):
     ):
         model = self._wrap_model(self.model, training=False, dataloader=dataloader)
         model.eval()
-        unwrapped_model = model.module if hasattr(model, "module") else model
 
         total_loss = torch.tensor(0.0, device=self.args.device)
         total_steps = torch.tensor(0, device=self.args.device)
         # Pure flow-matching loss, separate from total_loss (which is action +
-        # keypoint combined once the aux head is on).
+        # motion combined once the aux head is on).
         total_action_loss = torch.tensor(0.0, device=self.args.device)
         # Per-group (human/robot) action-loss breakdown, accumulated as (num, den)
         # pairs across the whole eval pass and divided once at the end (rather than
@@ -338,21 +343,26 @@ class Gr00tTrainer(Trainer):
             "robot": torch.tensor(0.0, device=self.args.device),
         }
 
-        # Object-centric keypoint aux head: aggregate its losses separately and, on
+        # VLM-backbone motion-keypoint head: aggregate its loss separately and, on
         # rank 0, reservoir-sample a handful of GT-vs-predicted keypoint overlay
         # images across the WHOLE eval pass to log to W&B (debug/eval only —
         # action_pred is unaffected either way). Reservoir sampling means each
         # evaluate() call independently draws a fresh random subset instead of
         # always showing the same first-N samples encountered.
-        enable_keypoint_head = getattr(self.model.config, "enable_keypoint_head", False)
-        # "cvae" mode additionally reports keypoint_kl_loss — no mode reports a
-        # separate "active" loss anymore (see Gr00tN1d7Config.keypoint_head_mode).
-        keypoint_is_cvae = getattr(self.model.config, "keypoint_head_mode", None) == "cvae"
-        total_kp_loss = torch.tensor(0.0, device=self.args.device)
-        total_kp_kl_loss = torch.tensor(0.0, device=self.args.device)
+        enable_motion_head = getattr(self.model.config, "enable_motion_head", False)
+        enable_ot_align = getattr(self.model.config, "enable_ot_align", False)
+        total_motion_loss = torch.tensor(0.0, device=self.args.device)
+        total_ot_loss = torch.tensor(0.0, device=self.args.device)
+        ot_batches = torch.tensor(0, device=self.args.device)
         viz_images_gt: list = []
         viz_images_pred: list = []
         viz_candidates_seen = 0
+        # Pooled human/robot motion features + domain flag, reservoir-sampled
+        # across the eval pass for the alignment diagnostics (t-SNE scatter, KNN
+        # domain-composition, per-domain variance — see _log_domain_alignment_viz).
+        domain_feats: list = []
+        domain_is_human: list = []
+        domain_candidates_seen = 0
 
         for inputs in tqdm(dataloader, desc=description):
             inputs = self._prepare_inputs(inputs)
@@ -364,10 +374,8 @@ class Gr00tTrainer(Trainer):
             if isinstance(outputs, dict) and "action_loss_scalar" in outputs:
                 total_action_loss += outputs["action_loss_scalar"].detach()
 
-            if enable_keypoint_head and isinstance(outputs, dict) and "keypoint_loss" in outputs:
-                total_kp_loss += outputs["keypoint_loss"].detach()
-                if keypoint_is_cvae:
-                    total_kp_kl_loss += outputs["keypoint_kl_loss"].detach()
+            if enable_motion_head and isinstance(outputs, dict) and "motion_loss" in outputs:
+                total_motion_loss += outputs["motion_loss"].detach()
 
             # The collator wraps the real batch as {"inputs": {...actual keys...}} so
             # that model(**inputs) resolves to forward(self, inputs=<batch>) — unwrap
@@ -388,42 +396,49 @@ class Gr00tTrainer(Trainer):
                         group_action_num[name] += num
                         group_action_den[name] += den
 
+            is_human_batch = batch.get("is_human")
+            if (
+                enable_ot_align
+                and isinstance(outputs, dict)
+                and "motion_pooled_features" in outputs
+                and is_human_batch is not None
+            ):
+                ot = self._compute_ot_loss(
+                    outputs["motion_pooled_features"].detach(), is_human_batch
+                )
+                if ot is not None:
+                    total_ot_loss += ot.detach()
+                    ot_batches += 1
+
             has_keypoint_batch = batch.get("has_keypoint")
             if (
-                enable_keypoint_head
+                enable_motion_head
                 and self.args.local_rank in (-1, 0)
                 and "viz_image" in batch
                 and has_keypoint_batch is not None
                 and bool((has_keypoint_batch >= 0.5).any())
-                and viz_candidates_seen < self.keypoint_viz_max_images * 20
+                and isinstance(outputs, dict)
+                and "motion_pred" in outputs
+                and viz_candidates_seen < self.motion_viz_max_images * 20
             ):
-                with torch.inference_mode():
-                    # Reuse the backbone/state features compute_loss's forward pass
-                    # already computed above instead of re-running the full VLM
-                    # backbone a second time (that redundant rerun, once per eval
-                    # batch with keypoint data, was the actual cause of eval blowing
-                    # up training wall time). action_input deliberately carries
-                    # ONLY keypoint_target — its t=0 step is the anchor the point
-                    # tokens/position decoder need (see _keypoint_anchor) — and
-                    # NOT "action", whose presence would trip the RTC inpainting
-                    # gate (this is a real, non-teacher-forced rollout for viz).
-                    action_out = unwrapped_model.action_head.get_action_with_features(
-                        backbone_features=outputs["backbone_features"],
-                        state_features=outputs["state_features"],
-                        embodiment_id=batch["embodiment_id"],
-                        backbone_output=BatchFeature(
-                            data={
-                                "image_mask": outputs["image_mask"],
-                                "backbone_attention_mask": outputs["backbone_attention_mask"],
-                            }
-                        ),
-                        action_input=BatchFeature(
-                            data={"keypoint_target": batch["keypoint_target"]}
-                        ),
-                        options={"return_keypoints": True},
-                    )
-                viz_candidates_seen = self._collect_keypoint_viz(
-                    batch, action_out, viz_images_gt, viz_images_pred, viz_candidates_seen
+                viz_candidates_seen = self._collect_motion_viz(
+                    batch, outputs, viz_images_gt, viz_images_pred, viz_candidates_seen
+                )
+
+            if (
+                enable_motion_head
+                and self.args.local_rank in (-1, 0)
+                and isinstance(outputs, dict)
+                and "motion_pooled_features" in outputs
+                and is_human_batch is not None
+                and domain_candidates_seen < self.domain_viz_max_points * 20
+            ):
+                domain_candidates_seen = self._collect_domain_features(
+                    outputs["motion_pooled_features"].detach(),
+                    is_human_batch,
+                    domain_feats,
+                    domain_is_human,
+                    domain_candidates_seen,
                 )
 
         # Single reduce at the end — avoids per-step all_gather deadlock
@@ -435,10 +450,11 @@ class Gr00tTrainer(Trainer):
             for name in ("human", "robot"):
                 dist.all_reduce(group_action_num[name], op=dist.ReduceOp.SUM)
                 dist.all_reduce(group_action_den[name], op=dist.ReduceOp.SUM)
-            if enable_keypoint_head:
-                dist.all_reduce(total_kp_loss, op=dist.ReduceOp.SUM)
-                if keypoint_is_cvae:
-                    dist.all_reduce(total_kp_kl_loss, op=dist.ReduceOp.SUM)
+            if enable_motion_head:
+                dist.all_reduce(total_motion_loss, op=dist.ReduceOp.SUM)
+            if enable_ot_align:
+                dist.all_reduce(total_ot_loss, op=dist.ReduceOp.SUM)
+                dist.all_reduce(ot_batches, op=dist.ReduceOp.SUM)
 
         denom = total_steps.clamp(min=1)
         mean_loss = (total_loss / denom).item()
@@ -453,55 +469,86 @@ class Gr00tTrainer(Trainer):
                 metrics[f"{metric_key_prefix}_action_loss_{name}"] = (
                     group_action_num[name] / group_action_den[name]
                 ).item()
-        if enable_keypoint_head:
-            metrics[f"{metric_key_prefix}_keypoint_loss"] = (total_kp_loss / denom).item()
-            if keypoint_is_cvae:
-                metrics[f"{metric_key_prefix}_keypoint_kl_loss"] = (total_kp_kl_loss / denom).item()
+        if enable_motion_head:
+            metrics[f"{metric_key_prefix}_motion_loss"] = (total_motion_loss / denom).item()
+        if enable_ot_align and ot_batches > 0:
+            metrics[f"{metric_key_prefix}_ot_loss"] = (
+                total_ot_loss / ot_batches.clamp(min=1)
+            ).item()
 
-        if enable_keypoint_head and self.args.local_rank in (-1, 0):
+        if enable_motion_head and self.args.local_rank in (-1, 0):
             logging.info(
-                f"Keypoint viz: reservoir-sampled {len(viz_images_gt)}/"
-                f"{self.keypoint_viz_max_images} image pairs from {viz_candidates_seen} "
+                f"Motion viz: reservoir-sampled {len(viz_images_gt)}/"
+                f"{self.motion_viz_max_images} image pairs from {viz_candidates_seen} "
                 f"candidates for {metric_key_prefix}."
             )
             if viz_images_gt:
-                self._log_keypoint_viz(viz_images_gt, viz_images_pred, metric_key_prefix)
-            if self.keypoint_video_episodes > 0 and self.keypoint_video_max_frames > 0:
-                self._log_keypoint_episode_video(model, unwrapped_model, metric_key_prefix)
+                self._log_motion_viz(viz_images_gt, viz_images_pred, metric_key_prefix)
+            if self.motion_video_episodes > 0 and self.motion_video_max_frames > 0:
+                self._log_motion_episode_video(model, metric_key_prefix)
+            if domain_feats:
+                self._log_domain_alignment_viz(domain_feats, domain_is_human, metric_key_prefix)
 
         return EvalLoopOutput(
             predictions=None, label_ids=None, metrics=metrics, num_samples=num_samples
         )
 
-    def _collect_keypoint_viz(
+    def _compute_ot_loss(self, pooled: torch.Tensor, is_human: torch.Tensor) -> torch.Tensor | None:
+        """Sinkhorn OT loss between this batch's pooled robot vs human motion
+        features (see gr00t/model/modules/optimal_transport.py). Returns None
+        if the batch doesn't contain both domains (nothing to align this step)
+        — caller decides whether to detach `pooled` first (eval: yes; training:
+        no, gradients must flow into the motion-token/backbone parameters)."""
+        is_human_mask = is_human.to(pooled.dtype).view(-1) >= 0.5
+        h_robot = pooled[~is_human_mask]
+        h_human = pooled[is_human_mask]
+        if h_robot.shape[0] == 0 or h_human.shape[0] == 0:
+            return None
+        cfg = self.model.config
+        return sinkhorn_ot_loss(
+            h_robot, h_human, eps=cfg.ot_sinkhorn_eps, n_iters=cfg.ot_sinkhorn_iters
+        )
+
+    def _ot_lambda(self) -> float:
+        """Linear warmup of the OT alignment loss weight from 0 to
+        ot_align_weight over ot_warmup_steps — gives the motion-token
+        embeddings time to become meaningful before alignment pressure starts."""
+        cfg = self.model.config
+        warmup = max(1, cfg.ot_warmup_steps)
+        return cfg.ot_align_weight * min(1.0, self.state.global_step / warmup)
+
+    def _collect_motion_viz(
         self,
         inputs: dict,
-        action_out: dict,
+        outputs: dict,
         gt_images: list,
         pred_images: list,
         num_seen: int,
     ) -> int:
-        """Reservoir-sample (Algorithm R) up to keypoint_viz_max_images GT-vs-
-        predicted overlay pairs, uniformly over every has_keypoint candidate seen
-        across the eval pass so far — not just the first ones encountered, so a
-        long eval set isn't dominated by whichever shard happens to load first.
+        """Reservoir-sample (Algorithm R) up to motion_viz_max_images GT-vs-
+        predicted keypoint overlay pairs, uniformly over every has_keypoint
+        candidate seen across the eval pass so far — not just the first ones
+        encountered, so a long eval set isn't dominated by whichever shard
+        happens to load first.
 
-        `inputs` carries the GT keypoint targets and the raw-frame thumbnail (see
-        ShardedSingleStepDataset._render_viz_thumbnail); `action_out` carries the
-        model's own flow-matching rollout keypoint prediction (get_action with
-        options={"return_keypoints": True}). `num_seen` is the running candidate
-        count from prior batches this eval pass; returns the updated count.
+        `inputs` carries the GT keypoint targets and the raw-frame thumbnail
+        (see ShardedSingleStepDataset._render_viz_thumbnail); `outputs` carries
+        the model's own motion_pred from the SAME forward pass compute_loss
+        already ran (the motion head is a direct feedforward readout, not part
+        of the flow-matching rollout, so no separate action-generation pass is
+        needed here). `num_seen` is the running candidate count from prior
+        batches this eval pass; returns the updated count.
         """
         has_keypoint = inputs.get("has_keypoint")
         viz_image = inputs.get("viz_image")
-        if has_keypoint is None or viz_image is None or "keypoint_pred" not in action_out:
+        motion_pred = outputs.get("motion_pred")
+        if has_keypoint is None or viz_image is None or motion_pred is None:
             return num_seen
 
         kp_target = inputs["keypoint_target"]
         active_target = inputs["keypoint_active_target"]
-        kp_pred = action_out["keypoint_pred"]
-        num_objects = kp_pred.shape[2]
-        kp_per_object = kp_pred.shape[3]
+        num_objects = motion_pred.shape[2]
+        points_per_object = motion_pred.shape[3]
 
         for i in range(viz_image.shape[0]):
             if has_keypoint[i].item() < 0.5:
@@ -513,38 +560,36 @@ class Gr00tTrainer(Trainer):
                 .float()
                 .cpu()
                 .numpy()
-                .reshape(-1, num_objects, kp_per_object, 2)
+                .reshape(-1, num_objects, points_per_object, 2)
             )
             gt_active = active_target[i].detach().float().cpu().numpy()
             if gt_active.shape[-1] != num_objects:
-                # Per-object GT valid mask vs per-point prediction groups
-                # ("tokens"/"cvae" report each point as its own group; see
-                # keypoint_pred in get_action_with_features) — broadcast each
-                # object's mask to its points.
+                # Per-object GT valid mask vs per-point prediction groups (each
+                # motion token is reported as its own single-point group — see
+                # motion_head.py) — broadcast each object's mask to its points.
                 gt_active = np.repeat(gt_active, num_objects // gt_active.shape[-1], axis=-1)
-            pred_kp = kp_pred[i].detach().float().cpu().numpy()
-            # The GT valid mask weights BOTH panels (no keypoint_active_pred —
-            # no mode predicts an "active" signal, and a prediction for a
-            # padding/invalid slot shouldn't be drawn either): every mode's
-            # keypoint_pred is on the same keypoint_horizon window as the GT.
+            pred_kp = motion_pred[i].detach().float().cpu().numpy()
+            # The GT valid mask weights BOTH panels: motion_pred is on the same
+            # motion_horizon window as the GT, and there's no separate
+            # predicted "active" signal to weight by instead.
             gt_img = render_keypoint_overlay(img, gt_kp, gt_active)
             pred_img = render_keypoint_overlay(img, pred_kp, gt_active)
 
-            if num_seen < self.keypoint_viz_max_images:
+            if num_seen < self.motion_viz_max_images:
                 gt_images.append(gt_img)
                 pred_images.append(pred_img)
             else:
                 j = random.randint(0, num_seen)
-                if j < self.keypoint_viz_max_images:
+                if j < self.motion_viz_max_images:
                     gt_images[j] = gt_img
                     pred_images[j] = pred_img
             num_seen += 1
         return num_seen
 
-    def _log_keypoint_viz(self, gt_images: list, pred_images: list, metric_key_prefix: str) -> None:
+    def _log_motion_viz(self, gt_images: list, pred_images: list, metric_key_prefix: str) -> None:
         if wandb.run is None:
             logging.info(
-                f"Keypoint viz: {len(gt_images)} image pairs collected but wandb.run is None "
+                f"Motion viz: {len(gt_images)} image pairs collected but wandb.run is None "
                 "(use_wandb not set?) — skipping W&B image log."
             )
             return
@@ -555,21 +600,21 @@ class Gr00tTrainer(Trainer):
             wandb.Image(combine_gt_pred(gt, pred), caption=f"sample {i}")
             for i, (gt, pred) in enumerate(zip(gt_images, pred_images))
         ]
-        wandb.log({f"{metric_key_prefix}/keypoint": combined}, step=self.state.global_step)
+        wandb.log({f"{metric_key_prefix}/motion": combined}, step=self.state.global_step)
 
-    def _pick_keypoint_video_episodes(self) -> list:
-        """Pick keypoint_video_episodes distinct held-out episodes PER dataset_path
+    def _pick_motion_video_episodes(self) -> list:
+        """Pick motion_video_episodes distinct held-out episodes PER dataset_path
         (every ShardedSingleStepDataset in the eval split — see eval_set_split_ratio
         / validation_path — that carries a "keypoint" modality), not
-        keypoint_video_episodes total pooled across all of them: otherwise a
+        motion_video_episodes total pooled across all of them: otherwise a
         multi-dataset mix could end up rendering every video from the same one
         dataset by chance, starving the rest of coverage. Sampling within each
         dataset is without replacement, capped to however many held-out episodes
         that dataset actually has.
 
         Returns (dataset, episode_index, slot) tuples, where slot is the pick's
-        0-indexed position within this dataset's picks (0..keypoint_video_episodes-1)
-        — see _log_keypoint_episode_video for why callers key on slot, not
+        0-indexed position within this dataset's picks (0..motion_video_episodes-1)
+        — see _log_motion_episode_video for why callers key on slot, not
         episode_index.
         """
         eval_dataset = getattr(self, "eval_dataset", None)
@@ -583,80 +628,51 @@ class Gr00tTrainer(Trainer):
             episode_indices = getattr(ds, "episode_indices", None) or []
             if not episode_indices:
                 continue
-            k = min(self.keypoint_video_episodes, len(episode_indices))
+            k = min(self.motion_video_episodes, len(episode_indices))
             picks.extend(
                 (ds, ep_idx, slot) for slot, ep_idx in enumerate(random.sample(episode_indices, k))
             )
         return picks
 
-    def _render_keypoint_episode_video(
-        self, model, unwrapped_model, dataset, ep_idx: int
-    ) -> np.ndarray | None:
-        """Roll the model's keypoint head forward over a held-out episode's frames
-        (strided down to keypoint_video_max_frames) and render a GT-vs-predicted
-        overlay video, the per-episode analogue of _collect_keypoint_viz's
+    def _render_motion_episode_video(self, model, dataset, ep_idx: int) -> np.ndarray | None:
+        """Roll the model's motion head forward over a held-out episode's frames
+        (strided down to motion_video_max_frames) and render a GT-vs-predicted
+        overlay video, the per-episode analogue of _collect_motion_viz's
         single-frame panels — see keypoint_viz.render_keypoint_overlay for the
         overlay.mp4-style visualization itself.
 
         Loads the full episode once (dense, so keypoint_target's forward-looking
         delta indices stay correct — see LeRobotEpisodeLoader / extract_step_data)
-        and only spends model rollout compute on the strided subset of frames.
+        and only spends model compute on the strided subset of frames. Unlike
+        the old Action-Head keypoint head, motion_pred is a direct feedforward
+        readout from a single model(...) forward call — no denoising rollout.
         """
         episode_data = dataset.episode_loader[ep_idx]
         effective_len = dataset.get_effective_episode_length(ep_idx)
         if effective_len <= 0:
             return None
-        stride = max(1, effective_len // self.keypoint_video_max_frames)
-        step_indices = list(range(0, effective_len, stride))[: self.keypoint_video_max_frames]
+        stride = max(1, effective_len // self.motion_video_max_frames)
+        step_indices = list(range(0, effective_len, stride))[: self.motion_video_max_frames]
 
-        # No special handling needed for keypoint_n_key here: the processor's
+        # No special handling needed for num_motion_tokens here: the processor's
         # top-k-by-motion selection is deterministic per window, so consecutive
         # frames pick near-identical point sets on their own (see the keypoint
         # block in Gr00tN1d7Processor).
         frames = []
-        for start in range(0, len(step_indices), self.keypoint_video_batch_size):
-            chunk = step_indices[start : start + self.keypoint_video_batch_size]
+        for start in range(0, len(step_indices), self.motion_video_batch_size):
+            chunk = step_indices[start : start + self.motion_video_batch_size]
             datapoints = [dataset.get_datapoint(episode_data, t) for t in chunk]
             batch = self.data_collator(datapoints)["inputs"]
             batch = self._prepare_inputs(batch)
             if "viz_image" not in batch or "keypoint_target" not in batch:
                 return None
-            # Deliberately NOT unwrapped_model.get_action(inputs=batch, ...): that
-            # runs the VLM backbone directly, bypassing model.forward — the only
-            # place Accelerate's bf16 handling (whether an autocast patch or
-            # DeepSpeed's own precision management) actually gets applied — so any
-            # backbone_trainable_params_fp32 layer produces real fp32 activations,
-            # which flash-attn rejects outright. Instead, get backbone_features via
-            # the WRAPPED model's forward (the exact call compute_loss already makes
-            # successfully every eval batch), then hand them to
-            # action_head.get_action_with_features for the actual rollout — same
-            # split _collect_keypoint_viz above uses, and it never touches the
-            # backbone a second time.
             with torch.inference_mode():
                 outputs = model(inputs=batch)
-            if not isinstance(outputs, dict) or "backbone_features" not in outputs:
+            if not isinstance(outputs, dict) or "motion_pred" not in outputs:
                 return None
-            with torch.inference_mode():
-                action_out = unwrapped_model.action_head.get_action_with_features(
-                    backbone_features=outputs["backbone_features"],
-                    state_features=outputs["state_features"],
-                    embodiment_id=batch["embodiment_id"],
-                    backbone_output=BatchFeature(
-                        data={
-                            "image_mask": outputs["image_mask"],
-                            "backbone_attention_mask": outputs["backbone_attention_mask"],
-                        }
-                    ),
-                    # keypoint_target supplies the t=0 anchor — same reasoning as
-                    # _collect_keypoint_viz's call site above (and no "action" key,
-                    # so the RTC gate never trips).
-                    action_input=BatchFeature(data={"keypoint_target": batch["keypoint_target"]}),
-                    options={"return_keypoints": True},
-                )
-            if "keypoint_pred" not in action_out:
-                return None
-            num_objects = action_out["keypoint_pred"].shape[2]
-            kp_per_object = action_out["keypoint_pred"].shape[3]
+            motion_pred = outputs["motion_pred"]
+            num_objects = motion_pred.shape[2]
+            points_per_object = motion_pred.shape[3]
             for i in range(len(chunk)):
                 img = batch["viz_image"][i].detach().cpu().numpy()
                 gt_kp = (
@@ -665,15 +681,15 @@ class Gr00tTrainer(Trainer):
                     .float()
                     .cpu()
                     .numpy()
-                    .reshape(-1, num_objects, kp_per_object, 2)
+                    .reshape(-1, num_objects, points_per_object, 2)
                 )
                 gt_active = batch["keypoint_active_target"][i].detach().float().cpu().numpy()
                 if gt_active.shape[-1] != num_objects:
-                    # Same per-object -> per-point broadcast as _collect_keypoint_viz.
+                    # Same per-object -> per-point broadcast as _collect_motion_viz.
                     gt_active = np.repeat(gt_active, num_objects // gt_active.shape[-1], axis=-1)
-                pred_kp = action_out["keypoint_pred"][i].detach().float().cpu().numpy()
+                pred_kp = motion_pred[i].detach().float().cpu().numpy()
                 # The GT valid mask weights BOTH panels (same reasoning as
-                # _collect_keypoint_viz) — this is also what blanks the pred
+                # _collect_motion_viz) — this is also what blanks the pred
                 # overlay on windows with no valid tracked points
                 # (has_keypoint=0: zero-filled mask/anchor would otherwise draw
                 # junk trails; a video must keep the frame rather than skip it).
@@ -689,10 +705,10 @@ class Gr00tTrainer(Trainer):
             return None
         return np.stack(frames).transpose(0, 3, 1, 2)  # (T, C, H, W), RGB, for wandb.Video
 
-    def _log_keypoint_episode_video(self, model, unwrapped_model, metric_key_prefix: str) -> None:
+    def _log_motion_episode_video(self, model, metric_key_prefix: str) -> None:
         if wandb.run is None:
             return
-        episodes = self._pick_keypoint_video_episodes()
+        episodes = self._pick_motion_video_episodes()
         if not episodes:
             return
         # One key per episode (rather than a list under one key, as with
@@ -700,32 +716,142 @@ class Gr00tTrainer(Trainer):
         # guaranteed to render the same way. Key includes the dataset (basename of
         # dataset_path) since episodes are now picked per dataset_path — with a
         # multi-dataset mix there can be several videos per eval call. Keyed by
-        # `slot` (0..keypoint_video_episodes-1, this pick's position in
-        # _pick_keypoint_video_episodes) rather than the sampled episode's real,
+        # `slot` (0..motion_video_episodes-1, this pick's position in
+        # _pick_motion_video_episodes) rather than the sampled episode's real,
         # random dataset-wide index: the real index changes every eval call, which
         # would scatter each dataset's videos across an ever-growing set of keys
         # instead of giving W&B a stable key per slot to show progress over
         # training on. The real episode index is kept in the caption for reference.
         logs = {}
         for dataset, ep_idx, slot in episodes:
-            video = self._render_keypoint_episode_video(model, unwrapped_model, dataset, ep_idx)
+            video = self._render_motion_episode_video(model, dataset, ep_idx)
             if video is not None:
                 dataset_name = os.path.basename(str(getattr(dataset, "dataset_path", "dataset")))
-                logs[f"{metric_key_prefix}/keypoint_episode_video/{dataset_name}/ep{slot}"] = (
+                logs[f"{metric_key_prefix}/motion_episode_video/{dataset_name}/ep{slot}"] = (
                     wandb.Video(
                         video,
-                        fps=self.keypoint_video_fps,
+                        fps=self.motion_video_fps,
                         format="mp4",
                         caption=f"{dataset_name} episode_{ep_idx}",
                     )
                 )
         if not logs:
             logging.info(
-                "Keypoint episode video: no held-out episode with keypoint data produced a "
+                "Motion episode video: no held-out episode with keypoint data produced a "
                 f"video for {metric_key_prefix}."
             )
             return
         wandb.log(logs, step=self.state.global_step)
+
+    def _collect_domain_features(
+        self,
+        pooled: torch.Tensor,
+        is_human: torch.Tensor,
+        feats: list,
+        is_human_list: list,
+        num_seen: int,
+    ) -> int:
+        """Reservoir-sample (Algorithm R) up to domain_viz_max_points pooled
+        motion-feature vectors + their human/robot flag across the eval pass,
+        for _log_domain_alignment_viz."""
+        pooled_np = pooled.float().cpu().numpy()
+        is_human_np = is_human.detach().float().cpu().numpy()
+        for i in range(pooled_np.shape[0]):
+            if num_seen < self.domain_viz_max_points:
+                feats.append(pooled_np[i])
+                is_human_list.append(is_human_np[i])
+            else:
+                j = random.randint(0, num_seen)
+                if j < self.domain_viz_max_points:
+                    feats[j] = pooled_np[i]
+                    is_human_list[j] = is_human_np[i]
+            num_seen += 1
+        return num_seen
+
+    def _log_domain_alignment_viz(
+        self, feats: list, is_human_list: list, metric_key_prefix: str
+    ) -> None:
+        """Alignment diagnostics for the pooled motion features (see
+        method_motion_keypoint_ot_v2.md Section 7): a t-SNE scatter of
+        robot-vs-human features — are the two domains actually being pulled
+        together, not just the loss number going down? — plus the scalar KNN
+        domain-composition and per-domain-variance checks from the same
+        diagnostic checklist. Meaningful whenever the motion head runs, even
+        without OT alignment enabled (e.g. to establish a baseline before
+        turning enable_ot_align on)."""
+        feats_arr = np.stack(feats)
+        is_human_arr = np.asarray(is_human_list) >= 0.5
+        n_robot = int((~is_human_arr).sum())
+        n_human = int(is_human_arr.sum())
+        if n_robot < 2 or n_human < 2:
+            logging.info(
+                "Domain alignment viz: need >=2 samples per domain "
+                f"(got {n_robot} robot, {n_human} human) - skipping for {metric_key_prefix}."
+            )
+            return
+
+        robot_var = float(feats_arr[~is_human_arr].var(axis=0).mean())
+        human_var = float(feats_arr[is_human_arr].var(axis=0).mean())
+
+        # KNN domain-composition: for each point, what fraction of its k nearest
+        # OTHER points (raw feature space, not the 2D t-SNE projection) share
+        # its domain. Close to 0.5 = well mixed; close to 1.0 = domains still
+        # segregated despite whatever the loss curve says.
+        k = min(10, feats_arr.shape[0] - 1)
+        dists = np.linalg.norm(feats_arr[:, None, :] - feats_arr[None, :, :], axis=-1)
+        np.fill_diagonal(dists, np.inf)
+        nn_idx = np.argsort(dists, axis=1)[:, :k]
+        same_domain_frac = float((is_human_arr[nn_idx] == is_human_arr[:, None]).mean())
+
+        scalars = {
+            f"{metric_key_prefix}/motion_domain_robot_variance": robot_var,
+            f"{metric_key_prefix}/motion_domain_human_variance": human_var,
+            f"{metric_key_prefix}/motion_domain_knn_same_domain_frac": same_domain_frac,
+        }
+        if wandb.run is not None:
+            wandb.log(scalars, step=self.state.global_step)
+
+        try:
+            from sklearn.manifold import TSNE
+        except ImportError:
+            logging.warning(
+                "scikit-learn not installed - skipping t-SNE domain scatter plot "
+                "(scalars were still logged)."
+            )
+            return
+
+        perplexity = min(30, feats_arr.shape[0] - 1)
+        proj = TSNE(
+            n_components=2, perplexity=perplexity, init="pca", random_state=0
+        ).fit_transform(feats_arr)
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.scatter(
+            proj[~is_human_arr, 0],
+            proj[~is_human_arr, 1],
+            c="tab:blue",
+            label="robot",
+            alpha=0.6,
+            s=12,
+        )
+        ax.scatter(
+            proj[is_human_arr, 0],
+            proj[is_human_arr, 1],
+            c="tab:orange",
+            label="human",
+            alpha=0.6,
+            s=12,
+        )
+        ax.legend()
+        ax.set_title(f"Motion feature t-SNE ({metric_key_prefix}, step {self.state.global_step})")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if wandb.run is not None:
+            wandb.log(
+                {f"{metric_key_prefix}/motion_domain_tsne": wandb.Image(fig)},
+                step=self.state.global_step,
+            )
+        plt.close(fig)
 
     def get_eval_dataloader(self, eval_dataset=None):
         """Return a plain DataLoader for eval to avoid accelerate's NCCL broadcast on CPU tensors."""
@@ -734,7 +860,9 @@ class Gr00tTrainer(Trainer):
             raise ValueError("No eval dataset provided")
 
         data_collator = self.data_collator
-        data_collator = self._get_collator_with_removed_columns(data_collator, description="evaluation")
+        data_collator = self._get_collator_with_removed_columns(
+            data_collator, description="evaluation"
+        )
 
         persistent_workers = self.args.dataloader_num_workers > 0
         dataloader_params = {
@@ -801,20 +929,34 @@ class Gr00tTrainer(Trainer):
             return_outputs=True,
             num_items_in_batch=num_items_in_batch,
         )
-        # import ipdb; ipdb.set_trace()
-        # # save the model's embedding for the first step
-        # input_embeddings = model.get_input_embeddings().weight.data.cpu()
-        # output_embeddings = model.get_output_embeddings().weight.data.cpu()
-        # torch.save(input_embeddings, f"input_embeddings_{self.state.global_step}.pt")
-        # torch.save(output_embeddings, f"output_embeddings_{self.state.global_step}.pt")
+
+        # OT alignment loss between pooled human/robot motion features (see
+        # gr00t/model/modules/optimal_transport.py) — computed here rather than
+        # inside the model: is_human is a Trainer/data-layer concept,
+        # deliberately never routed into the model's forward (same reasoning
+        # as _action_loss_by_group). Ramped in linearly via _ot_lambda so it
+        # doesn't fight the motion head before its embeddings carry any signal.
+        # No detach here — gradients must flow into the motion-token/backbone
+        # parameters, unlike the eval-time call in evaluation_loop.
+        ot_loss = None
+        if (
+            getattr(self.model.config, "enable_ot_align", False)
+            and isinstance(outputs, dict)
+            and "motion_pooled_features" in outputs
+        ):
+            is_human_batch = inputs["inputs"].get("is_human")
+            if is_human_batch is not None:
+                ot_loss = self._compute_ot_loss(outputs["motion_pooled_features"], is_human_batch)
+                if ot_loss is not None:
+                    loss = loss + self._ot_lambda() * ot_loss
 
         # Record last loss for testing purposes.
         self.loss = loss
 
         # --------------------------------------------------------------
         # Loss component logging: pure action (flow-matching) loss, separate from
-        # "loss" (which is action + keypoint combined once the aux head is on), plus
-        # the keypoint aux head's own components.
+        # "loss" (which is action + motion + OT combined once those are on), plus
+        # the motion head's / OT alignment's own components.
         # --------------------------------------------------------------
         if (
             self.state.global_step % self.args.logging_steps == 0
@@ -838,14 +980,13 @@ class Gr00tTrainer(Trainer):
                     )
                     for name, (num, den) in groups.items():
                         log_values[f"action_loss_{name}"] = (num / den).item()
-            if "keypoint_loss" in outputs:
-                log_values["keypoint_loss"] = (
-                    self._nested_gather(outputs["keypoint_loss"].detach()).mean().item()
+            if "motion_loss" in outputs:
+                log_values["motion_loss"] = (
+                    self._nested_gather(outputs["motion_loss"].detach()).mean().item()
                 )
-                if "keypoint_kl_loss" in outputs:
-                    log_values["keypoint_kl_loss"] = (
-                        self._nested_gather(outputs["keypoint_kl_loss"].detach()).mean().item()
-                    )
+            if ot_loss is not None:
+                log_values["ot_loss"] = self._nested_gather(ot_loss.detach()).mean().item()
+                log_values["ot_lambda"] = self._ot_lambda()
             if log_values and self.args.local_rank in (-1, 0):
                 self.log(log_values)
 

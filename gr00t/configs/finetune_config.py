@@ -86,166 +86,95 @@ class FinetuneConfig:
     Dropout probability applied to state inputs for regularization during training.
     """
 
-    # --- Object-centric keypoint auxiliary head ---
-    enable_keypoint_head: bool = False
-    """If True, add the object-centric keypoint auxiliary head: predicts 16-step
-    future object keypoint POSITIONS (Huber regression by fixed point index — see
-    keypoint_head_mode). "default"/"tokens" are a pure readout — the action path
-    and inference are unchanged. Requires datasets with a "keypoint" section in
-    meta/modality.json (datasets without one contribute has_keypoint=0 samples)."""
+    # --- VLM-backbone motion-keypoint head + human/robot OT alignment ---
+    enable_motion_head: bool = False
+    """If True, add `num_motion_tokens` learnable query tokens that pass through
+    the VLM backbone's own transformer layers (alongside the image/language
+    tokens — not the DiT/action head), trained to predict `motion_horizon - 1`
+    future 2D object-keypoint positions from their post-backbone hidden states
+    (Huber regression, anchored on each point's t=0 position — see
+    num_motion_tokens). Applies to human AND robot samples alike. A pure
+    readout with respect to the action path: the DiT/action head never sees
+    these tokens, so action_pred is unaffected whether or not this head runs.
+    Requires datasets with a "keypoint" section in meta/modality.json (datasets
+    without one contribute has_keypoint=0 samples). See also enable_ot_align."""
 
-    keypoint_horizon: int = 16
-    """Number of future steps the keypoint head predicts. Must not exceed the
-    action horizon. Fixes keypoint_position_decoder's shape, so it must match
+    motion_horizon: int = 16
+    """Number of future steps the motion head predicts. Must not exceed the
+    action horizon. Fixes motion_position_decoder's shape, so it must match
     both the dataset's actual keypoint window and whatever checkpoint you
-    resume/start from — a mismatch with the dataset fails at data-processing time
-    (reshape error); a mismatch with the checkpoint fails at load time
-    (size-mismatch error)."""
+    resume/start from."""
 
-    max_keypoint_objects: int = 2
-    """Number of tracked object slots the keypoint head predicts per step. Same
-    matching requirement as keypoint_horizon (dataset's actual object-slot count
-    and the checkpoint being resumed/started from)."""
+    max_motion_objects: int = 2
+    """Number of tracked object slots in the dataset's raw keypoint layout
+    (meta/modality.json), before num_motion_tokens selects a subset. Must match
+    the dataset and the checkpoint being resumed/started from."""
 
-    keypoints_per_object: int = 8
-    """Number of tracked points per object the keypoint head predicts. Same
-    matching requirement as keypoint_horizon (dataset's actual per-object point
-    count in meta/modality.json, and the checkpoint being resumed/started from)."""
+    motion_points_per_object: int = 8
+    """Number of tracked points per object in the dataset's raw keypoint layout.
+    Same matching requirement as max_motion_objects."""
 
-    keypoint_loss_weight: float = 1.0
-    """Weight of the keypoint position loss (Huber) in the total loss."""
+    num_motion_tokens: int | None = 8
+    """Number of learnable motion-query tokens (= number of tracked points the
+    head predicts). The processor selects this many points per training sample
+    from the valid subset of the max_motion_objects*motion_points_per_object
+    flat set — the top-k MOST-MOVING points of the window (motion = total
+    per-step displacement over the horizon); moving points carry the
+    object-interaction signal, static ones are trivially predictable. None =
+    use the full flat set. Changes the motion-query-token parameter shape, so
+    it must match between saving and loading a checkpoint."""
 
-    static_keypoint_weight: float = 0.0
+    motion_loss_weight: float = 1.0
+    """Weight of the motion-keypoint position loss (Huber) in the total loss."""
+
+    motion_static_weight: float = 0.0
     """Relative loss weight for keypoints of objects whose valid mask is 0
     (padding slot — no real object at the init frame). Default 0 uses the valid
     mask as a hard loss mask: only valid slots are supervised."""
 
-    keypoint_head_mode: str = "default"
-    """How the keypoint head attaches to the action head. Every mode predicts
-    POSITION only (point k always means the same physical point for the whole
-    episode in the current data pipeline — test_keypoint_tracking_simple.py — so
-    there is no time-varying "active" signal left to classify). One of:
+    motion_relative: bool = False
+    """Train the anchored position decoder on RELATIVE displacements from each
+    point's t=0 anchor instead of absolute positions — zero-centered, mostly
+    small (a static point's target is exactly 0), an easier regression
+    geometry. The anchor is added back for eval/viz. No parameter-shape change,
+    but a checkpoint trained one way predicts garbage interpreted the other
+    way — keep it consistent across save/load."""
 
-    "default": decode keypoint position from the same action-token hidden states
-    that decode the action itself — a pure readout, action_pred is bit-identical
-    whether or not the head runs.
+    motion_pool: str = "mean"
+    """How the num_motion_tokens post-backbone hidden states are pooled into
+    one per-sample feature vector for the OT alignment loss (enable_ot_align).
+    Currently only "mean" (simple average across tokens) is implemented."""
 
-    "tokens": append point tokens to the DiT sequence — one learned slot
-    embedding per point (see keypoint_n_key), so each slot gathers its own
-    motion-scene context through attention (slot order follows the processor's
-    motion-rank emission order). Firm per-point identity enters at the position
-    decoder, which concatenates slot i's hidden state with point i's ENCODED
-    t=0 anchor (a small MLP over keypoint_target's first step — tracker data
-    the sample already carries) and predicts the keypoint_horizon - 1 FUTURE
-    steps — absolute, or displacements from the anchor (keypoint_relative). The
-    anchor binds each slot's identity through its input, so the plain by-index
-    Huber loss is well posed (no exchangeable-target collapse, no Hungarian
-    matching needed here). A
-    one-directional self-attention mask keeps this a pure readout: point tokens
-    may attend to the state/action tokens (so keypoint prediction stays
-    conditioned on the specific action being generated), but state/action
-    tokens are masked from ever attending back — action_pred is unaffected by
-    their presence, same guarantee as "default". At inference the tokens are
-    only appended when keypoint predictions are explicitly requested (eval/viz,
-    anchor from the eval batch's own keypoint_target) — the real-robot action
-    path pays no extra sequence length and never needs current keypoint
-    positions. Adds keypoint_query_base + keypoint_query_coord_encoder
-    parameters, so it must match between saving and loading a checkpoint.
+    # --- Optimal Transport alignment between human and robot motion features ---
+    enable_ot_align: bool = False
+    """If True, compute a Sinkhorn (entropic optimal transport) alignment loss
+    between the pooled motion-token features of human vs. robot samples in each
+    batch, ramped in linearly over ot_warmup_steps. A separate switch from
+    enable_motion_head so the motion-keypoint auxiliary loss can be trained
+    alone (no alignment pressure) as an ablation; forced off when
+    enable_motion_head=False (no pooled features to align). Distinguishing
+    human/robot uses the existing per-sample is_human signal (see
+    LeRobotEpisodeLoader.detect_is_human) — never routed into the model itself,
+    computed purely in the Trainer."""
 
-    "share_dim": fold future keypoint POSITIONS themselves as extra channels of the
-    same per-step action vector, jointly noised/denoised by flow matching — plain
-    masked MSE, well posed here because point identity is fixed so there's no
-    arbitrary-index ambiguity for the loss to be invariant to. NOT a pure readout
-    like "default"/"tokens": action_encoder mixes every input channel into one
-    embedding via a dense matrix, so the (noised) position values genuinely
-    influence the shared representation that also produces the real action
-    prediction during training, same as this codebase's existing effort/
-    torque-aware channels. What's preserved is the guarantee that actually
-    matters: no real keypoint data is ever fed as input at train or inference
-    time (the Euler rollout's position channels always start from pure noise,
-    same as the real action channels), and action_pred never leaks the extra
-    channels. No separate position decoder in this mode. Widens action_encoder's
-    input dim and action_decoder's output dim by
-    max_keypoint_objects*keypoints_per_object*2, so — like "tokens" — it must
-    match between saving and loading a checkpoint (start_from_checkpoint loading
-    splices the checkpoint's narrower action head into the widened tensors'
-    leading slice automatically).
+    ot_align_weight: float = 1.0
+    """Target weight (lambda) of the OT alignment loss once ot_warmup_steps has
+    elapsed."""
 
-    "cvae": everything "tokens" does plus a small CVAE to handle multimodal
-    futures (which object moves, in what direction) that plain regression would
-    blur into an average. An encoder sees the true future keypoints + a
-    condition token (see keypoint_cvae_condition) during training and produces a
-    style latent z_style, added to the "tokens"-mode point tokens (never
-    concatenated into the shared action/state tokens, so action_pred stays a
-    pure readout exactly like "tokens"/"default"); at inference z_style defaults
-    to zeros. Trained with reconstruction (Huber, same as every other mode) + KL
-    to N(0,I) (keypoint_kl_weight)."""
+    ot_warmup_steps: int = 1000
+    """Number of training steps over which the OT alignment loss weight ramps
+    linearly from 0 to ot_align_weight — gives the motion-token embeddings time
+    to become meaningful (via motion_loss_weight / action loss) before alignment
+    pressure starts pulling human and robot representations together."""
 
-    keypoint_style_dim: int = 16
-    """CVAE style latent dimensionality (keypoint_head_mode="cvae" only). Kept
-    small so it can only capture a coarse "which future" choice, not enough to
-    losslessly reconstruct the whole trajectory (which would make the decoder
-    ignore real conditioning and rely on z_style alone — fine at train time since
-    z_style is label-derived, but breaks at inference where z_style=0)."""
+    ot_sinkhorn_eps: float = 0.1
+    """Entropic regularization strength for the Sinkhorn solver. Larger values
+    give smoother (more uniform) transport plans and more stable gradients;
+    smaller values approximate exact OT more closely but can be numerically
+    harder to converge."""
 
-    keypoint_kl_weight: float = 0.01
-    """Weight of KL(q(z_style|future,condition) || N(0,I)) in the total loss
-    (keypoint_head_mode="cvae" only). Keeps the posterior close enough to the
-    prior that z_style=0 at inference is a reasonable stand-in for "no
-    information about which future"."""
-
-    keypoint_cvae_condition: str = "vlm"
-    """What conditions the CVAE recognition encoder alongside the true future
-    keypoints (keypoint_head_mode="cvae" only). "vlm" (default) pools the
-    backbone's vision+language tokens — richer than "state" (robot proprioception
-    only), so z_style only has to capture residual ambiguity the backbone can't
-    already resolve. One of {"vlm", "state"}."""
-
-    keypoint_cvae_encoder_layers: int = 2
-    """Self-attention layers in the CVAE recognition encoder (keypoint_head_mode
-    ="cvae" only)."""
-
-    keypoint_cvae_encoder_heads: int = 4
-    """Attention heads in the CVAE recognition encoder (keypoint_head_mode="cvae"
-    only)."""
-
-    keypoint_n_key: int | None = None
-    """keypoint_head_mode "tokens"/"cvae" only: number of points the processor
-    selects per training sample from the valid subset of the
-    max_keypoint_objects*keypoints_per_object flat set — the top-k MOST-MOVING
-    points of the window (motion = total per-step displacement over the
-    horizon). Moving points carry the object-interaction signal; static ones
-    are trivially predictable. The head appends exactly this many t0-anchored
-    point tokens, predicts exactly these points' futures, and the loss updates
-    exactly them (bound by each point's anchor — see keypoint_head_mode). None
-    (default) = use the full flat set. Changes parameter shapes (per-slot
-    keypoint_query_base; plus keypoint_label_step_embed for "cvae") and the
-    token count, so it must match between saving and loading a checkpoint."""
-
-    keypoint_relative: bool = False
-    """keypoint_head_mode "tokens"/"cvae" only: train the anchored position
-    decoder on RELATIVE displacements from each point's t=0 anchor instead of
-    absolute positions — zero-centered, mostly small (a static point's target
-    is exactly 0), an easier regression geometry. The anchor is added back for
-    eval/viz. No parameter-shape change, but a checkpoint trained one way
-    predicts garbage interpreted the other way — keep it consistent across
-    save/load."""
-
-    keypoint_match: str = "index"
-    """keypoint_head_mode="default" only: how predicted keypoints are paired
-    with target keypoints within one object before the Huber loss. "default" is
-    the one mode left regressing against the converter's arbitrary per-episode
-    point enumeration (farthest_point_sample in
-    test_keypoint_tracking_simple.py — index k within an object has no
-    consistent meaning across episodes). "index": plain by-index regression.
-    "hungarian": optimal one-to-one assignment of target points to predicted
-    points within each object, cost aggregated over the whole keypoint_horizon
-    (one fixed bijection per sample/object — the strict bijection is what
-    prevents every prediction collapsing onto one point, see
-    Gr00tN1d7ActionHead._match_keypoints_hungarian). Ignored by every other
-    mode: "tokens"/"cvae" bind predictions to targets through the t=0 anchor
-    input (no matching needed), "share_dim" has no decoded prediction to match
-    before its flow-matching loss."""
+    ot_sinkhorn_iters: int = 50
+    """Number of Sinkhorn normalization iterations."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
@@ -367,27 +296,33 @@ class FinetuneConfig:
     """Number of training steps between validation loss evaluations (only used when
     validation_path or eval_set_split_ratio is set)."""
 
-    # --- Object-centric keypoint debug/eval visualization ---
-    keypoint_viz_max_images: int = 50
+    # --- Motion-keypoint debug/eval visualization ---
+    motion_viz_max_images: int = 50
     """Max number of GT-vs-predicted keypoint overlay image pairs to log to W&B per
-    evaluation run (only meaningful when enable_keypoint_head=True and eval is
+    evaluation run (only meaningful when enable_motion_head=True and eval is
     configured via validation_path or eval_set_split_ratio)."""
 
-    keypoint_video_episodes: int = 1
+    motion_video_episodes: int = 1
     """Number of held-out episodes to roll the model forward over and log as a
     GT-vs-predicted keypoint overlay video per evaluation run, PER dataset_path
     (each dataset in the mix that carries a "keypoint" modality gets its own
-    keypoint_video_episodes videos, drawn from that dataset's validation_path /
+    motion_video_episodes videos, drawn from that dataset's validation_path /
     eval_set_split_ratio split — not a total pooled across every dataset). 0
-    disables episode-video logging (only meaningful when enable_keypoint_head=True)."""
+    disables episode-video logging (only meaningful when enable_motion_head=True)."""
 
-    keypoint_video_max_frames: int = 100
+    motion_video_max_frames: int = 100
     """Cap on frames rendered per episode video (uniformly strided across the
     episode if longer) — bounds the extra per-eval rollout cost."""
 
-    keypoint_video_batch_size: int = 8
+    motion_video_batch_size: int = 8
     """Batch size used when rolling the model forward over an episode's frames for
-    keypoint_video_episodes."""
+    motion_video_episodes."""
 
-    keypoint_video_fps: int = 10
+    motion_video_fps: int = 10
     """Playback fps for the logged keypoint overlay video."""
+
+    domain_viz_max_points: int = 500
+    """Max number of (pooled motion feature, is_human) pairs to reservoir-sample
+    across an evaluation run for the human-vs-robot t-SNE alignment scatter plot
+    and KNN domain-composition diagnostic (only meaningful when enable_ot_align
+    or enable_motion_head=True and eval is configured)."""

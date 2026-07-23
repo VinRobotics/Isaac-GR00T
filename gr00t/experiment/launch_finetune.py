@@ -175,22 +175,21 @@ if __name__ == "__main__":
     else:
         config.model.extra_augmentation_config = None
 
-    # Object-centric keypoint auxiliary head
-    config.model.enable_keypoint_head = ft_config.enable_keypoint_head
-    config.model.keypoint_horizon = ft_config.keypoint_horizon
-    config.model.max_keypoint_objects = ft_config.max_keypoint_objects
-    config.model.keypoints_per_object = ft_config.keypoints_per_object
-    config.model.keypoint_loss_weight = ft_config.keypoint_loss_weight
-    config.model.static_keypoint_weight = ft_config.static_keypoint_weight
-    config.model.keypoint_head_mode = ft_config.keypoint_head_mode
-    config.model.keypoint_style_dim = ft_config.keypoint_style_dim
-    config.model.keypoint_kl_weight = ft_config.keypoint_kl_weight
-    config.model.keypoint_cvae_condition = ft_config.keypoint_cvae_condition
-    config.model.keypoint_cvae_encoder_layers = ft_config.keypoint_cvae_encoder_layers
-    config.model.keypoint_cvae_encoder_heads = ft_config.keypoint_cvae_encoder_heads
-    config.model.keypoint_n_key = ft_config.keypoint_n_key
-    config.model.keypoint_relative = ft_config.keypoint_relative
-    config.model.keypoint_match = ft_config.keypoint_match
+    # VLM-backbone motion-keypoint head + human/robot OT alignment
+    config.model.enable_motion_head = ft_config.enable_motion_head
+    config.model.motion_horizon = ft_config.motion_horizon
+    config.model.max_motion_objects = ft_config.max_motion_objects
+    config.model.motion_points_per_object = ft_config.motion_points_per_object
+    config.model.num_motion_tokens = ft_config.num_motion_tokens
+    config.model.motion_loss_weight = ft_config.motion_loss_weight
+    config.model.motion_static_weight = ft_config.motion_static_weight
+    config.model.motion_relative = ft_config.motion_relative
+    config.model.motion_pool = ft_config.motion_pool
+    config.model.enable_ot_align = ft_config.enable_ot_align
+    config.model.ot_align_weight = ft_config.ot_align_weight
+    config.model.ot_warmup_steps = ft_config.ot_warmup_steps
+    config.model.ot_sinkhorn_eps = ft_config.ot_sinkhorn_eps
+    config.model.ot_sinkhorn_iters = ft_config.ot_sinkhorn_iters
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False
@@ -235,10 +234,11 @@ if __name__ == "__main__":
         config.training.eval_strategy = "steps"
         config.training.eval_steps = ft_config.eval_steps
 
-    config.training.keypoint_viz_max_images = ft_config.keypoint_viz_max_images
-    config.training.keypoint_video_episodes = ft_config.keypoint_video_episodes
-    config.training.keypoint_video_max_frames = ft_config.keypoint_video_max_frames
-    config.training.keypoint_video_batch_size = ft_config.keypoint_video_batch_size
-    config.training.keypoint_video_fps = ft_config.keypoint_video_fps
+    config.training.motion_viz_max_images = ft_config.motion_viz_max_images
+    config.training.motion_video_episodes = ft_config.motion_video_episodes
+    config.training.motion_video_max_frames = ft_config.motion_video_max_frames
+    config.training.motion_video_batch_size = ft_config.motion_video_batch_size
+    config.training.motion_video_fps = ft_config.motion_video_fps
+    config.training.domain_viz_max_points = ft_config.domain_viz_max_points
 
     run(config)

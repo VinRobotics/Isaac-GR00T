@@ -145,6 +145,10 @@
     "apply_sincos_state_encoding": true,
     "use_relative_action": true,
     "exclude_state": false,
-    "state_dropout_prob": 0.0
+    "state_dropout_prob": 0.0,
+    "motion_horizon": 16,
+    "max_motion_objects": 2,
+    "motion_points_per_object": 8,
+    "num_motion_tokens": null
   }
 }

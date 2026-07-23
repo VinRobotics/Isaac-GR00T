@@ -121,186 +121,48 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Multi-embodiment parameters
     max_num_embodiments: int = 32
 
-    # Object-centric keypoint auxiliary head (human/robot co-training). Predicts
-    # future object keypoint POSITIONS. The data pipeline
-    # (test_keypoint_tracking_simple.py / keypoint_tracking_simple_pipeline.md)
-    # tracks every one of the N*K = max_keypoint_objects * keypoints_per_object
-    # points from a single init frame with a FIXED identity for the whole episode
-    # (no per-step active/role reassignment like the retired object-slot + FSM
-    # pipeline had) — so there is no time-varying "active" signal left to classify
-    # in ANY mode, and keypoint_active_target is reinterpreted as a static
-    # per-object valid mask (same value at every horizon step: 1 if a real object
-    # occupied that slot at the init frame, 0 if it's padding). Fixed identity
-    # across TIME means no per-step re-matching is ever needed; across POINTS,
-    # "tokens"/"cvae" bind each prediction to its target through the t=0 anchor
-    # input (see keypoint_head_mode below), "default" optionally
-    # Hungarian-matches within objects (keypoint_match).
-    # "default"/"tokens" are a pure readout: action_pred never depends on
-    # whether the head runs. "share_dim" is NOT — see its note below.
-    enable_keypoint_head: bool = False
-    keypoint_horizon: int = 16
-    max_keypoint_objects: int = 2
-    keypoints_per_object: int = 8
-    keypoint_loss_weight: float = 1.0
+    # VLM-backbone motion-keypoint head + human/robot OT alignment. Adds
+    # num_motion_tokens learnable query tokens that pass through the VLM
+    # backbone's own transformer layers (alongside image/language tokens — not
+    # the DiT/action head), predicting motion_horizon - 1 future 2D keypoint
+    # positions from their post-backbone hidden states, anchored on each
+    # point's t=0 position (same anchoring mechanism the retired keypoint
+    # head's "tokens" mode used, transplanted here — see
+    # gr00t/model/gr00t_n1d7/motion_head.py). Applies to human AND robot
+    # samples alike (dense two-domain supervision is the main anti-collapse
+    # force). A pure readout with respect to the action path: the DiT/action
+    # head never sees these tokens. enable_ot_align additionally aligns pooled
+    # human/robot motion-token features via Sinkhorn OT (see
+    # gr00t/model/modules/optimal_transport.py), gated by the existing
+    # per-sample is_human signal (never routed into the model itself — see
+    # LeRobotEpisodeLoader.detect_is_human), computed in the Trainer.
+    enable_motion_head: bool = False
+    motion_horizon: int = 16
+    max_motion_objects: int = 2
+    motion_points_per_object: int = 8
+    num_motion_tokens: int | None = 8
+    motion_loss_weight: float = 1.0
     # Loss weight for keypoints of objects whose valid mask is 0 (padding slot —
     # no real object at the init frame). Default 0 = hard mask: only valid slots
     # are supervised.
-    static_keypoint_weight: float = 0.0
-    # How the keypoint head attaches to the action head. One of:
-    #   "default": decode keypoint position from the same action-token hidden
-    #     states that decode the action itself (cheap, shared representation).
-    #   "tokens": append point tokens to the DiT sequence — one learned slot
-    #     embedding per point (keypoint_query_base, keypoint_n_key of them), so
-    #     each slot gathers its own motion-scene context through attention
-    #     (slot order follows the processor's motion-rank emission order).
-    #     Firm per-point identity enters at the position decoder, which
-    #     concatenates slot i's hidden state with point i's ENCODED t=0 anchor
-    #     (keypoint_query_coord_encoder over keypoint_target's first step —
-    #     tracker data the sample already carries) and predicts the
-    #     keypoint_horizon - 1 FUTURE steps — absolute, or displacements from
-    #     the anchor (keypoint_relative). The anchor binds each slot's identity
-    #     through its input, so the plain by-index Huber loss is well posed
-    #     (each slot's target is unique given its anchor — none of the
-    #     exchangeable-target collapse that unanchored by-index regression
-    #     suffered, and no Hungarian matching needed;
-    #     _match_keypoints_hungarian remains for "default" only). A one-directional
-    #     self-attention mask (see
-    #     Gr00tN1d7ActionHead._keypoint_self_attention_mask) keeps this a pure
-    #     readout: point tokens may attend to the state/action tokens (so
-    #     keypoint prediction stays conditioned on the specific action being
-    #     generated), but state/action tokens are masked from ever attending back
-    #     — so action_pred is unaffected by their presence, exactly like
-    #     "default". That same mask is what lets get_action_with_features skip
-    #     appending these tokens entirely unless keypoint predictions are
-    #     explicitly requested (options["return_keypoints"]) — the real-robot
-    #     action path pays no extra sequence length and never needs current
-    #     keypoint positions. Adds keypoint_query_base +
-    #     keypoint_query_coord_encoder parameters, so it must match between
-    #     saving and loading a checkpoint.
-    #   "share_dim": fold future keypoint POSITIONS themselves as extra channels of
-    #     the same per-step action vector, jointly noised/denoised by flow
-    #     matching — the same mechanism this codebase already uses to extend
-    #     action_encoder/action_decoder for other per-embodiment action-space
-    #     widening (see expand_action_dimension in embodiment_conditioned_mlp.py).
-    #     Well posed as plain per-channel MSE because point identity is fixed
-    #     across TIME (see above) — no *temporal* permutation ambiguity; this is
-    #     what makes folding POSITION (not just a per-object flag) viable here,
-    #     unlike the retired object-slot pipeline, where only the *active* flags
-    #     (max_keypoint_objects dims) were cheap enough to fold and position had
-    #     to stay on a separate set-matched decoder. Always uses "index"
-    #     matching regardless of keypoint_match (see below) — it has no decoded
-    #     prediction to match against before the flow-matching loss runs, so the
-    #     within-object enumeration-order ambiguity keypoint_match="hungarian"
-    #     addresses for "default" is left unaddressed here. NOT a
-    #     pure readout, unlike
-    #     "default"/"tokens": action_encoder's W1 is a dense matrix mixing every
-    #     input channel into one embedding, so the (noised) position values
-    #     genuinely influence the shared representation that also produces the
-    #     real action prediction during training — same property this codebase's
-    #     existing effort/torque-aware channels already have. What's preserved is
-    #     the guarantee that actually matters: no real keypoint data is ever fed as
-    #     input at train or inference time (the Euler rollout's position channels
-    #     always start from pure noise, exactly like the real action channels),
-    #     and the returned action_pred never leaks the extra channels (sliced to
-    #     real_action_dim). No separate keypoint_position_decoder in this mode —
-    #     position is read directly off action_decoder's own output. Widens
-    #     action_encoder's input dim and action_decoder's output dim by
-    #     max_keypoint_objects * keypoints_per_object * 2, so — like "tokens" — it
-    #     must match between saving and loading a checkpoint.
-    #   "cvae": everything above ("default"/"tokens" style Huber regression) plus a
-    #     small CVAE to handle multimodal futures (which object moves, in what
-    #     direction) that plain regression would blur into an average. A
-    #     recognition encoder (Gr00tN1d7ActionHead._encode_keypoint_style) sees the
-    #     TRUE future keypoints + a condition token (see keypoint_cvae_condition)
-    #     during training and outputs (mu, logvar) for a style latent z_style;
-    #     z_style is added to the "tokens"-mode anchored point tokens
-    #     (NOT concatenated into sa_embs — see below) before the DiT, and the
-    #     position decoder (reading those tokens' hidden states, exactly like
-    #     "tokens" mode) becomes the CVAE decoder p(keypoints | z_style, context).
-    #     Trained with reconstruction (Huber, same as every other mode) + KL
-    #     (q(z_style|...) || N(0,I)) weighted by keypoint_kl_weight. At inference
-    #     (get_action_with_features) there is no true future to encode, so z_style
-    #     defaults to zeros — the KL term's job is exactly to make that a
-    #     reasonable stand-in (the prior's mean). Deliberately uses the "tokens"
-    #     query-token/self-attention-mask mechanism rather than concatenating
-    #     z_style into sa_embs directly: sa_embs also feeds action_decoder, and
-    #     z_style is derived from the ground-truth future keypoints during
-    #     training — concatenating it into sa_embs would leak that label into
-    #     action_pred at train time while inference (z_style=0) sees none of it, a
-    #     train/inference mismatch. Routing through the query tokens' one-
-    #     directional mask keeps action_pred provably unaffected, same guarantee as
-    #     "tokens"/"default".
-    #
-    # None of the four modes classify anything anymore (see above) —
-    # get_action_with_features returns keypoint_pred only (always on the
-    # keypoint_horizon window); viz weights both GT and predicted overlays with
-    # the GT valid mask (see trainer._collect_keypoint_viz).
-    keypoint_head_mode: str = "default"  # one of {"default", "tokens", "share_dim", "cvae"}
-    # CVAE style latent dimensionality (keypoint_head_mode="cvae" only). Kept small
-    # (default 16) so it can only capture a coarse "which future" choice, not enough
-    # to losslessly reconstruct the whole trajectory itself — that would let the
-    # decoder ignore real conditioning and rely on z_style alone, which is fine at
-    # train time (z_style is label-derived) but breaks at inference (z_style=0).
-    keypoint_style_dim: int = 16
-    # Weight of KL(q(z_style|future,condition) || N(0,I)) in the total loss. Keeps
-    # the posterior close enough to the prior that z_style=0 at inference (see
-    # keypoint_head_mode="cvae" above) is a reasonable stand-in for "no information
-    # about which future". Too large collapses z_style to carry no information at
-    # all (posterior == prior always); too small lets the decoder over-rely on
-    # z_style and ignore real conditioning. Standard beta-VAE-style tuning knob.
-    keypoint_kl_weight: float = 0.01
-    # What conditions the CVAE recognition encoder alongside the true future
-    # keypoints: "vlm" (default, recommended) pools the backbone's vision+language
-    # tokens (masked mean over backbone_attention_mask) — richer than "state"
-    # (robot proprioception only, no scene/language), so z_style only has to
-    # capture the residual ambiguity the backbone genuinely can't resolve, rather
-    # than being forced to also re-derive scene information the decoder already
-    # has via its own cross-attention to the same backbone features. "state" is
-    # provided for comparison/ablation.
-    keypoint_cvae_condition: str = "vlm"  # one of {"vlm", "state"}
-    keypoint_cvae_encoder_layers: int = 2
-    keypoint_cvae_encoder_heads: int = 4
-    # "tokens"/"cvae" only: number of points the PROCESSOR selects per training
-    # sample from the valid subset of the max_keypoint_objects *
-    # keypoints_per_object flat set — the TOP-K MOST-MOVING points of the window
-    # (motion score = total per-step displacement over the horizon, descending;
-    # see Gr00tN1d7Processor). Moving points carry the object-interaction
-    # signal; static ones are trivially predictable. Deterministic per window,
-    # so eval picks are stable frame to frame. The head appends exactly this
-    # many t0-anchored point tokens, predicts exactly these points' futures,
-    # and the loss updates exactly them. None (default) = use the full flat set
-    # (no selection; the per-object valid mask handles padding slots). Changing
-    # it changes keypoint_query_base's and keypoint_label_step_embed's ("cvae")
-    # shapes and the token count, so it must match between saving and loading a
-    # checkpoint.
-    keypoint_n_key: int | None = None
-    # "tokens"/"cvae" only: train the anchored position decoder on RELATIVE
-    # displacements from each point's t=0 anchor instead of absolute [-1, 1]
-    # positions. Zero-centered and mostly small (a static point's target is
-    # exactly 0), which is an easier regression geometry; the anchor is added
-    # back when reassembling absolute trajectories for eval/viz
-    # (get_action_with_features). Pure target reparameterization — no shape or
-    # parameter change, but a checkpoint trained one way predicts garbage
-    # interpreted the other way, so keep it consistent across save/load.
-    keypoint_relative: bool = False
-    # "default" mode only: how predicted keypoints are paired with target
-    # keypoints within one object before the Huber loss. "default" is the one
-    # mode left regressing against the converter's arbitrary per-episode
-    # enumeration order (farthest_point_sample in
-    # test_keypoint_tracking_simple.py starts from a random pixel, so index k
-    # within an object carries no consistent meaning ACROSS episodes, only
-    # within one). "index" (default): plain by-index regression. "hungarian":
-    # optimal one-to-one assignment of target points to predicted points within
-    # each object, cost aggregated over the whole keypoint_horizon (one fixed
-    # bijection per sample/object, not re-matched independently at every step)
-    # — see Gr00tN1d7ActionHead._match_keypoints_hungarian for why the strict
-    # bijection matters (softer variants collapse every prediction onto one
-    # point). The object axis is untouched either way (it carries real signal,
-    # e.g. "first object to move"). Ignored by every other mode: "tokens"/
-    # "cvae" ALWAYS Hungarian-match over their full point set (see
-    # keypoint_head_mode above), and "share_dim" has no decoded prediction to
-    # match before its flow-matching loss runs.
-    keypoint_match: str = "index"  # one of {"index", "hungarian"}
+    motion_static_weight: float = 0.0
+    # Train the anchored position decoder on RELATIVE displacements from each
+    # point's t=0 anchor instead of absolute [-1, 1] positions. Zero-centered
+    # and mostly small (a static point's target is exactly 0) — an easier
+    # regression geometry; the anchor is added back when reassembling absolute
+    # trajectories for eval/viz. No shape/parameter change, but a checkpoint
+    # trained one way predicts garbage interpreted the other way.
+    motion_relative: bool = False
+    # How the num_motion_tokens post-backbone hidden states are pooled into one
+    # per-sample feature vector for the OT alignment loss. Only "mean" is
+    # currently implemented.
+    motion_pool: str = "mean"  # one of {"mean"}
+
+    enable_ot_align: bool = False
+    ot_align_weight: float = 1.0
+    ot_warmup_steps: int = 1000
+    ot_sinkhorn_eps: float = 0.1
+    ot_sinkhorn_iters: int = 50
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -317,39 +179,17 @@ class Gr00tN1d7Config(PretrainedConfig):
                 elif getattr(f, "default_factory", MISSING) is not MISSING:
                     setattr(self, f.name, f.default_factory())
 
-        if self.keypoint_head_mode not in ("default", "tokens", "share_dim", "cvae"):
-            raise ValueError(
-                f"keypoint_head_mode must be one of 'default', 'tokens', 'share_dim', 'cvae', "
-                f"got {self.keypoint_head_mode!r}"
-            )
-        if self.keypoint_cvae_condition not in ("vlm", "state"):
-            raise ValueError(
-                f"keypoint_cvae_condition must be one of 'vlm', 'state', "
-                f"got {self.keypoint_cvae_condition!r}"
-            )
-        if self.keypoint_match not in ("index", "hungarian"):
-            raise ValueError(
-                f"keypoint_match must be one of 'index', 'hungarian', got {self.keypoint_match!r}"
-            )
-        if self.keypoint_n_key is not None:
-            if self.keypoint_head_mode not in ("tokens", "cvae"):
+        if self.motion_pool not in ("mean",):
+            raise ValueError(f"motion_pool must be 'mean', got {self.motion_pool!r}")
+        if self.num_motion_tokens is not None:
+            n_total = self.max_motion_objects * self.motion_points_per_object
+            if not 1 <= self.num_motion_tokens <= n_total:
                 raise ValueError(
-                    "keypoint_n_key requires keypoint_head_mode 'tokens' or 'cvae' "
-                    "(anchored point tokens); 'default'/'share_dim' always "
-                    f"predict the full flat point set, got {self.keypoint_head_mode!r}"
+                    f"num_motion_tokens must be in [1, max_motion_objects * "
+                    f"motion_points_per_object = {n_total}], got {self.num_motion_tokens}"
                 )
-            n_total = self.max_keypoint_objects * self.keypoints_per_object
-            if not 1 <= self.keypoint_n_key <= n_total:
-                raise ValueError(
-                    f"keypoint_n_key must be in [1, max_keypoint_objects * "
-                    f"keypoints_per_object = {n_total}], got {self.keypoint_n_key}"
-                )
-        if self.keypoint_relative and self.keypoint_head_mode not in ("tokens", "cvae"):
-            raise ValueError(
-                "keypoint_relative requires keypoint_head_mode 'tokens' or 'cvae' (the "
-                "anchored position decoder); 'default'/'share_dim' regress absolute "
-                f"positions only, got {self.keypoint_head_mode!r}"
-            )
+        if self.enable_ot_align and not self.enable_motion_head:
+            raise ValueError("enable_ot_align requires enable_motion_head=True")
 
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""

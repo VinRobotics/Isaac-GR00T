@@ -80,19 +80,24 @@ class TrainingConfig:
     save_best_eval_metric_greater_is_better: bool = True
 
     # Max GT-vs-predicted keypoint overlay image pairs logged to W&B per eval run
-    # (object-centric keypoint auxiliary head only).
-    keypoint_viz_max_images: int = 50
+    # (motion-keypoint head only).
+    motion_viz_max_images: int = 50
 
-    # Per-eval-run GT-vs-predicted keypoint overlay VIDEO (object-centric keypoint
-    # auxiliary head only): rolls the model forward over held-out episode(s) (drawn
-    # from the eval_set_split_ratio split) and logs them to W&B, the per-episode
-    # analogue of keypoint_viz_max_images' single-frame panels. keypoint_video_episodes
+    # Per-eval-run GT-vs-predicted keypoint overlay VIDEO (motion-keypoint head
+    # only): rolls the model forward over held-out episode(s) (drawn from the
+    # eval_set_split_ratio split) and logs them to W&B, the per-episode
+    # analogue of motion_viz_max_images' single-frame panels. motion_video_episodes
     # is applied PER dataset_path carrying a "keypoint" modality, not pooled across
     # the whole mix. 0 disables it.
-    keypoint_video_episodes: int = 1
-    keypoint_video_max_frames: int = 100
-    keypoint_video_batch_size: int = 8
-    keypoint_video_fps: int = 10
+    motion_video_episodes: int = 1
+    motion_video_max_frames: int = 100
+    motion_video_batch_size: int = 8
+    motion_video_fps: int = 10
+
+    # Max (pooled motion feature, is_human) pairs reservoir-sampled per eval run
+    # for the human-vs-robot t-SNE alignment scatter + KNN domain-composition
+    # diagnostic (enable_ot_align / enable_motion_head only).
+    domain_viz_max_points: int = 500
 
     # DeepSpeed (default)
     deepspeed_stage: int = 2  # ZeRO stage (1, 2, or 3)

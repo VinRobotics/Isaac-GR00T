@@ -52,7 +52,7 @@ except ImportError:
 # Suppress protobuf deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="google.protobuf")
 
-# Noise floor for the keypoint_n_key top-k-by-motion selection: total path length
+# Noise floor for the num_motion_tokens top-k-by-motion selection: total path length
 # over the keypoint window (sum of per-step displacement norms, in the loader's
 # [-1, 1]-normalized image coordinates) below which a point is treated as static.
 # Point-tracker jitter accumulates linearly in this score (norms never cancel),
@@ -170,10 +170,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         max_state_dim: int = 29,
         max_action_dim: int = 29,
         max_action_horizon: int = 40,
-        keypoint_horizon: int = 16,
-        max_keypoint_objects: int = 2,
-        keypoints_per_object: int = 8,
-        keypoint_n_key: int | None = None,
+        motion_horizon: int = 16,
+        max_motion_objects: int = 2,
+        motion_points_per_object: int = 8,
+        num_motion_tokens: int | None = None,
         apply_sincos_state_encoding: bool = False,
         use_albumentations: bool = False,
         extra_augmentation_config: dict | None = None,
@@ -226,10 +226,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         # Object keypoint aux targets: if any registered embodiment has a "keypoint"
         # modality, every sample must emit the keypoint keys (zero-filled when the
         # sample's dataset has none) so mixed batches collate.
-        self.keypoint_horizon = keypoint_horizon
-        self.max_keypoint_objects = max_keypoint_objects
-        self.keypoints_per_object = keypoints_per_object
-        self.keypoint_n_key = keypoint_n_key
+        self.motion_horizon = motion_horizon
+        self.max_motion_objects = max_motion_objects
+        self.motion_points_per_object = motion_points_per_object
+        self.num_motion_tokens = num_motion_tokens
         self._any_keypoint_modality = any(
             "keypoint" in cfgs for cfgs in self.modality_configs.values()
         )
@@ -631,36 +631,36 @@ class Gr00tN1d7Processor(BaseProcessor):
         # Emitted for every sample once any embodiment has a "keypoint" modality, so
         # samples with and without keypoints collate into the same batch.
         #
-        # keypoint_n_key=None: emit the full flat point set —
+        # num_motion_tokens=None: emit the full flat point set —
         # keypoint_target [H, N*K*2] + per-OBJECT static valid mask [H, N].
-        # keypoint_n_key set ("tokens"/"cvae" query-conditioned modes, see
-        # Gr00tN1d7Config.keypoint_n_key): select the TOP-K MOST-MOVING valid
+        # num_motion_tokens set (MotionHead's anchored point tokens, see
+        # Gr00tN1d7Config.num_motion_tokens): select the TOP-K MOST-MOVING valid
         # (non-padding-slot) points of this window — motion score = total
         # per-step displacement over the horizon — ordered by descending motion.
         # Moving points carry the actual object-interaction signal (static ones
         # are trivially predictable), and the selection is deterministic per
         # window, so consecutive frames of an episode pick near-identical sets
         # (watchable eval videos, comparable eval metrics). Identity is bound to
-        # each point's t=0 coordinate query, not its token position
-        # (Gr00tN1d7ActionHead._append_keypoint_queries). Note the selection
-        # reads the window's FUTURE track (it's the label) — fine for choosing
-        # what to supervise/visualize; nothing about it feeds the action path.
+        # each point's t=0 coordinate query, not its token position (see
+        # gr00t/model/gr00t_n1d7/motion_head.py). Note the selection reads the
+        # window's FUTURE track (it's the label) — fine for choosing what to
+        # supervise/visualize; nothing about it feeds the action path.
         # Emits keypoint_target [H, n_key*2] + per-POINT valid mask [H, n_key]
         # (the loss tells the two mask layouts apart by their last dim).
         if self._any_keypoint_modality:
-            n_total = self.max_keypoint_objects * self.keypoints_per_object
+            n_total = self.max_motion_objects * self.motion_points_per_object
             full_dim = n_total * 2
-            n_key = self.keypoint_n_key
+            n_key = self.num_motion_tokens
             out_points = n_key or n_total
-            valid_dim = out_points if n_key is not None else self.max_keypoint_objects
-            keypoint_target = torch.zeros(self.keypoint_horizon, out_points * 2)
-            keypoint_active_target = torch.zeros(self.keypoint_horizon, valid_dim)
+            valid_dim = out_points if n_key is not None else self.max_motion_objects
+            keypoint_target = torch.zeros(self.motion_horizon, out_points * 2)
+            keypoint_active_target = torch.zeros(self.motion_horizon, valid_dim)
             has_keypoint = 0.0
             keypoints = content.keypoints or {}
             # "active" = retired object-slot pipeline's time-varying flag; "valid" =
             # the current flat-point pipeline's static per-object mask (see
-            # test_keypoint_tracking_simple.py / Gr00tN1d7Config.keypoint_head_mode).
-            # Both are 0/1 flags, never coordinate data.
+            # test_keypoint_tracking_simple.py). Both are 0/1 flags, never
+            # coordinate data.
             coord_keys = [k for k in keypoints if "active" not in k and "valid" not in k]
             active_keys = [k for k in keypoints if "active" in k or "valid" in k]
             if coord_keys and active_keys:
@@ -669,9 +669,9 @@ class Gr00tN1d7Processor(BaseProcessor):
                 ).reshape(-1, full_dim)
                 active = torch.from_numpy(
                     np.asarray(keypoints[active_keys[0]], dtype=np.float32)
-                ).reshape(-1, self.max_keypoint_objects)
-                assert kp.shape[0] == self.keypoint_horizon, (
-                    f"Expected {self.keypoint_horizon} keypoint steps, got {kp.shape[0]}"
+                ).reshape(-1, self.max_motion_objects)
+                assert kp.shape[0] == self.motion_horizon, (
+                    f"Expected {self.motion_horizon} keypoint steps, got {kp.shape[0]}"
                 )
                 if n_key is None:
                     keypoint_target = kp
@@ -680,10 +680,10 @@ class Gr00tN1d7Processor(BaseProcessor):
                 else:
                     # Static per-point validity from the (static) per-object mask
                     # at the window's first step.
-                    point_valid = active[0].repeat_interleave(self.keypoints_per_object)
+                    point_valid = active[0].repeat_interleave(self.motion_points_per_object)
                     valid_idx = (point_valid > 0.5).nonzero(as_tuple=True)[0]
                     if len(valid_idx) > 0:
-                        kp_pts = kp.view(self.keypoint_horizon, n_total, 2)
+                        kp_pts = kp.view(self.motion_horizon, n_total, 2)
                         # Motion score per point: total per-step displacement
                         # across the window (see the block comment above). Norms
                         # are non-negative, so tracker jitter ACCUMULATES over
@@ -709,9 +709,9 @@ class Gr00tN1d7Processor(BaseProcessor):
                             # list (duplicated points just get supervised twice).
                             reps = -(-n_key // len(ranked))  # ceil division
                             sel = ranked.repeat(reps)[:n_key]
-                        keypoint_target = kp_pts[:, sel].reshape(self.keypoint_horizon, -1)
+                        keypoint_target = kp_pts[:, sel].reshape(self.motion_horizon, -1)
                         keypoint_active_target = (
-                            point_valid[sel].unsqueeze(0).expand(self.keypoint_horizon, -1).clone()
+                            point_valid[sel].unsqueeze(0).expand(self.motion_horizon, -1).clone()
                         )
                         has_keypoint = 1.0
             transformed_inputs["keypoint_target"] = keypoint_target
@@ -802,10 +802,10 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "max_action_dim": self.max_action_dim,
                 "max_action_horizon": self.max_action_horizon,
                 # Object keypoint aux target dimensions
-                "keypoint_horizon": self.keypoint_horizon,
-                "max_keypoint_objects": self.max_keypoint_objects,
-                "keypoints_per_object": self.keypoints_per_object,
-                "keypoint_n_key": self.keypoint_n_key,
+                "motion_horizon": self.motion_horizon,
+                "max_motion_objects": self.max_motion_objects,
+                "motion_points_per_object": self.motion_points_per_object,
+                "num_motion_tokens": self.num_motion_tokens,
                 # StateActionProcessor settings
                 "use_percentiles": self.use_percentiles,
                 "use_mean_std": self.use_mean_std,
@@ -889,10 +889,10 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "formalize_language",
                 "apply_sincos_state_encoding",
                 "max_action_horizon",
-                "keypoint_horizon",
-                "max_keypoint_objects",
-                "keypoints_per_object",
-                "keypoint_n_key",
+                "motion_horizon",
+                "max_motion_objects",
+                "motion_points_per_object",
+                "num_motion_tokens",
                 "use_albumentations",
                 "extra_augmentation_config",
                 "shortest_image_edge",

@@ -36,6 +36,7 @@ dependencies = [
     "numpy==1.26.4",
     "omegaconf==2.3.0",
     "scipy==1.15.3",
+    "scikit-learn==1.5.2",
     # x86_64: PyPI wheel; aarch64 Linux: prebuilt wheel in scripts/deployment/dgpu/wheels/
     "torchcodec==0.4.0; platform_machine == 'x86_64'",
     "torchcodec==0.10.0a0; platform_machine == 'aarch64' and sys_platform == 'linux'",
