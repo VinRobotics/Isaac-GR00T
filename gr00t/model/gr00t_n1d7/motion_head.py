@@ -142,11 +142,34 @@ class MotionHead(nn.Module):
         return (num * sample_weight).sum() / ((den * sample_weight).sum() + 1e-6)
 
     def pool(self, motion_token_features: torch.Tensor) -> torch.Tensor:
-        """Mean-pool the motion tokens into one per-sample feature vector,
-        the space the OT alignment loss operates in (config.motion_pool)."""
-        if self.config.motion_pool == "mean":
-            return motion_token_features.mean(dim=1)
-        raise ValueError(f"Unsupported motion_pool: {self.config.motion_pool!r}")
+        """Reduce the motion tokens into one per-sample feature vector, then
+        L2-normalize — the space the OT alignment loss's matching plan is
+        computed from (config.motion_pool).
+
+        Unlike backbone_features (a variable-length image/language sequence
+        that MUST be reduced to a fixed size somehow — see
+        BackboneAttentionPool in gr00t_n1d7.py), motion_token_features always
+        has exactly num_motion_tokens positions: a small, fixed count where
+        each slot has a stable per-index identity (a persistent query
+        embedding tracking "the i-th most-moving point" — see
+        motion_head.md's point-identity section). There's no variable-length
+        sequence to collapse here, so "concat" (default) simply flattens all
+        P slots into one P*D vector, losing nothing a mean would have
+        averaged away, at negligible extra Sinkhorn cost (the transport cost
+        matrix scales with batch size, not feature dim). "mean" is kept only
+        for backward compatibility / ablation against the old behavior.
+        L2-normalizing keeps this space on the same (cosine-like) scale as
+        BackboneAttentionPool's output; motion_pooled_features isn't the side
+        gradient collapse was observed on (it's trained only by motion_loss,
+        never touched by the OT loss), but normalizing keeps both sides of
+        the Sinkhorn cost consistent."""
+        if self.config.motion_pool == "concat":
+            pooled = motion_token_features.reshape(motion_token_features.shape[0], -1)
+        elif self.config.motion_pool == "mean":
+            pooled = motion_token_features.mean(dim=1)
+        else:
+            raise ValueError(f"Unsupported motion_pool: {self.config.motion_pool!r}")
+        return F.normalize(pooled, dim=-1)
 
     def forward(self, motion_token_features: torch.Tensor, motion_input: BatchFeature) -> dict:
         """

@@ -32,7 +32,6 @@ def _small_config(**overrides) -> Gr00tN1d7Config:
         num_motion_tokens=4,
         motion_static_weight=0.0,
         motion_relative=False,
-        motion_pool="mean",
     )
     defaults.update(overrides)
     return Gr00tN1d7Config(**defaults)
@@ -51,6 +50,10 @@ def _motion_input(batch_size, horizon, num_points, has_keypoint=1.0):
 
 
 def test_motion_head_output_shapes():
+    """Default motion_pool="concat": lossless flatten of all num_motion_tokens
+    slots, so motion_pooled_features is num_motion_tokens times wider than a
+    single token's feature dim (unlike backbone_pooled_features, which must
+    reduce a variable-length sequence to backbone_embedding_dim)."""
     config = _small_config()
     head = MotionHead(config)
 
@@ -62,7 +65,28 @@ def test_motion_head_output_shapes():
 
     assert out["motion_loss"].shape == ()
     assert out["motion_pred"].shape == (batch_size, config.motion_horizon, num_points, 1, 2)
-    assert out["motion_pooled_features"].shape == (batch_size, config.backbone_embedding_dim)
+    assert out["motion_pooled_features"].shape == (
+        batch_size,
+        num_points * config.backbone_embedding_dim,
+    )
+    norms = out["motion_pooled_features"].norm(dim=-1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+
+def test_motion_head_mean_pool_ablation():
+    """motion_pool="mean" is kept for backward compatibility / ablation
+    against the pre-concat behavior — still averages down to a single
+    token's feature dim."""
+    config = _small_config(motion_pool="mean")
+    head = MotionHead(config)
+
+    batch_size, num_points = 3, config.num_motion_tokens
+    motion_token_features = torch.randn(batch_size, num_points, config.backbone_embedding_dim)
+
+    pooled = head.pool(motion_token_features)
+    assert pooled.shape == (batch_size, config.backbone_embedding_dim)
+    norms = pooled.norm(dim=-1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
 
 
 def test_motion_head_anchor_matches_target_step0():

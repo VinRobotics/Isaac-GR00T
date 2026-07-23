@@ -162,14 +162,36 @@ class Gr00tN1d7Config(PretrainedConfig):
     # How the num_motion_tokens post-backbone hidden states are pooled into one
     # per-sample feature vector — the MATCHING signal for the OT alignment
     # loss, not the thing actually pulled together (see enable_ot_align).
-    # Only "mean" is currently implemented.
-    motion_pool: str = "mean"  # one of {"mean"}
+    # "concat" (default): flatten all num_motion_tokens slots into one
+    # num_motion_tokens*backbone_embedding_dim vector — lossless, since (unlike
+    # backbone_features) this is always a small, fixed-size set with a stable
+    # per-slot identity, so there's no variable-length sequence forcing a real
+    # pool. "mean": average over tokens (loses cross-slot information), kept
+    # for backward compatibility / ablation against the old behavior.
+    motion_pool: str = "concat"  # one of {"concat", "mean"}
 
     enable_ot_align: bool = False
     ot_align_weight: float = 1.0
     ot_warmup_steps: int = 1000
     ot_sinkhorn_eps: float = 0.1
     ot_sinkhorn_iters: int = 50
+
+    # Attention-pooling heads for backbone_pooled_features (the OT alignment
+    # TARGET — see BackboneAttentionPool in gr00t_n1d7.py). Replaces naive
+    # masked-mean pooling, which empirically let backbone_pooled_features
+    # collapse toward a near-constant vector during OT training (measured via
+    # Gr00tTrainer._log_domain_alignment_viz's per-domain variance dropping to
+    # ~1e-8): averaging over the whole image/language token sequence dilutes
+    # sample-specific signal behind hundreds of largely-similar tokens, and
+    # the OT loss's unconstrained squared-Euclidean cost then has a trivial
+    # "shrink everything to one point" minimum. A single learnable query
+    # cross-attending over the sequence, combined with L2-normalizing the
+    # pooled output (see BackboneAttentionPool.forward /
+    # MotionHead.pool), removes that trivial minimum: normalized vectors
+    # can't collapse via uniform shrinkage, only by literally aligning in
+    # direction, a qualitatively different (and much harder to hit by
+    # accident) degenerate solution. Must divide backbone_embedding_dim.
+    backbone_pool_heads: int = 8
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -186,8 +208,8 @@ class Gr00tN1d7Config(PretrainedConfig):
                 elif getattr(f, "default_factory", MISSING) is not MISSING:
                     setattr(self, f.name, f.default_factory())
 
-        if self.motion_pool not in ("mean",):
-            raise ValueError(f"motion_pool must be 'mean', got {self.motion_pool!r}")
+        if self.motion_pool not in ("concat", "mean"):
+            raise ValueError(f"motion_pool must be 'concat' or 'mean', got {self.motion_pool!r}")
         if self.num_motion_tokens is not None:
             n_total = self.max_motion_objects * self.motion_points_per_object
             if not 1 <= self.num_motion_tokens <= n_total:
@@ -197,6 +219,11 @@ class Gr00tN1d7Config(PretrainedConfig):
                 )
         if self.enable_ot_align and not self.enable_motion_head:
             raise ValueError("enable_ot_align requires enable_motion_head=True")
+        if self.enable_motion_head and self.backbone_embedding_dim % self.backbone_pool_heads != 0:
+            raise ValueError(
+                f"backbone_pool_heads ({self.backbone_pool_heads}) must divide "
+                f"backbone_embedding_dim ({self.backbone_embedding_dim})"
+            )
 
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""

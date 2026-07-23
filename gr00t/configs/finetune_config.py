@@ -152,12 +152,16 @@ class FinetuneConfig:
     but a checkpoint trained one way predicts garbage interpreted the other
     way — keep it consistent across save/load."""
 
-    motion_pool: str = "mean"
+    motion_pool: str = "concat"
     """How the num_motion_tokens post-backbone hidden states are pooled into
     one per-sample feature vector — the MATCHING signal for the OT alignment
     loss (enable_ot_align), not the thing actually pulled together (see
-    enable_ot_align). Currently only "mean" (simple average across tokens) is
-    implemented."""
+    enable_ot_align). "concat" (default): flatten all num_motion_tokens slots
+    into one vector — lossless, since this is always a small, fixed-size set
+    with a stable per-slot identity (unlike backbone_features' variable-length
+    sequence, there's no real pooling need here). "mean": average across
+    tokens (loses cross-slot information), kept for backward compatibility /
+    ablation."""
 
     # --- Optimal Transport alignment between human and robot samples ---
     enable_ot_align: bool = False
@@ -206,6 +210,15 @@ class FinetuneConfig:
 
     ot_sinkhorn_iters: int = 50
     """Number of Sinkhorn normalization iterations."""
+
+    backbone_pool_heads: int = 8
+    """Number of attention heads for BackboneAttentionPool, which pools
+    backbone_features into backbone_pooled_features (the OT alignment
+    TARGET) via a single learnable query cross-attending over the token
+    sequence, L2-normalized — replaces naive mean-pool, which let this
+    pooled vector collapse toward a near-constant value during OT training
+    (see enable_ot_align, gr00t_n1d7.py's BackboneAttentionPool). Must
+    divide backbone_embedding_dim."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None

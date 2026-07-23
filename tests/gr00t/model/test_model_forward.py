@@ -285,33 +285,52 @@ class TestGr00tN1d7MotionHead:
             1,
             2,
         )
-        assert output["motion_pooled_features"].shape == (2, config.backbone_embedding_dim)
+        assert output["motion_pooled_features"].shape == (
+            2,
+            config.num_motion_tokens * config.backbone_embedding_dim,
+        )
 
     def test_backbone_pooled_features_present_and_correctly_shaped(
         self, small_model_with_motion_head
     ):
         """backbone_pooled_features is the OT alignment TARGET (see
         gr00t/model/modules/optimal_transport.py) — distinct from
-        motion_pooled_features (the matching signal)."""
+        motion_pooled_features (the matching signal). The two are NOT
+        required to share a shape: motion_pool="concat" (default) flattens
+        all num_motion_tokens slots losslessly, while backbone_pooled_features
+        is always pooled down to backbone_embedding_dim (BackboneAttentionPool
+        must reduce a variable-length sequence to a fixed size)."""
         model, config = small_model_with_motion_head
         inputs = _make_dummy_inputs_with_keypoints(config)
         output = model.forward(inputs)
 
         assert "backbone_pooled_features" in output
         assert output["backbone_pooled_features"].shape == (2, config.backbone_embedding_dim)
-        # Distinct tensors, not aliases of the motion features.
-        assert output["backbone_pooled_features"].shape == output["motion_pooled_features"].shape
         assert not torch.allclose(
-            output["backbone_pooled_features"], output["motion_pooled_features"]
+            output["backbone_pooled_features"],
+            output["motion_pooled_features"][:, : config.backbone_embedding_dim],
         )
 
-    def test_backbone_pooled_features_matches_manual_mean(self, small_model_with_motion_head):
+    def test_backbone_pooled_features_are_l2_normalized(self, small_model_with_motion_head):
+        """BackboneAttentionPool L2-normalizes its output (see gr00t_n1d7.py)
+        to remove the OT loss's trivial shrink-to-a-point collapse minimum —
+        confirm every pooled vector actually lands on the unit sphere."""
         model, config = small_model_with_motion_head
         inputs = _make_dummy_inputs_with_keypoints(config)
         output = model.forward(inputs)
 
-        manual_pool = output["backbone_features"].mean(dim=1)
-        assert torch.allclose(output["backbone_pooled_features"], manual_pool, atol=1e-5)
+        norms = output["backbone_pooled_features"].norm(dim=-1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+    def test_backbone_pool_gradient_flows_to_attention_query(self, small_model_with_motion_head):
+        model, config = small_model_with_motion_head
+        model.train()
+        inputs = _make_dummy_inputs_with_keypoints(config)
+        output = model.forward(inputs)
+
+        output["backbone_pooled_features"].sum().backward()
+        assert model.backbone_pool.query.grad is not None
+        assert model.backbone_pool.query.grad.norm().item() > 0
 
     def test_motion_loss_folded_into_total_loss(self, small_model_with_motion_head):
         model, config = small_model_with_motion_head

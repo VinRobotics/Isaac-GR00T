@@ -486,17 +486,40 @@ class Gr00tN1d7ActionHead(nn.Module):
         return BatchFeature(data=batch)
 
 
-def _masked_mean_pool(features: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-    """Masked mean over the sequence dim — pools per-token backbone features
-    into one per-sample vector for OT alignment (see
-    gr00t/model/modules/optimal_transport.py's cross-feature mode: this is
-    the alignment TARGET, distinct from motion_pooled_features which decides
-    the matching). Mirrors the retired keypoint head's
-    _keypoint_condition_token pooling."""
-    if mask is None:
-        return features.mean(dim=1)
-    mask = mask.to(features.dtype).unsqueeze(-1)
-    return (features * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+class BackboneAttentionPool(nn.Module):
+    """Learnable single-query attention pooling for backbone_pooled_features
+    (see gr00t/model/modules/optimal_transport.py's cross-feature OT
+    alignment) — replaces naive masked-mean pooling.
+
+    Averaging over the whole image/language token sequence dilutes
+    sample-specific signal behind hundreds of largely-similar
+    background/scene tokens; empirically this correlated with
+    backbone_pooled_features collapsing toward a near-constant vector during
+    OT training (per-domain variance -> ~1e-8, see
+    Gr00tTrainer._log_domain_alignment_viz). A single learnable query
+    cross-attends over the masked token sequence so the model can choose what
+    to summarize instead of averaging everything equally, and the output is
+    L2-normalized (see forward()) so the OT loss's squared-Euclidean cost
+    can't be trivially minimized by shrinking every sample's pooled vector
+    toward a single point — only by actually aligning in direction."""
+
+    def __init__(self, hidden_size: int, num_heads: int = 8):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
+        self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+
+    def forward(self, features: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        batch_size = features.shape[0]
+        query = self.query.expand(batch_size, -1, -1).to(features.dtype)
+        key_padding_mask = None
+        if mask is not None:
+            # nn.MultiheadAttention's key_padding_mask is True at positions to
+            # IGNORE — inverted from our valid-token mask convention.
+            key_padding_mask = ~mask.bool()
+        pooled, _ = self.attn(
+            query, features, features, key_padding_mask=key_padding_mask, need_weights=False
+        )
+        return F.normalize(pooled.squeeze(1), dim=-1)
 
 
 def get_backbone_cls(config: Gr00tN1d7Config):
@@ -575,6 +598,11 @@ class Gr00tN1d7(PreTrainedModel):
         from .motion_head import MotionHead
 
         self.motion_head = MotionHead(config) if config.enable_motion_head else None
+        self.backbone_pool = (
+            BackboneAttentionPool(config.backbone_embedding_dim, config.backbone_pool_heads)
+            if config.enable_motion_head
+            else None
+        )
 
         from .processing_gr00t_n1d7 import Gr00tN1d7DataCollator
 
@@ -656,7 +684,7 @@ class Gr00tN1d7(PreTrainedModel):
                 action_outputs["motion_loss"] = motion_outputs["motion_loss"]
                 action_outputs["motion_pred"] = motion_outputs["motion_pred"]
                 action_outputs["motion_pooled_features"] = motion_outputs["motion_pooled_features"]
-                action_outputs["backbone_pooled_features"] = _masked_mean_pool(
+                action_outputs["backbone_pooled_features"] = self.backbone_pool(
                     action_outputs["backbone_features"],
                     action_outputs.get("backbone_attention_mask"),
                 )

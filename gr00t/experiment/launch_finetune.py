@@ -191,6 +191,7 @@ if __name__ == "__main__":
     config.model.ot_warmup_steps = ft_config.ot_warmup_steps
     config.model.ot_sinkhorn_eps = ft_config.ot_sinkhorn_eps
     config.model.ot_sinkhorn_iters = ft_config.ot_sinkhorn_iters
+    config.model.backbone_pool_heads = ft_config.backbone_pool_heads
     if ft_config.enable_ot_align:
         assert len(ft_config.dataset_path) == 2, (
             "--enable-ot-align requires exactly two dataset paths so batches can be "

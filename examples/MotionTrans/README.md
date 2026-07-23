@@ -145,14 +145,21 @@ OT alignment uses TWO distinct pooled feature spaces, computed by the **Trainer*
 the model (human vs. robot grouping uses the existing per-sample `is_human` signal,
 deliberately never routed into the model's forward pass):
 
-- **Matching space** = pooled motion-token features (`mean` over the token axis, by
-  default) — an embodiment-invariant "what motion is this" signal, trained only by
-  `motion_loss`. Used to compute the Sinkhorn transport plan `P*`.
+- **Matching space** = pooled motion-token features (`mean` over the token axis, then
+  L2-normalized) — an embodiment-invariant "what motion is this" signal, trained only
+  by `motion_loss`. Used to compute the Sinkhorn transport plan `P*`.
 - **Alignment target** = pooled backbone features (`backbone_pooled_features` — the
   vlln/vl_self_attention-refined representation that actually feeds the DiT via
-  cross-attention) — what actually gets pulled together according to `P*`. Motion
-  decides *which* robot/human samples correspond; the pull is applied to the
-  representation that matters for transfer.
+  cross-attention), pooled via `BackboneAttentionPool` (a single learnable query
+  cross-attending over the token sequence, L2-normalized) — what actually gets
+  pulled together according to `P*`. Motion decides *which* robot/human samples
+  correspond; the pull is applied to the representation that matters for transfer.
+  Replaces an earlier naive mean-pool, which let this pooled vector collapse
+  toward a near-constant value during OT training (per-domain variance measured
+  dropping to ~1e-8 over a real run) — the attention pool reduces dilution from
+  averaging hundreds of tokens, and L2-normalizing removes the OT cost's trivial
+  "shrink everything to one point" minimum (see motion_head.md for the full
+  incident writeup).
 
 The transport plan is **detached** before computing the alignment loss
 (`stopgrad_plan`, default on in `sinkhorn_ot_loss`), so this never leaks an
@@ -217,7 +224,11 @@ pass:
 out = policy.model(inputs=batch)
 out["motion_pred"]  # [B, motion_horizon, P, 1, 2], [-1, 1] normalized image coords.
                      # Weight overlays with the GT valid mask (keypoint_active_target).
-out["motion_pooled_features"]    # [B, backbone_embedding_dim], the OT MATCHING space.
+out["motion_pooled_features"]    # [B, num_motion_tokens * backbone_embedding_dim] with the
+                                  # default motion_pool="concat" (lossless flatten of all
+                                  # slots — a small, fixed-size set unlike backbone_features'
+                                  # variable-length sequence, so no real pooling is needed).
+                                  # The OT MATCHING space.
 out["backbone_pooled_features"]  # [B, backbone_embedding_dim], the OT alignment TARGET.
 ```
 

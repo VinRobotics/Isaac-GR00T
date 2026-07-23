@@ -40,11 +40,13 @@ MOTION_AUX_PARAM_NAMES = (
     "motion_query_tokens",
     "motion_coord_encoder",
     "motion_position_decoder",
+    "backbone_pool",
 )
 
 
 def _reinit_fresh_linear_like(module: torch.nn.Module) -> None:
-    """Re-run real parameter init for every Linear/Embedding inside `module`.
+    """Re-run real parameter init for every Linear/Embedding/MultiheadAttention
+    inside `module`.
 
     from_pretrained's fast-init path monkey-patches torch.nn.init.{kaiming_uniform_,
     uniform_,normal_} to no-ops for the duration of model construction (skipping the
@@ -55,7 +57,12 @@ def _reinit_fresh_linear_like(module: torch.nn.Module) -> None:
     returned, once that patch context has exited.
     """
     for m in module.modules():
-        if isinstance(m, (torch.nn.Linear, torch.nn.Embedding)):
+        if isinstance(m, torch.nn.MultiheadAttention):
+            # in_proj_weight/in_proj_bias are bare Parameters on the module
+            # itself (not wrapped in a child Linear), so the isinstance check
+            # below never reaches them — MHA carries its own reset method.
+            m._reset_parameters()
+        elif isinstance(m, (torch.nn.Linear, torch.nn.Embedding)):
             m.reset_parameters()
 
 
@@ -66,7 +73,8 @@ def _reinit_missing_motion_params(model: torch.nn.Module, missing_keys: list) ->
     an explicit post-load re-init rather than assuming __init__ already did it.
 
     motion_query_tokens lives on model.backbone; motion_coord_encoder /
-    motion_position_decoder live on model.motion_head.
+    motion_position_decoder live on model.motion_head; backbone_pool
+    (BackboneAttentionPool) lives directly on model.
     """
     missing_names = [
         name for name in MOTION_AUX_PARAM_NAMES if any(name in k for k in missing_keys)
@@ -76,10 +84,15 @@ def _reinit_missing_motion_params(model: torch.nn.Module, missing_keys: list) ->
         if submodule is None:
             submodule = getattr(model.motion_head, name, None)
         if submodule is None:
+            submodule = getattr(model, name, None)
+        if submodule is None:
             continue
         with torch.no_grad():
             if name == "motion_query_tokens":
                 submodule.data.normal_(mean=0.0, std=0.02)
+            elif name == "backbone_pool":
+                torch.nn.init.normal_(submodule.query, mean=0.0, std=0.02)
+                _reinit_fresh_linear_like(submodule)
             else:
                 _reinit_fresh_linear_like(submodule)
     return missing_names
@@ -158,6 +171,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 ot_warmup_steps=self.config.model.ot_warmup_steps,
                 ot_sinkhorn_eps=self.config.model.ot_sinkhorn_eps,
                 ot_sinkhorn_iters=self.config.model.ot_sinkhorn_iters,
+                backbone_pool_heads=self.config.model.backbone_pool_heads,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 # num_motion_tokens can change shape of motion_query_tokens/
