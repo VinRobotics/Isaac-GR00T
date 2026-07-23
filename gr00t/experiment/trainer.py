@@ -52,6 +52,7 @@ import wandb
 
 from gr00t.model.gr00t_n1d7.keypoint_viz import combine_gt_pred, render_keypoint_overlay
 from gr00t.model.modules.optimal_transport import sinkhorn_ot_loss
+from sklearn.neighbors import NearestNeighbors
 
 
 def _action_loss_by_group(
@@ -816,13 +817,7 @@ class Gr00tTrainer(Trainer):
         # [N, N, D] broadcasted difference tensor here: a whole validation set
         # of only ~8k examples with 2k-dim features would require hundreds of GB.
         k = min(10, feats_arr.shape[0] - 1)
-        try:
-            from sklearn.neighbors import NearestNeighbors
-        except ImportError:
-            logging.warning(
-                "scikit-learn not installed - skipping motion-domain KNN and t-SNE diagnostics."
-            )
-            return
+
         nn_idx = (
             NearestNeighbors(n_neighbors=k + 1)
             .fit(feats_arr)
