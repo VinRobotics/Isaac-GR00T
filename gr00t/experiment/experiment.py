@@ -248,11 +248,11 @@ def run(config: Config):
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         multiprocessing_context=config.data.multiprocessing_context,
-        keypoint_viz_max_images=config.training.keypoint_viz_max_images,
-        keypoint_video_episodes=config.training.keypoint_video_episodes,
-        keypoint_video_max_frames=config.training.keypoint_video_max_frames,
-        keypoint_video_batch_size=config.training.keypoint_video_batch_size,
-        keypoint_video_fps=config.training.keypoint_video_fps,
+        motion_viz_max_images=config.training.motion_viz_max_images,
+        motion_video_episodes=config.training.motion_video_episodes,
+        motion_video_max_frames=config.training.motion_video_max_frames,
+        motion_video_batch_size=config.training.motion_video_batch_size,
+        motion_video_fps=config.training.motion_video_fps,
     )
 
     trainer.add_callback(
