@@ -263,7 +263,7 @@ class Gr00tTrainer(Trainer):
         self.motion_video_max_frames = kwargs.pop("motion_video_max_frames", 100)
         self.motion_video_batch_size = kwargs.pop("motion_video_batch_size", 8)
         self.motion_video_fps = kwargs.pop("motion_video_fps", 10)
-        self.domain_viz_max_points = kwargs.pop("domain_viz_max_points", 500)
+        self.domain_viz_max_points = kwargs.pop("domain_viz_max_points", None)
         super().__init__(
             *args,
             **kwargs,
@@ -427,11 +427,13 @@ class Gr00tTrainer(Trainer):
 
             if (
                 enable_motion_head
-                and self.args.local_rank in (-1, 0)
                 and isinstance(outputs, dict)
                 and "motion_pooled_features" in outputs
                 and is_human_batch is not None
-                and domain_candidates_seen < self.domain_viz_max_points * 20
+                and (
+                    self.domain_viz_max_points is None
+                    or domain_candidates_seen < self.domain_viz_max_points * 20
+                )
             ):
                 domain_candidates_seen = self._collect_domain_features(
                     outputs["motion_pooled_features"].detach(),
@@ -475,6 +477,20 @@ class Gr00tTrainer(Trainer):
             metrics[f"{metric_key_prefix}_ot_loss"] = (
                 total_ot_loss / ot_batches.clamp(min=1)
             ).item()
+
+        # Each DDP rank evaluates a disjoint portion of the iterable dataset.
+        # Gather feature vectors once, after evaluation, so the alignment chart
+        # represents the whole validation set rather than rank 0's portion.
+        if enable_motion_head and self.args.world_size > 1:
+            gathered_domain_data = [None] * self.args.world_size
+            dist.all_gather_object(gathered_domain_data, (domain_feats, domain_is_human))
+            if self.args.local_rank in (-1, 0):
+                domain_feats = [
+                    feature for features, _ in gathered_domain_data for feature in features
+                ]
+                domain_is_human = [
+                    domain for _, domains in gathered_domain_data for domain in domains
+                ]
 
         if enable_motion_head and self.args.local_rank in (-1, 0):
             logging.info(
@@ -751,13 +767,13 @@ class Gr00tTrainer(Trainer):
         is_human_list: list,
         num_seen: int,
     ) -> int:
-        """Reservoir-sample (Algorithm R) up to domain_viz_max_points pooled
-        motion-feature vectors + their human/robot flag across the eval pass,
-        for _log_domain_alignment_viz."""
+        """Collect pooled motion features and their human/robot flags for the
+        evaluation alignment visualization. With domain_viz_max_points=None,
+        retain the whole validation set; otherwise use reservoir sampling."""
         pooled_np = pooled.float().cpu().numpy()
         is_human_np = is_human.detach().float().cpu().numpy()
         for i in range(pooled_np.shape[0]):
-            if num_seen < self.domain_viz_max_points:
+            if self.domain_viz_max_points is None or num_seen < self.domain_viz_max_points:
                 feats.append(pooled_np[i])
                 is_human_list.append(is_human_np[i])
             else:

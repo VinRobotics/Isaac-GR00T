@@ -321,8 +321,8 @@ class FinetuneConfig:
     motion_video_fps: int = 10
     """Playback fps for the logged keypoint overlay video."""
 
-    domain_viz_max_points: int = 500
-    """Max number of (pooled motion feature, is_human) pairs to reservoir-sample
-    across an evaluation run for the human-vs-robot t-SNE alignment scatter plot
-    and KNN domain-composition diagnostic (only meaningful when enable_ot_align
-    or enable_motion_head=True and eval is configured)."""
+    domain_viz_max_points: int | None = None
+    """Optional cap on (pooled motion feature, is_human) pairs used for the
+    human-vs-robot t-SNE alignment scatter plot and KNN domain-composition
+    diagnostic. None (the default) uses every validation sample; set a positive
+    value to reservoir-sample a large validation set."""
