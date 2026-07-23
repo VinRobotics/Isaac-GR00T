@@ -136,6 +136,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             model, loading_info = AutoModel.from_pretrained(
                 self.config.training.start_from_checkpoint,
                 tune_llm=self.config.model.tune_llm,
+                tune_top_llm_layers=self.config.model.tune_top_llm_layers,
                 tune_visual=self.config.model.tune_visual,
                 tune_projector=self.config.model.tune_projector,
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
