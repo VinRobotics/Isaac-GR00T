@@ -81,6 +81,10 @@ class DataConfig:
     video_decode_workers: int = 1
     num_ffmpeg_threads: int = 0
     overlap_episode_io: bool = False
+    # For two-source OT co-training, alternate individual samples from source 0
+    # and source 1. This makes every even-sized DataLoader batch exactly 50/50,
+    # rather than merely balancing the long-run shard sampling ratio.
+    interleave_two_datasets: bool = False
 
     # Override statistics from the pretrained checkpoint
     override_pretraining_statistics: bool = True

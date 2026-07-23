@@ -172,6 +172,7 @@ class ShardedMixtureDataset(IterableDataset):
         training: bool = True,
         num_shards_per_epoch: int = int(1e5),
         override_pretraining_statistics: bool = False,
+        interleave_two_datasets: bool = False,
     ):
         """Initialize mixture dataset with datasets, weights, and configuration."""
         self.datasets = datasets
@@ -182,6 +183,15 @@ class ShardedMixtureDataset(IterableDataset):
         self.epoch = 0
         self.processor = processor
         self.override_pretraining_statistics = override_pretraining_statistics
+        self.interleave_two_datasets = interleave_two_datasets
+        if self.interleave_two_datasets:
+            if not self.training:
+                raise ValueError("interleave_two_datasets is only supported for training")
+            if len(self.datasets) != 2:
+                raise ValueError(
+                    "interleave_two_datasets requires exactly two datasets, "
+                    f"got {len(self.datasets)}"
+                )
 
         # Generate initial shard sampling schedule
         self.shard_sampling_schedule = self.generate_shard_sampling_schedule()
@@ -360,6 +370,10 @@ class ShardedMixtureDataset(IterableDataset):
         4. Shuffle timesteps within each shard for additional randomization
         5. Handle epoch transitions and schedule regeneration
         """
+        if self.interleave_two_datasets:
+            yield from self._iter_interleaved_two_datasets()
+            return
+
         # Start background thread pool
         self._executor = ThreadPoolExecutor(max_workers=1)
 
@@ -408,6 +422,51 @@ class ShardedMixtureDataset(IterableDataset):
             processed_shards += 1
             if not self.training and processed_shards >= total_shards:
                 break
+
+    def _iter_interleaved_two_datasets(self):
+        """Alternate samples from the two sources within each worker stream.
+
+        DataLoader forms a batch from consecutive samples produced by one worker.
+        Alternating source 0/1 therefore yields an exact 50/50 split for every
+        even-sized per-device batch, keeping both domains available for OT.
+        """
+        worker_schedule = self.filter_shard_sample_schedule()
+        shard_queues = {
+            dataset_index: [
+                shard_index
+                for scheduled_dataset_index, shard_index in worker_schedule
+                if scheduled_dataset_index == dataset_index
+            ]
+            for dataset_index in range(2)
+        }
+        if not all(shard_queues.values()):
+            raise RuntimeError(
+                "Interleaved two-dataset mixing assigned no shard from one source to this worker. "
+                "Increase num_shards_per_epoch or reduce the number of data-loader workers."
+            )
+
+        rng = np.random.default_rng(self.seed + self.epoch)
+        current_shards: dict[int, list] = {}
+        remaining_indices: dict[int, list[int]] = {0: [], 1: []}
+
+        def next_sample(dataset_index: int):
+            while not remaining_indices[dataset_index]:
+                if not shard_queues[dataset_index]:
+                    # This only occurs after this worker has consumed its assigned
+                    # epoch schedule. Recycle the source's shards in a new random
+                    # order while preserving the 1:1 sample alternation.
+                    shard_queues[dataset_index] = list(range(len(self.datasets[dataset_index])))
+                    rng.shuffle(shard_queues[dataset_index])
+                shard_index = shard_queues[dataset_index].pop(0)
+                current_shards[dataset_index] = self.datasets[dataset_index].get_shard(shard_index)
+                remaining_indices[dataset_index] = list(range(len(current_shards[dataset_index])))
+                rng.shuffle(remaining_indices[dataset_index])
+            sample_index = remaining_indices[dataset_index].pop()
+            return current_shards[dataset_index][sample_index]
+
+        while True:
+            yield next_sample(0)
+            yield next_sample(1)
 
     def cache_next_shard(self):
         """

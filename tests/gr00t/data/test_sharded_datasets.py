@@ -72,7 +72,7 @@ class MockShardedDataset(ShardedDataset):
         return self._shard_length
 
     def get_shard(self, idx):
-        return [{"dummy": i} for i in range(self._shard_length)]
+        return [{"dummy": i, "dataset_path": self.dataset_path} for i in range(self._shard_length)]
 
     def get_dataset_statistics(self):
         return self._statistics
@@ -214,6 +214,18 @@ class TestShardedMixtureDataset:
                 seed=42,
             )
         processor.set_statistics.assert_called_once()
+
+    def test_interleaved_two_datasets_alternates_sources(self):
+        mixture = self._make_mixture(num_shards_per_epoch=20)
+        mixture.interleave_two_datasets = True
+
+        iterator = iter(mixture)
+        samples = [next(iterator) for _ in range(10)]
+
+        assert [sample["dataset_path"] for sample in samples] == [
+            "/fake/path_0",
+            "/fake/path_1",
+        ] * 5
 
 
 # ---------------------------------------------------------------------------

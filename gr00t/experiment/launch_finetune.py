@@ -190,6 +190,19 @@ if __name__ == "__main__":
     config.model.ot_warmup_steps = ft_config.ot_warmup_steps
     config.model.ot_sinkhorn_eps = ft_config.ot_sinkhorn_eps
     config.model.ot_sinkhorn_iters = ft_config.ot_sinkhorn_iters
+    if ft_config.enable_ot_align:
+        assert len(ft_config.dataset_path) == 2, (
+            "--enable-ot-align requires exactly two dataset paths so batches can be "
+            "interleaved 50/50 between the human and robot sources."
+        )
+        per_device_batch_size = ft_config.global_batch_size // ft_config.num_gpus
+        assert (
+            ft_config.global_batch_size % ft_config.num_gpus == 0 and per_device_batch_size % 2 == 0
+        ), (
+            "--enable-ot-align requires an even per-device batch size for an exact "
+            "50/50 human/robot split."
+        )
+        config.data.interleave_two_datasets = True
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False

@@ -189,6 +189,7 @@ class DatasetFactory:
             training=True,
             num_shards_per_epoch=self.config.data.num_shards_per_epoch,
             override_pretraining_statistics=self.config.data.override_pretraining_statistics,
+            interleave_two_datasets=self.config.data.interleave_two_datasets,
         )
 
         eval_dataset = None
