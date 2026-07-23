@@ -97,13 +97,14 @@ Object motion is embodiment-invariant: the same cup slides the same way whether 
 hand or a robot gripper pushes it. `num_motion_tokens` learnable query tokens pass
 through the **VLM backbone's own transformer layers** (alongside the image/language
 tokens — not the DiT/action head) and are trained to predict the future motion of
-tracked object keypoints, on **both human and robot samples**. The same pooled
-token embedding then doubles as the space for an **Optimal Transport (Sinkhorn)
-alignment loss** between human and robot samples in a batch — pulling the two domains'
-representations together. See `method_motion_keypoint_ot_v2.md` at the repo root for
-the full design rationale, and `gr00t/model/gr00t_n1d7/motion_head.py` /
-`gr00t/model/modules/optimal_transport.py` / `gr00t/model/modules/qwen3_backbone.py`
-for the implementation.
+tracked object keypoints, on **both human and robot samples**. The pooled motion-token
+embedding then decides, via an **Optimal Transport (Sinkhorn) alignment loss**, WHICH
+human and robot samples in a batch correspond — and that correspondence is used to pull
+the general **backbone representation** (the one actually feeding the DiT/action head)
+of matched pairs together, since that's the representation that matters for transfer.
+See `method_motion_keypoint_ot_v2.md` at the repo root for the full design rationale,
+and `gr00t/model/gr00t_n1d7/motion_head.py` / `gr00t/model/modules/optimal_transport.py`
+/ `gr00t/model/modules/qwen3_backbone.py` for the implementation.
 
 ### Data format
 
@@ -140,12 +141,25 @@ analysis this design is built on). `num_motion_tokens` selects the top-K
 MOST-MOVING valid points of the window per training sample (deterministic per window,
 so eval videos are stable); `None` uses the full flat point set.
 
-Pooled motion features (`mean` over the token axis, by default) feed the OT alignment
-loss (`enable_ot_align`), computed by the **Trainer**, not the model — human vs. robot
-grouping uses the existing per-sample `is_human` signal, which is deliberately never
-routed into the model's forward pass. `ot_align_weight` ramps in linearly over
-`ot_warmup_steps` so alignment pressure doesn't fight the motion head before its
-embeddings carry any signal.
+OT alignment uses TWO distinct pooled feature spaces, computed by the **Trainer**, not
+the model (human vs. robot grouping uses the existing per-sample `is_human` signal,
+deliberately never routed into the model's forward pass):
+
+- **Matching space** = pooled motion-token features (`mean` over the token axis, by
+  default) — an embodiment-invariant "what motion is this" signal, trained only by
+  `motion_loss`. Used to compute the Sinkhorn transport plan `P*`.
+- **Alignment target** = pooled backbone features (`backbone_pooled_features` — the
+  vlln/vl_self_attention-refined representation that actually feeds the DiT via
+  cross-attention) — what actually gets pulled together according to `P*`. Motion
+  decides *which* robot/human samples correspond; the pull is applied to the
+  representation that matters for transfer.
+
+The transport plan is **detached** before computing the alignment loss
+(`stopgrad_plan`, default on in `sinkhorn_ot_loss`), so this never leaks an
+alignment-driven gradient back into the motion-token encoder — it stays trained
+purely by `motion_loss`. `ot_align_weight` ramps in linearly over `ot_warmup_steps` so
+alignment pressure doesn't fight the motion head before its embeddings carry any
+signal.
 
 ### Loss
 
@@ -154,9 +168,9 @@ with the per-sample α co-training `loss_weight` folded into `motion_loss` the s
 as the action loss. `motion_loss` is a masked Huber position-regression loss against
 `keypoint_target`/`keypoint_active_target` (`motion_static_weight` re-enables
 down-weighted supervision on padding slots, default 0 = hard-masked). `ot_loss` is the
-Sinkhorn entropic-OT cost between the batch's pooled robot and human features
-(`ot_sinkhorn_eps`/`ot_sinkhorn_iters` control the solver). Both are logged separately
-by the trainer.
+Sinkhorn entropic-OT cost, matched on pooled motion features and applied to pooled
+backbone features (`ot_sinkhorn_eps`/`ot_sinkhorn_iters` control the solver). Both are
+logged separately by the trainer.
 
 ### Usage
 
@@ -179,19 +193,32 @@ Action-Head keypoint mechanism also loads fine — those `action_head.keypoint_*
 weights are discarded (logged as an expected migration, not an error).
 
 For debugging/eval, the trainer automatically logs GT-vs-predicted keypoint overlay
-images/videos to W&B (`{prefix}/motion`, `{prefix}/motion_episode_video/...`) plus a
-t-SNE scatter of pooled robot-vs-human features and KNN domain-composition/variance
-scalars (`{prefix}/motion_domain_tsne`, `{prefix}/motion_domain_knn_same_domain_frac`)
+images/videos to W&B (`{prefix}/motion`, `{prefix}/motion_episode_video/...`) plus,
 whenever the motion head is enabled and eval is configured (`validation_path` or
 `eval_set_split_ratio`) — see `gr00t/experiment/trainer.py`'s
-`_log_motion_viz`/`_log_domain_alignment_viz`. To decode keypoints directly from a
-forward pass instead:
+`_log_motion_viz`/`_log_domain_alignment_viz`:
+
+- A t-SNE scatter of pooled robot-vs-human **backbone** features (the actual alignment
+  target) plus KNN domain-composition/variance scalars
+  (`{prefix}/backbone_domain_tsne`, `{prefix}/backbone_domain_knn_same_domain_frac`,
+  `{prefix}/backbone_domain_robot_variance`, `{prefix}/backbone_domain_human_variance`)
+  — this is what answers "are robot/human representations actually being pulled
+  together", not the loss curve alone.
+- A motion-vs-backbone neighbor-structure agreement scalar
+  (`{prefix}/motion_backbone_neighbor_agreement`) — the cross-feature design assumes
+  correspondence found in motion-space is a reasonable correspondence to impose on
+  backbone-space; this isn't automatic, and a low value means that assumption doesn't
+  hold for this checkpoint/data even if the OT loss number looks fine.
+
+To decode keypoints and inspect both pooled feature spaces directly from a forward
+pass:
 
 ```python
 out = policy.model(inputs=batch)
 out["motion_pred"]  # [B, motion_horizon, P, 1, 2], [-1, 1] normalized image coords.
                      # Weight overlays with the GT valid mask (keypoint_active_target).
-out["motion_pooled_features"]  # [B, backbone_embedding_dim], the OT alignment space.
+out["motion_pooled_features"]    # [B, backbone_embedding_dim], the OT MATCHING space.
+out["backbone_pooled_features"]  # [B, backbone_embedding_dim], the OT alignment TARGET.
 ```
 
 ### Caveats

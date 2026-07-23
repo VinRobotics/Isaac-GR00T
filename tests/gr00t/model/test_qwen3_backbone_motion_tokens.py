@@ -137,3 +137,24 @@ def test_disabled_motion_tokens_is_backward_compatible():
     assert backbone.motion_query_tokens is None
     out = backbone(_text_only_input(batch_size=2, seq_len=6))
     assert "motion_token_features" not in out
+
+
+def test_no_shared_tensors_in_state_dict():
+    """Regression test: `_inner` (the resolved language_model/visual owner —
+    either `self.model` or `self.model.model` depending on transformers
+    version, see _resolve_inner_model) must NOT be stored as a plain instance
+    attribute, or nn.Module registers it as a second submodule aliasing the
+    same parameters under a `_inner.*` prefix. safetensors then refuses to
+    save the checkpoint at all ("shared tensors"). `_inner` must stay a
+    `@property` so it's never registered as a submodule."""
+    tiny_model = _tiny_qwen3_vl_model()
+    backbone = _make_backbone(num_motion_tokens=2, tiny_model=tiny_model)
+
+    names = [n for n, _ in backbone.named_parameters()]
+    assert not any(n.startswith("_inner.") for n in names)
+
+    seen_storage = set()
+    for _, p in backbone.named_parameters():
+        key = p.data_ptr()
+        assert key not in seen_storage, "duplicate tensor storage under two different names"
+        seen_storage.add(key)

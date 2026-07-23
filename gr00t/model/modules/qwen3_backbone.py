@@ -137,7 +137,6 @@ class Qwen3Backbone(torch.nn.Module):
             **extra_kwargs,
             **transformers_loading_kwargs,
         ).eval()
-        self._inner = _resolve_inner_model(self.model)
 
         # needed since we don't use these layers. Also saves compute
         while len(self._inner.language_model.layers) > select_layer:
@@ -159,6 +158,19 @@ class Qwen3Backbone(torch.nn.Module):
                 if p.requires_grad:
                     p.data = p.data.to(torch.float32)
                     logger.debug(f"Casting trainable parameter {n} to fp32")
+
+    @property
+    def _inner(self) -> torch.nn.Module:
+        """Resolved fresh on every access rather than cached as `self._inner =
+        ...` — an nn.Module instance assigned as an attribute gets registered
+        as a submodule, which would duplicate every one of `self.model`'s (or
+        `self.model.model`'s) parameters under a second attribute path
+        (`backbone._inner.*` alongside the real `backbone.model.*`/
+        `backbone.model.model.*`) in `state_dict()`/`named_parameters()` —
+        safetensors then refuses to save the checkpoint at all ("shared
+        tensors"). A property has no such cost: it's just a function call,
+        never registered as a submodule."""
+        return _resolve_inner_model(self.model)
 
     def _placeholder_token_id(self) -> int:
         """Vocab id used to reserve motion-query-token positions in input_ids
@@ -256,6 +268,14 @@ class Qwen3Backbone(torch.nn.Module):
             outputs = self.model(**vl_input, output_hidden_states=True)
 
         hidden = outputs.hidden_states[-1]
+        # backbone_features (real image/language tokens, feeds the DiT/action
+        # head via cross-attention) and motion_token_features (the appended
+        # learnable query tokens, feeds MotionHead/OT alignment) are DISJOINT
+        # slices of the same hidden sequence — motion tokens are always the
+        # last num_motion_tokens positions (appended in this same forward
+        # call, above), never overlapping with real_len real-token positions.
+        # They share the transformer's parameters (one backbone processes one
+        # joint sequence) but never share a token position / feature vector.
         real_len = hidden.shape[1] - self.num_motion_tokens
         backbone_features = hidden[:, :real_len]
         image_mask = vl_input["input_ids"][:, :real_len] == self.model.config.image_token_id

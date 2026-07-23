@@ -142,20 +142,39 @@ class FinetuneConfig:
 
     motion_pool: str = "mean"
     """How the num_motion_tokens post-backbone hidden states are pooled into
-    one per-sample feature vector for the OT alignment loss (enable_ot_align).
-    Currently only "mean" (simple average across tokens) is implemented."""
+    one per-sample feature vector — the MATCHING signal for the OT alignment
+    loss (enable_ot_align), not the thing actually pulled together (see
+    enable_ot_align). Currently only "mean" (simple average across tokens) is
+    implemented."""
 
-    # --- Optimal Transport alignment between human and robot motion features ---
+    # --- Optimal Transport alignment between human and robot samples ---
     enable_ot_align: bool = False
     """If True, compute a Sinkhorn (entropic optimal transport) alignment loss
-    between the pooled motion-token features of human vs. robot samples in each
-    batch, ramped in linearly over ot_warmup_steps. A separate switch from
+    between human and robot samples in each batch, ramped in linearly over
+    ot_warmup_steps. The transport plan is computed from pooled
+    motion-token features (motion_pooled_features — an embodiment-invariant
+    "what motion is this" signal, trained only by motion_loss), but the loss
+    actually pulls pooled BACKBONE features (backbone_pooled_features — the
+    vlln/vl_self_attention-refined representation that really feeds the
+    DiT/action head) together according to that plan: motion decides which
+    robot/human samples correspond, but the representation that matters for
+    transfer is the one the action head actually sees. The plan is detached
+    before computing the alignment loss (see
+    gr00t/model/modules/optimal_transport.py's stopgrad_plan, default True) so
+    this doesn't leak an alignment-driven gradient back into the motion-token
+    encoder — it stays trained purely by motion_loss. A separate switch from
     enable_motion_head so the motion-keypoint auxiliary loss can be trained
     alone (no alignment pressure) as an ablation; forced off when
     enable_motion_head=False (no pooled features to align). Distinguishing
     human/robot uses the existing per-sample is_human signal (see
     LeRobotEpisodeLoader.detect_is_human) — never routed into the model itself,
-    computed purely in the Trainer."""
+    computed purely in the Trainer. Eval-time diagnostics (see
+    Gr00tTrainer._log_domain_alignment_viz) log a t-SNE scatter + KNN
+    domain-composition + variance on backbone_pooled_features (the actual
+    alignment target) plus a motion-vs-backbone neighbor-structure agreement
+    check — the design assumes correspondence found in motion-space transfers
+    sensibly to backbone-space, which isn't automatic and should be verified,
+    not assumed."""
 
     ot_align_weight: float = 1.0
     """Target weight (lambda) of the OT alignment loss once ot_warmup_steps has

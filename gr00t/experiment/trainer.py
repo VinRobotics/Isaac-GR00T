@@ -42,6 +42,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from sklearn.neighbors import NearestNeighbors
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
@@ -52,7 +53,6 @@ import wandb
 
 from gr00t.model.gr00t_n1d7.keypoint_viz import combine_gt_pred, render_keypoint_overlay
 from gr00t.model.modules.optimal_transport import sinkhorn_ot_loss
-from sklearn.neighbors import NearestNeighbors
 
 
 def _action_loss_by_group(
@@ -358,10 +358,14 @@ class Gr00tTrainer(Trainer):
         viz_images_gt: list = []
         viz_images_pred: list = []
         viz_candidates_seen = 0
-        # Pooled human/robot motion features + domain flag, reservoir-sampled
-        # across the eval pass for the alignment diagnostics (t-SNE scatter, KNN
-        # domain-composition, per-domain variance — see _log_domain_alignment_viz).
-        domain_feats: list = []
+        # Paired pooled motion + backbone features (same sample, same reservoir
+        # slot) + domain flag, reservoir-sampled across the eval pass for the
+        # alignment diagnostics (t-SNE scatter, KNN domain-composition,
+        # per-domain variance on backbone_pooled_features — the actual OT
+        # alignment TARGET — plus a motion-vs-backbone neighbor-structure
+        # agreement check; see _log_domain_alignment_viz).
+        domain_motion_feats: list = []
+        domain_backbone_feats: list = []
         domain_is_human: list = []
         domain_candidates_seen = 0
 
@@ -402,10 +406,13 @@ class Gr00tTrainer(Trainer):
                 enable_ot_align
                 and isinstance(outputs, dict)
                 and "motion_pooled_features" in outputs
+                and "backbone_pooled_features" in outputs
                 and is_human_batch is not None
             ):
                 ot = self._compute_ot_loss(
-                    outputs["motion_pooled_features"].detach(), is_human_batch
+                    outputs["motion_pooled_features"].detach(),
+                    outputs["backbone_pooled_features"].detach(),
+                    is_human_batch,
                 )
                 if ot is not None:
                     total_ot_loss += ot.detach()
@@ -430,6 +437,7 @@ class Gr00tTrainer(Trainer):
                 enable_motion_head
                 and isinstance(outputs, dict)
                 and "motion_pooled_features" in outputs
+                and "backbone_pooled_features" in outputs
                 and is_human_batch is not None
                 and (
                     self.domain_viz_max_points is None
@@ -438,8 +446,10 @@ class Gr00tTrainer(Trainer):
             ):
                 domain_candidates_seen = self._collect_domain_features(
                     outputs["motion_pooled_features"].detach(),
+                    outputs["backbone_pooled_features"].detach(),
                     is_human_batch,
-                    domain_feats,
+                    domain_motion_feats,
+                    domain_backbone_feats,
                     domain_is_human,
                     domain_candidates_seen,
                 )
@@ -484,13 +494,18 @@ class Gr00tTrainer(Trainer):
         # represents the whole validation set rather than rank 0's portion.
         if enable_motion_head and self.args.world_size > 1:
             gathered_domain_data = [None] * self.args.world_size
-            dist.all_gather_object(gathered_domain_data, (domain_feats, domain_is_human))
+            dist.all_gather_object(
+                gathered_domain_data, (domain_motion_feats, domain_backbone_feats, domain_is_human)
+            )
             if self.args.local_rank in (-1, 0):
-                domain_feats = [
-                    feature for features, _ in gathered_domain_data for feature in features
+                domain_motion_feats = [
+                    feature for features, _, _ in gathered_domain_data for feature in features
+                ]
+                domain_backbone_feats = [
+                    feature for _, features, _ in gathered_domain_data for feature in features
                 ]
                 domain_is_human = [
-                    domain for _, domains in gathered_domain_data for domain in domains
+                    domain for _, _, domains in gathered_domain_data for domain in domains
                 ]
 
         if enable_motion_head and self.args.local_rank in (-1, 0):
@@ -503,27 +518,49 @@ class Gr00tTrainer(Trainer):
                 self._log_motion_viz(viz_images_gt, viz_images_pred, metric_key_prefix)
             if self.motion_video_episodes > 0 and self.motion_video_max_frames > 0:
                 self._log_motion_episode_video(model, metric_key_prefix)
-            if domain_feats:
-                self._log_domain_alignment_viz(domain_feats, domain_is_human, metric_key_prefix)
+            if domain_backbone_feats:
+                self._log_domain_alignment_viz(
+                    domain_motion_feats, domain_backbone_feats, domain_is_human, metric_key_prefix
+                )
 
         return EvalLoopOutput(
             predictions=None, label_ids=None, metrics=metrics, num_samples=num_samples
         )
 
-    def _compute_ot_loss(self, pooled: torch.Tensor, is_human: torch.Tensor) -> torch.Tensor | None:
-        """Sinkhorn OT loss between this batch's pooled robot vs human motion
-        features (see gr00t/model/modules/optimal_transport.py). Returns None
-        if the batch doesn't contain both domains (nothing to align this step)
-        — caller decides whether to detach `pooled` first (eval: yes; training:
-        no, gradients must flow into the motion-token/backbone parameters)."""
-        is_human_mask = is_human.to(pooled.dtype).view(-1) >= 0.5
-        h_robot = pooled[~is_human_mask]
-        h_human = pooled[is_human_mask]
-        if h_robot.shape[0] == 0 or h_human.shape[0] == 0:
+    def _compute_ot_loss(
+        self,
+        motion_pooled: torch.Tensor,
+        backbone_pooled: torch.Tensor,
+        is_human: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Sinkhorn OT loss for this batch: the transport plan is computed
+        from `motion_pooled` (an embodiment-invariant "what motion is this"
+        signal, trained only by motion_loss), but the loss actually pulls
+        `backbone_pooled` (the representation that really feeds the
+        DiT/action head) together according to that plan — matching and
+        alignment are deliberately different feature spaces, see
+        gr00t/model/modules/optimal_transport.py's cross-feature mode.
+        stopgrad_plan (default True there) keeps the matching signal clean:
+        gradients from this loss reach backbone_pooled/the backbone but not
+        motion_pooled/the motion-token encoder. Returns None if the batch
+        doesn't contain both domains (nothing to align this step) — caller
+        decides whether to detach the inputs first (eval: yes; training: no,
+        gradients must flow into the backbone parameters)."""
+        is_human_mask = is_human.to(motion_pooled.dtype).view(-1) >= 0.5
+        motion_robot = motion_pooled[~is_human_mask]
+        motion_human = motion_pooled[is_human_mask]
+        if motion_robot.shape[0] == 0 or motion_human.shape[0] == 0:
             return None
+        backbone_robot = backbone_pooled[~is_human_mask]
+        backbone_human = backbone_pooled[is_human_mask]
         cfg = self.model.config
         return sinkhorn_ot_loss(
-            h_robot, h_human, eps=cfg.ot_sinkhorn_eps, n_iters=cfg.ot_sinkhorn_iters
+            motion_robot,
+            motion_human,
+            eps=cfg.ot_sinkhorn_eps,
+            n_iters=cfg.ot_sinkhorn_iters,
+            target_robot=backbone_robot,
+            target_human=backbone_human,
         )
 
     def _ot_lambda(self) -> float:
@@ -762,41 +799,64 @@ class Gr00tTrainer(Trainer):
 
     def _collect_domain_features(
         self,
-        pooled: torch.Tensor,
+        motion_pooled: torch.Tensor,
+        backbone_pooled: torch.Tensor,
         is_human: torch.Tensor,
-        feats: list,
+        motion_feats: list,
+        backbone_feats: list,
         is_human_list: list,
         num_seen: int,
     ) -> int:
-        """Collect pooled motion features and their human/robot flags for the
-        evaluation alignment visualization. With domain_viz_max_points=None,
+        """Collect PAIRED pooled motion + backbone features (same sample, same
+        reservoir slot) and their human/robot flags for the evaluation
+        alignment diagnostics — paired so the motion-vs-backbone
+        neighbor-structure check in _log_domain_alignment_viz compares the two
+        spaces on the same underlying samples. With domain_viz_max_points=None,
         retain the whole validation set; otherwise use reservoir sampling."""
-        pooled_np = pooled.float().cpu().numpy()
+        motion_np = motion_pooled.float().cpu().numpy()
+        backbone_np = backbone_pooled.float().cpu().numpy()
         is_human_np = is_human.detach().float().cpu().numpy()
-        for i in range(pooled_np.shape[0]):
+        for i in range(motion_np.shape[0]):
             if self.domain_viz_max_points is None or num_seen < self.domain_viz_max_points:
-                feats.append(pooled_np[i])
+                motion_feats.append(motion_np[i])
+                backbone_feats.append(backbone_np[i])
                 is_human_list.append(is_human_np[i])
             else:
                 j = random.randint(0, num_seen)
                 if j < self.domain_viz_max_points:
-                    feats[j] = pooled_np[i]
+                    motion_feats[j] = motion_np[i]
+                    backbone_feats[j] = backbone_np[i]
                     is_human_list[j] = is_human_np[i]
             num_seen += 1
         return num_seen
 
     def _log_domain_alignment_viz(
-        self, feats: list, is_human_list: list, metric_key_prefix: str
+        self,
+        motion_feats: list,
+        backbone_feats: list,
+        is_human_list: list,
+        metric_key_prefix: str,
     ) -> None:
-        """Alignment diagnostics for the pooled motion features (see
-        method_motion_keypoint_ot_v2.md Section 7): a t-SNE scatter of
-        robot-vs-human features — are the two domains actually being pulled
-        together, not just the loss number going down? — plus the scalar KNN
-        domain-composition and per-domain-variance checks from the same
-        diagnostic checklist. Meaningful whenever the motion head runs, even
-        without OT alignment enabled (e.g. to establish a baseline before
-        turning enable_ot_align on)."""
-        feats_arr = np.stack(feats)
+        """Alignment diagnostics (see method_motion_keypoint_ot_v2.md Section
+        7), primarily on `backbone_feats` — the actual OT alignment TARGET
+        (see gr00t/model/modules/optimal_transport.py's cross-feature mode):
+        a t-SNE scatter of robot-vs-human backbone features — are the two
+        domains actually being pulled together, not just the loss number
+        going down? — plus the scalar KNN domain-composition and
+        per-domain-variance checks from the same diagnostic checklist.
+        Meaningful whenever the motion head runs, even without OT alignment
+        enabled (e.g. to establish a baseline before turning enable_ot_align
+        on).
+
+        Also checks the assumption the cross-feature design rests on: that
+        correspondence found in motion-space is a reasonable correspondence
+        to impose on backbone-space. Compares each sample's k-nearest
+        neighbors in motion-space vs. backbone-space — low overlap means the
+        two spaces disagree on "who's similar to whom", so matching on
+        motion-space may not be pulling the RIGHT backbone-space pairs
+        together, regardless of what the OT loss number says.
+        """
+        backbone_arr = np.stack(backbone_feats)
         is_human_arr = np.asarray(is_human_list) >= 0.5
         n_robot = int((~is_human_arr).sum())
         n_human = int(is_human_arr.sum())
@@ -807,8 +867,8 @@ class Gr00tTrainer(Trainer):
             )
             return
 
-        robot_var = float(feats_arr[~is_human_arr].var(axis=0).mean())
-        human_var = float(feats_arr[is_human_arr].var(axis=0).mean())
+        robot_var = float(backbone_arr[~is_human_arr].var(axis=0).mean())
+        human_var = float(backbone_arr[is_human_arr].var(axis=0).mean())
 
         # KNN domain-composition: for each point, what fraction of its k nearest
         # OTHER points (raw feature space, not the 2D t-SNE projection) share
@@ -816,29 +876,49 @@ class Gr00tTrainer(Trainer):
         # segregated despite whatever the loss curve says. Do not form an
         # [N, N, D] broadcasted difference tensor here: a whole validation set
         # of only ~8k examples with 2k-dim features would require hundreds of GB.
-        k = min(10, feats_arr.shape[0] - 1)
+        k = min(10, backbone_arr.shape[0] - 1)
 
-        nn_idx = (
+        backbone_nn_idx = (
             NearestNeighbors(n_neighbors=k + 1)
-            .fit(feats_arr)
-            .kneighbors(feats_arr, return_distance=False)[:, 1:]
+            .fit(backbone_arr)
+            .kneighbors(backbone_arr, return_distance=False)[:, 1:]
         )
-        same_domain_frac = float((is_human_arr[nn_idx] == is_human_arr[:, None]).mean())
+        same_domain_frac = float((is_human_arr[backbone_nn_idx] == is_human_arr[:, None]).mean())
 
         scalars = {
-            f"{metric_key_prefix}/motion_domain_robot_variance": robot_var,
-            f"{metric_key_prefix}/motion_domain_human_variance": human_var,
-            f"{metric_key_prefix}/motion_domain_knn_same_domain_frac": same_domain_frac,
+            f"{metric_key_prefix}/backbone_domain_robot_variance": robot_var,
+            f"{metric_key_prefix}/backbone_domain_human_variance": human_var,
+            f"{metric_key_prefix}/backbone_domain_knn_same_domain_frac": same_domain_frac,
         }
+
+        # Motion-space vs. backbone-space neighbor-structure agreement: for
+        # each sample, what fraction of its k nearest neighbors are the SAME
+        # in both spaces. High = correspondence transfers sensibly from
+        # motion-space to backbone-space; low = the cross-feature design's
+        # core assumption doesn't hold for this checkpoint/data.
+        motion_arr = np.stack(motion_feats)
+        motion_nn_idx = (
+            NearestNeighbors(n_neighbors=k + 1)
+            .fit(motion_arr)
+            .kneighbors(motion_arr, return_distance=False)[:, 1:]
+        )
+        overlap = np.array(
+            [
+                len(set(motion_nn_idx[i]) & set(backbone_nn_idx[i])) / k
+                for i in range(motion_nn_idx.shape[0])
+            ]
+        )
+        scalars[f"{metric_key_prefix}/motion_backbone_neighbor_agreement"] = float(overlap.mean())
+
         if wandb.run is not None:
             wandb.log(scalars, step=self.state.global_step)
 
         from sklearn.manifold import TSNE
 
-        perplexity = min(30, feats_arr.shape[0] - 1)
+        perplexity = min(30, backbone_arr.shape[0] - 1)
         proj = TSNE(
             n_components=2, perplexity=perplexity, init="pca", random_state=0
-        ).fit_transform(feats_arr)
+        ).fit_transform(backbone_arr)
 
         fig, ax = plt.subplots(figsize=(6, 6))
         ax.scatter(
@@ -858,12 +938,12 @@ class Gr00tTrainer(Trainer):
             s=12,
         )
         ax.legend()
-        ax.set_title(f"Motion feature t-SNE ({metric_key_prefix}, step {self.state.global_step})")
+        ax.set_title(f"Backbone feature t-SNE ({metric_key_prefix}, step {self.state.global_step})")
         ax.set_xticks([])
         ax.set_yticks([])
         if wandb.run is not None:
             wandb.log(
-                {f"{metric_key_prefix}/motion_domain_tsne": wandb.Image(fig)},
+                {f"{metric_key_prefix}/backbone_domain_tsne": wandb.Image(fig)},
                 step=self.state.global_step,
             )
         plt.close(fig)
@@ -945,23 +1025,32 @@ class Gr00tTrainer(Trainer):
             num_items_in_batch=num_items_in_batch,
         )
 
-        # OT alignment loss between pooled human/robot motion features (see
-        # gr00t/model/modules/optimal_transport.py) — computed here rather than
-        # inside the model: is_human is a Trainer/data-layer concept,
-        # deliberately never routed into the model's forward (same reasoning
-        # as _action_loss_by_group). Ramped in linearly via _ot_lambda so it
-        # doesn't fight the motion head before its embeddings carry any signal.
-        # No detach here — gradients must flow into the motion-token/backbone
-        # parameters, unlike the eval-time call in evaluation_loop.
+        # OT alignment loss (see gr00t/model/modules/optimal_transport.py) —
+        # computed here rather than inside the model: is_human is a
+        # Trainer/data-layer concept, deliberately never routed into the
+        # model's forward (same reasoning as _action_loss_by_group). Matches
+        # on motion_pooled_features (embodiment-invariant, trained only by
+        # motion_loss) but pulls backbone_pooled_features together (the
+        # representation that actually feeds the DiT/action head) — see
+        # _compute_ot_loss. Ramped in linearly via _ot_lambda so it doesn't
+        # fight the motion head before its embeddings carry any signal. No
+        # detach here — gradients must flow into the backbone parameters,
+        # unlike the eval-time call in evaluation_loop (stopgrad_plan inside
+        # sinkhorn_ot_loss still keeps the motion-token encoder unaffected).
         ot_loss = None
         if (
             getattr(self.model.config, "enable_ot_align", False)
             and isinstance(outputs, dict)
             and "motion_pooled_features" in outputs
+            and "backbone_pooled_features" in outputs
         ):
             is_human_batch = inputs["inputs"].get("is_human")
             if is_human_batch is not None:
-                ot_loss = self._compute_ot_loss(outputs["motion_pooled_features"], is_human_batch)
+                ot_loss = self._compute_ot_loss(
+                    outputs["motion_pooled_features"],
+                    outputs["backbone_pooled_features"],
+                    is_human_batch,
+                )
                 if ot_loss is not None:
                     loss = loss + self._ot_lambda() * ot_loss
 

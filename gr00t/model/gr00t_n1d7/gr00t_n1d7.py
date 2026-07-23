@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import logging
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import nn
@@ -486,6 +486,19 @@ class Gr00tN1d7ActionHead(nn.Module):
         return BatchFeature(data=batch)
 
 
+def _masked_mean_pool(features: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    """Masked mean over the sequence dim — pools per-token backbone features
+    into one per-sample vector for OT alignment (see
+    gr00t/model/modules/optimal_transport.py's cross-feature mode: this is
+    the alignment TARGET, distinct from motion_pooled_features which decides
+    the matching). Mirrors the retired keypoint head's
+    _keypoint_condition_token pooling."""
+    if mask is None:
+        return features.mean(dim=1)
+    mask = mask.to(features.dtype).unsqueeze(-1)
+    return (features * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+
+
 def get_backbone_cls(config: Gr00tN1d7Config):
     if "nvidia/Cosmos-Reason2" in config.model_name or "Qwen/Qwen3-VL" in config.model_name:
         # We import here as Qwen3Backbone depends on newer transformers versions than the rest of the code.
@@ -621,10 +634,21 @@ class Gr00tN1d7(PreTrainedModel):
 
         # Motion-keypoint head: independent of the action head/DiT (applies to
         # both human and robot samples — see method_motion_keypoint_ot_v2.md
-        # Section 2). Folded into "loss" alongside the action loss;
-        # motion_pooled_features feeds the Trainer-side OT alignment loss (see
-        # gr00t/experiment/trainer.py, kept out of the model since is_human is
-        # a data-layer concept never routed into forward()).
+        # Section 2). Folded into "loss" alongside the action loss.
+        #
+        # Two DISTINCT pooled features feed the Trainer-side OT alignment loss
+        # (gr00t/experiment/trainer.py; kept out of the model since is_human is
+        # a data-layer concept never routed into forward()):
+        #   - motion_pooled_features: decides WHICH robot/human samples
+        #     correspond (an embodiment-invariant "what motion is this"
+        #     signal, trained only by motion_loss).
+        #   - backbone_pooled_features: what actually gets pulled together —
+        #     action_outputs["backbone_features"] is the vlln/vl_self_attention
+        #     -refined representation that really feeds the DiT via
+        #     cross-attention (see Gr00tN1d7ActionHead.process_backbone_output),
+        #     disjoint from the motion query tokens (see
+        #     gr00t/model/modules/qwen3_backbone.py's forward()).
+        # See gr00t/model/modules/optimal_transport.py's cross-feature mode.
         if self.motion_head is not None:
             motion_token_features = backbone_outputs.get("motion_token_features")
             if motion_token_features is not None:
@@ -632,6 +656,10 @@ class Gr00tN1d7(PreTrainedModel):
                 action_outputs["motion_loss"] = motion_outputs["motion_loss"]
                 action_outputs["motion_pred"] = motion_outputs["motion_pred"]
                 action_outputs["motion_pooled_features"] = motion_outputs["motion_pooled_features"]
+                action_outputs["backbone_pooled_features"] = _masked_mean_pool(
+                    action_outputs["backbone_features"],
+                    action_outputs.get("backbone_attention_mask"),
+                )
                 action_outputs["loss"] = (
                     action_outputs["loss"]
                     + self.config.motion_loss_weight * motion_outputs["motion_loss"]

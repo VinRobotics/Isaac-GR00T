@@ -50,3 +50,111 @@ def test_sinkhorn_ot_loss_is_differentiable():
     assert h_robot.grad is not None
     assert torch.isfinite(h_robot.grad).all()
     assert h_robot.grad.norm().item() > 0
+
+
+def test_sinkhorn_ot_loss_cross_feature_matches_on_one_space_aligns_another():
+    """Match on `h_*` (e.g. motion features) but align `target_*` (e.g.
+    backbone features) — the loss must depend on the TARGET distance, not
+    the matching-feature distance, and gradients must reach both spaces."""
+    torch.manual_seed(0)
+    h_robot = torch.randn(6, 3)
+    h_human = torch.randn(6, 3)
+    target_robot = torch.randn(6, 5, requires_grad=True)
+    target_human_far = torch.randn(6, 5) + torch.tensor([10.0, 0, 0, 0, 0])
+    target_human_close = target_robot.detach().clone() + 0.01 * torch.randn(6, 5)
+
+    loss_far = sinkhorn_ot_loss(
+        h_robot,
+        h_human,
+        eps=0.1,
+        n_iters=50,
+        target_robot=target_robot,
+        target_human=target_human_far,
+    )
+    loss_close = sinkhorn_ot_loss(
+        h_robot,
+        h_human,
+        eps=0.1,
+        n_iters=50,
+        target_robot=target_robot,
+        target_human=target_human_close,
+    )
+    assert loss_far.item() > loss_close.item()
+
+    loss_far.backward()
+    assert target_robot.grad is not None
+    assert torch.isfinite(target_robot.grad).all()
+    assert target_robot.grad.norm().item() > 0
+
+
+def test_sinkhorn_ot_loss_cross_feature_matching_ignores_target_values():
+    """Two calls with identical h_robot/h_human (same matching plan) but
+    swapped target tensors should NOT reduce to the same loss as matching on
+    the targets directly — confirms the plan really comes from h_*, not
+    target_*."""
+    torch.manual_seed(1)
+    h_robot = torch.randn(5, 3) + torch.tensor([5.0, 0, 0])
+    h_human = torch.randn(5, 3) + torch.tensor([-5.0, 0, 0])
+    target_robot = torch.randn(5, 2)
+    target_human = torch.randn(5, 2)
+
+    cross_loss = sinkhorn_ot_loss(
+        h_robot, h_human, eps=0.1, n_iters=50, target_robot=target_robot, target_human=target_human
+    )
+    direct_loss = sinkhorn_ot_loss(target_robot, target_human, eps=0.1, n_iters=50)
+    assert not torch.isclose(cross_loss, direct_loss)
+
+
+def test_sinkhorn_ot_loss_stopgrad_isolates_matching_features():
+    """With stopgrad_plan=True (the default), the cross-feature alignment
+    loss must NOT push h_robot/h_human (the matching features, e.g. the
+    motion-token encoder) — only target_robot/target_human (e.g. the backbone
+    features) should receive gradient. This keeps the matching signal clean
+    and driven only by its own task loss, not "bought" by how easy it makes
+    the alignment loss."""
+    torch.manual_seed(2)
+    h_robot = torch.randn(5, 3, requires_grad=True)
+    h_human = torch.randn(5, 3, requires_grad=True)
+    target_robot = torch.randn(5, 2, requires_grad=True)
+    target_human = torch.randn(5, 2, requires_grad=True)
+
+    loss = sinkhorn_ot_loss(
+        h_robot,
+        h_human,
+        eps=0.1,
+        n_iters=50,
+        target_robot=target_robot,
+        target_human=target_human,
+        stopgrad_plan=True,
+    )
+    loss.backward()
+
+    assert h_robot.grad is None or torch.all(h_robot.grad == 0)
+    assert h_human.grad is None or torch.all(h_human.grad == 0)
+    assert target_robot.grad is not None and target_robot.grad.norm().item() > 0
+    assert target_human.grad is not None and target_human.grad.norm().item() > 0
+
+
+def test_sinkhorn_ot_loss_without_stopgrad_leaks_into_matching_features():
+    """Sanity check for the flag itself: stopgrad_plan=False should let
+    gradient reach h_robot/h_human too (the behavior stopgrad_plan=True is
+    specifically guarding against)."""
+    torch.manual_seed(3)
+    h_robot = torch.randn(5, 3, requires_grad=True)
+    h_human = torch.randn(5, 3, requires_grad=True)
+    target_robot = torch.randn(5, 2)
+    target_human = torch.randn(5, 2)
+
+    loss = sinkhorn_ot_loss(
+        h_robot,
+        h_human,
+        eps=0.1,
+        n_iters=50,
+        target_robot=target_robot,
+        target_human=target_human,
+        stopgrad_plan=False,
+    )
+    loss.backward()
+
+    assert h_robot.grad is not None
+    assert h_robot.grad.norm().item() > 0

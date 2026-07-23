@@ -16,10 +16,47 @@ masking thay vì cần tự viết attention mask một chiều như thiết k�
 
 `MotionHead` (`gr00t/model/gr00t_n1d7/motion_head.py`) đọc hidden state sau-backbone của các token
 này, decode vị trí tương lai bằng 1 forward pass thuần feedforward (KHÔNG cần flow-matching rollout
-như thiết kế cũ — motion token không nằm trong DiT nên không có gì để denoise). Pooled feature
-(mean qua trục token, `motion_pool="mean"`) là không gian OT alignment (`enable_ot_align`,
-`gr00t/model/modules/optimal_transport.py`), tính ở Trainer chứ không phải trong model — `is_human`
-là khái niệm tầng data/Trainer, cố tình không đưa vào forward().
+như thiết kế cũ — motion token không nằm trong DiT nên không có gì để denoise).
+
+## OT alignment: match trên motion, align trên backbone feature (2 không gian TÁCH BIỆT)
+
+`enable_ot_align` không align trực tiếp `motion_pooled_features` (mean qua trục token,
+`motion_pool="mean"`) với chính nó. Thay vào đó, tách rõ 2 vai trò (`gr00t/model/modules/
+optimal_transport.py`'s `sinkhorn_ot_loss(..., target_robot=, target_human=)`):
+
+- **Không gian matching** = `motion_pooled_features` — tín hiệu embodiment-invariant "chuyển động
+  này là gì", chỉ được train bởi `motion_loss` (sạch, không bị ảnh hưởng bởi mục tiêu alignment —
+  xem stop-gradient bên dưới). Dùng để tính transport plan `P* = Sinkhorn(cost(motion_robot,
+  motion_human))`.
+- **Không gian align (target thật)** = `backbone_pooled_features` — masked-mean-pool của
+  `action_outputs["backbone_features"]` (chính là hidden state đã qua `vlln`/`vl_self_attention`,
+  cái THẬT SỰ feed vào DiT qua cross-attention — xem `Gr00tN1d7ActionHead.process_backbone_output`),
+  tính trong `Gr00tN1d7.forward()` (hàm `_masked_mean_pool`). `L_align = Σ P*_ij · d(backbone_robot_i,
+  backbone_human_j)` — motion quyết định "ai khớp ai", nhưng lực kéo tác động lên đúng representation
+  ảnh hưởng đến action prediction, không phải lên motion-token.
+
+**Stop-gradient trên `P*` (mặc định `stopgrad_plan=True`)**: nếu không chặn, gradient của `L_align`
+sẽ chảy ngược qua `P*(motion_pooled_features)` vào motion-token encoder — nghĩa là motion-token giờ
+chịu ảnh hưởng gián tiếp từ mục tiêu "làm sao cho backbone dễ align hơn", phá vỡ tính "sạch" (chỉ
+phục vụ `motion_loss`) vốn là lý do chọn nó làm tín hiệu dẫn đường. Detach `P*` giữ 2 không gian tách
+bạch hoàn toàn: gradient của `L_align` chỉ chảy vào `backbone_pooled_features`/backbone qua cost
+term, không chảy ngược vào motion-token qua plan. Tương đương thực hành chuẩn trong OT-based domain
+adaptation (vd. DeepJDOT): plan được coi là cố định tại cost hiện tại mỗi bước, không lan truyền qua.
+
+**Tách kiến trúc rõ**: `motion_token_features` (`hidden[:, real_len:]`) và `backbone_features`
+(`hidden[:, :real_len]`) là 2 lát cắt KHÔNG chồng lấn của cùng 1 hidden sequence
+(`gr00t/model/modules/qwen3_backbone.py`'s `forward()`) — chia sẻ tham số backbone (cùng 1
+transformer xử lý 1 sequence chung) nhưng không bao giờ chia sẻ vị trí token/feature vector.
+
+**Diagnostic bắt buộc trước khi tin kết quả** (`Gr00tTrainer._log_domain_alignment_viz`): vì
+correspondence tìm được ở motion-space không tự động đảm bảo hợp lý ở backbone-space (giả định ngầm
+2 không gian "đồng bộ" về ngữ nghĩa), so sánh k-nearest-neighbor structure giữa 2 không gian
+(`{prefix}/motion_backbone_neighbor_agreement`, cùng 1 tập sample) — thấp nghĩa là 2 không gian
+không đồng ý "ai giống ai", correspondence mượn từ motion-space có thể không phù hợp áp cho
+backbone-space dù loss OT vẫn giảm. t-SNE scatter + KNN domain-composition + per-domain variance
+(`{prefix}/backbone_domain_*`) chạy trên **backbone feature** — target align thật — để trả lời đúng
+câu hỏi "robot/human feature có thực sự bị kéo lại gần nhau không", không phải câu hỏi về
+motion-space. `is_human` là khái niệm tầng data/Trainer, cố tình không đưa vào forward().
 
 ## Point identity: anchor t=0 tại decoder (thừa kế nguyên vẹn từ thiết kế cũ)
 

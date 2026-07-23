@@ -131,10 +131,16 @@ class Gr00tN1d7Config(PretrainedConfig):
     # gr00t/model/gr00t_n1d7/motion_head.py). Applies to human AND robot
     # samples alike (dense two-domain supervision is the main anti-collapse
     # force). A pure readout with respect to the action path: the DiT/action
-    # head never sees these tokens. enable_ot_align additionally aligns pooled
-    # human/robot motion-token features via Sinkhorn OT (see
-    # gr00t/model/modules/optimal_transport.py), gated by the existing
-    # per-sample is_human signal (never routed into the model itself — see
+    # head never sees these tokens. enable_ot_align additionally aligns human
+    # vs. robot samples via Sinkhorn OT (see
+    # gr00t/model/modules/optimal_transport.py): the transport plan is
+    # computed from pooled motion-token features (embodiment-invariant,
+    # trained only by motion_loss), but the loss pulls pooled BACKBONE
+    # features (the representation that actually feeds the DiT) together —
+    # motion decides correspondence, backbone is what gets aligned. The plan
+    # is detached (stopgrad_plan) so this never leaks a gradient back into the
+    # motion-token encoder. Gated by the existing per-sample is_human signal
+    # (never routed into the model itself — see
     # LeRobotEpisodeLoader.detect_is_human), computed in the Trainer.
     enable_motion_head: bool = False
     motion_horizon: int = 16
@@ -154,8 +160,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     # trained one way predicts garbage interpreted the other way.
     motion_relative: bool = False
     # How the num_motion_tokens post-backbone hidden states are pooled into one
-    # per-sample feature vector for the OT alignment loss. Only "mean" is
-    # currently implemented.
+    # per-sample feature vector — the MATCHING signal for the OT alignment
+    # loss, not the thing actually pulled together (see enable_ot_align).
+    # Only "mean" is currently implemented.
     motion_pool: str = "mean"  # one of {"mean"}
 
     enable_ot_align: bool = False
