@@ -812,11 +812,22 @@ class Gr00tTrainer(Trainer):
         # KNN domain-composition: for each point, what fraction of its k nearest
         # OTHER points (raw feature space, not the 2D t-SNE projection) share
         # its domain. Close to 0.5 = well mixed; close to 1.0 = domains still
-        # segregated despite whatever the loss curve says.
+        # segregated despite whatever the loss curve says. Do not form an
+        # [N, N, D] broadcasted difference tensor here: a whole validation set
+        # of only ~8k examples with 2k-dim features would require hundreds of GB.
         k = min(10, feats_arr.shape[0] - 1)
-        dists = np.linalg.norm(feats_arr[:, None, :] - feats_arr[None, :, :], axis=-1)
-        np.fill_diagonal(dists, np.inf)
-        nn_idx = np.argsort(dists, axis=1)[:, :k]
+        try:
+            from sklearn.neighbors import NearestNeighbors
+        except ImportError:
+            logging.warning(
+                "scikit-learn not installed - skipping motion-domain KNN and t-SNE diagnostics."
+            )
+            return
+        nn_idx = (
+            NearestNeighbors(n_neighbors=k + 1)
+            .fit(feats_arr)
+            .kneighbors(feats_arr, return_distance=False)[:, 1:]
+        )
         same_domain_frac = float((is_human_arr[nn_idx] == is_human_arr[:, None]).mean())
 
         scalars = {
@@ -827,14 +838,7 @@ class Gr00tTrainer(Trainer):
         if wandb.run is not None:
             wandb.log(scalars, step=self.state.global_step)
 
-        try:
-            from sklearn.manifold import TSNE
-        except ImportError:
-            logging.warning(
-                "scikit-learn not installed - skipping t-SNE domain scatter plot "
-                "(scalars were still logged)."
-            )
-            return
+        from sklearn.manifold import TSNE
 
         perplexity = min(30, feats_arr.shape[0] - 1)
         proj = TSNE(
