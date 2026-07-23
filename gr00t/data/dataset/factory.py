@@ -141,7 +141,11 @@ class DatasetFactory:
         use_auto_split = (
             self.config.training.eval_strategy != "no" and not val_paths and eval_split_ratio > 0.0
         )
-        collect_viz_images = getattr(self.config.model, "enable_keypoint_head", False)
+        # The VLM-backbone motion head owns the GT-vs-predicted keypoint image
+        # and episode-video diagnostics. `enable_keypoint_head` was the retired
+        # Action-Head implementation, so checking it here silently omitted the
+        # thumbnails those diagnostics require.
+        collect_viz_images = getattr(self.config.model, "enable_motion_head", False)
 
         all_datasets = []
         all_weights = []
