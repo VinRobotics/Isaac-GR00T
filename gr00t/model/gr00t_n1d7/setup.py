@@ -72,7 +72,9 @@ def _reinit_missing_motion_params(model: torch.nn.Module, missing_keys: list) ->
         name for name in MOTION_AUX_PARAM_NAMES if any(name in k for k in missing_keys)
     ]
     for name in missing_names:
-        submodule = getattr(model.backbone, name, None) or getattr(model.motion_head, name, None)
+        submodule = getattr(model.backbone, name, None)
+        if submodule is None:
+            submodule = getattr(model.motion_head, name, None)
         if submodule is None:
             continue
         with torch.no_grad():
