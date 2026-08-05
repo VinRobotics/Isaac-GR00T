@@ -3078,7 +3078,7 @@ class EquiALOHA_2Hand_Quat_Config(BaseDataConfig):
     
 
 class EquiRoboTwin_2Hand_Quat_Config(BaseDataConfig):
-    video_keys = ["video.image", "video.left_wrist_image", "video.right_wrist_image"]
+    video_keys = ["video.image", "video.left_image", "video.right_image"]
     # video.image (index 0) = top/head camera → equivariant FA
     # video.left_wrist_image (index 1) = left wrist camera → VL only, skipped from equi_vision_embs
     # video.right_wrist_image (index 2) = right wrist camera → VL only, skipped from equi_vision_embs
