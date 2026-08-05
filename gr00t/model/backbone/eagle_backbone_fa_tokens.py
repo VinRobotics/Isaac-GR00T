@@ -573,25 +573,31 @@ class EagleBackboneFATokens(nn.Module):
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
         """
-        Freeze the entire eagle_model (VLM) and train only the new equivariant layers.
+        Freeze the pretrained VLM by default, then selectively unfreeze
+        eagle_model.language_model / eagle_model.vision_model (+ mlp1) per
+        tune_llm / tune_visual — same semantics as the plain EagleBackbone.
 
-        tune_llm / tune_visual are kept as arguments for API compatibility but
-        the VLM is always frozen here — only vision_proj, eagle_linear,
-        inv_projector and equi_adapter are trained.
+        The new equivariant layers (vision_proj, eagle_linear, inv_fa_proj,
+        equi_adapter) are always trainable regardless of these flags.
         """
-        self.tune_llm = False
-        self.tune_visual = False
+        self.tune_llm = tune_llm
+        self.tune_visual = tune_visual
 
-        # Freeze entire VLM
+        # Freeze the whole pretrained VLM, then selectively unfreeze per flags.
         self.eagle_model.requires_grad_(False)
+        if tune_llm:
+            self.eagle_model.language_model.requires_grad_(True)
+        if tune_visual:
+            self.eagle_model.vision_model.requires_grad_(True)
+            self.eagle_model.mlp1.requires_grad_(True)
 
-        # Unfreeze new equivariant layers only
+        # New equivariant layers are always trainable, on top of the above.
         for name, p in self.named_parameters():
             if name.startswith(self._NEW_LAYER_PREFIXES):
                 p.requires_grad_(True)
-            else:
-                p.requires_grad_(False)
 
+        print(f"Tune backbone llm: {self.tune_llm}")
+        print(f"Tune backbone visual: {self.tune_visual}")
         trainable = [n for n, p in self.named_parameters() if p.requires_grad]
         print(f"Backbone trainable parameters ({len(trainable)}):")
         for n in trainable:
