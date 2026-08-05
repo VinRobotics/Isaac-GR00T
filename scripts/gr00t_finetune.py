@@ -88,6 +88,12 @@ class ArgsConfig:
     use_action_conditioning: bool = False
     """Whether to use action conditioning in the flow matching action head."""
 
+    init_dit_from_scratch: bool = False
+    """Whether to randomly re-initialize the action head's DiT (diffusion transformer) instead of
+    loading its weights from the pretrained checkpoint. The backbone/projector/action_encoder/
+    action_decoder still load from the pretrained checkpoint as usual; only the DiT is reset.
+    Useful for training the diffusion transformer from scratch on top of a pretrained backbone."""
+
     rotation_augment: bool = False
     """Whether to apply random Z-axis rotation augmentation during training.
     Rotates only the camera slots listed in the data config's rotate_image_indices,
@@ -358,6 +364,23 @@ def main(config: ArgsConfig):
         model.action_dim = data_max_action_dim
 
         # Set trainable parameters for the new action head
+        model.action_head.set_trainable_parameters(
+            tune_projector=config.tune_projector, tune_diffusion_model=config.tune_diffusion_model
+        )
+
+    if config.init_dit_from_scratch:
+        # Discard the pretrained DiT weights and re-initialize the module fresh, keeping the
+        # rest of the action head (action_encoder/action_decoder/projector) and the backbone
+        # loaded from the pretrained checkpoint.
+        if config.use_action_conditioning:
+            from gr00t.model.action_head.cross_attention_dit_action_condition import DiT
+        else:
+            from gr00t.model.action_head.cross_attention_dit import DiT
+
+        print("Re-initializing action head's DiT from scratch (ignoring pretrained DiT weights)")
+        model.action_head.model = DiT(**model.action_head.config.diffusion_model_cfg)  # type: ignore[assignment]
+        # Re-apply tune_projector/tune_diffusion_model, since the freshly constructed DiT
+        # defaults to requires_grad=True on all its parameters regardless of that setting.
         model.action_head.set_trainable_parameters(
             tune_projector=config.tune_projector, tune_diffusion_model=config.tune_diffusion_model
         )
