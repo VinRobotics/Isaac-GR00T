@@ -94,6 +94,12 @@ class ArgsConfig:
     action_decoder still load from the pretrained checkpoint as usual; only the DiT is reset.
     Useful for training the diffusion transformer from scratch on top of a pretrained backbone."""
 
+    init_action_projector_from_scratch: bool = False
+    """Whether to randomly re-initialize the action head's state_encoder, action_encoder, and
+    action_decoder instead of loading their weights from the pretrained checkpoint. Can be
+    combined with --init_dit_from_scratch. Useful when the new embodiment's state/action layout
+    makes the pretrained projector weights a poor starting point."""
+
     rotation_augment: bool = False
     """Whether to apply random Z-axis rotation augmentation during training.
     Rotates only the camera slots listed in the data config's rotate_image_indices,
@@ -381,6 +387,43 @@ def main(config: ArgsConfig):
         model.action_head.model = DiT(**model.action_head.config.diffusion_model_cfg)  # type: ignore[assignment]
         # Re-apply tune_projector/tune_diffusion_model, since the freshly constructed DiT
         # defaults to requires_grad=True on all its parameters regardless of that setting.
+        model.action_head.set_trainable_parameters(
+            tune_projector=config.tune_projector, tune_diffusion_model=config.tune_diffusion_model
+        )
+
+    if config.init_action_projector_from_scratch:
+        # Discard the pretrained state_encoder/action_encoder/action_decoder weights and
+        # re-initialize them fresh, keeping the DiT (unless --init_dit_from_scratch is also
+        # set) and the backbone loaded from the pretrained checkpoint.
+        from gr00t.model.action_head.flow_matching_action_head import (
+            CategorySpecificMLP,
+            MultiEmbodimentActionEncoder,
+        )
+
+        print(
+            "Re-initializing action head's state_encoder/action_encoder/action_decoder from "
+            "scratch (ignoring pretrained weights)"
+        )
+        head_config = model.action_head.config
+        model.action_head.state_encoder = CategorySpecificMLP(
+            num_categories=head_config.max_num_embodiments,
+            input_dim=head_config.max_state_dim,
+            hidden_dim=model.action_head.hidden_size,
+            output_dim=model.action_head.input_embedding_dim,
+        )
+        model.action_head.action_encoder = MultiEmbodimentActionEncoder(
+            action_dim=head_config.action_dim,
+            hidden_size=model.action_head.input_embedding_dim,
+            num_embodiments=head_config.max_num_embodiments,
+        )
+        model.action_head.action_decoder = CategorySpecificMLP(
+            num_categories=head_config.max_num_embodiments,
+            input_dim=model.action_head.hidden_size,
+            hidden_dim=model.action_head.hidden_size,
+            output_dim=head_config.action_dim,
+        )
+        # Re-apply tune_projector/tune_diffusion_model, since the freshly constructed modules
+        # default to requires_grad=True on all their parameters regardless of that setting.
         model.action_head.set_trainable_parameters(
             tune_projector=config.tune_projector, tune_diffusion_model=config.tune_diffusion_model
         )
