@@ -284,6 +284,7 @@ class EagleBackboneFATokens(nn.Module):
         project_to_dim: int = 1536,
         # Late FA specific parameters
         n_group: int = 4,  # Number of rotations (C4 = 4, C8 = 8)
+        vision_extract_chunk_group: int | None = None,
         num_images_per_sample: int = 1,
         rotate_image_indices: List[int] | None = None,  # Which images to rotate (None = all)
         output_type: str = 'reg',  # 'reg' for regular representation
@@ -300,6 +301,15 @@ class EagleBackboneFATokens(nn.Module):
             select_layer: which LLM layer to extract features from
             project_to_dim: project features to this dimension (must be divisible by n_group for reg repr)
             n_group: number of rotations for CN group (4 for C4, 8 for C8)
+            vision_extract_chunk_group: max number of rotation states run through
+                eagle_model.extract_feature(...) in one call. Peak activation memory for
+                that call scales with B * n_group * n_equi, so at large n_group (e.g. C16)
+                a single call can OOM even though the final result doesn't depend on how
+                it's batched (the vision tower is per-sample; LayerNorm-based, no
+                cross-sample coupling — chunking is numerically a no-op, purely a memory/
+                perf knob). None (default) = single call, unchanged prior behavior. Set to
+                e.g. 8 to cap it at 2 chunks for C16, 4 chunks for C32, etc. Must divide
+                n_group evenly.
             num_images_per_sample: number of images per sample
             rotate_image_indices: which image indices to rotate (None = all)
             output_type: 'reg' for regular representation output
@@ -312,6 +322,12 @@ class EagleBackboneFATokens(nn.Module):
 
         # Store config
         self.n_group = n_group
+        self.vision_extract_chunk_group = vision_extract_chunk_group
+        if vision_extract_chunk_group is not None:
+            assert n_group % vision_extract_chunk_group == 0, (
+                f"vision_extract_chunk_group ({vision_extract_chunk_group}) must divide "
+                f"n_group ({n_group}) evenly"
+            )
         self.num_images_per_sample = num_images_per_sample
         self.output_type = output_type
         self.project_to_dim = project_to_dim if project_to_dim else 2048
@@ -384,6 +400,7 @@ class EagleBackboneFATokens(nn.Module):
 
         print(f"EagleBackboneFATokens initialized:")
         print(f"  n_group (CN): {self.n_group}")
+        print(f"  vision_extract_chunk_group: {self.vision_extract_chunk_group or '(single call, no chunking)'}")
         print(f"  d_eagle (LLM hidden): {d_eagle}")
         print(f"  project_to_dim: {self.project_to_dim}")
         print(f"  rotate_image_indices: {self.rotate_image_indices}")
@@ -905,6 +922,49 @@ class EagleBackboneFATokens(nn.Module):
         
         return permuted
 
+    def _extract_equi_vision_features(
+        self, equi_pixels: torch.Tensor, B: int, n_equi: int
+    ) -> torch.Tensor:
+        """
+        Run eagle_model.extract_feature on the rotated equi-camera pixels.
+
+        equi_pixels is [B*N*n_equi, C, H, W] in (B, N, n_equi) row-major order (see
+        rotate_vl_batch). If self.vision_extract_chunk_group is set, split along N and
+        run extract_feature per chunk instead of on the whole thing at once — peak
+        activation memory for that call scales with B*N*n_equi, so at large N (e.g. C16)
+        a single call can OOM. The vision tower has no cross-sample coupling (LayerNorm,
+        not BatchNorm), so this is numerically identical to the unchunked call, purely a
+        memory/perf knob.
+
+        Returns:
+            vis_tokens_raw: [B*N*n_equi, T, vision_dim] — same layout as a single
+                extract_feature(equi_pixels) call would produce.
+        """
+        N = self.n_group
+        chunk_group = self.vision_extract_chunk_group
+        if not chunk_group or chunk_group >= N:
+            vis_tokens_raw, _ = self.eagle_model.extract_feature(equi_pixels)
+            return vis_tokens_raw
+
+        C_img, H_img, W_img = equi_pixels.shape[1], equi_pixels.shape[2], equi_pixels.shape[3]
+        equi_pixels_5d = equi_pixels.reshape(B, N, n_equi, C_img, H_img, W_img)
+
+        chunks_out = []
+        for start in range(0, N, chunk_group):
+            end = min(start + chunk_group, N)
+            chunk = equi_pixels_5d[:, start:end].reshape(
+                B * (end - start) * n_equi, C_img, H_img, W_img
+            )
+            vis_chunk, _ = self.eagle_model.extract_feature(chunk)
+            num_vision_tokens = vis_chunk.shape[1]
+            vision_dim        = vis_chunk.shape[2]
+            chunks_out.append(vis_chunk.reshape(B, end - start, n_equi, num_vision_tokens, vision_dim))
+
+        vis_tokens_raw = torch.cat(chunks_out, dim=1).reshape(
+            B * N * n_equi, num_vision_tokens, vision_dim
+        )
+        return vis_tokens_raw
+
     # ──────────────────────────────────────────────────────────────────────────
     # Phase 2 helper: inject InvariantProjector tokens into Eagle LLM
     # ──────────────────────────────────────────────────────────────────────────
@@ -1041,8 +1101,9 @@ class EagleBackboneFATokens(nn.Module):
         equi_pixels, noequi_pixels, img_batch, B = self.rotate_vl_batch(dict(vl_input))
         n_equi = len(self.rotate_image_indices)
 
-        # [B*N*n_equi, T, vision_dim]
-        vis_tokens_raw, _ = self.eagle_model.extract_feature(equi_pixels)
+        # [B*N*n_equi, T, vision_dim] — chunked along N when vision_extract_chunk_group
+        # is set, to bound peak memory at large n_group (e.g. C16); see docstring.
+        vis_tokens_raw = self._extract_equi_vision_features(equi_pixels, B, n_equi)
         num_vision_tokens = vis_tokens_raw.shape[1]
         vision_dim        = vis_tokens_raw.shape[2]
 

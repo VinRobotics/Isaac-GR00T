@@ -18,7 +18,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 import torch
 import tyro
@@ -134,6 +134,27 @@ class ArgsConfig:
     scale_factor=1 (default) keeps the pretrained dimensions unchanged.
     scale_factor=2 doubles project_to_dim (e.g. 2048 → 4096, blocks 256 → 512)."""
 
+    n_group: Optional[int] = None
+    """Cyclic group order C_N for the equivariant FA backbone + action head (e.g. 4, 8, 16).
+    None (default) keeps whatever the data config's get_rotation_config() / base checkpoint
+    already specify (usually 4). Setting this overrides both — it's the single knob for
+    picking C4 vs C8 vs C16 at finetune time; no need to hand-edit data_config.py.
+
+    Must evenly divide project_to_dim (and the action head's hidden_size /
+    input_embedding_dim / cross_attention_dim, which come from the base checkpoint and are
+    NOT auto-scaled by this flag) — the escnn regular representation is sized by n_group.
+    If it doesn't divide, pair this with --equi-scale-factor to grow project_to_dim, or
+    pick an n_group that already divides the base checkpoint's dims (2048 default → 4, 8,
+    16, 32 all divide evenly)."""
+
+    vision_extract_chunk_group: Optional[int] = None
+    """Cap on rotation states run through the vision tower in one call (must divide
+    n_group). Peak activation memory for that call scales with batch_size * n_group *
+    num_images, so a large n_group (e.g. 16) can OOM even though the result doesn't
+    depend on how it's batched. None (default) = single call, unchanged behavior. Set
+    e.g. 8 when running --n-group 16 and hitting OOM (splits into 2 chunks); purely a
+    memory/perf knob, does not change the equivariance math or trained weights."""
+
     rot_aug: bool = False
     """Whether to apply rotation augmentation during training."""
 
@@ -235,6 +256,17 @@ def main(config: ArgsConfig):
     # Build backbone_cfg overrides: rotation config + always persist n_group
     backbone_cfg_overrides = dict(rotation_config)
 
+    # --n-group CLI override — takes precedence over whatever the data config's
+    # get_rotation_config() set (or the base checkpoint's own n_group, if neither
+    # specifies one). This is the knob for picking C4 vs C8 vs C16 at finetune time.
+    if config.n_group is not None:
+        backbone_cfg_overrides["n_group"] = config.n_group
+        print(f"n_group overridden via --n-group: C{config.n_group}")
+
+    if config.vision_extract_chunk_group is not None:
+        backbone_cfg_overrides["vision_extract_chunk_group"] = config.vision_extract_chunk_group
+        print(f"vision_extract_chunk_group overridden via CLI: {config.vision_extract_chunk_group}")
+
     # Scale project_to_dim if equi_scale_factor != 1
     if config.equi_scale_factor != 1:
         from gr00t.model.gr00t_n1 import GR00T_N1_5_Config
@@ -248,6 +280,25 @@ def main(config: ArgsConfig):
         )
         backbone_cfg_overrides["project_to_dim"] = _new_project_to_dim
         print(f"equi_scale_factor={config.equi_scale_factor}: project_to_dim {_base_project_to_dim} → {_new_project_to_dim} (blocks {_base_project_to_dim//_n_group} → {_new_project_to_dim//_n_group})")
+    elif "n_group" in backbone_cfg_overrides:
+        # project_to_dim isn't being rescaled — it comes straight from the base
+        # checkpoint, so make sure the new n_group still divides it evenly (the
+        # escnn regular representation is sized by n_group; a bad combo would
+        # otherwise fail deep inside EagleBackboneFATokens with a less obvious
+        # assert). Doesn't check hidden_size/input_embedding_dim/cross_attention_dim
+        # (action-head side) — those raise their own clear asserts at construction
+        # if mismatched.
+        from transformers import AutoConfig
+        _base_cfg = AutoConfig.from_pretrained(config.base_model_path)
+        _project_to_dim = backbone_cfg_overrides.get(
+            "project_to_dim", _base_cfg.backbone_cfg.get("project_to_dim") or 2048
+        )
+        _n_group = backbone_cfg_overrides["n_group"]
+        assert _project_to_dim % _n_group == 0, (
+            f"project_to_dim ({_project_to_dim}) must be divisible by n_group ({_n_group}); "
+            f"pick an n_group that divides it, or pair --n-group with --equi-scale-factor "
+            f"to grow project_to_dim instead."
+        )
 
     # Load model — backbone_cfg_overrides are merged into backbone_cfg before construction
     model = GR00T_N1_5.from_pretrained(
