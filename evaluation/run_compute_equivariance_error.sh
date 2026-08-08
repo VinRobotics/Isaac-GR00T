@@ -53,7 +53,7 @@ C4_CKPT=${C4_CKPT:-""}
 C16_CKPT=${C16_CKPT:-""}
 # -----------------------------------------------------------------------------
 
-source /home/locht1/miniconda3/bin/activate gr00t_equi_fa
+source /home/locht1/miniconda3/bin/activate gr00t_equi_fa_c4
 
 run_one() {
     local label="$1"
