@@ -18,19 +18,36 @@
 #   put next to a C16 model's own epsilon_eq. So: measure each checkpoint with
 #   --args.n_group set to the SAME group order it was trained with.
 #
+# Two measurement modes — pick deliberately, they are NOT comparable:
+#
+#   RANDOM_INIT=true  (DEFAULT) — ARCHITECTURAL equivariance.
+#       Loads the checkpoint, then re-initialises every learnable weight via
+#       reset_parameters() before measuring. Equivariance is a structural
+#       property, so a correctly-equivariant architecture must give
+#       epsilon_eq ~= 0 for ANY weights; if it doesn't, the architecture itself
+#       isn't end-to-end equivariant. This is the mode the paper_table numbers
+#       were produced with (EquiVLA 0.28, Equi Actor 0.84, Baseline 7.75) —
+#       use it to compare C4 vs C16 against that table.
+#
+#   RANDOM_INIT=false — equivariance of the TRAINED checkpoint as-is.
+#       Answers a different question: did training preserve the architectural
+#       property. Expect larger numbers, partly because epsilon_eq is an
+#       ABSOLUTE L2 norm and trained models have ~2x larger action norms
+#       (see empirical_B_mean_action_norm in the json — always divide by it
+#       before comparing across models).
+#
+#   Comparing a trained-weights run against a random-init run is the single
+#   easiest way to get a misleading table. Check the header line in each .log
+#   ("RANDOM-INIT diagnostic: ...") to confirm which mode produced a number.
+#
 # Checkpoint requirement:
-#   Yes, compute_equivariance_error.py needs a checkpoint DIRECTORY to load —
-#   it builds the policy via Gr00tn15_inference(pretrained_model_path), which
-#   reads config.json (embodiment/action-head/backbone shapes, incl. n_group)
-#   from that path and instantiates from it. There is no from-scratch/self-init
-#   path. If you only want to check ARCHITECTURAL equivariance (independent of
-#   how well training went), you don't need a fully-trained checkpoint — pass
-#   RANDOM_INIT=true below and any checkpoint directory with the right
-#   architecture (e.g. an early/step-0 save) will do: the script loads it, then
-#   re-initialises every module's weights via reset_parameters() (same seed,
-#   same architecture) before measuring. Equivariance is structural, so a
-#   correctly-equivariant architecture should give epsilon_eq ~= 0 even then;
-#   if it doesn't, the architecture itself isn't end-to-end equivariant.
+#   Either way, compute_equivariance_error.py needs a checkpoint DIRECTORY to
+#   load — it builds the policy via Gr00tn15_inference(pretrained_model_path),
+#   which reads config.json (embodiment/action-head/backbone shapes, incl.
+#   n_group) from that path and instantiates from it. There is no
+#   from-scratch/self-init path. Under RANDOM_INIT=true the weights are thrown
+#   away, so any checkpoint with the right ARCHITECTURE works (e.g. an early or
+#   step-0 save) — but the directory must exist.
 #
 # Edit the checkpoint paths below before running.
 # Results are written to $SAVE_DIR/log/$EXP_NAME/<task_suite>_<model_label>.{log,json}
@@ -41,9 +58,24 @@ TASK_SUITE=${TASK_SUITE:-libero_10}
 NUM_SAMPLES=${NUM_SAMPLES:-500}
 NUM_STEPS_WAIT=${NUM_STEPS_WAIT:-10}
 SAVE_DIR=${SAVE_DIR:-/mnt/data/sftp/data/locht1/equi_eq_error}
-EXP_NAME=${EXP_NAME:-c4_c16_table}
-RANDOM_INIT=${RANDOM_INIT:-false}
-# set RANDOM_INIT=true to measure architecture only (see header) — no trained weights needed
+
+# Default ON — this is the mode the paper_table numbers were produced with
+# (their logs all carry "RANDOM-INIT diagnostic: re-initialising all learnable
+# weights"). Leave it on to put C4/C16 next to those numbers; set
+# RANDOM_INIT=false to instead measure the trained checkpoints as-is.
+RANDOM_INIT=${RANDOM_INIT:-true}
+
+# Keep the two modes in SEPARATE exp dirs — results are named only by
+# <task_suite>_<model_label>, so reusing one EXP_NAME would silently overwrite
+# the other mode's .log/.json. (The existing trained-weight run lives in
+# c4_c16_table; don't point a random-init run at that name.)
+if [[ "$RANDOM_INIT" == "true" || "$RANDOM_INIT" == "1" ]]; then
+    EXP_NAME=${EXP_NAME:-c4_c16_random_init}
+    MODE_DESC="RANDOM-INIT (architectural equivariance — comparable to paper_table)"
+else
+    EXP_NAME=${EXP_NAME:-c4_c16_trained}
+    MODE_DESC="TRAINED WEIGHTS (NOT comparable to paper_table's random-init numbers)"
+fi
 
 # ---- checkpoint paths, one per cyclic group order (fill these in) -----------
 # Each must be a checkpoint that was actually FINE-TUNED with that group order
@@ -66,6 +98,8 @@ run_one() {
     echo "===================================================================="
     echo "Running $label  (C${n_group} group, --args.n_group ${n_group})"
     echo "  ckpt = $ckpt"
+    echo "  mode = $MODE_DESC"
+    echo "  out  = $SAVE_DIR/log/$EXP_NAME/${TASK_SUITE}_${label}.{log,json}"
     echo "===================================================================="
     # tyro renders bool fields as bare flags (--args.random_init flips it True),
     # not `--flag value` — so only append it when the user opted in, rather than
