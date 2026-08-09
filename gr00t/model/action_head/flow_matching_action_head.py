@@ -1012,7 +1012,174 @@ class FlowmatchingActionHead(nn.Module):
             
         actions = self.getActionOutput(actions)
         return BatchFeature(data={"action_pred": actions})
-    
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Equivariance-testing helpers
+    # ─────────────────────────────────────────────────────────────────────────
+    #
+    # For exact equivariance under a world rotation g, the flow-matching head
+    # needs BOTH the conditioning AND the initial noise z_0 to transform
+    # consistently:
+    #     denoise(ρ_action(g) · z_0, ρ_cond(g) · c) = ρ_action(g) · denoise(z_0, c)
+    #
+    # A fixed z_0 (e.g. from a fixed torch seed) BREAKS this — ρ_action(g)·z_0
+    # ≠ z_0 in general.  These helpers let the equivariance test (e.g.
+    # evaluation/compute_equivariance_error.py):
+    #   1. sample z_0 once (via sample_init_noise),
+    #   2. rotate it by ρ_action(g_r) using the action_type's irrep structure
+    #      (apply_group_action_to_noise),
+    #   3. pass the rotated z_0 in through get_action_with_noise instead of the
+    #      action head sampling fresh noise.
+    #
+    # Ported from equi_gr00t_FA_equillm — unlike that branch's current
+    # getActionRelFieldType (which hardcodes rho2_copies=1, only valid for
+    # n_group >= 5), these three methods are group-order-agnostic: they iterate
+    # generically over self.action_type.representations, so they work as-is for
+    # this branch's C4 (or C8/C16) action_type.
+
+    def sample_init_noise(self, batch_size: int, device, dtype):
+        """Sample an initial noise tensor of the same shape used by get_action.
+
+        Shape: [batch_size, action_horizon, action_type.size].  Caller may
+        torch.manual_seed beforehand to get a reproducible draw.
+        """
+        return torch.randn(
+            size=(batch_size, self.config.action_horizon, self.action_type.size),
+            dtype=dtype,
+            device=device,
+        )
+
+    def apply_group_action_to_noise(self, noise: torch.Tensor, group_element_idx: int) -> torch.Tensor:
+        """Apply ρ_action(g_r) to a noise tensor laid out per `self.action_type`.
+
+        Iterates over the FieldType's representations (irrep(2), irrep(1),
+        trivial, …) and multiplies each block by its representation matrix.
+        Group-order-agnostic — works for whatever CyclicGroup(self.n_group)
+        this action head was constructed with.
+
+        Args:
+            noise: [B, T, D]  where D == self.action_type.size.
+            group_element_idx: r ∈ {0, …, |G|-1}.
+
+        Returns:
+            Rotated noise tensor, same shape as input.
+        """
+        G = self.action_type.gspace.fibergroup
+        g = G.element(group_element_idx)
+        B, T, D = noise.shape
+        flat = noise.reshape(-1, D)                              # [B*T, D]
+        result_blocks = []
+        offset = 0
+        for rep in self.action_type.representations:
+            size = rep.size
+            block = flat[:, offset : offset + size]              # [B*T, size]
+            R = torch.tensor(rep(g), dtype=flat.dtype, device=flat.device)
+            result_blocks.append(block @ R.T)
+            offset += size
+        rotated = torch.cat(result_blocks, dim=-1)
+        return rotated.reshape(B, T, D)
+
+    @torch.inference_mode()
+    def get_action_with_noise(
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        init_noise: torch.Tensor,
+    ) -> BatchFeature:
+        """Same forward as `get_action`, but uses the provided `init_noise`
+        instead of sampling fresh noise from `torch.randn`.
+
+        Used only by the equivariance test, which must feed ρ_action(g)·z_0
+        when the input was rotated by g. Mirrors get_action's own state-encoder
+        call convention (embodiment_id passed as-is, not repeat_interleave'd —
+        this branch's get_action does the same).
+
+        Args:
+            backbone_output: same as get_action.
+            action_input:    same as get_action.
+            init_noise:      [B, action_horizon, action_type.size] tensor.
+                             Will be moved/cast to match vl_embs.
+
+        Returns:
+            BatchFeature with key "action_pred".
+        """
+        self.model.eval()
+        self.action_decoder.eval()
+        self.state_encoder.eval()
+        self.action_encoder.eval()
+
+        backbone_output = self.process_backbone_output(backbone_output)
+
+        vl_embs = backbone_output.vl_features
+        encoder_mask = backbone_output.backbone_attention_mask
+        embodiment_id = action_input.embodiment_id
+
+        # Embed state.
+        B, T, _ = action_input.state.shape
+        state_input = self.getJointGeometricTensor(action_input.state, is_action=False)
+        state_features = self.state_encoder(state_input, embodiment_id)
+        state_features = state_features.tensor
+        state_features = einops.rearrange(state_features, '(b t) c -> b t c', b=B, t=T)
+        if self.config.add_pos_embed:
+            state_features = self._add_temporal_pos_embed(state_features)
+
+        # ── KEY DIFFERENCE FROM get_action: use the externally-supplied noise.
+        batch_size = vl_embs.shape[0]
+        device = vl_embs.device
+        expected_shape = (batch_size, self.config.action_horizon, self.action_type.size)
+        if tuple(init_noise.shape) != expected_shape:
+            raise ValueError(
+                f"init_noise shape {tuple(init_noise.shape)} does not match "
+                f"expected {expected_shape}"
+            )
+        actions = init_noise.to(device=device, dtype=vl_embs.dtype)
+
+        num_steps = self.num_inference_timesteps
+        dt = 1.0 / num_steps
+
+        for t in range(num_steps):
+            t_cont = t / float(num_steps)
+            t_discretized = int(t_cont * self.num_timestep_buckets)
+
+            timesteps_tensor = torch.full(
+                size=(batch_size,), fill_value=t_discretized, device=device
+            )
+            action_encoder_embodiment_id = embodiment_id.repeat((actions.shape[1]))
+            noisy_trajectory = einops.rearrange(actions, "b t c -> (b t) c")
+            noisy_trajectory = enn.GeometricTensor(noisy_trajectory, self.action_type)
+            action_features = self.action_encoder(
+                noisy_trajectory, timesteps_tensor, action_encoder_embodiment_id
+            )
+            action_features = action_features.tensor
+            action_features = einops.rearrange(
+                action_features, '(b t) c -> b t c',
+                b=actions.shape[0], t=actions.shape[1],
+            )
+            if self.config.add_pos_embed:
+                action_features = self._add_temporal_pos_embed(action_features)
+
+            sa_embs = torch.cat((state_features, action_features), dim=1)
+            model_output = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embs,
+                encoder_attention_mask=encoder_mask,
+                timestep=timesteps_tensor,
+            )
+            N_sa = model_output.shape[1]
+            action_decoder_embodiment_id = embodiment_id.repeat(N_sa)
+            model_output = einops.rearrange(model_output, 'b t c -> (b t) c')
+            model_output = enn.GeometricTensor(model_output, self.state_hidden_type)
+            pred = self.action_decoder(model_output, action_decoder_embodiment_id)
+            pred = einops.rearrange(
+                pred.tensor, '(b t) c -> b t c',
+                b=sa_embs.shape[0], t=N_sa,
+            )
+            pred_velocity = pred[:, -self.action_horizon:]
+            actions = actions + dt * pred_velocity
+
+        actions = self.getActionOutput(actions)
+        return BatchFeature(data={"action_pred": actions})
+
     @torch.enable_grad()
     def get_realtime_action(
         self,
